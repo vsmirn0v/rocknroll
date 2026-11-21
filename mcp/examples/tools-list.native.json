@@ -1034,8 +1034,10 @@
               "scroll",
               "filter",
               "click",
+              "click_at",
               "highlight",
-              "inspect"
+              "inspect",
+              "snapshot"
             ],
             "type" : "string"
           },
@@ -1048,6 +1050,10 @@
           "meeting_id" : {
             "description" : "Active session identifier (session:native:...) for share_to_meeting.",
             "type" : "string"
+          },
+          "normalized" : {
+            "description" : "When true (default), x and y are normalized viewport fractions in 0.0...1.0.",
+            "type" : "boolean"
           },
           "query" : {
             "description" : "Search query for filter.",
@@ -1064,6 +1070,16 @@
           "url" : {
             "description" : "HTTPS or localhost URL for open_url.",
             "type" : "string"
+          },
+          "x" : {
+            "description" : "Horizontal coordinate for click_at (normalized 0.0...1.0 unless normalized=false).",
+            "minimum" : 0,
+            "type" : "number"
+          },
+          "y" : {
+            "description" : "Vertical coordinate for click_at (normalized 0.0...1.0 unless normalized=false).",
+            "minimum" : 0,
+            "type" : "number"
           }
         },
         "required" : [
@@ -1112,6 +1128,61 @@
         "type" : "object"
       },
       "name" : "rocknroll_join_meetings"
+    },
+    {
+      "annotations" : {
+        "destructiveHint" : false,
+        "readOnlyHint" : false
+      },
+      "description" : "Search Jira issues with JQL or post a comment directly on a Jira issue.",
+      "inputSchema" : {
+        "additionalProperties" : false,
+        "properties" : {
+          "action_id" : {
+            "description" : "Client-generated UUID used as an idempotency key. Retrying with the same action_id and identical arguments replays the recorded result; reusing it with different arguments fails with ACTION_ID_REUSED.",
+            "type" : "string"
+          },
+          "comment" : {
+            "description" : "Comment body to add when operation is comment.",
+            "minLength" : 1,
+            "type" : "string"
+          },
+          "issue_key" : {
+            "description" : "Jira issue key (e.g. PROJ-123) for comment.",
+            "minLength" : 2,
+            "type" : "string"
+          },
+          "jql" : {
+            "description" : "Explicit JQL query for search.",
+            "type" : "string"
+          },
+          "max_results" : {
+            "default" : 15,
+            "description" : "Maximum issues to return for search (1...50).",
+            "maximum" : 50,
+            "minimum" : 1,
+            "type" : "integer"
+          },
+          "operation" : {
+            "description" : "Jira operation.",
+            "enum" : [
+              "search",
+              "comment"
+            ],
+            "type" : "string"
+          },
+          "query" : {
+            "description" : "Plain text search query when jql is omitted.",
+            "type" : "string"
+          }
+        },
+        "required" : [
+          "action_id",
+          "operation"
+        ],
+        "type" : "object"
+      },
+      "name" : "rocknroll_jira_action"
     }
   ]
 }

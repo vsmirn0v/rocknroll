@@ -1,3 +1,4 @@
+import AVFoundation
 import MeetingEngine
 import ConferenceCore
 import Foundation
@@ -150,6 +151,7 @@ struct IOSAssistantEvaluationRequest: Sendable {
     var notesDraft: String
     var recentEvents: [SyncedTranscriptEvent]
     var language: String
+    var customJudgePrompt: String? = nil
 }
 
 struct IOSAssistantVerdict: Equatable, Sendable {
@@ -195,6 +197,7 @@ struct IOSAssistantSessionBridge {
     var releaseTranscription: @MainActor () async -> Void = {}
     var sendChat: @MainActor (String) async throws -> Void
     var speakVoice: @MainActor (String) async throws -> Void
+    var speakAudioBuffer: (@MainActor (AVAudioPCMBuffer) async throws -> Void)? = nil
 }
 
 struct IOSAssistantLLMService: IOSAssistantEvaluating {
@@ -288,8 +291,10 @@ struct IOSAssistantLLMService: IOSAssistantEvaluating {
             modeRule = "Actively participate on the user's behalf: determine when a concise first-person response is helpful or expected, and write suggested_reply in first person matching the meeting language (\(req.language)). Goal: \(req.participationGoal.isEmpty ? "Help answer direct questions and confirm ownership concisely." : req.participationGoal). Style: \(req.replyStyle)."
         }
 
+        let baseIntro = (req.customJudgePrompt?.trimmingCharacters(in: .whitespacesAndNewlines)).flatMap { $0.isEmpty ? nil : $0 }
+            ?? "You are an unobtrusive live meeting assistant watching an ongoing call for the user."
         let system = """
-        You are an unobtrusive live meeting assistant watching an ongoing call for the user.
+        \(baseIntro)
         Return ONLY valid JSON with keys:
         {"needs_user": boolean, "urgency": "none"|"soon"|"now", "reason": string, "suggested_reply": string|null, "confidence": number}
         Mode instruction: \(modeRule)
@@ -405,6 +410,8 @@ final class IOSAssistantCoordinator: ObservableObject {
 
     var onBannerAlert: ((IOSAssistantAlertCard) -> Void)?
     var onSessionModeChanged: ((UUID, IOSMeetingAssistantMode, Bool) -> Void)?
+    var onTranscriptEvents: ((UUID, String, URL?, [SyncedTranscriptEvent], [String]) -> Void)?
+    var attentionPromptProvider: (() -> String?)?
 
     private var eventBuffers: [UUID: [SyncedTranscriptEvent]] = [:]
     private var seenEventIDs: [UUID: Set<String>] = [:]
@@ -668,6 +675,7 @@ final class IOSAssistantCoordinator: ObservableObject {
         let previousCount = seen.count
         var buffer = eventBuffers[controllerID] ?? []
         var freshEvents: [SyncedTranscriptEvent] = []
+        var freshAllEvents: [SyncedTranscriptEvent] = []
 
         for ev in events {
             guard !seen.contains(ev.id), !partialEventIDs.contains(ev.id) else { continue }
@@ -675,6 +683,7 @@ final class IOSAssistantCoordinator: ObservableObject {
             guard !clean.isEmpty, ev.kind == "transcript" || ev.kind == "chat" else { continue }
             seen.insert(ev.id)
             buffer.append(ev)
+            freshAllEvents.append(ev)
             if !ev.isOwn {
                 freshEvents.append(ev)
             }
@@ -687,6 +696,13 @@ final class IOSAssistantCoordinator: ObservableObject {
         seenEventIDs[controllerID] = seen
         eventBuffers[controllerID] = buffer
 
+        let bridge = resolveBridge(controllerID)
+        let aliases = collectedAliases(for: bridge)
+        if !freshAllEvents.isEmpty {
+            let roomURL = bridge.flatMap { URL(string: $0.roomKey) }
+            onTranscriptEvents?(controllerID, bridge?.title ?? L("Meeting"), roomURL, freshAllEvents, aliases)
+        }
+
         guard !freshEvents.isEmpty else { return }
         let mode = resolvedMode(for: controllerID)
         guard mode != .off else { return }
@@ -697,8 +713,6 @@ final class IOSAssistantCoordinator: ObservableObject {
             lastStatusNoteBySession.removeValue(forKey: controllerID)
         }
 
-        let bridge = resolveBridge(controllerID)
-        let aliases = collectedAliases(for: bridge)
         let mention = Self.findMention(in: freshEvents, aliases: aliases)
 
         guard mention != nil || hasModelConfigured() else { return }
@@ -796,7 +810,8 @@ final class IOSAssistantCoordinator: ObservableObject {
                 replyStyle: participationConfig.replyStyle,
                 notesDraft: workspace?.workspaceSessionID(forControllerID: controllerID).flatMap { workspace?.noteDraft(for: $0) } ?? "",
                 recentEvents: Array(recentEvents.suffix(24)),
-                language: Locale.current.language.languageCode?.identifier ?? "en"
+                language: Locale.current.language.languageCode?.identifier ?? "en",
+                customJudgePrompt: attentionPromptProvider?()
             )
             do {
                 verdict = try await evaluator.evaluate(req)

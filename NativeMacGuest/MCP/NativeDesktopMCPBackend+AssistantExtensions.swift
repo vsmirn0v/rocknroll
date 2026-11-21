@@ -407,6 +407,9 @@ extension NativeDesktopMCPBackend {
         let selector = try MCPValue.optionalString(args["selector"], key: "selector")
         let text = try MCPValue.optionalString(args["text"], key: "text")
         let deltaY = args["delta_y"] as? Int
+        let coordX = (args["x"] as? NSNumber)?.doubleValue
+        let coordY = (args["y"] as? NSNumber)?.doubleValue
+        let normalized = try MCPValue.optionalBool(args["normalized"], key: "normalized") ?? true
 
         guard let attention else { throw MCPToolFailure("APP_NOT_RUNNING", "The native workspace is unavailable.") }
         let board = attention.boardController
@@ -417,6 +420,10 @@ extension NativeDesktopMCPBackend {
                 throw MCPToolFailure("INVALID_ARGUMENT", "url must be an https:// or localhost URL.",
                                      details: ["field": "url", "reason": "format"])
             }
+        }
+        if command == "click_at", (coordX == nil || coordY == nil) {
+            throw MCPToolFailure("INVALID_ARGUMENT", "x and y coordinates are required for click_at.",
+                                 details: ["field": "x", "reason": "required"])
         }
 
         let (id, replay) = try beginAction(args, client: client)
@@ -453,6 +460,10 @@ extension NativeDesktopMCPBackend {
             let message = try await board.click(selector: selector, text: text)
             return actions.finish(id, client: client, type: "board", target: "click", status: "applied",
                                   result: ["action_id": id, "status": "applied", "observed_at": mcpNow(), "message": message, "warnings": []])
+        case "click_at":
+            let message = try await board.clickAt(x: coordX ?? 0.5, y: coordY ?? 0.5, normalized: normalized)
+            return actions.finish(id, client: client, type: "board", target: "click_at", status: "applied",
+                                  result: ["action_id": id, "status": "applied", "observed_at": mcpNow(), "message": message, "warnings": []])
         case "highlight":
             let message = try await board.highlight(text: text ?? query ?? "")
             return actions.finish(id, client: client, type: "board", target: "highlight", status: "applied",
@@ -461,6 +472,25 @@ extension NativeDesktopMCPBackend {
             let info = try await board.inspect()
             return actions.finish(id, client: client, type: "board", target: "inspect", status: "applied",
                                   result: ["action_id": id, "status": "applied", "observed_at": mcpNow(), "board": info, "warnings": []])
+        case "snapshot":
+            let snap = try await board.snapshotBase64()
+            return actions.finish(
+                id,
+                client: client,
+                type: "board",
+                target: "snapshot",
+                status: "applied",
+                result: [
+                    "action_id": id,
+                    "status": "applied",
+                    "observed_at": mcpNow(),
+                    "width": snap.width,
+                    "height": snap.height,
+                    "mime_type": "image/jpeg",
+                    "image_base64": snap.jpegBase64,
+                    "warnings": [],
+                ]
+            )
         default:
             throw MCPToolFailure("INVALID_ARGUMENT", "Unsupported board command.")
         }
@@ -506,5 +536,80 @@ extension NativeDesktopMCPBackend {
         return actions.finish(id, client: client, type: "meeting_control",
                               target: outcome.joinedTitles.first ?? rawQueries[0],
                               status: "applied", result: result)
+    }
+
+    func jiraAction(_ args: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON {
+        _ = try validateActionID(args)
+        let operation = try MCPValue.string(args["operation"], key: "operation")
+        let rawJQL = try MCPValue.optionalString(args["jql"], key: "jql")
+        let query = try MCPValue.optionalString(args["query"], key: "query")
+        let maxResults = try MCPValue.integer(args["max_results"], key: "max_results", default: 15, maximum: 50)
+        let issueKey = try MCPValue.optionalString(args["issue_key"], key: "issue_key")?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let comment = try MCPValue.optionalString(args["comment"], key: "comment")?.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if operation == "comment" {
+            guard let issueKey, !issueKey.isEmpty else {
+                throw MCPToolFailure("INVALID_ARGUMENT", "issue_key is required for comment.",
+                                     details: ["field": "issue_key", "reason": "required"])
+            }
+            guard let comment, !comment.isEmpty else {
+                throw MCPToolFailure("INVALID_ARGUMENT", "comment is required for comment.",
+                                     details: ["field": "comment", "reason": "required"])
+            }
+        }
+        guard let attention else { throw MCPToolFailure("APP_NOT_RUNNING", "The native workspace is unavailable.") }
+
+        let (id, replay) = try beginAction(args, client: client)
+        if let replay { return replay }
+
+        if operation == "comment" {
+            guard await actions.approval("Add Jira comment", ["issue_key": issueKey ?? "", "comment": comment ?? ""]) else {
+                return actions.finish(id, client: client, type: "jira", target: issueKey ?? "", status: "rejected", failure: "APPROVAL_DENIED")
+            }
+            try await attention.taskSync.commentOnJiraIssue(key: issueKey ?? "", comment: comment ?? "")
+            let result: MCPJSON = [
+                "action_id": id,
+                "status": "applied",
+                "observed_at": mcpNow(),
+                "operation": "comment",
+                "issue_key": issueKey ?? "",
+                "commented": true,
+                "warnings": [],
+            ]
+            return actions.finish(id, client: client, type: "jira", target: issueKey ?? "", status: "applied", result: result)
+        }
+
+        // search
+        let team = await attention.loadTeamContext()
+        let jql = AssistantSkillToolRegistrar.resolvedJiraJQL(
+            rawJQL: rawJQL,
+            query: query,
+            teamProjectKey: team.defaultJiraProjectKey,
+            jiraProjectKey: attention.taskSync.preferences.jira.cleanProjectKey
+        )
+
+        let issues = try await attention.taskSync.searchJiraIssues(jql: jql, maxResults: maxResults)
+        let rows: [MCPJSON] = issues.map { issue in
+            [
+                "key": issue.key,
+                "summary": issue.summary,
+                "status": issue.statusName,
+                "assignee": issue.assigneeName ?? "",
+                "priority": issue.priority?.localizedTitle ?? "",
+                "due_day": issue.dueDay ?? "",
+                "browse_url": issue.browseURL ?? "",
+            ]
+        }
+        let result: MCPJSON = [
+            "action_id": id,
+            "status": "applied",
+            "observed_at": mcpNow(),
+            "operation": "search",
+            "jql": jql,
+            "count": rows.count,
+            "issues": rows,
+            "warnings": [],
+        ]
+        return actions.finish(id, client: client, type: "jira", target: jql, status: "applied", result: result)
     }
 }

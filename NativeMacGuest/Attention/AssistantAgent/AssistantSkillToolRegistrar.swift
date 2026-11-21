@@ -66,6 +66,9 @@ enum AssistantSkillToolRegistrar {
         allowedToolGroups: Set<AssistantSkillToolGroup>? = nil
     ) {
         registerReadTools(into: registry, attention: attention, allowedToolGroups: allowedToolGroups)
+        if allowedToolGroups?.contains(.jira) ?? true {
+            registerJiraActionTool(into: registry, attention: attention, allowComments: allowPrivilegedActions)
+        }
         guard allowPrivilegedActions else { return }
         registerWriteAndControlTools(
             into: registry,
@@ -74,6 +77,17 @@ enum AssistantSkillToolRegistrar {
             snapshot: snapshot,
             allowedToolGroups: allowedToolGroups
         )
+    }
+
+    nonisolated static func resolvedJiraJQL(rawJQL: String?, query: String?, teamProjectKey: String, jiraProjectKey: String) -> String {
+        let explicit = rawJQL?.trimmed ?? ""
+        if !explicit.isEmpty { return explicit }
+        let project = teamProjectKey.trimmed.isEmpty ? jiraProjectKey : teamProjectKey.trimmed
+        let cleanQuery = (query ?? "").trimmed.replacingOccurrences(of: "\"", with: "")
+        var clauses: [String] = []
+        if !project.isEmpty { clauses.append("project = \(project)") }
+        if !cleanQuery.isEmpty { clauses.append("text ~ \"\(cleanQuery)\"") }
+        return clauses.isEmpty ? "ORDER BY updated DESC" : (clauses.joined(separator: " AND ") + " ORDER BY updated DESC")
     }
 
     static func exportRealtimeTools(from registry: AssistantAgentToolRegistry) -> [RealtimeToolDeclaration] {
@@ -236,6 +250,76 @@ enum AssistantSkillToolRegistrar {
                 json: .object(["items": .array(items)]),
                 summary: L("Found %ld knowledge matches for “%@”.", items.count, query)
             )
+        })
+    }
+
+    private static func registerJiraActionTool(
+        into registry: AssistantAgentToolRegistry,
+        attention: AttentionCoordinator,
+        allowComments: Bool
+    ) {
+        let allowedOps = allowComments ? ["search", "comment"] : ["search"]
+        registry.register(AgentSkillClosureTool(
+            descriptor: .init(
+                name: "rocknroll_jira_action",
+                description: allowComments
+                    ? "Search Jira issues with JQL/text or post a comment directly on an existing Jira issue."
+                    : "Search Jira issues read-only using JQL or a text query.",
+                arguments: [
+                    .init(name: "operation", type: .string, required: true, allowedValues: allowedOps),
+                    .init(name: "jql", type: .string, required: false),
+                    .init(name: "query", type: .string, required: false),
+                    .init(name: "max_results", type: .integer, required: false),
+                    .init(name: "issue_key", type: .string, required: false),
+                    .init(name: "comment", type: .string, required: false),
+                ]
+            )
+        ) { call, args in
+            let operation = args["operation"]?.stringValue ?? "search"
+            switch operation {
+            case "comment":
+                guard allowComments else {
+                    return .error(call, L("Jira comments require an approved speaker."))
+                }
+                guard let key = args["issue_key"]?.stringValue?.trimmed, !key.isEmpty,
+                      let comment = args["comment"]?.stringValue?.trimmed, !comment.isEmpty else {
+                    throw AssistantAgentError.missingArgument(call.name, "issue_key, comment")
+                }
+                try await attention.taskSync.commentOnJiraIssue(key: key, comment: comment)
+                return .init(
+                    callID: call.id,
+                    toolName: call.name,
+                    json: .object(("issue_key", .string(key)), ("commented", .bool(true))),
+                    summary: L("Added a Jira comment on %@.", key)
+                )
+            case "search":
+                let team = await attention.loadTeamContext()
+                let configuredProject = await MainActor.run { attention.taskSync.preferences.jira.cleanProjectKey }
+                let jql = resolvedJiraJQL(
+                    rawJQL: args["jql"]?.stringValue,
+                    query: args["query"]?.stringValue,
+                    teamProjectKey: team.defaultJiraProjectKey,
+                    jiraProjectKey: configuredProject
+                )
+                let maxResults = max(1, min(args["max_results"]?.intValue ?? 15, 50))
+                let issues = try await attention.taskSync.searchJiraIssues(jql: jql, maxResults: maxResults)
+                let rows: [AssistantJSON] = issues.map { issue in
+                    .object(
+                        ("key", .string(issue.key)),
+                        ("summary", .string(issue.summary)),
+                        ("status", .string(issue.statusName)),
+                        ("assignee", .string(issue.assigneeName ?? ""))
+                    )
+                }
+                return .init(
+                    callID: call.id,
+                    toolName: call.name,
+                    json: .object(("jql", .string(jql)), ("issues", .array(rows))),
+                    summary: L("Found %ld Jira issues.", rows.count)
+                )
+            default:
+                throw AssistantAgentError.invalidArguments(call.name, "Unsupported Jira operation \(operation)")
+            }
         })
     }
 
@@ -591,16 +675,19 @@ enum AssistantSkillToolRegistrar {
         registry.register(AgentSkillClosureTool(
             descriptor: .init(
                 name: "rocknroll_control_board",
-                description: "Open, inspect, filter, scroll, click, highlight, or share the in-app Jira/Board browser window into an active meeting.",
+                description: "Open, inspect, capture a visual snapshot, filter, scroll, click (CSS/text or normalized canvas coordinates), highlight, or share the in-app Jira/Board browser window into an active meeting.",
                 arguments: [
                     .init(name: "command", type: .string, required: true,
-                          allowedValues: ["open_url", "share_to_meeting", "stop_share", "scroll", "filter", "click", "highlight", "inspect"]),
+                          allowedValues: ["open_url", "share_to_meeting", "stop_share", "scroll", "filter", "click", "click_at", "highlight", "inspect", "snapshot"]),
                     .init(name: "url", type: .string, required: false),
                     .init(name: "meeting_id", type: .string, required: false, description: "Active session UUID; defaults to selected meeting."),
                     .init(name: "query", type: .string, required: false),
                     .init(name: "selector", type: .string, required: false),
                     .init(name: "text", type: .string, required: false),
                     .init(name: "delta_y", type: .integer, required: false),
+                    .init(name: "x", type: .number, required: false, description: "Horizontal coordinate for click_at (normalized 0.0...1.0 unless normalized=false)."),
+                    .init(name: "y", type: .number, required: false, description: "Vertical coordinate for click_at (normalized 0.0...1.0 unless normalized=false)."),
+                    .init(name: "normalized", type: .boolean, required: false),
                 ]
             )
         ) { call, args in
@@ -642,12 +729,32 @@ enum AssistantSkillToolRegistrar {
             case "click":
                 let msg = try await board.click(selector: args["selector"]?.stringValue, text: args["text"]?.stringValue)
                 return .init(callID: call.id, toolName: call.name, json: .object(["message": .string(msg)]), summary: msg)
+            case "click_at":
+                guard let x = args["x"]?.doubleValue, let y = args["y"]?.doubleValue else {
+                    throw AssistantAgentError.missingArgument(call.name, "x, y")
+                }
+                let normalized = args["normalized"]?.boolValue ?? true
+                let msg = try await board.clickAt(x: x, y: y, normalized: normalized)
+                return .init(callID: call.id, toolName: call.name, json: .object(["message": .string(msg)]), summary: msg)
             case "highlight":
                 let msg = try await board.highlight(text: args["text"]?.stringValue ?? args["query"]?.stringValue ?? "")
                 return .init(callID: call.id, toolName: call.name, json: .object(["message": .string(msg)]), summary: msg)
             case "inspect":
                 let info = try await board.inspect()
                 return .init(callID: call.id, toolName: call.name, json: AssistantJSON.make(info), summary: L("Inspected the visible Assistant Board."))
+            case "snapshot":
+                let snap = try await board.snapshotBase64()
+                return .init(
+                    callID: call.id,
+                    toolName: call.name,
+                    json: .object(
+                        ("width", .int(snap.width)),
+                        ("height", .int(snap.height)),
+                        ("mime_type", .string("image/jpeg")),
+                        ("image_base64", .string(snap.jpegBase64))
+                    ),
+                    summary: L("Captured board snapshot (%ld×%ld).", snap.width, snap.height)
+                )
             default:
                 throw AssistantAgentError.invalidArguments(call.name, "Unsupported command \(command)")
             }

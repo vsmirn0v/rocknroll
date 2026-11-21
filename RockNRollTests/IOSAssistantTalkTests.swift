@@ -229,4 +229,138 @@ final class IOSAssistantTalkTests: XCTestCase {
             XCTAssertNotEqual(error as? IOSVoiceSynthesisError, .voxModelNotInstalled)
         }
     }
+
+    func testIOSSkillsControllerSeedsDefaultsAndResolvesPeopleAndPrompts() throws {
+        let suite = SuiteBox()
+        let tempRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ios-skills-test-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempRoot) }
+
+        let controller = IOSAssistantSkillsController(
+            workspace: nil,
+            preferences: suite.defaults,
+            keychain: WorkspaceAPIKeychain(service: "dev.vsmirn0v.ios.test.\(UUID().uuidString)"),
+            customRootURL: tempRoot
+        )
+        defer { controller.stopWatcher() }
+
+        XCTAssertFalse(controller.skills.isEmpty)
+        XCTAssertTrue(controller.skills.contains(where: { $0.id == "scrum-master" }))
+        XCTAssertTrue(controller.promptText(for: .basePersona).contains("Rock"))
+
+        _ = try controller.savePrompt(.meetingSummary, content: "# Custom Summary Prompt")
+        XCTAssertEqual(
+            controller.promptText(for: .meetingSummary).trimmingCharacters(in: .whitespacesAndNewlines),
+            "# Custom Summary Prompt"
+        )
+
+        _ = try controller.upsertPerson(AssistantPersonEntry(
+            displayName: "Anna Petrova",
+            aliases: ["Аня", "Anna"],
+            jiraUsername: "apetrova",
+            jiraAccountID: "acc-99",
+            approvedVoiceCommander: true
+        ))
+        XCTAssertEqual(controller.resolvedOwnerName("Аня"), "Anna Petrova")
+        XCTAssertTrue(controller.people.isApprovedSpeaker("Anna", localUserNames: []))
+        XCTAssertFalse(controller.people.isApprovedSpeaker("Random Guest", localUserNames: []))
+    }
+
+    func testIOSMultiMeetingVoiceJoinWithSkillBinding() async {
+        let suite = SuiteBox()
+        let tempRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ios-multijoin-test-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempRoot) }
+
+        let skills = IOSAssistantSkillsController(
+            workspace: nil,
+            preferences: suite.defaults,
+            keychain: WorkspaceAPIKeychain(service: "dev.vsmirn0v.ios.multijoin.\(UUID().uuidString)"),
+            customRootURL: tempRoot
+        )
+        defer { skills.stopWatcher() }
+
+        let facilitator = IOSAutonomousMeetingFacilitator(
+            skills: skills,
+            workspace: nil,
+            board: nil,
+            resolveBridge: { _ in nil }
+        )
+
+        let now = Date()
+        let daily = JoinableMeetingCandidate(
+            id: UUID(),
+            title: "Daily Standup",
+            invitation: URL(string: "https://meet.example.com/daily")!,
+            source: .ongoingCalendar,
+            start: now.addingTimeInterval(-60),
+            end: now.addingTimeInterval(1800)
+        )
+        let retro = JoinableMeetingCandidate(
+            id: UUID(),
+            title: "Sprint Retro",
+            invitation: URL(string: "https://meet.example.com/retro")!,
+            source: .upcomingCalendar,
+            start: now.addingTimeInterval(300),
+            end: now.addingTimeInterval(3600)
+        )
+
+        var joined: [String] = []
+        let talk = IOSAssistantTalkController()
+        talk.skills = skills
+        talk.facilitator = facilitator
+        talk.joinableTargets = { _ in [daily, retro] }
+        talk.onJoinCandidate = { candidate in
+            joined.append(candidate.title)
+            return true
+        }
+
+        await talk.run("Рок, подключи меня к Daily Standup и Sprint Retro как Scrum Master", source: .voiceWake)
+        XCTAssertEqual(joined, ["Daily Standup", "Sprint Retro"])
+        XCTAssertEqual(
+            facilitator.pendingSkillByTitleOrURL["https://meet.example.com/daily"],
+            "scrum-master"
+        )
+        XCTAssertEqual(
+            facilitator.pendingSkillByTitleOrURL["https://meet.example.com/retro"],
+            "scrum-master"
+        )
+    }
+
+    func testIOSFacilitatorAuthorizationAndEchoSuppression() throws {
+        let suite = SuiteBox()
+        let tempRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ios-auth-test-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempRoot) }
+
+        let skills = IOSAssistantSkillsController(
+            workspace: nil,
+            preferences: suite.defaults,
+            keychain: WorkspaceAPIKeychain(service: "dev.vsmirn0v.ios.auth.\(UUID().uuidString)"),
+            customRootURL: tempRoot
+        )
+        defer { skills.stopWatcher() }
+
+        _ = try skills.upsertPerson(AssistantPersonEntry(
+            displayName: "Lead Dev",
+            aliases: ["Lead"],
+            approvedVoiceCommander: true
+        ))
+        let facilitator = IOSAutonomousMeetingFacilitator(
+            skills: skills,
+            workspace: nil,
+            board: nil,
+            resolveBridge: { _ in nil }
+        )
+        let scrumSkill = skills.skills.first(where: { $0.id == "scrum-master" })
+        XCTAssertTrue(facilitator.isSpeakerAuthorized(speakerName: "Anyone", isLocalSpeaker: true, skill: scrumSkill, localNames: []))
+        XCTAssertTrue(facilitator.isSpeakerAuthorized(speakerName: "Lead", isLocalSpeaker: false, skill: scrumSkill, localNames: []))
+        XCTAssertFalse(facilitator.isSpeakerAuthorized(speakerName: "Stranger", isLocalSpeaker: false, skill: scrumSkill, localNames: []))
+        XCTAssertTrue(AssistantWakePhraseMatcher.isLikelySelfEcho(
+            candidate: "Ready to kick off standup now",
+            lastSpoken: "Hi team, ready to kick off standup now.",
+            isLocal: false,
+            withinEchoWindow: true
+        ))
+    }
 }

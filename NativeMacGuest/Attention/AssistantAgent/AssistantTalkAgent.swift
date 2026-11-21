@@ -14,10 +14,114 @@ extension AssistantTalkController {
         do {
             let environment = try await makeAgentEnvironment(external: external, source: activeInputSource, commandText: input)
             agentEnvironment = environment
+            if !external && source.isVoice,
+               await runVoiceRealtimeTurnIfConfigured(input, environment: environment) {
+                return
+            }
             let result = await agentRuntime.submit(input, environment: environment)
             handleAgentOutcome(result)
         } catch is CancellationError { return }
         catch { agentAppend(error.localizedDescription) }
+    }
+
+    /// Runs a low-latency single-turn Realtime WebSocket query for spoken voice interactions
+    /// when a Realtime provider key is configured, falling back to `agentRuntime.submit` on failure.
+    private func runVoiceRealtimeTurnIfConfigured(_ input: String, environment: AssistantAgentEnvironment) async -> Bool {
+        guard let attention else { return false }
+        let kind = attention.store.realtimeProvider
+        guard kind != .disabled,
+              let apiKey = attention.store.realtimeAPIKey(for: kind),
+              !apiKey.trimmed.isEmpty else {
+            return false
+        }
+
+        @MainActor
+        final class Collector {
+            var chunks: [Data] = []
+            var transcript = ""
+            var finished = false
+            var failed = false
+        }
+
+        let collector = Collector()
+        let basePersona = environment.context["obsidian_base_persona"] ?? ""
+        let skills = environment.context["obsidian_skills"] ?? ""
+        let instructions = [basePersona, skills, "Answer concisely by voice in the user's language."]
+            .filter { !$0.isEmpty }
+            .joined(separator: "\n\n")
+        let config = RealtimeSessionConfig(
+            provider: kind,
+            apiKey: apiKey,
+            model: attention.store.realtimeModel,
+            voice: attention.store.realtimeVoice,
+            endpointOverride: attention.store.realtimeEndpoint,
+            systemInstructions: instructions,
+            tools: AssistantSkillToolRegistrar.exportRealtimeTools(from: environment.registry)
+        )
+        let router = RealtimeVoiceRouter()
+        await router.start(
+            config: config,
+            executeTool: { name, argsJSON in
+                await AssistantSkillToolRegistrar.executeToolCallJSON(
+                    registry: environment.registry,
+                    name: name,
+                    argumentsJSON: argsJSON
+                )
+            },
+            onEvent: { event in
+                await MainActor.run {
+                    switch event {
+                    case .audioPCM16(let pcm, _):
+                        collector.chunks.append(pcm)
+                    case .assistantTranscriptDelta(let delta):
+                        collector.transcript += delta
+                    case .assistantTranscriptDone(let full):
+                        collector.transcript = full
+                    case .audioDone:
+                        collector.finished = true
+                    case .error, .disconnected:
+                        collector.failed = true
+                    default:
+                        break
+                    }
+                }
+            }
+        )
+        guard await router.isRealtimeConnected else {
+            await router.stop()
+            return false
+        }
+        guard await router.sendText(input) else {
+            await router.stop()
+            return false
+        }
+
+        // Wait bounded up to 20s for completion.
+        for _ in 0..<200 {
+            if collector.finished || collector.failed || Task.isCancelled { break }
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+        await router.stop()
+
+        let text = collector.transcript.trimmed
+        let audioData = collector.chunks.reduce(into: Data()) { $0.append($1) }
+        guard !collector.failed, (!text.isEmpty || !audioData.isEmpty) else {
+            return false
+        }
+
+        let displayAnswer = text.isEmpty ? L("Spoken response played.") : text
+        let messageID = agentRuntime.appendDeterministicTurnForUI(userText: input, assistantText: displayAnswer)
+        lastVoiceAnswer = displayAnswer
+        if let buffer = AutonomousMeetingFacilitator.pcm16ToAudioBuffer(data: audioData, sampleRate: 24_000) {
+            do {
+                try playAuditionBuffer(buffer, id: messageID)
+            } catch {
+                autoAuditionIfNeeded(id: messageID, text: displayAnswer, source: activeInputSource)
+            }
+        } else {
+            autoAuditionIfNeeded(id: messageID, text: displayAnswer, source: activeInputSource)
+        }
+        return true
     }
 
     func handleAgentOutcome(_ result: Result<AssistantAgentRunOutcome, Error>) {
@@ -385,7 +489,7 @@ extension AssistantTalkController {
         if asksJoin && mentionsCurrentOrMeeting && AssistantVoiceApprovalPolicy.shouldAutoApprove(
             actionKind: "join", inputSource: source, sendsWithoutAsking: false) {
             let skills = await attention.listAssistantSkills()
-            let matchedSkill = skills.first { $0.matches(meetingTitle: "", commandText: input) }
+            let matchedSkill = AssistantSkill.preferredSkill(matching: input, in: skills)
             let candidates = attention.joinableTargets(now)
             if let explicitQueries = Self.extractMultiMeetingQueries(from: input, candidates: candidates, skills: skills),
                !explicitQueries.isEmpty {
@@ -446,71 +550,8 @@ extension AssistantTalkController {
         candidates: [JoinableMeetingCandidate],
         skills: [AssistantSkill]
     ) -> [String]? {
-        let foldedInput = input.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil)
-            .replacingOccurrences(of: "ё", with: "е")
-        var matchedTitles: [String] = []
-
-        // 1. Exact full-title containment
-        for candidate in candidates {
-            let title = candidate.title.trimmed
-            guard title.count >= 3 else { continue }
-            let foldedTitle = title.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil)
-                .replacingOccurrences(of: "ё", with: "е")
-            if foldedInput.contains(foldedTitle) {
-                matchedTitles.append(candidate.title)
-            }
-        }
-
-        // 2. Clause-split token matching for partial spoken names ("Daily и Design Review", "standup and planning")
-        let stopWords: Set<String> = [
-            "встреча", "встречу", "встречи", "встрече", "звонок", "созвон", "митинг", "meeting", "call",
-            "подключи", "подключить", "подключись", "зайди", "войди", "меня", "туда", "сюда",
-            "join", "connect", "rock", "рок", "как", "role", "роли", "роль", "пожалуйста", "please",
-            "текущую", "текущая", "текущей", "сейчас", "current", "now", "следующую", "следующая", "next",
-            "with", "into"
-        ]
-
-        let normalizedClauses = foldedInput
-            .replacingOccurrences(of: " и ", with: "|")
-            .replacingOccurrences(of: " and ", with: "|")
-            .replacingOccurrences(of: ",", with: "|")
-            .replacingOccurrences(of: ";", with: "|")
-            .split(separator: "|")
-            .map(String.init)
-
-        let roleMarkers = [" в роли ", " with skill ", " with role ", " как ", " as "]
-        for rawClause in normalizedClauses {
-            var clause = rawClause
-            for marker in roleMarkers {
-                if let range = clause.range(of: marker) {
-                    clause = String(clause[..<range.lowerBound])
-                }
-            }
-            let clauseTokens = clause.split(whereSeparator: { !$0.isLetter && !$0.isNumber })
-                .map(String.init)
-                .filter { $0.count >= 3 && !stopWords.contains($0) }
-            guard !clauseTokens.isEmpty else { continue }
-            var bestCandidate: (title: String, score: Int)?
-            for candidate in candidates {
-                let candidateTokens = Set(
-                    candidate.title.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil)
-                        .replacingOccurrences(of: "ё", with: "е")
-                        .split(whereSeparator: { !$0.isLetter && !$0.isNumber })
-                        .map(String.init)
-                )
-                let hits = clauseTokens.filter { candidateTokens.contains($0) }.count
-                if hits > 0, hits > (bestCandidate?.score ?? 0) {
-                    bestCandidate = (candidate.title, hits)
-                }
-            }
-            if let bestCandidate {
-                matchedTitles.append(bestCandidate.title)
-            }
-        }
-
-        var seen: Set<String> = []
-        let unique = matchedTitles.filter { seen.insert($0.lowercased()).inserted }
-        return unique.isEmpty ? nil : unique
+        _ = skills
+        return CurrentMeetingTargetResolver.extractMultiMeetingQueries(from: input, candidates: candidates)
     }
 
     private nonisolated static func extractParticipationObjective(from input: String) -> String {

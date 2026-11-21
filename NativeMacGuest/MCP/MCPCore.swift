@@ -263,6 +263,7 @@ struct MCPAuditEvent {
     func managePeople(_ args: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON
     func controlBoard(_ args: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON
     func joinMeetings(_ args: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON
+    func jiraAction(_ args: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON
 }
 
 // MARK: - JSON-RPC server
@@ -337,6 +338,7 @@ struct MCPAuditEvent {
                 case "rocknroll_manage_people": value = try await backend.managePeople(args, client: client)
                 case "rocknroll_control_board": value = try await backend.controlBoard(args, client: client)
                 case "rocknroll_join_meetings": value = try await backend.joinMeetings(args, client: client)
+                case "rocknroll_jira_action": value = try await backend.jiraAction(args, client: client)
                 default: throw MCPToolFailure("CAPABILITY_UNAVAILABLE", "Unsupported tool: \(name)")
                 }
                 return rpcResult(id: request["id"], value: toolResult(value))

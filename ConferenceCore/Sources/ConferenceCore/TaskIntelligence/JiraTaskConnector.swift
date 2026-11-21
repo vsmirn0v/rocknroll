@@ -139,6 +139,11 @@ public protocol JiraTaskConnecting: Sendable {
         targetStatus: TaskWorkflowStatus?,
         comment: String?
     ) async throws -> JiraRemoteIssue
+    func addIssueComment(key: String, comment: String) async throws
+}
+
+public extension JiraTaskConnecting {
+    func addIssueComment(key: String, comment: String) async throws {}
 }
 
 public final class JiraTaskConnector: JiraTaskConnecting, @unchecked Sendable {
@@ -368,6 +373,19 @@ public final class JiraTaskConnector: JiraTaskConnecting, @unchecked Sendable {
         }
 
         return try await fetchIssue(key: encodedKey)
+    }
+
+    public func addIssueComment(key: String, comment: String) async throws {
+        let encodedKey = try Self.validatedJiraKey(key)
+        let clean = comment.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty else {
+            throw JiraConnectorError.badRequest(L("Comment text cannot be empty."))
+        }
+        _ = try await send(
+            path: "/rest/api/2/issue/\(encodedKey)/comment",
+            method: "POST",
+            jsonBody: ["body": String(clean.prefix(8_000))]
+        )
     }
 
     public func fetchIssue(key: String) async throws -> JiraRemoteIssue {

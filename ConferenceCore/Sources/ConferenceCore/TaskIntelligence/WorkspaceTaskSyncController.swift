@@ -722,4 +722,22 @@ public final class WorkspaceTaskSyncController: ObservableObject {
         }
         statusMessage = L("Processed %ld Jira handover(s) from iPhone.", pending.count)
     }
+
+    // MARK: - Direct Assistant Jira Queries & Comments
+
+    public func searchJiraIssues(jql: String, maxResults: Int = 20) async throws -> [JiraRemoteIssue] {
+        guard preferences.jira.enabled else {
+            throw JiraConnectorError.badRequest(L("Jira integration is not enabled."))
+        }
+        let connector = hooks.makeJiraConnector(preferences.jira, keychain)
+        return try await connector.searchIssues(jql: jql, maxResults: maxResults)
+    }
+
+    public func commentOnJiraIssue(key: String, comment: String) async throws {
+        guard preferences.jira.enabled else {
+            throw JiraConnectorError.badRequest(L("Jira integration is not enabled."))
+        }
+        let connector = hooks.makeJiraConnector(preferences.jira, keychain)
+        try await connector.addIssueComment(key: key, comment: comment)
+    }
 }

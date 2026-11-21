@@ -146,6 +146,49 @@ extension AttentionCoordinator {
         _ = await listAssistantPrompts()
     }
 
+    func startSkillFolderWatcher() async {
+        stopSkillFolderWatcher()
+        var watchRoot = store.localAssistantSkillsRootURL()
+        _ = store.localSkillRepository()
+
+        if let destination = try? await store.meetingLibrary.store.destination(),
+           let bookmark = destination.vaultBookmark {
+            let resolved = ObsidianVaultAccess.resolveWithRefresh(bookmark)
+            if let refreshed = resolved.refreshedBookmark, case .granted = resolved.resolution {
+                var updated = destination
+                updated.vaultBookmark = refreshed
+                try? await store.meetingLibrary.store.saveDestination(updated)
+            }
+            if case .granted(let vaultURL) = resolved.resolution {
+                watchedSkillVaultURL = vaultURL
+                let candidate = vaultURL.appendingPathComponent("Rock Assistant", isDirectory: true)
+                let repo = AssistantSkillRepository(rootURL: candidate)
+                try? repo.ensureDefaultsInstalled()
+                watchRoot = candidate
+            }
+        }
+
+        let watcher = AssistantSkillFolderWatcher(rootURL: watchRoot) { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                await self.refreshCachedPrompts()
+                self.facilitator?.invalidateSkillCache()
+                self.objectWillChange.send()
+            }
+        }
+        watcher.start()
+        skillFolderWatcher = watcher
+    }
+
+    func stopSkillFolderWatcher() {
+        skillFolderWatcher?.stop()
+        skillFolderWatcher = nil
+        if let vaultURL = watchedSkillVaultURL {
+            vaultURL.stopAccessingSecurityScopedResource()
+            watchedSkillVaultURL = nil
+        }
+    }
+
     func searchAssistantKnowledge(query: String, limit: Int = 8) async -> [AssistantKnowledgeSearchHit] {
         await withSkillRepository { repo, vaultURL in
             repo.searchKnowledge(query: query, extraVaultRoot: vaultURL, limit: limit)

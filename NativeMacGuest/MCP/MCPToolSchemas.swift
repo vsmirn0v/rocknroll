@@ -9,7 +9,7 @@ import Foundation
 
 final class MCPToolProperty {
     enum ValueType: String {
-        case string, boolean, integer, object, array
+        case string, boolean, integer, number, object, array
     }
 
     let type: ValueType
@@ -18,6 +18,8 @@ final class MCPToolProperty {
     var format: String? = nil
     var minimum: Int? = nil
     var maximum: Int? = nil
+    var minimumNumber: Double? = nil
+    var maximumNumber: Double? = nil
     var `default`: Any? = nil
     var enumValues: [String]? = nil
     var items: MCPToolProperty? = nil
@@ -48,6 +50,12 @@ final class MCPToolProperty {
         return property
     }
 
+    static func number(_ description: String, minimum: Double? = nil, maximum: Double? = nil) -> MCPToolProperty {
+        let property = MCPToolProperty(type: .number, description: description)
+        property.minimumNumber = minimum; property.maximumNumber = maximum
+        return property
+    }
+
     static func array(_ description: String, items: MCPToolProperty) -> MCPToolProperty {
         let property = MCPToolProperty(type: .array, description: description)
         property.items = items
@@ -68,6 +76,8 @@ final class MCPToolProperty {
         if let format { output["format"] = format }
         if let minimum { output["minimum"] = minimum }
         if let maximum { output["maximum"] = maximum }
+        if let minimumNumber { output["minimum"] = minimumNumber }
+        if let maximumNumber { output["maximum"] = maximumNumber }
         if let `default` { output["default"] = `default` }
         if let enumValues { output["enum"] = enumValues }
         if let items { output["items"] = items.json }
@@ -349,13 +359,16 @@ func nativeMCPToolDefinitions() -> [MCPToolDefinition] {
               readOnly: false, scope: "meetings:control",
               schema: .init(properties: [
                 "action_id": actionID,
-                "command": .string("Board action command.", enumValues: ["open_url", "share_to_meeting", "stop_share", "scroll", "filter", "click", "highlight", "inspect"]),
+                "command": .string("Board action command.", enumValues: ["open_url", "share_to_meeting", "stop_share", "scroll", "filter", "click", "click_at", "highlight", "inspect", "snapshot"]),
                 "url": .string("HTTPS or localhost URL for open_url."),
                 "meeting_id": .string("Active session identifier (session:native:...) for share_to_meeting."),
                 "query": .string("Search query for filter."),
                 "selector": .string("CSS selector for click."),
                 "text": .string("Visible label or issue text for click or highlight."),
                 "delta_y": .integer("Vertical scroll delta in pixels for scroll.", minimum: -4000, maximum: 4000),
+                "x": .number("Horizontal coordinate for click_at (normalized 0.0...1.0 unless normalized=false).", minimum: 0),
+                "y": .number("Vertical coordinate for click_at (normalized 0.0...1.0 unless normalized=false).", minimum: 0),
+                "normalized": .boolean("When true (default), x and y are normalized viewport fractions in 0.0...1.0."),
               ], required: ["action_id", "command"])),
         .init(name: "rocknroll_join_meetings", description: "Join one or more meetings by title/keyword queries, optionally bind an Obsidian skill role and enable in-meeting voice facilitation.",
               readOnly: false, scope: "meetings:control",
@@ -366,6 +379,17 @@ func nativeMCPToolDefinitions() -> [MCPToolDefinition] {
                 "skill_id": .string("Optional Obsidian skill slug to bind (e.g. scrum-master)."),
                 "enable_voice_facilitation": .boolean("Enable autonomous in-meeting voice facilitation after joining (defaults to true)."),
               ], required: ["action_id", "queries"])),
+        .init(name: "rocknroll_jira_action", description: "Search Jira issues with JQL or post a comment directly on a Jira issue.",
+              readOnly: false, scope: "tasks:write",
+              schema: .init(properties: [
+                "action_id": actionID,
+                "operation": .string("Jira operation.", enumValues: ["search", "comment"]),
+                "jql": .string("Explicit JQL query for search."),
+                "query": .string("Plain text search query when jql is omitted."),
+                "max_results": .integer("Maximum issues to return for search (1...50).", minimum: 1, maximum: 50, default: 15),
+                "issue_key": .string("Jira issue key (e.g. PROJ-123) for comment.", minLength: 2),
+                "comment": .string("Comment body to add when operation is comment.", minLength: 1),
+              ], required: ["action_id", "operation"])),
     ]
 }
 
@@ -415,6 +439,12 @@ enum MCPSchemaValidator {
             }
             if let minimum = property.minimum, number < minimum { throw invalid(field, "range", "\(field) must be at least \(minimum).") }
             if let maximum = property.maximum, number > maximum { throw invalid(field, "range", "\(field) must be at most \(maximum).") }
+        case .number:
+            guard !isBool(value), let raw = (value as? NSNumber)?.doubleValue, raw.isFinite else {
+                throw invalid(field, "type", "\(field) must be a number.")
+            }
+            if let minimum = property.minimumNumber, raw < minimum { throw invalid(field, "range", "\(field) must be at least \(minimum).") }
+            if let maximum = property.maximumNumber, raw > maximum { throw invalid(field, "range", "\(field) must be at most \(maximum).") }
         case .array:
             guard let elements = value as? [Any] else { throw invalid(field, "type", "\(field) must be an array.") }
             if let items = property.items {

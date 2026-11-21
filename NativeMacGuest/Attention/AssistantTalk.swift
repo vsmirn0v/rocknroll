@@ -467,6 +467,28 @@ import SwiftUI
         attention?.speech.setSpeakingResponse(false)
     }
 
+    func playAuditionBuffer(_ buffer: AVAudioPCMBuffer, id: UUID) throws {
+        stopAudition()
+        auditioningItemID = id
+        audioError = nil
+        attention?.speech.setSpeakingResponse(true)
+        do {
+            try VoicePreviewPlayer.shared.play(buffer) { [weak self] in
+                Task { @MainActor [weak self] in
+                    guard let self, self.auditioningItemID == id else { return }
+                    self.auditioningItemID = nil
+                    self.attention?.speech.setSpeakingResponse(false)
+                }
+            }
+        } catch {
+            if auditioningItemID == id {
+                auditioningItemID = nil
+                attention?.speech.setSpeakingResponse(false)
+            }
+            throw error
+        }
+    }
+
     private func startAudition(id: UUID, text: String) {
         guard let attention else { return }
         let clean = text.trimmed
@@ -481,13 +503,7 @@ import SwiftUI
             do {
                 let buffer = try await VoiceSynthesis.audition(clean, selection: selection)
                 guard !Task.isCancelled, self.auditioningItemID == id else { return }
-                try VoicePreviewPlayer.shared.play(buffer) { [weak self] in
-                    Task { @MainActor [weak self] in
-                        guard let self, self.auditioningItemID == id else { return }
-                        self.auditioningItemID = nil
-                        self.attention?.speech.setSpeakingResponse(false)
-                    }
-                }
+                try self.playAuditionBuffer(buffer, id: id)
             } catch is CancellationError {
                 if self.auditioningItemID == id {
                     self.auditioningItemID = nil

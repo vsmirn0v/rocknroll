@@ -199,4 +199,107 @@ final class AssistantSkillsAndPeopleTests: XCTestCase {
         _ = try repo.restoreDefaultPrompt(.basePersona)
         XCTAssertTrue(repo.loadPrompt(.basePersona).content.contains("Rock Assistant Persona"))
     }
+
+    func testFolderWatcherDetectsExternalSkillEdit() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("skill-watcher-tests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let repo = AssistantSkillRepository(rootURL: dir)
+        try repo.ensureDefaultsInstalled()
+
+        let fired = expectation(description: "watcher fires")
+        final class OnceFlag: @unchecked Sendable {
+            private let lock = NSLock()
+            private var didFire = false
+            func consume() -> Bool {
+                lock.lock(); defer { lock.unlock() }
+                if didFire { return false }
+                didFire = true
+                return true
+            }
+        }
+        let flag = OnceFlag()
+        let watcher = AssistantSkillFolderWatcher(rootURL: dir, debounceInterval: 0.08) {
+            if flag.consume() { fired.fulfill() }
+        }
+        watcher.start()
+        defer { watcher.stop() }
+
+        let customSkill = AssistantSkill(
+            id: "sprint-watcher",
+            name: "Sprint Watcher",
+            role: "Watcher smoke test",
+            instructions: "Track updates."
+        )
+        _ = try repo.saveSkill(customSkill)
+
+        wait(for: [fired], timeout: 3.0)
+    }
+
+    func testRealtimeKeychainDisabledProviderGuard() {
+        let keychain = WorkspaceAPIKeychain(service: "dev.vsmirn0v.test.\(UUID().uuidString)")
+        XCTAssertFalse(keychain.writeRealtime("secret", provider: .disabled))
+        XCTAssertNil(keychain.readRealtime(provider: .disabled))
+    }
+
+    func testJiraActionSearchAndCommentViaTaskSyncController() async throws {
+        actor ConnectorStorage {
+            var comments: [(key: String, comment: String)] = []
+            var queries: [String] = []
+            func appendQuery(_ q: String) { queries.append(q) }
+            func appendComment(key: String, comment: String) { comments.append((key, comment)) }
+        }
+        final class MockJiraConnector: JiraTaskConnecting, @unchecked Sendable {
+            let storage = ConnectorStorage()
+
+            func verifyMyself() async throws -> JiraUserContact {
+                JiraUserContact(identifier: "alex", displayName: "Alex", isServerOrDC: true)
+            }
+            func fetchProjectMetadata(projectKey: String) async throws -> JiraProjectMetadata {
+                JiraProjectMetadata(key: projectKey, name: projectKey, issueTypes: ["Task"])
+            }
+            func fetchAssignableUsers(projectKey: String, query: String) async throws -> [JiraUserContact] { [] }
+            func searchIssues(jql: String, maxResults: Int) async throws -> [JiraRemoteIssue] {
+                await storage.appendQuery(jql)
+                return [JiraRemoteIssue(id: "1", key: "ENG-42", summary: "Fix audio route", description: "", statusName: "In Progress", workflowStatus: .inProgress)]
+            }
+            func createIssue(_ payload: JiraIssueWritePayload) async throws -> JiraRemoteIssue {
+                fatalError("unused")
+            }
+            func updateIssue(key: String, payload: JiraIssueWritePayload, targetStatus: TaskWorkflowStatus?, comment: String?) async throws -> JiraRemoteIssue {
+                fatalError("unused")
+            }
+            func addIssueComment(key: String, comment: String) async throws {
+                await storage.appendComment(key: key, comment: comment)
+            }
+        }
+
+        let connector = MockJiraConnector()
+        let controller = await MainActor.run {
+            let hooks = WorkspaceTaskSyncController.HostHooks(
+                loadTasks: { [] },
+                loadContacts: { [] },
+                loadMyAliases: { ["Alex"] },
+                applyMutations: { _ in },
+                persistPreferences: { _ in },
+                makeJiraConnector: { _, _ in connector }
+            )
+            let sync = WorkspaceTaskSyncController(hooks: hooks)
+            var prefs = sync.preferences
+            prefs.jira = JiraConnectionSettings(enabled: true, baseURL: "https://jira.example.com", projectKey: "ENG")
+            sync.preferences = prefs
+            return sync
+        }
+
+        let found = try await controller.searchJiraIssues(jql: "project = ENG", maxResults: 10)
+        XCTAssertEqual(found.map(\.key), ["ENG-42"])
+        let queries = await connector.storage.queries
+        XCTAssertEqual(queries, ["project = ENG"])
+
+        try await controller.commentOnJiraIssue(key: "ENG-42", comment: "Pushed fix to staging.")
+        let comments = await connector.storage.comments
+        XCTAssertEqual(comments.first?.key, "ENG-42")
+        XCTAssertEqual(comments.first?.comment, "Pushed fix to staging.")
+    }
 }

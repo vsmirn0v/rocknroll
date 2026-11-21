@@ -181,6 +181,103 @@ final class AssistantBoardWindowController: NSObject, ObservableObject, WKNaviga
         return clicked ? L("Clicked “%@” on the board.", label) : L("No matching element was found on the board.")
     }
 
+    func clickAt(x: Double, y: Double, normalized: Bool = true) async throws -> String {
+        guard let webView else {
+            throw NativeDesktopError.unavailable(L("Open a board first before clicking."))
+        }
+        guard x.isFinite, y.isFinite else {
+            throw NativeDesktopError.unavailable(L("Board coordinates must be finite numbers."))
+        }
+        let clampedX = normalized ? min(max(x, 0.0), 1.0) : max(0.0, x)
+        let clampedY = normalized ? min(max(y, 0.0), 1.0) : max(0.0, y)
+        let js = """
+        const normalized = \(normalized ? "true" : "false");
+        const px = normalized ? (\(clampedX) * window.innerWidth) : \(clampedX);
+        const py = normalized ? (\(clampedY) * window.innerHeight) : \(clampedY);
+        const el = document.elementFromPoint(px, py);
+        if (!el) { return { clicked: false, x: Math.round(px), y: Math.round(py) }; }
+        for (const kind of ['pointerdown', 'mousedown']) {
+          el.dispatchEvent(new PointerEvent(kind, { bubbles: true, cancelable: true, clientX: px, clientY: py, view: window }));
+        }
+        for (const kind of ['pointerup', 'mouseup', 'click']) {
+          el.dispatchEvent(new MouseEvent(kind, { bubbles: true, cancelable: true, clientX: px, clientY: py, view: window }));
+        }
+        if (typeof el.focus === 'function') { el.focus(); }
+        return {
+          clicked: true,
+          x: Math.round(px),
+          y: Math.round(py),
+          tag: (el.tagName || '').toLowerCase(),
+          label: (el.innerText || el.getAttribute('aria-label') || el.tagName || '').trim().slice(0, 80)
+        };
+        """
+        let res = try await evaluateJS(webView: webView, script: js)
+        let dict = res as? [String: Any]
+        let clicked = dict?["clicked"] as? Bool ?? false
+        let px = dict?["x"] as? Int ?? Int(clampedX)
+        let py = dict?["y"] as? Int ?? Int(clampedY)
+        let label = (dict?["label"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+            ?? (dict?["tag"] as? String)
+            ?? "element"
+        lastActionSummary = clicked ? L("Clicked %@ at (%ld, %ld)", label, px, py) : L("Nothing clickable at (%ld, %ld)", px, py)
+        return clicked
+            ? L("Clicked “%@” at (%ld, %ld) on the board.", label, px, py)
+            : L("No element was found at (%ld, %ld) on the board.", px, py)
+    }
+
+    func snapshotBase64(maxWidth: CGFloat = 1280) async throws -> (width: Int, height: Int, jpegBase64: String) {
+        guard let webView, webView.bounds.width >= 8, webView.bounds.height >= 8 else {
+            throw NativeDesktopError.unavailable(L("Open a board first before capturing a snapshot."))
+        }
+        let config = WKSnapshotConfiguration()
+        config.afterScreenUpdates = false
+        let image: NSImage? = try await withCheckedThrowingContinuation { continuation in
+            webView.takeSnapshot(with: config) { img, error in
+                if let error {
+                    continuation.resume(throwing: error)
+                } else {
+                    continuation.resume(returning: img)
+                }
+            }
+        }
+        guard let image,
+              let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+            throw NativeDesktopError.unavailable(L("Could not capture the Assistant Board snapshot."))
+        }
+        let targetWidth = min(CGFloat(cg.width), maxWidth)
+        let scale = CGFloat(cg.width) > 0 ? targetWidth / CGFloat(cg.width) : 1.0
+        let targetHeight = max(2, Int((CGFloat(cg.height) * scale).rounded()))
+        let intWidth = max(2, Int(targetWidth.rounded()))
+
+        let rep = NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: intWidth,
+            pixelsHigh: targetHeight,
+            bitsPerSample: 8,
+            samplesPerPixel: 4,
+            hasAlpha: true,
+            isPlanar: false,
+            colorSpaceName: .deviceRGB,
+            bytesPerRow: 0,
+            bitsPerPixel: 0
+        )
+        guard let rep, let ctx = NSGraphicsContext(bitmapImageRep: rep) else {
+            throw NativeDesktopError.unavailable(L("Could not encode the Assistant Board snapshot."))
+        }
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = ctx
+        ctx.imageInterpolation = .high
+        NSImage(cgImage: cg, size: NSSize(width: intWidth, height: targetHeight))
+            .draw(in: NSRect(x: 0, y: 0, width: intWidth, height: targetHeight))
+        NSGraphicsContext.restoreGraphicsState()
+
+        guard let jpegData = rep.representation(using: .jpeg, properties: [.compressionFactor: 0.72]) else {
+            throw NativeDesktopError.unavailable(L("Could not encode the Assistant Board snapshot."))
+        }
+        lastActionSummary = L("Captured board snapshot (%ld×%ld)", intWidth, targetHeight)
+        return (intWidth, targetHeight, jpegData.base64EncodedString())
+    }
+
     func highlight(text: String) async throws -> String {
         guard let webView else {
             throw NativeDesktopError.unavailable(L("Open a board first before highlighting."))

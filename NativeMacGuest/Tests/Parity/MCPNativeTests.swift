@@ -232,6 +232,7 @@ import XCTest
         func managePeople(_: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON { [:] }
         func controlBoard(_: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON { [:] }
         func joinMeetings(_: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON { [:] }
+        func jiraAction(_: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON { [:] }
     }
 
     func testToolsListExposesTwelveToolsWithHonestAnnotations() {
@@ -700,6 +701,21 @@ import XCTest
             ], client: identity)
             XCTAssertEqual(joinRes["status"] as? String, "applied")
             XCTAssertEqual(joinedTitlesViaMCP, ["Daily Standup"])
+
+            // 6. rocknroll_jira_action validates comment requirements and rejects when Jira is disabled.
+            await self.assertFailure("INVALID_ARGUMENT") {
+                try await fixtures.backend.jiraAction([
+                    "action_id": UUID().uuidString,
+                    "operation": "comment",
+                    "issue_key": "PROJ-1",
+                ], client: identity)
+            }
+            await self.assertFailure("INVALID_ARGUMENT") {
+                try await fixtures.backend.controlBoard([
+                    "action_id": UUID().uuidString,
+                    "command": "click_at",
+                ], client: identity)
+            }
 
             await self.drain(fixtures.store, fixtures.coordinator)
         }

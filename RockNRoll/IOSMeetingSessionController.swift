@@ -1192,6 +1192,37 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
         try await withTaskCancellationHandler { try await task.value } onCancel: { task.cancel() }
     }
 
+    func speakVoiceBuffer(_ buffer: AVAudioPCMBuffer) async throws {
+        guard !leaving, phase == .connected else {
+            throw MeetingSessionError.notConnected
+        }
+        guard !isHeld else {
+            throw MeetingSessionError.unavailable(L("Cannot send a voice reply while the call is on hold."))
+        }
+        guard isMeetingSoundAudible else {
+            throw MeetingSessionError.unavailable(L("Unmute meeting sound before sending a voice reply."))
+        }
+        let previous = voiceReplyTask
+        previous?.cancel()
+        isSpeakingVoiceReply = true
+        let task = Task<Void, Error> { @MainActor [weak self] in
+            _ = await previous?.result
+            try Task.checkCancellation()
+            guard let self, !leaving, phase == .connected, !isHeld else { throw MeetingSessionError.notConnected }
+            let played = await session.playVoiceReply(buffer)
+            try Task.checkCancellation()
+            guard played else { throw MeetingSessionError.unavailable(L("Could not send the voice reply into this meeting.")) }
+        }
+        voiceReplyTask = task
+        defer {
+            if voiceReplyTask == task {
+                voiceReplyTask = nil
+                isSpeakingVoiceReply = false
+            }
+        }
+        try await withTaskCancellationHandler { try await task.value } onCancel: { task.cancel() }
+    }
+
     func cancelVoiceReply() {
         voiceReplyTask?.cancel()
         isSpeakingVoiceReply = false
@@ -1353,14 +1384,23 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
         host.present(sheet, animated: true)
     }
 
-    func presentAssistantSheet(assistant: IOSAssistantCoordinator, speech: IOSAssistantSpeechCoordinator? = nil) {
+    func presentAssistantSheet(
+        assistant: IOSAssistantCoordinator,
+        speech: IOSAssistantSpeechCoordinator? = nil,
+        skills: IOSAssistantSkillsController? = nil,
+        facilitator: IOSAutonomousMeetingFacilitator? = nil,
+        board: IOSAssistantBoardController? = nil
+    ) {
         guard let host = topPresentedCallController() else { return }
         let view = IOSAssistantModeSheet(
             controllerID: id,
             meetingTitle: title,
             canSendChat: canSendAssistantChat,
             assistant: assistant,
-            speech: speech
+            speech: speech,
+            skills: skills,
+            facilitator: facilitator,
+            board: board
         )
         let sheet = UIHostingController(rootView: view)
         sheet.overrideUserInterfaceStyle = .dark

@@ -1,4 +1,40 @@
+import AVFoundation
 import Foundation
+
+/// Audio conversion utilities shared between macOS and iOS Realtime voice sessions.
+public enum RealtimeVoiceAudio {
+    public static func pcm16ToAudioBuffer(data: Data, sampleRate: Double = 24_000) -> AVAudioPCMBuffer? {
+        let frameCount = data.count / MemoryLayout<Int16>.size
+        guard frameCount > 0,
+              let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: sampleRate, channels: 1, interleaved: false),
+              let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(frameCount)),
+              let channel = buffer.floatChannelData?[0] else {
+            return nil
+        }
+        buffer.frameLength = AVAudioFrameCount(frameCount)
+        data.withUnsafeBytes { raw in
+            guard let samples = raw.bindMemory(to: Int16.self).baseAddress else { return }
+            let scale: Float = 1.0 / 32768.0
+            for i in 0..<frameCount {
+                channel[i] = Float(Int16(littleEndian: samples[i])) * scale
+            }
+        }
+        return buffer
+    }
+
+    public static func validateBoardURL(_ raw: String) -> URL? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              let url = URL(string: trimmed),
+              let scheme = url.scheme?.lowercased(),
+              let host = url.host?.lowercased(), !host.isEmpty else {
+            return nil
+        }
+        let isLocal = ["localhost", "127.0.0.1", "::1"].contains(host)
+        guard scheme == "https" || (scheme == "http" && isLocal) else { return nil }
+        return url
+    }
+}
 
 /// Coordinates optional WebSocket realtime voice sessions (`OpenAI Realtime` / `Gemini Live`)
 /// and reports fallback status whenever standard STT → LLM → TTS should handle turns instead.

@@ -148,6 +148,35 @@ public struct AssistantWakePhraseMatcher: Sendable {
         }
         return String(text[idx...]).trimmingCharacters(in: .whitespacesAndNewlines)
     }
+
+    /// Detects when a live transcript line is likely acoustic echo of the assistant's own speech.
+    public static func isLikelySelfEcho(
+        candidate: String,
+        lastSpoken: String,
+        isLocal: Bool,
+        withinEchoWindow: Bool
+    ) -> Bool {
+        let cleanCandidate = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanLast = lastSpoken.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanCandidate.isEmpty, !cleanLast.isEmpty else { return false }
+        if isLocal && (cleanCandidate == cleanLast || cleanLast.contains(cleanCandidate)) {
+            return true
+        }
+        guard withinEchoWindow else { return false }
+        let normalize: (String) -> Set<String> = { text in
+            let folded = text.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil)
+            let tokens = folded
+                .components(separatedBy: CharacterSet.alphanumerics.inverted)
+                .filter { $0.count >= 2 }
+            return Set(tokens)
+        }
+        let candTokens = normalize(cleanCandidate)
+        let lastTokens = normalize(cleanLast)
+        guard !candTokens.isEmpty, !lastTokens.isEmpty else { return false }
+        let intersection = candTokens.intersection(lastTokens).count
+        let overlap = Double(intersection) / Double(candTokens.count)
+        return overlap >= 0.72
+    }
 }
 
 /// Maintains a short armed follow-up window after a standalone "Рок" / "Rock" wake utterance.

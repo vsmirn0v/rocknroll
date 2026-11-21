@@ -777,6 +777,30 @@ struct JoinView: View {
                 assistant: model.assistant,
                 talk: model.assistantTalk,
                 speech: model.assistantSpeech,
+                skills: model.assistantSkills,
+                facilitator: model.assistantFacilitator,
+                board: model.assistantBoard,
+                candidatesProvider: {
+                    CurrentMeetingTargetResolver.rankedCandidates(
+                        now: Date(),
+                        calendarMeetings: calendar.meetings,
+                        handoffs: continuation.candidates,
+                        rooms: history.rooms,
+                        activeRooms: [:]
+                    )
+                },
+                onJoinMultiple: { selected, skillID, enableVoice in
+                    for candidate in selected {
+                        if enableVoice {
+                            model.assistantFacilitator.queuePendingSkill(
+                                skillID,
+                                title: candidate.title,
+                                invitation: candidate.invitation
+                            )
+                        }
+                        _ = model.assistantTalk.onJoinCandidate?(candidate)
+                    }
+                },
                 initialTab: tab
             )
         case .assistantMode(let sessionID):
@@ -787,6 +811,9 @@ struct JoinView: View {
                     canSendChat: session.canSendAssistantChat,
                     assistant: model.assistant,
                     speech: model.assistantSpeech,
+                    skills: model.assistantSkills,
+                    facilitator: model.assistantFacilitator,
+                    board: model.assistantBoard,
                     onFocusMeeting: { model.presentSession(id: session.id) }
                 )
             }
@@ -840,7 +867,13 @@ struct JoinView: View {
                         Label(L("Calendars"), systemImage: "calendar")
                     }.accessibilityIdentifier("calendar.settings")
                     NavigationLink {
-                        IOSAssistantSettingsView(workspace: model.workspace, sync: sync, assistant: model.assistant)
+                        IOSAssistantSettingsView(
+                            workspace: model.workspace,
+                            sync: sync,
+                            assistant: model.assistant,
+                            skills: model.assistantSkills,
+                            board: model.assistantBoard
+                        )
                     } label: {
                         Label(L("Assistant & Sync"), systemImage: "sparkles")
                     }.accessibilityIdentifier("settings.assistant")

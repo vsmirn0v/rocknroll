@@ -160,11 +160,12 @@ Updates or appends summary, decisions, open questions, and action items on a mee
 ### rocknroll_list_skills / rocknroll_get_skill / rocknroll_search_knowledge
 Read-only tools (scope `meetings:read`) exposing Obsidian-backed skills (`Skills/*.md`), `People.md`, `TeamContext.md`, and vault Markdown search.
 
-### rocknroll_upsert_skill / rocknroll_manage_people / rocknroll_control_board / rocknroll_join_meetings
+### rocknroll_upsert_skill / rocknroll_manage_people / rocknroll_control_board / rocknroll_join_meetings / rocknroll_jira_action
 - `rocknroll_upsert_skill` (`settings:write`): creates or edits `Skills/<skill_id>.md`.
 - `rocknroll_manage_people` (`tasks:write`): looks up or upserts team member ↔ Jira mappings and approved voice commanders in `Knowledge/People.md`.
-- `rocknroll_control_board` (`meetings:control`): controls and shares the sandbox-safe in-app Assistant Board WKWebView (`open_url`, `share_to_meeting`, `stop_share`, `scroll`, `filter`, `click`, `highlight`, `inspect`).
+- `rocknroll_control_board` (`meetings:control`): controls and shares the sandbox-safe in-app Assistant Board WKWebView (`open_url`, `share_to_meeting`, `stop_share`, `scroll`, `filter`, `click`, `click_at`, `highlight`, `inspect`, `snapshot`). Supports normalized/pixel coordinate clicks and base64 JPEG visual snapshots.
 - `rocknroll_join_meetings` (`meetings:control`): batch-joins one or more meetings by title/keyword queries and binds an Obsidian skill + voice facilitation.
+- `rocknroll_jira_action` (`tasks:write`): searches Jira issues via JQL/query (`operation: "search"`) or posts a comment on an issue (`operation: "comment"`).
 
 ### rocknroll_update_settings
 Shows a native approval dialog; denied calls are recorded as `rejected`.

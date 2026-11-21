@@ -59,6 +59,9 @@ import FoundationModels
 
     weak var workspace: IOSWorkspaceCoordinator?
     weak var assistant: IOSAssistantCoordinator?
+    weak var skills: IOSAssistantSkillsController?
+    weak var facilitator: IOSAutonomousMeetingFacilitator?
+    weak var board: IOSAssistantBoardController?
     var speech: IOSAssistantSpeechCoordinator?
     let voiceStore: IOSVoiceStore
 
@@ -144,6 +147,10 @@ import FoundationModels
             } catch {
                 append(.system, error.localizedDescription)
             }
+            return
+        }
+
+        if source.isVoice, await runVoiceRealtimeTurnIfConfigured(clean, source: source) {
             return
         }
 
@@ -385,18 +392,48 @@ import FoundationModels
             return L("%@: %@.", countClause, summaryList)
         }
 
-        // 2. Join current meeting
+        // 2. Join current OR named / multiple meetings with optional Obsidian skill role
         let asksJoin = lower.contains("подключ") || lower.contains("зайди") || lower.contains("войди")
             || lower.contains("join") || lower.contains("connect me")
         let mentionsTarget = lower.contains("текущ") || lower.contains("сейчас") || lower.contains("current")
             || lower.contains("следующ") || lower.contains("next") || mentionsMeeting
-        if asksJoin && mentionsTarget {
-            let candidates = joinableTargets(currentNow)
+        let candidates = joinableTargets(currentNow)
+        let matchedSkill = AssistantSkill.preferredSkill(matching: input, in: skills?.skills ?? [])
+        let multiQueries = CurrentMeetingTargetResolver.extractMultiMeetingQueries(from: input, candidates: candidates)
+
+        if asksJoin && (multiQueries != nil || mentionsTarget) {
+            if let explicitQueries = multiQueries, explicitQueries.count >= 2 || (!explicitQueries.isEmpty && !mentionsTarget) {
+                var joinedTitles: [String] = []
+                for query in explicitQueries {
+                    let needle = query.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil)
+                    guard let candidate = candidates.first(where: {
+                        $0.title.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil).contains(needle)
+                    }) else { continue }
+                    if let skill = matchedSkill {
+                        facilitator?.queuePendingSkill(skill.id, title: candidate.title, invitation: candidate.invitation)
+                    }
+                    if onJoinCandidate?(candidate) == true {
+                        joinedTitles.append(candidate.title)
+                    }
+                }
+                if !joinedTitles.isEmpty {
+                    if let skill = matchedSkill {
+                        return L("Joined meetings (%@) with role “%@”.", joinedTitles.joined(separator: ", "), skill.name)
+                    }
+                    return L("Joined meetings: %@", joinedTitles.joined(separator: ", "))
+                }
+            }
             guard let best = CurrentMeetingTargetResolver.bestCurrentMeeting(from: candidates, now: currentNow) else {
                 return L("No ongoing or upcoming meeting with a join link was found.")
             }
             if AssistantVoiceApprovalPolicy.shouldAutoApprove(actionKind: "join", inputSource: source, sendsWithoutAsking: false) {
+                if let skill = matchedSkill {
+                    facilitator?.queuePendingSkill(skill.id, title: best.title, invitation: best.invitation)
+                }
                 if onJoinCandidate?(best) == true {
+                    if let skill = matchedSkill {
+                        return L("Joining “%@” with role “%@”.", best.title, skill.name)
+                    }
                     return L("Joining “%@”.", best.title)
                 }
                 return L("Unable to join “%@”.", best.title)
@@ -511,28 +548,166 @@ import FoundationModels
             return L("Open tasks (%ld):", open.count) + "\n" + bullets
         }
 
+        // 8. Create task directly (e.g. "создай задачу подготовить релиз на Аню")
+        if let createdDraft = Self.extractDirectTask(from: input, lower: lower), let skills {
+            let targetSID = resolvedTargetMeetingID().flatMap { id in
+                activeMeetingsProvider().first(where: { $0.id == id })?.sessionID
+            }
+            if let created = await skills.createTaskWithPeopleResolution(
+                sessionID: targetSID,
+                title: createdDraft.title,
+                owner: createdDraft.owner
+            ) {
+                return created.resolvedOwner.isEmpty
+                    ? L("Created task “%@”.", created.resolvedTitle)
+                    : L("Created task “%@” for %@.", created.resolvedTitle, created.resolvedOwner)
+            }
+        }
+
+        // 9. Open Jira / Assistant Board
+        if (lower.contains("открой") || lower.contains("покажи") || lower.contains("open") || lower.contains("show"))
+            && (lower.contains("доск") || lower.contains("board") || lower.contains("jira")),
+           let board, let skills {
+            let url = skills.teamContext.defaultJiraBoardURL
+            if !url.isEmpty, let msg = try? await board.open(urlString: url) {
+                return msg
+            }
+        }
+
         return nil
+    }
+
+    private func runVoiceRealtimeTurnIfConfigured(_ input: String, source: AssistantInputSource) async -> Bool {
+        guard let skills else { return false }
+        let kind = skills.realtimeProvider
+        guard kind != .disabled,
+              let apiKey = skills.realtimeAPIKey(for: kind),
+              !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return false
+        }
+
+        @MainActor
+        final class Collector {
+            var chunks: [Data] = []
+            var transcript = ""
+            var finished = false
+            var failed = false
+        }
+
+        let collector = Collector()
+        let rendered = skills.renderPromptContext(commandText: input)
+        let instructions = [
+            rendered.basePersona,
+            rendered.instructions,
+            "Answer concisely by voice in the user's language."
+        ]
+            .filter { !$0.isEmpty }
+            .joined(separator: "\n\n")
+        let config = RealtimeSessionConfig(
+            provider: kind,
+            apiKey: apiKey,
+            model: skills.realtimeModel,
+            voice: skills.realtimeVoice,
+            endpointOverride: skills.realtimeEndpoint,
+            systemInstructions: instructions
+        )
+        let router = RealtimeVoiceRouter()
+        await router.start(
+            config: config,
+            executeTool: { _, _ in "{}" },
+            onEvent: { event in
+                await MainActor.run {
+                    switch event {
+                    case .audioPCM16(let pcm, _):
+                        collector.chunks.append(pcm)
+                    case .assistantTranscriptDelta(let delta):
+                        collector.transcript += delta
+                    case .assistantTranscriptDone(let full):
+                        collector.transcript = full
+                    case .audioDone:
+                        collector.finished = true
+                    case .error, .disconnected:
+                        collector.failed = true
+                    default:
+                        break
+                    }
+                }
+            }
+        )
+        guard await router.isRealtimeConnected, await router.sendText(input) else {
+            await router.stop()
+            return false
+        }
+        for _ in 0..<200 {
+            if collector.finished || collector.failed || Task.isCancelled { break }
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+        await router.stop()
+
+        let text = collector.transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+        let audioData = collector.chunks.reduce(into: Data()) { $0.append($1) }
+        guard !collector.failed, (!text.isEmpty || !audioData.isEmpty) else {
+            return false
+        }
+
+        let displayAnswer = text.isEmpty ? L("Spoken response played.") : text
+        let message = Message(role: .assistant, text: displayAnswer, at: now())
+        messages.append(message)
+        if source.isVoice { lastVoiceAnswer = displayAnswer }
+        if let buffer = RealtimeVoiceAudio.pcm16ToAudioBuffer(data: audioData, sampleRate: 24_000),
+           !isInActiveCall() || !Self.isSpeakerOutputActive {
+            stopAudition()
+            auditioningMessageID = message.id
+            speech?.setSpeakingResponse(true)
+            do {
+                try IOSVoicePreviewPlayer.shared.play(buffer) { [weak self] in
+                    Task { @MainActor [weak self] in
+                        guard let self, self.auditioningMessageID == message.id else { return }
+                        self.auditioningMessageID = nil
+                        self.speech?.setSpeakingResponse(false)
+                    }
+                }
+            } catch {
+                auditioningMessageID = nil
+                speech?.setSpeakingResponse(false)
+            }
+        }
+        return true
     }
 
     private func answerWithWorkspaceOrAI(_ query: String) async -> String {
         let hits = await (workspace?.search(query: query) ?? [])
+        let knowledgeHits = skills?.searchKnowledge(query: query, limit: 5) ?? []
+        let rendered = skills?.renderPromptContext(commandText: query)
         let cal = Calendar.current
         let currentNow = now()
         let monthCount = workspace?.sessions.filter { cal.isDate($0.startedAt, equalTo: currentNow, toGranularity: .month) }.count ?? 0
         let openTasks = workspace?.tasks.filter { !$0.done && workspace?.taskArchivedAt($0) == nil }.prefix(6).map(\.text) ?? []
         let candidates = joinableTargets(currentNow).prefix(4).map(\.title)
         let snippets = hits.prefix(5).map { "\($0.title) (\($0.startedAt.formatted(date: .abbreviated, time: .shortened))): \($0.snippet)" }
+        let knowledgeSnippets = knowledgeHits.map { "[\($0.kind)] \($0.title): \($0.excerpt)" }
 
         let contextText = """
         Current date: \(currentNow.formatted(date: .abbreviated, time: .shortened))
         Meetings this month: \(monthCount)
         Open tasks: \(openTasks.isEmpty ? "none" : openTasks.joined(separator: "; "))
         Upcoming or ongoing meetings: \(candidates.isEmpty ? "none" : candidates.joined(separator: ", "))
+        Obsidian knowledge matches: \(knowledgeSnippets.isEmpty ? "none" : knowledgeSnippets.joined(separator: "\n"))
         Search matches: \(snippets.isEmpty ? "none" : snippets.joined(separator: "\n"))
         """
 
         if let workspace, let config = try? workspace.permittedAIConfiguration() {
-            let systemPrompt = "You are Rock, a concise voice assistant inside Rock'N'Roll. Answer the user's question in their language strictly from the provided workspace context. Never invent meetings or facts."
+            let persona = rendered?.basePersona.isEmpty == false
+                ? rendered!.basePersona
+                : "You are Rock, a concise voice assistant inside Rock'N'Roll."
+            let skillText = rendered?.instructions ?? ""
+            let systemPrompt = """
+            \(persona)
+
+            \(skillText)
+
+            Answer the user's question concisely in their language strictly from the provided workspace & Obsidian context. Never invent meetings or facts.
+            """
             let userPrompt = "Question: \(query)\n\nWorkspace context:\n\(contextText)"
 
             switch config.providerKind {
@@ -584,7 +759,34 @@ import FoundationModels
         if !snippets.isEmpty {
             return snippets.joined(separator: "\n\n")
         }
+        if !knowledgeSnippets.isEmpty {
+            return knowledgeSnippets.joined(separator: "\n\n")
+        }
         return L("No exact matches found. Ask about monthly meetings, open tasks, or say “Rock, join current meeting”.")
+    }
+
+    private nonisolated static func extractDirectTask(
+        from input: String,
+        lower: String
+    ) -> (title: String, owner: String?)? {
+        for marker in ["создай задачу ", "добавь задачу ", "поставь задачу ", "create task ", "add task "] {
+            if let range = lower.range(of: marker) {
+                let tailIdx = input.index(input.startIndex, offsetBy: lower.distance(from: lower.startIndex, to: range.upperBound))
+                let raw = String(input[tailIdx...]).trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !raw.isEmpty else { return nil }
+                for prep in [" на ", " для ", " for "] {
+                    if let pRange = raw.range(of: prep, options: [.caseInsensitive, .backwards]) {
+                        let title = String(raw[..<pRange.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+                        let owner = String(raw[pRange.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+                        if !title.isEmpty && !owner.isEmpty && owner.count <= 40 {
+                            return (title, owner)
+                        }
+                    }
+                }
+                return (raw, nil)
+            }
+        }
+        return nil
     }
 
     private nonisolated static func extractObjective(from input: String) -> String {

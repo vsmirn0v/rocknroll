@@ -88,6 +88,7 @@ final class IOSWorkspaceCoordinator: ObservableObject {
     private weak var calendar: CalendarMeetingStore?
     private let syncPreferences: RoomSyncCoordinator
     private let preferences: UserDefaults
+    var summaryPromptProvider: (() -> String?)?
     private let outcomeWriter: any PortableOutcomeWriting
     let keychain: WorkspaceAPIKeychain
     let archiveStore: TranscriptArchiveStore
@@ -609,7 +610,8 @@ final class IOSWorkspaceCoordinator: ObservableObject {
                 events: events,
                 notes: noteText,
                 language: language,
-                configuration: configuration
+                configuration: configuration,
+                customInstructions: summaryPromptProvider?()
             )
 
             stage = "save"

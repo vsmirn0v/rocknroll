@@ -188,4 +188,73 @@ public enum CurrentMeetingTargetResolver {
         }
         return candidates.first
     }
+
+    public static func extractMultiMeetingQueries(
+        from input: String,
+        candidates: [JoinableMeetingCandidate]
+    ) -> [String]? {
+        let foldedInput = input.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil)
+            .replacingOccurrences(of: "ё", with: "е")
+        var matchedTitles: [String] = []
+
+        for candidate in candidates {
+            let title = candidate.title.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard title.count >= 3 else { continue }
+            let foldedTitle = title.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil)
+                .replacingOccurrences(of: "ё", with: "е")
+            if foldedInput.contains(foldedTitle) {
+                matchedTitles.append(candidate.title)
+            }
+        }
+
+        let stopWords: Set<String> = [
+            "встреча", "встречу", "встречи", "встрече", "звонок", "созвон", "митинг", "meeting", "call",
+            "подключи", "подключить", "подключись", "зайди", "войди", "меня", "туда", "сюда",
+            "join", "connect", "rock", "рок", "как", "role", "роли", "роль", "пожалуйста", "please",
+            "текущую", "текущая", "текущей", "сейчас", "current", "now", "следующую", "следующая", "next",
+            "with", "into"
+        ]
+
+        let normalizedClauses = foldedInput
+            .replacingOccurrences(of: " и ", with: "|")
+            .replacingOccurrences(of: " and ", with: "|")
+            .replacingOccurrences(of: ",", with: "|")
+            .replacingOccurrences(of: ";", with: "|")
+            .split(separator: "|")
+            .map(String.init)
+
+        let roleMarkers = [" в роли ", " with skill ", " with role ", " как ", " as "]
+        for rawClause in normalizedClauses {
+            var clause = rawClause
+            for marker in roleMarkers {
+                if let range = clause.range(of: marker) {
+                    clause = String(clause[..<range.lowerBound])
+                }
+            }
+            let clauseTokens = clause.split(whereSeparator: { !$0.isLetter && !$0.isNumber })
+                .map(String.init)
+                .filter { $0.count >= 3 && !stopWords.contains($0) }
+            guard !clauseTokens.isEmpty else { continue }
+            var bestCandidate: (title: String, score: Int)?
+            for candidate in candidates {
+                let candidateTokens = Set(
+                    candidate.title.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil)
+                        .replacingOccurrences(of: "ё", with: "е")
+                        .split(whereSeparator: { !$0.isLetter && !$0.isNumber })
+                        .map(String.init)
+                )
+                let hits = clauseTokens.filter { candidateTokens.contains($0) }.count
+                if hits > 0, hits > (bestCandidate?.score ?? 0) {
+                    bestCandidate = (candidate.title, hits)
+                }
+            }
+            if let bestCandidate {
+                matchedTitles.append(bestCandidate.title)
+            }
+        }
+
+        var seen: Set<String> = []
+        let unique = matchedTitles.filter { seen.insert($0.lowercased()).inserted }
+        return unique.isEmpty ? nil : unique
+    }
 }

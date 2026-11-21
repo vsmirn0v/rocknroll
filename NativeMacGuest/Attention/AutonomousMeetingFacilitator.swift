@@ -33,12 +33,20 @@ final class AutonomousMeetingFacilitator: ObservableObject {
     private var busySessions: Set<UUID> = []
     private var manuallyDisabledSessions: Set<UUID> = []
     private var lastSpokeAtBySession: [UUID: Date] = [:]
+    private var lastVoiceDeliveryEndedAtBySession: [UUID: Date] = [:]
     private var realtimeSessions: [UUID: SessionRealtimeState] = [:]
     private var cachedSkills: [AssistantSkill] = []
     private var lastSkillRefreshAt = Date.distantPast
 
     init(attention: AttentionCoordinator) {
         self.attention = attention
+    }
+
+    func invalidateSkillCache() {
+        lastSkillRefreshAt = .distantPast
+        Task { @MainActor [weak self] in
+            await self?.refreshSkillsCache()
+        }
     }
 
     func queuePendingSkill(_ skillID: String, title: String?, invitation: URL?) {
@@ -142,6 +150,7 @@ final class AutonomousMeetingFacilitator: ObservableObject {
             processedLineIDsBySession[model.sessionID] = seen
 
             let inFollowUpWindow = lastSpokeAtBySession[model.sessionID].map { now.timeIntervalSince($0) <= 20 } ?? false
+            let inEchoWindow = lastVoiceDeliveryEndedAtBySession[model.sessionID].map { now.timeIntervalSince($0) <= 6 } ?? false
             let lastSpoken = lastSpokenAnswerBySession[model.sessionID]?.trimmed ?? ""
 
             var matchedLine = unseen.first { _ in false }
@@ -149,7 +158,7 @@ final class AutonomousMeetingFacilitator: ObservableObject {
             for line in unseen.reversed() {
                 let text = line.text.trimmed
                 guard !text.isEmpty else { continue }
-                if !lastSpoken.isEmpty && (text == lastSpoken || lastSpoken.contains(text)) && line.isOwn {
+                if Self.isLikelySelfEcho(candidate: text, lastSpoken: lastSpoken, isLocal: line.isOwn, withinEchoWindow: inEchoWindow) {
                     continue
                 }
                 if case .command(let cmd) = AssistantWakePhraseMatcher.match(text),
@@ -398,14 +407,22 @@ final class AutonomousMeetingFacilitator: ObservableObject {
 
     private func attachAudioTap(to model: NativeDesktopMeetingModel, state: SessionRealtimeState) {
         let router = state.router
-        model.onRealtimeAudioPCM16 = { [weak model] _, trackID, pcm in
-            Task { @MainActor [weak model] in
-                if trackID == MeetingTranscriber.localTrackID && model?.isVoiceReplyInFlight == true {
-                    return
+        let sessionID = model.sessionID
+        model.onRealtimeAudioPCM16 = { [weak self, weak model] _, trackID, pcm in
+            Task { @MainActor [weak self, weak model] in
+                if trackID == MeetingTranscriber.localTrackID {
+                    if model?.isVoiceReplyInFlight == true || self?.isInAudioEchoCooldown(sessionID: sessionID) == true {
+                        return
+                    }
                 }
                 _ = await router.sendAudioPCM16(pcm)
             }
         }
+    }
+
+    private func isInAudioEchoCooldown(sessionID: UUID) -> Bool {
+        guard let ended = lastVoiceDeliveryEndedAtBySession[sessionID] else { return false }
+        return Date().timeIntervalSince(ended) < 1.5
     }
 
     private func executeRealtimeTool(sessionID: UUID, name: String, argumentsJSON: String) async -> String {
@@ -514,6 +531,9 @@ final class AutonomousMeetingFacilitator: ObservableObject {
         if !fallbackText.isEmpty {
             lastSpokenAnswerBySession[model.sessionID] = fallbackText
         }
+        defer {
+            lastVoiceDeliveryEndedAtBySession[model.sessionID] = Date()
+        }
         if model.supportsVoiceReply && model.snapshot.playoutOn {
             if !model.ownsMicrophone, let arbiter = model.microphoneArbiter {
                 _ = await arbiter(model)
@@ -554,21 +574,20 @@ final class AutonomousMeetingFacilitator: ObservableObject {
     }
 
     nonisolated static func pcm16ToAudioBuffer(data: Data, sampleRate: Double) -> AVAudioPCMBuffer? {
-        let frameCount = data.count / MemoryLayout<Int16>.size
-        guard frameCount > 0,
-              let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: sampleRate, channels: 1, interleaved: false),
-              let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(frameCount)),
-              let channel = buffer.floatChannelData?[0] else {
-            return nil
-        }
-        buffer.frameLength = AVAudioFrameCount(frameCount)
-        data.withUnsafeBytes { raw in
-            guard let samples = raw.bindMemory(to: Int16.self).baseAddress else { return }
-            let scale: Float = 1.0 / 32768.0
-            for i in 0..<frameCount {
-                channel[i] = Float(Int16(littleEndian: samples[i])) * scale
-            }
-        }
-        return buffer
+        RealtimeVoiceAudio.pcm16ToAudioBuffer(data: data, sampleRate: sampleRate)
+    }
+
+    static func isLikelySelfEcho(
+        candidate: String,
+        lastSpoken: String,
+        isLocal: Bool,
+        withinEchoWindow: Bool
+    ) -> Bool {
+        AssistantWakePhraseMatcher.isLikelySelfEcho(
+            candidate: candidate,
+            lastSpoken: lastSpoken,
+            isLocal: isLocal,
+            withinEchoWindow: withinEchoWindow
+        )
     }
 }

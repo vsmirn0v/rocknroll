@@ -25,6 +25,11 @@ struct IOSWorkspaceHubView: View {
     @ObservedObject var assistant: IOSAssistantCoordinator
     var talk: IOSAssistantTalkController? = nil
     var speech: IOSAssistantSpeechCoordinator? = nil
+    var skills: IOSAssistantSkillsController? = nil
+    var facilitator: IOSAutonomousMeetingFacilitator? = nil
+    var board: IOSAssistantBoardController? = nil
+    var candidatesProvider: (() -> [JoinableMeetingCandidate])? = nil
+    var onJoinMultiple: (([JoinableMeetingCandidate], String, Bool) -> Void)? = nil
     let initialTab: IOSWorkspaceHubTab
 
     @Environment(\.dismiss) private var dismiss
@@ -34,6 +39,9 @@ struct IOSWorkspaceHubView: View {
     @State private var selectedSessionID: UUID?
     @State private var compactColumn: NavigationSplitViewColumn = .sidebar
     @State private var showingSettings = false
+    @State private var showingSkillsSheet = false
+    @State private var showingBoardSheet = false
+    @State private var showingMultiJoinSheet = false
     @State private var renamingSession: IOSMeetingSessionItem?
     @State private var renameDraft = ""
     @State private var searchQuery = ""
@@ -45,6 +53,11 @@ struct IOSWorkspaceHubView: View {
         assistant: IOSAssistantCoordinator,
         talk: IOSAssistantTalkController? = nil,
         speech: IOSAssistantSpeechCoordinator? = nil,
+        skills: IOSAssistantSkillsController? = nil,
+        facilitator: IOSAutonomousMeetingFacilitator? = nil,
+        board: IOSAssistantBoardController? = nil,
+        candidatesProvider: (() -> [JoinableMeetingCandidate])? = nil,
+        onJoinMultiple: (([JoinableMeetingCandidate], String, Bool) -> Void)? = nil,
         initialTab: IOSWorkspaceHubTab = .history
     ) {
         self.workspace = workspace
@@ -52,6 +65,11 @@ struct IOSWorkspaceHubView: View {
         self.assistant = assistant
         self.talk = talk
         self.speech = speech
+        self.skills = skills
+        self.facilitator = facilitator
+        self.board = board
+        self.candidatesProvider = candidatesProvider
+        self.onJoinMultiple = onJoinMultiple
         self.initialTab = initialTab
         _selectedTab = State(initialValue: initialTab)
     }
@@ -84,12 +102,48 @@ struct IOSWorkspaceHubView: View {
         }
         .sheet(isPresented: $showingSettings) {
             NavigationStack {
-                IOSAssistantSettingsView(workspace: workspace, sync: sync, assistant: assistant)
+                IOSAssistantSettingsView(
+                    workspace: workspace,
+                    sync: sync,
+                    assistant: assistant,
+                    skills: skills,
+                    board: board
+                )
                     .toolbar {
                         ToolbarItem(placement: .confirmationAction) {
                             Button(L("Done")) { showingSettings = false }
                         }
                     }
+            }
+        }
+        .sheet(isPresented: $showingSkillsSheet) {
+            if let skills, let board {
+                NavigationStack {
+                    IOSAssistantSkillsView(skills: skills, board: board)
+                        .toolbar {
+                            ToolbarItem(placement: .confirmationAction) {
+                                Button(L("Done")) { showingSkillsSheet = false }
+                            }
+                        }
+                }
+            }
+        }
+        .sheet(isPresented: $showingBoardSheet) {
+            if let board {
+                IOSAssistantBoardSheet(
+                    controller: board,
+                    defaultBoardURL: skills?.teamContext.defaultJiraBoardURL ?? ""
+                )
+            }
+        }
+        .sheet(isPresented: $showingMultiJoinSheet) {
+            if let skills {
+                IOSMultiMeetingRockJoinSheet(
+                    candidates: candidatesProvider?() ?? [],
+                    skills: skills
+                ) { chosen, skillID, enableVoice in
+                    onJoinMultiple?(chosen, skillID, enableVoice)
+                }
             }
         }
         .alert(L("Rename Meeting"), isPresented: Binding(
@@ -174,6 +228,33 @@ struct IOSWorkspaceHubView: View {
             Button(L("Done")) { dismiss() }
         }
         ToolbarItemGroup(placement: .topBarTrailing) {
+            if skills != nil {
+                Menu {
+                    Button {
+                        showingSkillsSheet = true
+                    } label: {
+                        Label(L("Skills, Prompts & People.md"), systemImage: "doc.text.magnifyingglass")
+                    }
+                    if board != nil {
+                        Button {
+                            showingBoardSheet = true
+                        } label: {
+                            Label(L("Open Assistant Board"), systemImage: "macwindow")
+                        }
+                    }
+                    if onJoinMultiple != nil {
+                        Button {
+                            showingMultiJoinSheet = true
+                        } label: {
+                            Label(L("Join Meetings with Rock…"), systemImage: "person.2.wave.2")
+                        }
+                    }
+                } label: {
+                    Image(systemName: "wand.and.stars")
+                }
+                .accessibilityLabel(L("Assistant Tools"))
+            }
+
             Button {
                 Task { await workspace.synchronizeNow() }
             } label: {

@@ -153,6 +153,8 @@ final class AttentionMemoryPressure: @unchecked Sendable {
     let boardController = AssistantBoardWindowController()
     var facilitator: AutonomousMeetingFacilitator?
     var cachedPromptTexts: [AssistantPromptKind: String] = [:]
+    var skillFolderWatcher: AssistantSkillFolderWatcher?
+    var watchedSkillVaultURL: URL?
     var meetings: () -> [NativeDesktopMeetingModel] = { [] }
     /// The meeting is in front of you; its mode then follows the on-screen default (Off unless changed).
     var isOnScreen: (NativeDesktopMeetingModel) -> Bool = { _ in false }
@@ -319,6 +321,9 @@ final class AttentionMemoryPressure: @unchecked Sendable {
     func start() {
         guard loop == nil else { return }
         beginOutcomeRecovery()
+        Task { @MainActor [weak self] in
+            await self?.startSkillFolderWatcher()
+        }
         loop = Task { @MainActor [weak self] in
             while !Task.isCancelled {
                 guard let self else { return }
@@ -338,6 +343,7 @@ final class AttentionMemoryPressure: @unchecked Sendable {
     }
     func stop() {
         loop?.cancel(); loop = nil
+        stopSkillFolderWatcher()
         for model in meetings() { model.participation.stop() }
     }
     deinit { loop?.cancel() }

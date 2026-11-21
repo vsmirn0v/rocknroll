@@ -130,10 +130,30 @@ final class ConferenceModel: ObservableObject {
         }
         return coordinator
     }()
-    lazy var workspace: IOSWorkspaceCoordinator = IOSWorkspaceCoordinator(
-        calendar: calendar,
-        syncPreferences: sync,
-        preferences: preferences
+    lazy var workspace: IOSWorkspaceCoordinator = {
+        let coordinator = IOSWorkspaceCoordinator(
+            calendar: calendar,
+            syncPreferences: sync,
+            preferences: preferences
+        )
+        coordinator.summaryPromptProvider = { [weak self] in
+            self?.assistantSkills.promptText(for: .meetingSummary)
+        }
+        return coordinator
+    }()
+    lazy var assistantSkills: IOSAssistantSkillsController = IOSAssistantSkillsController(
+        workspace: workspace,
+        preferences: preferences,
+        keychain: workspace.keychain
+    )
+    lazy var assistantBoard: IOSAssistantBoardController = IOSAssistantBoardController()
+    lazy var assistantFacilitator: IOSAutonomousMeetingFacilitator = IOSAutonomousMeetingFacilitator(
+        skills: assistantSkills,
+        workspace: workspace,
+        board: assistantBoard,
+        resolveBridge: { [weak self] controllerID in
+            self?.makeAssistantBridge(for: controllerID)
+        }
     )
     @Published var focusJoinLinkTrigger = UUID()
     lazy var assistant: IOSAssistantCoordinator = {
@@ -144,6 +164,18 @@ final class ConferenceModel: ObservableObject {
                 self?.makeAssistantBridge(for: controllerID)
             }
         )
+        coordinator.attentionPromptProvider = { [weak self] in
+            self?.assistantSkills.promptText(for: .attentionJudge)
+        }
+        coordinator.onTranscriptEvents = { [weak self] controllerID, title, invitation, events, localNames in
+            self?.assistantFacilitator.observeEvents(
+                controllerID: controllerID,
+                title: title,
+                invitationURL: invitation,
+                events: events,
+                localNames: localNames
+            )
+        }
         coordinator.onSessionModeChanged = { [weak self] controllerID, _, _ in
             self?.syncAssistantBadge(for: controllerID)
         }
@@ -160,7 +192,13 @@ final class ConferenceModel: ObservableObject {
                             self.presentSession(id: card.controllerID)
                         }
                         self.sessions.first(where: { $0.id == card.controllerID })?
-                            .presentAssistantSheet(assistant: self.assistant, speech: self.assistantSpeech)
+                            .presentAssistantSheet(
+                                assistant: self.assistant,
+                                speech: self.assistantSpeech,
+                                skills: self.assistantSkills,
+                                facilitator: self.assistantFacilitator,
+                                board: self.assistantBoard
+                            )
                     }
                 )
             }
@@ -192,6 +230,9 @@ final class ConferenceModel: ObservableObject {
             assistant: assistant,
             speech: assistantSpeech
         )
+        controller.skills = assistantSkills
+        controller.facilitator = assistantFacilitator
+        controller.board = assistantBoard
         controller.isInActiveCall = { [weak self] in
             self?.sessions.isEmpty == false
         }
@@ -286,7 +327,13 @@ final class ConferenceModel: ObservableObject {
                 )
             } else {
                 self.sessions.first(where: { $0.id == id })?
-                    .presentAssistantSheet(assistant: self.assistant, speech: self.assistantSpeech)
+                    .presentAssistantSheet(
+                        assistant: self.assistant,
+                        speech: self.assistantSpeech,
+                        skills: self.assistantSkills,
+                        facilitator: self.assistantFacilitator,
+                        board: self.assistantBoard
+                    )
             }
             self.assistantSpeech.refreshState()
         }
@@ -861,6 +908,10 @@ final class ConferenceModel: ObservableObject {
             speakVoice: { [weak controller] text in
                 guard let controller else { throw MeetingSessionError.notConnected }
                 try await controller.speakVoiceReply(text)
+            },
+            speakAudioBuffer: { [weak controller] buffer in
+                guard let controller else { throw MeetingSessionError.notConnected }
+                try await controller.speakVoiceBuffer(buffer)
             }
         )
     }
@@ -1370,7 +1421,13 @@ final class ConferenceModel: ObservableObject {
                 controller.onJoinAnotherMeeting = { [weak self] in self?.beginJoiningAnotherMeeting() }
                 controller.onOpenAssistant = { [weak self, weak controller] in
                     guard let self, let controller else { return }
-                    controller.presentAssistantSheet(assistant: self.assistant, speech: self.assistantSpeech)
+                    controller.presentAssistantSheet(
+                        assistant: self.assistant,
+                        speech: self.assistantSpeech,
+                        skills: self.assistantSkills,
+                        facilitator: self.assistantFacilitator,
+                        board: self.assistantBoard
+                    )
                 }
                 controller.configureAssistantHUD(talk: self.assistantTalk, speech: self.assistantSpeech)
                 controller.onMicrophoneStateChanged = { [weak self] id, unmuted in

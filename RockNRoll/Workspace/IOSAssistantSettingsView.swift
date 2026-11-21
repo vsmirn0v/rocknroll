@@ -9,6 +9,8 @@ struct IOSAssistantSettingsView: View {
     @ObservedObject var workspace: IOSWorkspaceCoordinator
     @ObservedObject var sync: RoomSyncCoordinator
     @ObservedObject var assistant: IOSAssistantCoordinator
+    var skills: IOSAssistantSkillsController? = nil
+    var board: IOSAssistantBoardController? = nil
     @ObservedObject private var voiceStore = IOSVoiceStore.shared
     @ObservedObject private var voxStore = IOSVoxCPM2Store.shared
 
@@ -49,6 +51,21 @@ struct IOSAssistantSettingsView: View {
                 Text(L("Live Meeting Assistant"))
             } footer: {
                 Text(L("Modes can be changed per meeting from the call header or active meetings list. Participation automatically pauses whenever your microphone is unmuted."))
+            }
+
+            if let skills, let board {
+                Section(L("Obsidian Skills & Realtime")) {
+                    NavigationLink {
+                        IOSAssistantSkillsView(skills: skills, board: board)
+                    } label: {
+                        LabeledContent(
+                            L("Skills, Prompts & People.md"),
+                            value: skills.realtimeProvider == .disabled
+                                ? L("%ld skills", skills.skills.filter(\.enabled).count)
+                                : skills.realtimeProvider.title
+                        )
+                    }
+                }
             }
 
             Section {

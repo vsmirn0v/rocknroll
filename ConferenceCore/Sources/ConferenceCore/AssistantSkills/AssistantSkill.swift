@@ -146,6 +146,22 @@ public struct AssistantSkill: Identifiable, Codable, Equatable, Sendable {
             return !needle.isEmpty && haystack.contains(needle)
         }
     }
+
+    /// Selects the skill matching an explicit role clause (`as ...` / `как ...`) first,
+    /// falling back to general trigger matching across `commandText`.
+    public static func preferredSkill(matching commandText: String, in skills: [AssistantSkill]) -> AssistantSkill? {
+        let folded = commandText.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+            .replacingOccurrences(of: "ё", with: "е")
+        for marker in [" в роли ", " with skill ", " with role ", " как ", " as "] {
+            if let range = folded.range(of: marker) {
+                let roleTail = String(folded[range.upperBound...])
+                if let explicit = skills.first(where: { $0.enabled && $0.matches(meetingTitle: "", commandText: roleTail) }) {
+                    return explicit
+                }
+            }
+        }
+        return skills.first(where: { $0.enabled && $0.matches(meetingTitle: "", commandText: commandText) })
+    }
 }
 
 /// Deterministic YAML-frontmatter Markdown codec for Obsidian skill files.

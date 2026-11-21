@@ -163,6 +163,56 @@ public struct WorkspaceAPIKeychain: Sendable {
         let status = SecItemDelete(query(for: kind) as CFDictionary)
         return status == errSecSuccess || status == errSecItemNotFound
     }
+
+    // MARK: - Realtime Provider Credentials (OpenAI Realtime / Gemini Live)
+
+    private func realtimeQuery(for provider: RealtimeProviderKind) -> [String: Any] {
+        let account = "realtime-api-key." + provider.rawValue
+        var result: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account
+        ]
+        #if os(macOS)
+        result[kSecUseDataProtectionKeychain as String] = true
+        #endif
+        return result
+    }
+
+    public func readRealtime(provider: RealtimeProviderKind) -> String? {
+        guard provider != .disabled else { return nil }
+        var item = realtimeQuery(for: provider)
+        item[kSecReturnData as String] = true
+        item[kSecMatchLimit as String] = kSecMatchLimitOne
+        var result: CFTypeRef?
+        guard SecItemCopyMatching(item as CFDictionary, &result) == errSecSuccess,
+              let data = result as? Data else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    @discardableResult
+    public func writeRealtime(_ value: String, provider: RealtimeProviderKind) -> Bool {
+        guard provider != .disabled else { return false }
+        let clean = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if clean.isEmpty { return deleteRealtime(provider: provider) }
+        let data = Data(clean.utf8)
+        let q = realtimeQuery(for: provider)
+        var status = SecItemUpdate(q as CFDictionary, [kSecValueData as String: data] as CFDictionary)
+        if status == errSecItemNotFound {
+            var add = q
+            add[kSecValueData as String] = data
+            add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+            status = SecItemAdd(add as CFDictionary, nil)
+        }
+        return status == errSecSuccess
+    }
+
+    @discardableResult
+    public func deleteRealtime(provider: RealtimeProviderKind) -> Bool {
+        guard provider != .disabled else { return true }
+        let status = SecItemDelete(realtimeQuery(for: provider) as CFDictionary)
+        return status == errSecSuccess || status == errSecItemNotFound
+    }
 }
 
 public struct PortableOutcomeResult: Equatable, Sendable {
@@ -214,6 +264,37 @@ public protocol PortableOutcomeWriting: Sendable {
         language: String,
         configuration: PortableOutcomeConfiguration
     ) async throws -> PortableOutcomeResult
+
+    func generateOutcome(
+        title: String,
+        endedAt: Date,
+        events: [SyncedTranscriptEvent],
+        notes: String,
+        language: String,
+        configuration: PortableOutcomeConfiguration,
+        customInstructions: String?
+    ) async throws -> PortableOutcomeResult
+}
+
+public extension PortableOutcomeWriting {
+    func generateOutcome(
+        title: String,
+        endedAt: Date,
+        events: [SyncedTranscriptEvent],
+        notes: String,
+        language: String,
+        configuration: PortableOutcomeConfiguration,
+        customInstructions: String?
+    ) async throws -> PortableOutcomeResult {
+        try await generateOutcome(
+            title: title,
+            endedAt: endedAt,
+            events: events,
+            notes: notes,
+            language: language,
+            configuration: configuration
+        )
+    }
 }
 
 public enum PortableOutcomePrompt {
@@ -232,7 +313,8 @@ public enum PortableOutcomePrompt {
         events: [SyncedTranscriptEvent],
         notes: String,
         language: String,
-        maxCharacters: Int = 60_000
+        maxCharacters: Int = 60_000,
+        customInstructions: String? = nil
     ) -> [[String: String]] {
         let lang = Localization.englishLanguageName(for: language)
         let clock = ISO8601DateFormatter()
@@ -258,8 +340,19 @@ public enum PortableOutcomePrompt {
             userContent += "Notes:\n\(String(cleanNotes.prefix(8_000)))\n\n"
         }
         userContent += bodyLines.joined(separator: "\n")
+        let trimmedCustom = customInstructions?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let resolvedSystem: String
+        if trimmedCustom.isEmpty {
+            resolvedSystem = systemPrompt
+        } else {
+            resolvedSystem = """
+            \(trimmedCustom)
+
+            Always answer with ONE valid JSON object matching this exact schema and nothing else: {"summary": string, "decisions": [string], "tasks": [{"text": string, "owner": string, "due_at": string}], "open_questions": [string]}.
+            """
+        }
         return [
-            ["role": "system", "content": systemPrompt + "\nWrite in \(lang)."],
+            ["role": "system", "content": resolvedSystem + "\nWrite in \(lang)."],
             ["role": "user", "content": userContent]
         ]
     }
@@ -365,6 +458,26 @@ public struct PortableOutcomeService: PortableOutcomeWriting {
         language: String,
         configuration: PortableOutcomeConfiguration
     ) async throws -> PortableOutcomeResult {
+        try await generateOutcome(
+            title: title,
+            endedAt: endedAt,
+            events: events,
+            notes: notes,
+            language: language,
+            configuration: configuration,
+            customInstructions: nil
+        )
+    }
+
+    public func generateOutcome(
+        title: String,
+        endedAt: Date,
+        events: [SyncedTranscriptEvent],
+        notes: String,
+        language: String,
+        configuration: PortableOutcomeConfiguration,
+        customInstructions: String?
+    ) async throws -> PortableOutcomeResult {
         let hasUsableEvents = events.contains {
             ($0.kind == "transcript" || $0.kind == "chat") &&
                 !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -378,7 +491,14 @@ public struct PortableOutcomeService: PortableOutcomeWriting {
             #if canImport(FoundationModels)
             if #available(iOS 26.0, macOS 26.0, *),
                SystemLanguageModel.default.availability == .available {
-                return try await generateOnDevice(title: title, endedAt: endedAt, events: events, notes: notes, language: language)
+                return try await generateOnDevice(
+                    title: title,
+                    endedAt: endedAt,
+                    events: events,
+                    notes: notes,
+                    language: language,
+                    customInstructions: customInstructions
+                )
             }
             #endif
             throw PortableOutcomeError.onDeviceUnavailable
@@ -398,7 +518,8 @@ public struct PortableOutcomeService: PortableOutcomeWriting {
                 endedAt: endedAt,
                 events: events,
                 notes: notes,
-                language: language
+                language: language,
+                customInstructions: customInstructions
             )
             let body = Self.requestBody(messages: messages, model: model, provider: configuration.providerKind)
             var request = URLRequest(url: endpoint)
@@ -474,7 +595,8 @@ public struct PortableOutcomeService: PortableOutcomeWriting {
         endedAt: Date,
         events: [SyncedTranscriptEvent],
         notes: String,
-        language: String
+        language: String,
+        customInstructions: String? = nil
     ) async throws -> PortableOutcomeResult {
         let messages = PortableOutcomePrompt.messages(
             title: title,
@@ -482,7 +604,8 @@ public struct PortableOutcomeService: PortableOutcomeWriting {
             events: events,
             notes: notes,
             language: language,
-            maxCharacters: 8_000
+            maxCharacters: 8_000,
+            customInstructions: customInstructions
         )
         let session = LanguageModelSession(instructions: messages[0]["content"]!)
         let response = try await session.respond(to: messages[1]["content"]!)

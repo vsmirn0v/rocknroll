@@ -206,6 +206,9 @@ struct IOSAssistantModeSheet: View {
     let canSendChat: Bool
     @ObservedObject var assistant: IOSAssistantCoordinator
     var speech: IOSAssistantSpeechCoordinator? = nil
+    var skills: IOSAssistantSkillsController? = nil
+    var facilitator: IOSAutonomousMeetingFacilitator? = nil
+    var board: IOSAssistantBoardController? = nil
     var onFocusMeeting: (() -> Void)? = nil
 
     @Environment(\.dismiss) private var dismiss
@@ -215,6 +218,7 @@ struct IOSAssistantModeSheet: View {
     @State private var goalDraft: String
     @State private var dictatingGoal = false
     @State private var updatingGoalFromSpeech = false
+    @State private var showingBoardSheet = false
 
     init(
         controllerID: UUID,
@@ -222,6 +226,9 @@ struct IOSAssistantModeSheet: View {
         canSendChat: Bool,
         assistant: IOSAssistantCoordinator,
         speech: IOSAssistantSpeechCoordinator? = nil,
+        skills: IOSAssistantSkillsController? = nil,
+        facilitator: IOSAutonomousMeetingFacilitator? = nil,
+        board: IOSAssistantBoardController? = nil,
         onFocusMeeting: (() -> Void)? = nil
     ) {
         self.controllerID = controllerID
@@ -229,6 +236,9 @@ struct IOSAssistantModeSheet: View {
         self.canSendChat = canSendChat
         self.assistant = assistant
         self.speech = speech
+        self.skills = skills
+        self.facilitator = facilitator
+        self.board = board
         self.onFocusMeeting = onFocusMeeting
         _output = State(initialValue: assistant.effectiveParticipationOutput(for: controllerID))
         _askBeforeSending = State(initialValue: assistant.effectiveAskBeforeSending(for: controllerID))
@@ -362,6 +372,17 @@ struct IOSAssistantModeSheet: View {
                     }
                 }
 
+                if let skills, let facilitator {
+                    IOSFacilitatorModeSection(
+                        controllerID: controllerID,
+                        meetingTitle: meetingTitle,
+                        skills: skills,
+                        facilitator: facilitator,
+                        board: board,
+                        onOpenBoard: { showingBoardSheet = true }
+                    )
+                }
+
                 if !sessionCards.isEmpty {
                     Section(L("Alerts & Suggested Replies")) {
                         ForEach(sessionCards) { card in
@@ -422,6 +443,14 @@ struct IOSAssistantModeSheet: View {
             }
             .onAppear { maybeAutoStartGoalDictation() }
             .onDisappear { stopGoalDictation(commit: false) }
+            .sheet(isPresented: $showingBoardSheet) {
+                if let board {
+                    IOSAssistantBoardSheet(
+                        controller: board,
+                        defaultBoardURL: skills?.teamContext.defaultJiraBoardURL ?? ""
+                    )
+                }
+            }
         }
     }
 
@@ -566,6 +595,68 @@ struct IOSAssistantAlertsHomeSection: View {
                 }
             }
             .accessibilityIdentifier("home.assistant-alerts")
+        }
+    }
+}
+
+private struct IOSFacilitatorModeSection: View {
+    let controllerID: UUID
+    let meetingTitle: String
+    @ObservedObject var skills: IOSAssistantSkillsController
+    @ObservedObject var facilitator: IOSAutonomousMeetingFacilitator
+    var board: IOSAssistantBoardController?
+    let onOpenBoard: () -> Void
+
+    var body: some View {
+        let activeSkillID = facilitator.activeSessionSkills[controllerID]
+        let isActive = activeSkillID != nil
+
+        Section(L("Autonomous Voice Facilitator")) {
+            Toggle(L("Voice facilitator in this meeting"), isOn: Binding(
+                get: { isActive },
+                set: { enabled in
+                    if enabled {
+                        facilitator.enable(controllerID: controllerID, title: meetingTitle, skillID: skills.selectedSkillIDs.first)
+                    } else {
+                        facilitator.disable(controllerID: controllerID)
+                    }
+                }
+            ))
+
+            if isActive {
+                Picker(L("Skill Role"), selection: Binding(
+                    get: { activeSkillID ?? skills.selectedSkillIDs.first ?? "scrum-master" },
+                    set: { chosen in
+                        facilitator.enable(controllerID: controllerID, title: meetingTitle, skillID: chosen)
+                    }
+                )) {
+                    ForEach(skills.skills.filter(\.enabled)) { skill in
+                        Text(skill.name).tag(skill.id)
+                    }
+                }
+
+                Button {
+                    Task {
+                        await facilitator.kickOffSkill(controllerID: controllerID, title: meetingTitle, skillID: activeSkillID)
+                    }
+                } label: {
+                    Label(L("Kick off role in call"), systemImage: "waveform")
+                }
+            }
+
+            if board != nil {
+                Button {
+                    onOpenBoard()
+                } label: {
+                    Label(L("Open Assistant Board"), systemImage: "macwindow")
+                }
+            }
+
+            if let note = facilitator.lastStatusBySession[controllerID] {
+                Text(note)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         }
     }
 }

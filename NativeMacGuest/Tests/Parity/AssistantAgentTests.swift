@@ -671,6 +671,7 @@ final class AssistantAgentTests: XCTestCase {
         func managePeople(_: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON { [:] }
         func controlBoard(_: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON { [:] }
         func joinMeetings(_: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON { [:] }
+        func jiraAction(_: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON { [:] }
     }
 
     /// Read-only tools only, `run_assistant` excluded, all namespaced `mcp__*`.
