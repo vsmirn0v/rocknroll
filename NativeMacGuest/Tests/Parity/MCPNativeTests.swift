@@ -222,6 +222,16 @@ import XCTest
         func updateTask(_: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON { [:] }
         func updateSettings(_: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON { [:] }
         func runAssistant(_: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON { [:] }
+        func createTask(_: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON { [:] }
+        func scheduleMeeting(_: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON { [:] }
+        func updateMeetingArtifacts(_: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON { [:] }
+        func listSkills(_: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON { [:] }
+        func getSkill(_: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON { [:] }
+        func upsertSkill(_: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON { [:] }
+        func searchKnowledge(_: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON { [:] }
+        func managePeople(_: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON { [:] }
+        func controlBoard(_: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON { [:] }
+        func joinMeetings(_: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON { [:] }
     }
 
     func testToolsListExposesTwelveToolsWithHonestAnnotations() {
@@ -602,6 +612,96 @@ import XCTest
             await store.assistant.waitForLoad()
             await store.waitForMoments()
             coordinator.stop()
+        }
+    }
+
+    func testAssistantSkillPeopleTaskCreateAndBoardValidation() {
+        runAsyncTest { @MainActor in
+            let allow = NSMutableArray(object: true)
+            let fixtures = self.makeSettingsBackend(allow: allow)
+            let identity = self.client(["meetings:read", "meetings:control", "settings:read", "settings:write"])
+
+            // 1. Upsert a person mapping into People.md and verify lookup.
+            let manageRes = try await fixtures.backend.managePeople([
+                "action_id": UUID().uuidString,
+                "operation": "upsert",
+                "display_name": "Elena Petrova",
+                "aliases": ["Лена", "Lena"],
+                "jira_username": "e.petrova",
+                "approved_voice_commander": true,
+            ], client: identity)
+            XCTAssertEqual(manageRes["status"] as? String, "applied")
+
+            // 2. Create a task assigned by alias ("Лена") and verify People.md resolves to Elena Petrova.
+            let createRes = try await fixtures.backend.createTask([
+                "action_id": UUID().uuidString,
+                "title": "Prepare sprint retro deck",
+                "owner": "Лена",
+                "due_day": "2026-11-25",
+            ], client: identity)
+            XCTAssertEqual(createRes["status"] as? String, "applied")
+            XCTAssertEqual((createRes["task"] as? MCPJSON)?["owner"] as? String, "Elena Petrova")
+
+            // 3. List default skills, upsert a custom skill, and search knowledge.
+            let listedSkills = try await fixtures.backend.listSkills([:], client: identity)
+            let defaultIDs = (listedSkills["items"] as? [MCPJSON])?.compactMap { $0["id"] as? String } ?? []
+            XCTAssertTrue(defaultIDs.contains("scrum-master"))
+
+            let upsertRes = try await fixtures.backend.upsertSkill([
+                "action_id": UUID().uuidString,
+                "skill_id": "qa-lead",
+                "name": "QA Lead",
+                "role": "Tracks release regression blockers.",
+                "triggers": ["release", "regression"],
+                "instructions": "List blocking QA tickets and tag owners.",
+            ], client: identity)
+            XCTAssertEqual(upsertRes["status"] as? String, "applied")
+
+            let searchRes = try await fixtures.backend.searchKnowledge(["query": "regression blockers"], client: identity)
+            let hitTitles = (searchRes["items"] as? [MCPJSON])?.compactMap { $0["title"] as? String } ?? []
+            XCTAssertTrue(hitTitles.contains("qa-lead"), "Expected custom skill in knowledge search, got: \(hitTitles)")
+
+            // 4. control_board rejects non-HTTP(S) URLs cleanly.
+            await self.assertFailure("INVALID_ARGUMENT") {
+                try await fixtures.backend.controlBoard([
+                    "action_id": UUID().uuidString,
+                    "command": "open_url",
+                    "url": "file:///etc/passwd",
+                ], client: identity)
+            }
+
+            // 5. rocknroll_join_meetings validates non-empty queries and joins matched candidates.
+            await self.assertFailure("INVALID_ARGUMENT") {
+                try await fixtures.backend.joinMeetings([
+                    "action_id": UUID().uuidString,
+                    "queries": ["   "],
+                ], client: identity)
+            }
+            fixtures.coordinator.joinableTargets = { now in
+                [JoinableMeetingCandidate(
+                    id: CurrentMeetingTargetResolver.stableID(namespace: "calendar", key: "standup"),
+                    title: "Daily Standup",
+                    invitation: URL(string: "https://meet.example.com/standup")!,
+                    source: .ongoingCalendar,
+                    start: now.addingTimeInterval(-60),
+                    end: now.addingTimeInterval(1200)
+                )]
+            }
+            var joinedTitlesViaMCP: [String] = []
+            fixtures.coordinator.talk.joinMeeting = { ref in
+                joinedTitlesViaMCP.append(ref.title)
+                return true
+            }
+            let joinRes = try await fixtures.backend.joinMeetings([
+                "action_id": UUID().uuidString,
+                "queries": ["Daily Standup"],
+                "skill_id": "scrum-master",
+                "enable_voice_facilitation": true,
+            ], client: identity)
+            XCTAssertEqual(joinRes["status"] as? String, "applied")
+            XCTAssertEqual(joinedTitlesViaMCP, ["Daily Standup"])
+
+            await self.drain(fixtures.store, fixtures.coordinator)
         }
     }
 }

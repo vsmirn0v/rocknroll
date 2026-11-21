@@ -6,6 +6,7 @@ struct MeetingOutcomeRequest: Codable, Sendable {
     var endedAt: Date
     var window: AttentionWindow
     var language: String
+    var customInstructions: String? = nil
 }
 
 /// Only the bounded input used by the writer. Retained locally until success or deletion.
@@ -150,7 +151,11 @@ enum MeetingOutcomePrompt {
             let time = line.at.map(clock.string(from:)) ?? ""
             return "[\(line.ref)] \(time) \(line.speaker)\(line.isYou ? " (the user)" : "")\(line.source == .chat ? " [chat]" : ""): \(line.text)"
         }.joined(separator: "\n")
-        return [["role": "system", "content": system + "\nAppend one or two source references such as [L3] at the end of each supported decision. Use only references present in the input. Keep source references out of the summary, tasks, owners and open questions. Write in " + language + "."],
+        var systemPrompt = system + "\nAppend one or two source references such as [L3] at the end of each supported decision. Use only references present in the input. Keep source references out of the summary, tasks, owners and open questions. Write in " + language + "."
+        if let custom = request.customInstructions?.trimmingCharacters(in: .whitespacesAndNewlines), !custom.isEmpty {
+            systemPrompt += "\n\nTeam summary instructions (Obsidian Prompts/MeetingSummary.md):\n" + custom
+        }
+        return [["role": "system", "content": systemPrompt],
                 ["role": "user", "content": "Meeting: \(request.meetingTitle)\nEnded: \(clock.string(from: request.endedAt))\n\n\(lines)"]]
     }
 

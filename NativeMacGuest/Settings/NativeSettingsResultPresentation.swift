@@ -138,6 +138,14 @@ enum NativeSettingsResultPresentation {
         case "settings.escalation-key":
             guard let store, let provider = store.escalationProvider, provider.needsKey else { return nil }
             return L(store.hasKey(for: provider) ? "Configured" : "Not configured")
+        case "settings.realtime-provider":
+            return store?.realtimeProvider.title
+        case "settings.skills":
+            return L("%ld selected", store?.selectedSkillIDs.count ?? 0)
+        case "settings.people-directory":
+            return L("Knowledge/People.md")
+        case "settings.assistant-board":
+            return L("Assistant Board")
         case "settings.writer-key":
             guard let store, let provider = store.writerProvider, provider.needsKey else { return nil }
             return L(store.hasKey(for: provider) ? "Configured" : "Not configured")

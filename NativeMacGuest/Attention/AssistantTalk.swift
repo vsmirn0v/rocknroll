@@ -968,6 +968,10 @@ struct AssistantTalkView: View {
                         Button(L("Cancel")) { talk.agentRuntime.cancel() }
                             .accessibilityIdentifier("assistant.agent.stop")
                     }
+                    Button(L("Assistant Board")) {
+                        attention.boardController.showWindow()
+                    }
+                    .controlSize(.small)
                     Spacer()
                     Button(L("New chat")) { talk.agentNewConversation() }
                         .disabled(talk.working)

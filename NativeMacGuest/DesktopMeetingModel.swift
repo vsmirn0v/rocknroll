@@ -273,6 +273,7 @@ import UniformTypeIdentifiers
                 self?.receiveLocalLine(line, generation: generation)
             }
             localTranscriber = transcriber
+            syncRealtimeAudioTap()
             engine.setTranscriptionAudioHandler { [weak self, weak transcriber] sources in
                 guard let self, self.localTranscriptionGeneration == generation else { return }
                 self.audioIdentities = Dictionary(sources.map { ($0.id, $0.participantIdentity) }, uniquingKeysWith: { first, _ in first })
@@ -290,6 +291,7 @@ import UniformTypeIdentifiers
             objectWillChange.send()
         } else if !wanted, let transcriber = localTranscriber {
             localTranscriber = nil
+            transcriber.setPCM16AudioHandler(nil)
             let generation = localTranscriptionGeneration
             let names = Dictionary(participants.map { ($0.id, $0.name) }, uniquingKeysWith: { first, _ in first })
             archivedLocalAttribution[generation] = audioIdentities.compactMapValues { $0.flatMap { names[$0] } }
@@ -912,6 +914,18 @@ import UniformTypeIdentifiers
     private(set) var concurrentAudio = false
     /// Moves the talk role here; true only after any previous talk meeting confirmed release.
     var microphoneArbiter: ((NativeDesktopMeetingModel) async -> Bool)?
+    /// Live 16kHz mono PCM16 audio chunks tapped for optional Realtime voice streaming.
+    var onRealtimeAudioPCM16: (@Sendable (UUID, String, Data) -> Void)? {
+        didSet { syncRealtimeAudioTap() }
+    }
+    var isVoiceReplyInFlight: Bool { voiceReplyActive }
+    private func syncRealtimeAudioTap() {
+        let handler = onRealtimeAudioPCM16
+        let id = sessionID
+        localTranscriber?.setPCM16AudioHandler(handler.map { callback in
+            { trackID, data in callback(id, trackID, data) }
+        })
+    }
     private var mediaClaim: NativeDesktopSharedMedia<GuestSystemAudio>.Suspension?
     var isClosed: Bool { closed }
     private(set) var joinReadinessReport: [String: Any] = [:]
@@ -1942,6 +1956,23 @@ import UniformTypeIdentifiers
             setSharingPending: { [weak self] pending in self?.sharingPending = pending },
             setLocalShare: { [weak self] track in self?.localShare = track },
             onError: { [weak self] message in self?.error = message })
+    }
+    func startBoardSharing() {
+        guard !closed, !transferHeld, connected, !sharingPending else { return }
+        let token = generation
+        captureCoordinator.startSharing(
+            canvas: false,
+            externalFrames: true,
+            isValidGeneration: { [weak self] in self?.generation == token },
+            isClosed: { [weak self] in self?.closed == true },
+            isSnapshotSharing: { [weak self] in self?.snapshot.sharing == true },
+            engine: { [weak self] in self?.engine },
+            setSharingPending: { [weak self] pending in self?.sharingPending = pending },
+            setLocalShare: { [weak self] track in self?.localShare = track },
+            onError: { [weak self] message in self?.error = message })
+    }
+    func pushBoardShareFrame(_ pixels: CVPixelBuffer) {
+        captureCoordinator.pushExternalShareFrame(pixels)
     }
     @discardableResult func stopSharing() async -> Bool {
         await captureCoordinator.stopSharing(

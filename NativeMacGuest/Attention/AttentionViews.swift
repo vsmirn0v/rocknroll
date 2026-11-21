@@ -616,7 +616,7 @@ private struct HeadphoneApproval: View {
 /// Task-focused Assistant settings destinations. Kept in the workspace so deep
 /// links, such as the voice-model status indicator, open the intended section.
 enum NativeDesktopAssistantSettingsArea: String, CaseIterable, Identifiable {
-    case overview, attention, voice, models, replies, privacy
+    case overview, attention, voice, models, replies, skills, privacy
     var id: String { rawValue }
     var title: String {
         switch self {
@@ -625,6 +625,7 @@ enum NativeDesktopAssistantSettingsArea: String, CaseIterable, Identifiable {
         case .voice: L("Voice & speaking")
         case .models: L("AI providers")
         case .replies: L("Replies & actions")
+        case .skills: L("Skills & roles")
         case .privacy: L("Memory & privacy")
         }
     }
@@ -639,6 +640,7 @@ struct NativeDesktopIntelligenceSettings: View {
     @State private var key = ""
     @State private var writerKey = ""
     @State private var escalationKey = ""
+    @State private var realtimeKey = ""
     @State private var aliases = ""
     @State private var testing = false
     @State private var testResult: String?
@@ -767,6 +769,7 @@ struct NativeDesktopIntelligenceSettings: View {
                     settingsLink(.voice, detail: voiceSummary)
                     settingsLink(.models, detail: describe(store.provider))
                     settingsLink(.replies, detail: L("Drafts, agent and meeting actions"))
+                    settingsLink(.skills, detail: L("Obsidian skills, People.md Jira directory and standup board"))
                     settingsLink(.privacy, detail: L("Memory, retention and data destinations"))
                     Text(L("Meeting audio goes to participants when your microphone is on. Depending on your settings, meeting text may also go to configured providers."))
                         .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
@@ -920,6 +923,50 @@ struct NativeDesktopIntelligenceSettings: View {
                     }
                 }
             }
+            Section(L("Realtime voice model (optional)")) {
+                NativeSettingsPopup(
+                    title: L("Realtime voice model"),
+                    selection: $store.realtimeProvider,
+                    choices: RealtimeProviderKind.allCases,
+                    titleForChoice: \.title,
+                    id: "settings.realtime-provider"
+                )
+                if store.realtimeProvider != .disabled {
+                    TextField(
+                        L("Model"),
+                        text: $store.realtimeModel,
+                        prompt: Text(store.realtimeProvider.defaultModel)
+                    )
+                    TextField(
+                        L("Voice"),
+                        text: $store.realtimeVoice,
+                        prompt: Text(store.realtimeProvider.defaultVoice)
+                    )
+                    HStack {
+                        let hasKey = store.realtimeAPIKey(for: store.realtimeProvider) != nil
+                        SecureField(hasKey ? L("Saved in the keychain") : L("Realtime API key"), text: $realtimeKey)
+                        Button(L("Save")) {
+                            store.setRealtimeAPIKey(realtimeKey, for: store.realtimeProvider)
+                            realtimeKey = ""
+                        }
+                        .disabled(realtimeKey.trimmed.isEmpty)
+                        if store.keyedRealtimeProviders.contains(store.realtimeProvider) {
+                            Button(L("Remove")) {
+                                store.setRealtimeAPIKey("", for: store.realtimeProvider)
+                            }
+                        }
+                    }
+                }
+                Text(L("Improves live meeting latency when enabled and configured. Rock automatically falls back to your standard STT, model, and TTS voice pipeline whenever Realtime is off or unavailable."))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            }
+            if area == .skills {
+                Section(L("Skills, People & Jira Board")) {
+                    AssistantSkillsView(attention: attention)
+                }
             }
             if area == .replies {
             Section(L("Replies")) {

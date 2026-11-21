@@ -249,6 +249,7 @@ final class MeetingCaptureCoordinator {
     }
 
     func startSharing(canvas: Bool,
+                      externalFrames: Bool = false,
                       isValidGeneration: @escaping @MainActor () -> Bool,
                       isClosed: @escaping @MainActor () -> Bool,
                       isSnapshotSharing: @escaping @MainActor () -> Bool,
@@ -276,7 +277,7 @@ final class MeetingCaptureCoordinator {
                 let profile = GuestVideoProfile(width: 3840, height: 2160, fps: 30, maximumBitrate: 18_000_000)
                 if let session = activeEngine as? MeetingSession, session.supportsScreenSharePublication {
                     try await session.startScreenShare(.init(profile: profile) { [weak self] source in
-                        let capture = NativeDesktopShareCapture(source: source, canvasOnly: canvas)
+                        let capture = NativeDesktopShareCapture(source: source, canvasOnly: canvas, externalFrames: externalFrames)
                         self?.configure(capture, shareToken: shareToken, isValidGeneration: isValidGeneration,
                                         isClosed: isClosed, isSnapshotSharing: isSnapshotSharing,
                                         engine: engine, setSharingPending: setSharingPending,
@@ -290,7 +291,7 @@ final class MeetingCaptureCoordinator {
                     }
                     let source = factory.videoSource(forScreenCast: true)
                     shareSource = source
-                    let capture = NativeDesktopShareCapture(source: source, canvasOnly: canvas)
+                    let capture = NativeDesktopShareCapture(source: source, canvasOnly: canvas, externalFrames: externalFrames)
                     configure(capture, shareToken: shareToken, isValidGeneration: isValidGeneration,
                               isClosed: isClosed, isSnapshotSharing: isSnapshotSharing,
                               engine: engine, setSharingPending: setSharingPending,
@@ -350,6 +351,10 @@ final class MeetingCaptureCoordinator {
                 if let failure { onError(failure.localizedDescription) }
             }
         }
+    }
+
+    func pushExternalShareFrame(_ pixels: CVPixelBuffer) {
+        capture?.updateExternalPixelBuffer(pixels)
     }
 
     @discardableResult

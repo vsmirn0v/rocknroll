@@ -55,8 +55,17 @@ struct AssistantAgentModelPrompt {
     """
 
     static func messages(_ request: AssistantAgentModelRequest, describeTools: Bool = true) -> [[String: Any]] {
-        var system = Self.system + "\n\nEnvironment:\n" + request.context.sorted { $0.key < $1.key }
-            .map { "\($0.key): \($0.value)" }.joined(separator: "\n")
+        var system = Self.system
+        if let persona = request.context["obsidian_base_persona"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !persona.isEmpty {
+            system += "\n\n## User & Team Persona (Obsidian Prompts/BasePersona.md)\n" + persona
+        }
+        let envPairs = request.context
+            .filter { $0.key != "obsidian_base_persona" }
+            .sorted { $0.key < $1.key }
+            .map { "\($0.key): \($0.value)" }
+            .joined(separator: "\n")
+        system += "\n\nEnvironment:\n" + envPairs
         if describeTools {
             system += "\n\nAvailable tools:\n" + request.tools.map { tool in
                 if let schema = tool.inputSchema {

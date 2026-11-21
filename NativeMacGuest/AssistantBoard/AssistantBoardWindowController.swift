@@ -1,0 +1,453 @@
+import AppKit
+import ConferenceCore
+import CoreVideo
+import Foundation
+import WebKit
+
+/// Sandbox-safe Computer Use controller for sharing and interacting with Jira or
+/// project boards inside an in-app WKWebView window without Accessibility permissions.
+@MainActor
+final class AssistantBoardWindowController: NSObject, ObservableObject, WKNavigationDelegate, NSWindowDelegate {
+    @Published private(set) var currentURL: URL?
+    @Published private(set) var pageTitle: String = L("Assistant Board")
+    @Published private(set) var isLoading = false
+    @Published private(set) var isWindowVisible = false
+    @Published private(set) var sharingMeetingID: UUID?
+    @Published private(set) var sharingMeetingTitle: String?
+    @Published private(set) var lastActionSummary: String?
+
+    private var window: NSWindow?
+    private var webView: WKWebView?
+    private var urlField: NSTextField?
+    private var shareBannerLabel: NSTextField?
+    private var stopShareButton: NSButton?
+    private var frameTask: Task<Void, Never>?
+    private var navigationContinuation: CheckedContinuation<Void, Never>?
+    private weak var sharedMeetingModel: NativeDesktopMeetingModel?
+
+    static func validateBoardURL(_ raw: String) -> URL? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              let url = URL(string: trimmed),
+              let scheme = url.scheme?.lowercased(),
+              let host = url.host?.lowercased(), !host.isEmpty else {
+            return nil
+        }
+        let isLocal = ["localhost", "127.0.0.1", "::1"].contains(host)
+        guard scheme == "https" || (scheme == "http" && isLocal) else { return nil }
+        return url
+    }
+
+    func showWindow() {
+        ensureWindow()
+        window?.makeKeyAndOrderFront(nil)
+        isWindowVisible = true
+    }
+
+    func closeWindow() {
+        stopSharing()
+        window?.orderOut(nil)
+        isWindowVisible = false
+    }
+
+    func open(urlString: String) async throws -> String {
+        guard let url = Self.validateBoardURL(urlString) else {
+            throw NativeDesktopError.unavailable(L("Enter an https:// or localhost URL for the Assistant Board."))
+        }
+        showWindow()
+        guard let webView else {
+            throw NativeDesktopError.unavailable(L("Assistant Board web view is unavailable."))
+        }
+        finishPendingNavigation()
+        currentURL = url
+        urlField?.stringValue = url.absoluteString
+        isLoading = true
+        webView.load(URLRequest(url: url))
+        try? await waitForLoadFinish(timeoutSeconds: 8)
+        let title = webView.title?.trimmed.isEmpty == false ? (webView.title ?? url.host ?? url.absoluteString) : url.absoluteString
+        pageTitle = title
+        lastActionSummary = L("Opened %@", title)
+        return L("Opened %@ (%@).", title, url.absoluteString)
+    }
+
+    func startSharing(to model: NativeDesktopMeetingModel) async throws -> String {
+        guard !model.isClosed, model.connected else {
+            throw NativeDesktopError.unavailable(L("Connect to the meeting before sharing the board."))
+        }
+        showWindow()
+        if let activeModel = sharedMeetingModel, activeModel.sessionID != model.sessionID {
+            await activeModel.stopSharing()
+        }
+        frameTask?.cancel()
+        sharedMeetingModel = model
+        sharingMeetingID = model.sessionID
+        sharingMeetingTitle = model.title
+        model.startBoardSharing()
+        refreshBanner()
+
+        let targetSessionID = model.sessionID
+        frameTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                guard let self,
+                      let meeting = self.sharedMeetingModel,
+                      meeting.sessionID == targetSessionID,
+                      !meeting.isClosed else {
+                    self?.stopSharing()
+                    return
+                }
+                if let buffer = await self.captureFrameBuffer() {
+                    meeting.pushBoardShareFrame(buffer)
+                }
+                try? await Task.sleep(for: .milliseconds(200))
+            }
+        }
+        lastActionSummary = L("Sharing board to %@", model.title)
+        return L("Sharing Assistant Board window to “%@”.", model.title)
+    }
+
+    func stopSharing() {
+        frameTask?.cancel()
+        frameTask = nil
+        if let model = sharedMeetingModel {
+            Task { @MainActor in await model.stopSharing() }
+        }
+        sharedMeetingModel = nil
+        sharingMeetingID = nil
+        sharingMeetingTitle = nil
+        refreshBanner()
+        lastActionSummary = L("Stopped sharing board")
+    }
+
+    func scroll(deltaY: Int) async throws -> String {
+        guard let webView else {
+            throw NativeDesktopError.unavailable(L("Open a board first before scrolling."))
+        }
+        let clamped = max(-4000, min(4000, deltaY))
+        _ = try await evaluateJS(webView: webView, script: "window.scrollBy({top: \(clamped), behavior: 'smooth'}); return window.scrollY;")
+        lastActionSummary = L("Scrolled board by %ld px", clamped)
+        return L("Scrolled the board by %ld px.", clamped)
+    }
+
+    func filter(query: String) async throws -> String {
+        guard let webView else {
+            throw NativeDesktopError.unavailable(L("Open a board first before filtering."))
+        }
+        let clean = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        let arg = try jsonLiteral(clean)
+        let js = """
+        const q = \(arg);
+        const candidates = Array.from(document.querySelectorAll('input[type="search"], input[aria-label*="Search" i], input[placeholder*="Search" i], input[placeholder*="Filter" i], input[name="search"], [data-testid*="search"] input'));
+        const input = candidates.find(el => el.offsetParent !== null) || candidates[0];
+        if (!input) { return { matched: false }; }
+        input.focus();
+        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+        if (setter) { setter.call(input, q); } else { input.value = q; }
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+        input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true }));
+        return { matched: true };
+        """
+        let res = try await evaluateJS(webView: webView, script: js)
+        let ok = (res as? [String: Any])?["matched"] as? Bool ?? false
+        lastActionSummary = ok ? L("Filtered board: %@", clean) : L("No search box found on board")
+        return ok ? L("Applied board filter “%@”.", clean) : L("No search input was found on the current board page.")
+    }
+
+    func click(selector: String?, text: String?) async throws -> String {
+        guard let webView else {
+            throw NativeDesktopError.unavailable(L("Open a board first before clicking."))
+        }
+        let selLiteral = try jsonLiteral(selector?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "")
+        let textLiteral = try jsonLiteral(text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "")
+        let js = """
+        const sel = \(selLiteral);
+        const txt = \(textLiteral).toLowerCase();
+        let el = null;
+        if (sel) { el = document.querySelector(sel); }
+        if (!el && txt) {
+          const all = Array.from(document.querySelectorAll('a, button, [role="button"], [data-testid*="issue"], [role="listitem"]'));
+          el = all.find(node => (node.innerText || node.textContent || '').toLowerCase().includes(txt));
+        }
+        if (!el) { return { clicked: false }; }
+        el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+        el.click();
+        return { clicked: true, label: (el.innerText || el.textContent || '').trim().slice(0, 80) };
+        """
+        let res = try await evaluateJS(webView: webView, script: js)
+        let dict = res as? [String: Any]
+        let clicked = dict?["clicked"] as? Bool ?? false
+        let label = (dict?["label"] as? String) ?? selector ?? text ?? ""
+        lastActionSummary = clicked ? L("Clicked %@", label) : L("Target not found on board")
+        return clicked ? L("Clicked “%@” on the board.", label) : L("No matching element was found on the board.")
+    }
+
+    func highlight(text: String) async throws -> String {
+        guard let webView else {
+            throw NativeDesktopError.unavailable(L("Open a board first before highlighting."))
+        }
+        let targetLiteral = try jsonLiteral(text.trimmingCharacters(in: .whitespacesAndNewlines))
+        let js = """
+        const needle = \(targetLiteral).toLowerCase();
+        if (!needle) { return { found: false }; }
+        const old = document.querySelector('[data-rock-highlight="true"]');
+        if (old) { old.style.outline = ''; old.removeAttribute('data-rock-highlight'); }
+        const nodes = Array.from(document.querySelectorAll('[data-issue-key], [data-testid*="card"], [role="listitem"], tr, article, a, div'));
+        const match = nodes.find(n => {
+          const t = (n.innerText || '').trim();
+          return t.length > 0 && t.length < 360 && t.toLowerCase().includes(needle);
+        });
+        if (!match) { return { found: false }; }
+        match.setAttribute('data-rock-highlight', 'true');
+        match.style.outline = '3px solid #FF9500';
+        match.style.outlineOffset = '2px';
+        match.scrollIntoView({ block: 'center', behavior: 'smooth' });
+        return { found: true, snippet: (match.innerText || '').trim().slice(0, 120) };
+        """
+        let res = try await evaluateJS(webView: webView, script: js)
+        let found = (res as? [String: Any])?["found"] as? Bool ?? false
+        lastActionSummary = found ? L("Highlighted %@", text) : L("Item %@ not visible", text)
+        return found ? L("Highlighted “%@” on the board.", text) : L("Could not find “%@” on the visible board.", text)
+    }
+
+    func inspect() async throws -> [String: Any] {
+        guard let webView else {
+            return ["open": false, "url": "", "title": "", "issues": []]
+        }
+        let js = """
+        const title = document.title || '';
+        const url = window.location.href || '';
+        const keyRe = /\\b[A-Z][A-Z0-9]{1,9}-\\d{1,6}\\b/g;
+        const bodyText = (document.body?.innerText || '').slice(0, 24000);
+        const foundKeys = Array.from(new Set(bodyText.match(keyRe) || [])).slice(0, 40);
+        const cards = Array.from(document.querySelectorAll('[data-issue-key], [data-testid*="issue"], [data-testid*="card"], [role="listitem"]'))
+          .slice(0, 30)
+          .map(n => (n.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 180))
+          .filter(Boolean);
+        return { open: true, url, title, issues: foundKeys, cards };
+        """
+        let res = (try? await evaluateJS(webView: webView, script: js)) as? [String: Any] ?? [:]
+        var output = res
+        output["sharing"] = sharingMeetingID != nil
+        if let sharingMeetingTitle {
+            output["sharing_meeting_title"] = sharingMeetingTitle
+        }
+        return output
+    }
+
+    // MARK: - Window & WebView setup
+
+    private func ensureWindow() {
+        if window != nil { return }
+        let frame = NSRect(x: 0, y: 0, width: 1200, height: 760)
+        let win = NSWindow(
+            contentRect: frame,
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        win.title = L("Rock Assistant Board")
+        win.isReleasedWhenClosed = false
+        win.delegate = self
+        win.center()
+
+        let root = NSView(frame: frame)
+        root.autoresizingMask = [.width, .height]
+
+        let barHeight: CGFloat = 44
+        let toolbar = NSView(frame: NSRect(x: 0, y: frame.height - barHeight, width: frame.width, height: barHeight))
+        toolbar.autoresizingMask = [.width, .minYMargin]
+
+        let field = NSTextField(frame: NSRect(x: 12, y: 10, width: frame.width - 360, height: 24))
+        field.autoresizingMask = [.width]
+        field.placeholderString = "https://jira.example.com/boards/..."
+        field.target = self
+        field.action = #selector(submitURLField(_:))
+
+        let banner = NSTextField(labelWithString: "")
+        banner.frame = NSRect(x: frame.width - 336, y: 13, width: 220, height: 18)
+        banner.autoresizingMask = [.minXMargin]
+        banner.font = .systemFont(ofSize: 11, weight: .medium)
+        banner.textColor = .secondaryLabelColor
+        banner.lineBreakMode = .byTruncatingTail
+
+        let stopBtn = NSButton(title: L("Stop Share"), target: self, action: #selector(handleStopShare(_:)))
+        stopBtn.frame = NSRect(x: frame.width - 108, y: 8, width: 96, height: 28)
+        stopBtn.autoresizingMask = [.minXMargin]
+        stopBtn.bezelStyle = .rounded
+        stopBtn.isHidden = true
+
+        toolbar.addSubview(field)
+        toolbar.addSubview(banner)
+        toolbar.addSubview(stopBtn)
+
+        let config = WKWebViewConfiguration()
+        config.websiteDataStore = .default()
+        let web = WKWebView(frame: NSRect(x: 0, y: 0, width: frame.width, height: frame.height - barHeight), configuration: config)
+        web.autoresizingMask = [.width, .height]
+        web.navigationDelegate = self
+
+        root.addSubview(web)
+        root.addSubview(toolbar)
+        win.contentView = root
+
+        self.window = win
+        self.webView = web
+        self.urlField = field
+        self.shareBannerLabel = banner
+        self.stopShareButton = stopBtn
+        refreshBanner()
+    }
+
+    @objc private func submitURLField(_ sender: NSTextField) {
+        let value = sender.stringValue
+        Task { @MainActor [weak self] in
+            _ = try? await self?.open(urlString: value)
+        }
+    }
+
+    @objc private func handleStopShare(_ sender: Any?) {
+        stopSharing()
+    }
+
+    private func refreshBanner() {
+        if let title = sharingMeetingTitle {
+            shareBannerLabel?.stringValue = L("Sharing to %@", title)
+            shareBannerLabel?.textColor = .systemOrange
+            stopShareButton?.isHidden = false
+        } else {
+            shareBannerLabel?.stringValue = L("Not sharing")
+            shareBannerLabel?.textColor = .secondaryLabelColor
+            stopShareButton?.isHidden = true
+        }
+    }
+
+    // MARK: - Snapshot → CVPixelBuffer
+
+    private func captureFrameBuffer() async -> CVPixelBuffer? {
+        guard let webView, webView.bounds.width >= 8, webView.bounds.height >= 8 else { return nil }
+        let config = WKSnapshotConfiguration()
+        config.afterScreenUpdates = false
+        return await withCheckedContinuation { continuation in
+            webView.takeSnapshot(with: config) { image, _ in
+                guard let image,
+                      let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+                    continuation.resume(returning: nil)
+                    return
+                }
+                continuation.resume(returning: Self.makePixelBuffer(from: cg))
+            }
+        }
+    }
+
+    nonisolated private static func makePixelBuffer(from cgImage: CGImage) -> CVPixelBuffer? {
+        let width = cgImage.width & ~1
+        let height = cgImage.height & ~1
+        guard width >= 2, height >= 2 else { return nil }
+
+        let attrs: [CFString: Any] = [
+            kCVPixelBufferCGImageCompatibilityKey: true,
+            kCVPixelBufferCGBitmapContextCompatibilityKey: true,
+            kCVPixelBufferIOSurfacePropertiesKey: [:],
+        ]
+        var pixelBuffer: CVPixelBuffer?
+        guard CVPixelBufferCreate(
+            kCFAllocatorDefault,
+            width,
+            height,
+            kCVPixelFormatType_32BGRA,
+            attrs as CFDictionary,
+            &pixelBuffer
+        ) == kCVReturnSuccess, let buffer = pixelBuffer else {
+            return nil
+        }
+
+        CVPixelBufferLockBaseAddress(buffer, [])
+        defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
+        guard let baseAddress = CVPixelBufferGetBaseAddress(buffer) else { return nil }
+
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        let bitmapInfo = CGBitmapInfo.byteOrder32Little.rawValue | CGImageAlphaInfo.premultipliedFirst.rawValue
+        guard let ctx = CGContext(
+            data: baseAddress,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: CVPixelBufferGetBytesPerRow(buffer),
+            space: colorSpace,
+            bitmapInfo: bitmapInfo
+        ) else {
+            return nil
+        }
+        ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+        return buffer
+    }
+
+    // MARK: - WKNavigationDelegate / NSWindowDelegate
+
+    func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+        isLoading = true
+        currentURL = webView.url
+        if let u = webView.url { urlField?.stringValue = u.absoluteString }
+    }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        isLoading = false
+        currentURL = webView.url
+        if let u = webView.url { urlField?.stringValue = u.absoluteString }
+        if let title = webView.title, !title.trimmed.isEmpty { pageTitle = title }
+        finishPendingNavigation()
+    }
+
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        isLoading = false
+        finishPendingNavigation()
+    }
+
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        isLoading = false
+        finishPendingNavigation()
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        finishPendingNavigation()
+        isWindowVisible = false
+        stopSharing()
+    }
+
+    // MARK: - Helpers
+
+    private func finishPendingNavigation() {
+        let cont = navigationContinuation
+        navigationContinuation = nil
+        cont?.resume()
+    }
+
+    private func waitForLoadFinish(timeoutSeconds: TimeInterval) async throws {
+        guard isLoading else { return }
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            navigationContinuation = continuation
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(for: .seconds(timeoutSeconds))
+                self?.finishPendingNavigation()
+            }
+        }
+    }
+
+    private func evaluateJS(webView: WKWebView, script: String) async throws -> Any? {
+        let wrapped = "(function(){\n\(script)\n})()"
+        return try await withCheckedThrowingContinuation { continuation in
+            webView.evaluateJavaScript(wrapped) { value, error in
+                if let error {
+                    continuation.resume(throwing: error)
+                } else {
+                    continuation.resume(returning: value)
+                }
+            }
+        }
+    }
+
+    private func jsonLiteral(_ value: String) throws -> String {
+        let data = try JSONEncoder().encode(value)
+        return String(decoding: data, as: UTF8.self)
+    }
+}

@@ -315,8 +315,13 @@ final class MeetingTranscriber: @unchecked Sendable {
     private var stopped = false
     private var finishDeliveries = false
     private var summary = Summary()
+    private var onPCM16Audio: (@Sendable (String, Data) -> Void)?
     /// Wall clock for line times; replaced in tests.
     var now: () -> Date = Date.init
+
+    func setPCM16AudioHandler(_ handler: (@Sendable (String, Data) -> Void)?) {
+        ingressLock.withLock { onPCM16Audio = handler }
+    }
 
     private final class Speaker {
         let detector: SherpaVoiceActivityDetector
@@ -356,6 +361,7 @@ final class MeetingTranscriber: @unchecked Sendable {
         ingressLock.withLock {
             acceptingAudio = false
             discardQueuedAudio = !flushing
+            onPCM16Audio = nil
         }
         for entry in taps.values { entry.source.detach(entry.tap) }
         taps = [:]
@@ -480,6 +486,15 @@ final class MeetingTranscriber: @unchecked Sendable {
 
     private func receiveOnQueue(_ trackID: String, _ buffer: AVAudioPCMBuffer, receivedAt: Date) {
         guard !stopped, let speaker = speaker(trackID), let samples = convert(buffer, speaker) else { return }
+        if let handler = ingressLock.withLock({ onPCM16Audio }), !samples.isEmpty {
+            var pcmData = Data(capacity: samples.count * MemoryLayout<Int16>.size)
+            for sample in samples {
+                let clamped = max(-1.0 as Float, min(1.0 as Float, sample))
+                var intSample = Int16((clamped * Float(Int16.max)).rounded()).littleEndian
+                withUnsafeBytes(of: &intSample) { pcmData.append(contentsOf: $0) }
+            }
+            handler(trackID, pcmData)
+        }
         // Sample counts advance only while audio flows; a playout stall (device change,
         // audio service restart) would date every later line early by the gap. Each
         // buffer re-anchors the timeline to the wall clock at its arrival.

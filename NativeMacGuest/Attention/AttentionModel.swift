@@ -299,6 +299,8 @@ struct JudgeRequest: Sendable {
     var memory: [AssistantMemoryExcerpt] = []
     /// Explicit, locally stored user instructions scoped to this meeting.
     var workspaceGuidance: [String] = []
+    /// Optional Obsidian `Prompts/AttentionJudge.md` customization.
+    var customInstructions: String? = nil
 }
 
 /// The ways a meeting accepts an answer from a card.
@@ -454,6 +456,9 @@ enum ReplyPrompt {
         if let style = request.judge.profile.replyStyle?.trimmed, !style.isEmpty {
             system += "\n- The user describes their writing style: " + String(style.prefix(300))
         }
+        if let custom = request.judge.customInstructions?.trimmed, !custom.isEmpty {
+            system += "\n\nTeam reply & judgment instructions (Obsidian Prompts/AttentionJudge.md):\n" + String(custom.prefix(2_000))
+        }
         return [["role": "system", "content": system], ["role": "user", "content": userContent(request)]]
     }
 
@@ -588,8 +593,12 @@ enum AttentionPrompt {
     """
 
     static func messages(_ request: JudgeRequest) -> [[String: String]] {
-        [["role": "system", "content": system + "\n- Write the reason in " + languageName(request.language) + "."],
-         ["role": "user", "content": userContent(request)]]
+        var systemContent = system + "\n- Write the reason in " + languageName(request.language) + "."
+        if let custom = request.customInstructions?.trimmed, !custom.isEmpty {
+            systemContent += "\n\nTeam alert instructions (Obsidian Prompts/AttentionJudge.md):\n" + String(custom.prefix(2_000))
+        }
+        return [["role": "system", "content": systemContent],
+                ["role": "user", "content": userContent(request)]]
     }
 
     static func userContent(_ request: JudgeRequest) -> String {

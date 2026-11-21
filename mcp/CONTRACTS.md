@@ -138,9 +138,33 @@ applies device state / leaves.
 | `expected_revision` | string | | **required unless replaying**; equals the outcome UUID — the middle component of `task_id` |
 | `text`, `owner` | string | | new value; omitted = unchanged |
 | `done` | boolean | | omitted = unchanged |
+| `due_day` | string | | optional YYYY-MM-DD due day (empty string clears) |
+| `jira_status` | string | | optional Jira/workflow status |
+| `sync_to_jira` | boolean | | trigger Jira sync for this task |
 
-An empty patch (none of `text`/`owner`/`done`) is structurally valid and applies no
+An empty patch (none of `text`/`owner`/`done`/`due_day`/`jira_status`/`sync_to_jira`) is structurally valid and applies no
 changes; it still requires approval and a fresh `expected_revision`.
+
+### rocknroll_create_task
+Creates a task in a meeting outcome or standalone Assistant Tasks bucket (scope `tasks:write`).
+`action_id` (UUID)*, `title` (string, minLength 1)*, `meeting_id`, `owner`, `due_day`, `notes`, `sync_to_jira`.
+
+### rocknroll_schedule_meeting
+Schedules an Apple Calendar event (scope `meetings:control`).
+`action_id` (UUID)*, `title`*, `start_at` (RFC 3339)*, `end_at` (RFC 3339)*, `meeting_url`, `agenda_notes`, `calendar_id`.
+
+### rocknroll_update_meeting_artifacts
+Updates or appends summary, decisions, open questions, and action items on a meeting outcome (scope `tasks:write`).
+`action_id` (UUID)*, `meeting_id`*, `summary_append`, `replace_summary`, `decisions`, `open_questions`, `action_items`.
+
+### rocknroll_list_skills / rocknroll_get_skill / rocknroll_search_knowledge
+Read-only tools (scope `meetings:read`) exposing Obsidian-backed skills (`Skills/*.md`), `People.md`, `TeamContext.md`, and vault Markdown search.
+
+### rocknroll_upsert_skill / rocknroll_manage_people / rocknroll_control_board / rocknroll_join_meetings
+- `rocknroll_upsert_skill` (`settings:write`): creates or edits `Skills/<skill_id>.md`.
+- `rocknroll_manage_people` (`tasks:write`): looks up or upserts team member ↔ Jira mappings and approved voice commanders in `Knowledge/People.md`.
+- `rocknroll_control_board` (`meetings:control`): controls and shares the sandbox-safe in-app Assistant Board WKWebView (`open_url`, `share_to_meeting`, `stop_share`, `scroll`, `filter`, `click`, `highlight`, `inspect`).
+- `rocknroll_join_meetings` (`meetings:control`): batch-joins one or more meetings by title/keyword queries and binds an Obsidian skill + voice facilitation.
 
 ### rocknroll_update_settings
 Shows a native approval dialog; denied calls are recorded as `rejected`.

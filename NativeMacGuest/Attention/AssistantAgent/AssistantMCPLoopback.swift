@@ -11,7 +11,8 @@ extension AssistantAgentToolRegistry {
         let tools = await AssistantExternalToolPolicy.exposedTools(provider, serverID: assistantMCPLoopbackServerID,
                                                                     trust: trust)
         let meetingTools: Set = ["mcp__rocknroll_list_meetings", "mcp__rocknroll_get_meeting", "mcp__rocknroll_get_outcome",
-                                 "mcp__rocknroll_get_notes", "mcp__rocknroll_get_transcript"]
+                                 "mcp__rocknroll_get_notes", "mcp__rocknroll_get_transcript",
+                                 "mcp__rocknroll_list_skills", "mcp__rocknroll_get_skill", "mcp__rocknroll_search_knowledge"]
         register(externalTools: tools.filter { includeAdditionalReads || meetingTools.contains($0.descriptor.name) })
     }
 }
@@ -64,6 +65,9 @@ extension AssistantAgentToolRegistry {
         case "rocknroll_list_tasks": value = try await backend.listTasks(args, client: client)
         case "rocknroll_search": value = try await backend.search(args, client: client)
         case "rocknroll_get_settings": value = try await backend.getSettings(args, client: client)
+        case "rocknroll_list_skills": value = try await backend.listSkills(args, client: client)
+        case "rocknroll_get_skill": value = try await backend.getSkill(args, client: client)
+        case "rocknroll_search_knowledge": value = try await backend.searchKnowledge(args, client: client)
         default: throw AssistantAgentError.unknownTool(name)
         }
         return AssistantJSON.make(value)

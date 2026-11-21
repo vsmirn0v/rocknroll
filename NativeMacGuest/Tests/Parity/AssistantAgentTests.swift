@@ -1,3 +1,4 @@
+import AVFoundation
 import ConferenceCore
 import Foundation
 import XCTest
@@ -660,6 +661,16 @@ final class AssistantAgentTests: XCTestCase {
         func updateTask(_: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON { [:] }
         func updateSettings(_: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON { [:] }
         func runAssistant(_: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON { [:] }
+        func createTask(_: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON { [:] }
+        func scheduleMeeting(_: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON { [:] }
+        func updateMeetingArtifacts(_: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON { [:] }
+        func listSkills(_: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON { ["items": []] }
+        func getSkill(_: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON { [:] }
+        func upsertSkill(_: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON { [:] }
+        func searchKnowledge(_: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON { ["items": []] }
+        func managePeople(_: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON { [:] }
+        func controlBoard(_: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON { [:] }
+        func joinMeetings(_: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON { [:] }
     }
 
     /// Read-only tools only, `run_assistant` excluded, all namespaced `mcp__*`.
@@ -1017,6 +1028,120 @@ final class AssistantAgentTests: XCTestCase {
             XCTAssertEqual(joinOutcome, .triggered(command: "подключи меня к текущей встрече"))
             XCTAssertEqual(joinedURL, joinURL)
             XCTAssertEqual(triggeredCommands.count, 2)
+            exp.fulfill()
+        }
+        wait(for: [exp], timeout: 5.0)
+    }
+
+    func testSkillToolRegistrarPrivilegeScopingAndPCM16AudioBuffer() {
+        let defaults = UserDefaults(suiteName: "skill-registrar-\(UUID().uuidString)")!
+        let keychain = AttentionKeychain(service: "dev.vsmirn0v.conferenceguest.skills.\(UUID().uuidString)")
+        let tempRoot = FileManager.default.temporaryDirectory.appendingPathComponent("skill-registrar-\(UUID().uuidString)", isDirectory: true)
+        addTeardownBlock {
+            keychain.deleteAll()
+            try? FileManager.default.removeItem(at: tempRoot)
+        }
+
+        let exp = expectation(description: "skill-registrar-verified")
+        Task { @MainActor in
+            let store = AttentionStore(root: tempRoot, defaults: defaults, keychain: keychain)
+            let coordinator = AttentionCoordinator(store: store)
+            let snapshot = self.fixture()
+
+            let readOnlyRegistry = self.registry(snapshot: snapshot)
+            AssistantSkillToolRegistrar.registerTools(
+                into: readOnlyRegistry,
+                attention: coordinator,
+                talk: coordinator.talk,
+                snapshot: snapshot,
+                allowPrivilegedActions: false
+            )
+            let readNames = Set(readOnlyRegistry.descriptors.map(\.name))
+            XCTAssertTrue(readNames.contains("rocknroll_list_skills"))
+            XCTAssertTrue(readNames.contains("rocknroll_get_skill"))
+            XCTAssertTrue(readNames.contains("rocknroll_search_knowledge"))
+            XCTAssertFalse(readNames.contains("rocknroll_create_task"))
+            XCTAssertFalse(readNames.contains("rocknroll_control_board"))
+            XCTAssertFalse(readNames.contains("rocknroll_join_meetings"))
+            XCTAssertFalse(readNames.contains("rocknroll_manage_people"))
+
+            let fullRegistry = self.registry(snapshot: snapshot)
+            AssistantSkillToolRegistrar.registerTools(
+                into: fullRegistry,
+                attention: coordinator,
+                talk: coordinator.talk,
+                snapshot: snapshot,
+                allowPrivilegedActions: true
+            )
+            let fullNames = Set(fullRegistry.descriptors.map(\.name))
+            XCTAssertTrue(fullNames.contains("rocknroll_create_task"))
+            XCTAssertTrue(fullNames.contains("rocknroll_update_task"))
+            XCTAssertTrue(fullNames.contains("rocknroll_schedule_meeting"))
+            XCTAssertTrue(fullNames.contains("rocknroll_update_meeting_artifacts"))
+            XCTAssertTrue(fullNames.contains("rocknroll_upsert_skill"))
+            XCTAssertTrue(fullNames.contains("rocknroll_manage_people"))
+            XCTAssertTrue(fullNames.contains("rocknroll_control_board"))
+            XCTAssertTrue(fullNames.contains("rocknroll_join_meetings"))
+
+            let realtimeTools = AssistantSkillToolRegistrar.exportRealtimeTools(from: fullRegistry)
+            XCTAssertTrue(realtimeTools.contains(where: { $0.name == "rocknroll_create_task" }))
+
+            // Verify PCM16 -> AVAudioPCMBuffer conversion helper.
+            XCTAssertNil(AutonomousMeetingFacilitator.pcm16ToAudioBuffer(data: Data(), sampleRate: 24_000))
+            let sampleCount = 240
+            var pcmData = Data(capacity: sampleCount * 2)
+            for i in 0..<sampleCount {
+                var sample = Int16(truncatingIfNeeded: i * 10).littleEndian
+                withUnsafeBytes(of: &sample) { pcmData.append(contentsOf: $0) }
+            }
+            let audioBuffer = AutonomousMeetingFacilitator.pcm16ToAudioBuffer(data: pcmData, sampleRate: 24_000)
+            XCTAssertNotNil(audioBuffer)
+            XCTAssertEqual(Int(audioBuffer?.frameLength ?? 0), sampleCount)
+            XCTAssertEqual(audioBuffer?.format.sampleRate ?? 0, 24_000, accuracy: 0.1)
+
+            // Verify per-skill tool-group scoping isolates tasks from board/calendar tools.
+            let tasksOnlyRegistry = self.registry(snapshot: snapshot)
+            AssistantSkillToolRegistrar.registerTools(
+                into: tasksOnlyRegistry,
+                attention: coordinator,
+                talk: coordinator.talk,
+                snapshot: snapshot,
+                allowPrivilegedActions: true,
+                allowedToolGroups: [.tasks]
+            )
+            let scopedNames = Set(tasksOnlyRegistry.descriptors.map(\.name))
+            XCTAssertTrue(scopedNames.contains("rocknroll_create_task"))
+            XCTAssertTrue(scopedNames.contains("rocknroll_manage_people"))
+            XCTAssertFalse(scopedNames.contains("rocknroll_control_board"))
+            XCTAssertFalse(scopedNames.contains("rocknroll_schedule_meeting"))
+            XCTAssertFalse(scopedNames.contains("rocknroll_join_meetings"))
+
+            // Verify clause-split multi-meeting query extraction matches partial spoken titles.
+            let now = Date()
+            let cands = [
+                JoinableMeetingCandidate(
+                    id: UUID(),
+                    title: "Mobile Daily Standup",
+                    invitation: URL(string: "https://meet.example.com/daily")!,
+                    source: .ongoingCalendar,
+                    start: now
+                ),
+                JoinableMeetingCandidate(
+                    id: UUID(),
+                    title: "Q4 Design Review",
+                    invitation: URL(string: "https://meet.example.com/design")!,
+                    source: .upcomingCalendar,
+                    start: now.addingTimeInterval(600)
+                ),
+            ]
+            let queries = AssistantTalkController.extractMultiMeetingQueries(
+                from: "Рок, подключи к Standup и Design Review как скрам мастер",
+                candidates: cands,
+                skills: DefaultAssistantSkills.all
+            )
+            XCTAssertEqual(Set(queries ?? []), ["Mobile Daily Standup", "Q4 Design Review"])
+
+            coordinator.stop()
             exp.fulfill()
         }
         wait(for: [exp], timeout: 5.0)

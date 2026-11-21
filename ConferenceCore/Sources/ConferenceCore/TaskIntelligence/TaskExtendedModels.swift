@@ -35,6 +35,33 @@ public enum TaskWorkflowStatus: String, Codable, CaseIterable, Sendable, Identif
         case .cancelled: return "xmark.circle.fill"
         }
     }
+
+    public static func fromExternalStatus(_ raw: String) -> TaskWorkflowStatus? {
+        let clean = raw
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: "-", with: "_")
+            .replacingOccurrences(of: " ", with: "_")
+        if let exact = TaskWorkflowStatus(rawValue: clean) {
+            return exact
+        }
+        switch clean {
+        case "to_do", "open", "new", "backlog", "selected_for_development":
+            return .todo
+        case "in_progress", "doing", "active", "working", "started":
+            return .inProgress
+        case "blocked", "on_hold", "impeded", "waiting":
+            return .blocked
+        case "in_review", "review", "code_review", "qa", "testing", "verifying":
+            return .inReview
+        case "done", "closed", "resolved", "completed", "fixed":
+            return .done
+        case "cancelled", "canceled", "wont_do", "won't_do", "rejected", "duplicate":
+            return .cancelled
+        default:
+            return nil
+        }
+    }
 }
 
 public enum TaskPriorityLevel: String, Codable, CaseIterable, Sendable, Identifiable {

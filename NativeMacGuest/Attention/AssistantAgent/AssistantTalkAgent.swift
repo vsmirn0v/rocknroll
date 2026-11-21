@@ -12,7 +12,7 @@ extension AssistantTalkController {
         guard attention != nil else { return }
         activeInputSource = external ? .externalMCP : source
         do {
-            let environment = try await makeAgentEnvironment(external: external, source: activeInputSource)
+            let environment = try await makeAgentEnvironment(external: external, source: activeInputSource, commandText: input)
             agentEnvironment = environment
             let result = await agentRuntime.submit(input, environment: environment)
             handleAgentOutcome(result)
@@ -84,7 +84,11 @@ extension AssistantTalkController {
 
     // MARK: Environment
 
-    private func makeAgentEnvironment(external: Bool, source: AssistantInputSource = .typed) async throws -> AssistantAgentEnvironment {
+    private func makeAgentEnvironment(
+        external: Bool,
+        source: AssistantInputSource = .typed,
+        commandText: String = ""
+    ) async throws -> AssistantAgentEnvironment {
         guard let attention else { throw AssistantAgentError.unsupported }
         let snapshot = makeAgentSnapshot()
         let provider = attention.store.provider
@@ -101,12 +105,39 @@ extension AssistantTalkController {
         if let provider = attention.externalToolProvider {
             await registry.registerMeetingMCPTools(provider, includeAdditionalReads: attention.store.agentExternalToolsEnabled)
         }
+        let selectedMeetingTitle = snapshot.contextMeetingID.flatMap { id in
+            snapshot.meetings.first(where: { $0.id == id })?.title
+        } ?? ""
+        let matchedSkills = await AssistantSkillToolRegistrar.resolvedSkills(
+            attention: attention,
+            meetingTitle: selectedMeetingTitle,
+            commandText: commandText
+        )
+        let allowedGroups: Set<AssistantSkillToolGroup>? = matchedSkills.isEmpty
+            ? nil
+            : Set(matchedSkills.flatMap(\.tools))
+        AssistantSkillToolRegistrar.registerTools(
+            into: registry,
+            attention: attention,
+            talk: self,
+            snapshot: snapshot,
+            allowPrivilegedActions: !external,
+            allowedToolGroups: allowedGroups
+        )
+        let enrichedContext = await AssistantSkillToolRegistrar.enrichedContext(
+            base: AssistantNativeToolProvider.context(snapshot: snapshot),
+            attention: attention,
+            meetingTitle: selectedMeetingTitle,
+            commandText: commandText,
+            speakerName: nil,
+            isApprovedSpeaker: !external
+        )
         let globalDefault = attention.store.agentMeetingSendDefault
         let overrides = sendPolicyOverrides
         return AssistantAgentEnvironment(
             registry: registry,
             model: provider.agentModel(key: attention.store.apiKey(for: provider)),
-            context: AssistantNativeToolProvider.context(snapshot: snapshot),
+            context: enrichedContext,
             approvalPolicy: { _, action in
                 // The app owns this gate. External callers can never inherit any send
                 // privilege; direct chat/voice/reaction sends follow persisted/per-meeting
@@ -145,6 +176,11 @@ extension AssistantTalkController {
         case .remember: return L("Remember this?")
         case .readChat: return call.name
         }
+    }
+
+    /// Bridges facilitator actions to the canonical native meeting action executor.
+    func executeFacilitatorNativeAction(_ action: AssistantCanonicalAction) async throws -> String {
+        try await executeAgentAction(action)
     }
 
     /// Canonical actions execute through the same validated executor as typed commands.
@@ -341,15 +377,31 @@ extension AssistantTalkController {
             return L("%@: %@.", countClause, summaryList)
         }
 
-        // 2. Join current meeting (auto-executes immediately for voice input)
+        // 2. Join current or specifically named meeting(s) (with optional skill role & voice facilitation)
         let asksJoin = lower.contains("подключ") || lower.contains("зайди") || lower.contains("войди")
             || lower.contains("join") || lower.contains("connect me")
         let mentionsCurrentOrMeeting = lower.contains("текущ") || lower.contains("сейчас") || lower.contains("current")
             || lower.contains("следующ") || lower.contains("next") || mentionsMeeting
         if asksJoin && mentionsCurrentOrMeeting && AssistantVoiceApprovalPolicy.shouldAutoApprove(
             actionKind: "join", inputSource: source, sendsWithoutAsking: false) {
+            let skills = await attention.listAssistantSkills()
+            let matchedSkill = skills.first { $0.matches(meetingTitle: "", commandText: input) }
             let candidates = attention.joinableTargets(now)
+            if let explicitQueries = Self.extractMultiMeetingQueries(from: input, candidates: candidates, skills: skills),
+               !explicitQueries.isEmpty {
+                let result = await AssistantSkillToolRegistrar.joinMeetingsByQueries(
+                    explicitQueries,
+                    skillID: matchedSkill?.id,
+                    enableFacilitation: matchedSkill != nil || attention.store.autonomousMeetingVoiceEnabled,
+                    attention: attention,
+                    talk: self
+                )
+                return result.summary
+            }
             if let best = CurrentMeetingTargetResolver.bestCurrentMeeting(from: candidates, now: now) {
+                if let matchedSkill {
+                    attention.facilitator?.queuePendingSkill(matchedSkill.id, title: best.title, invitation: best.invitation)
+                }
                 let targetID = best.activeSessionID ?? best.id
                 let command = AssistantCommand(action: .join, meetingID: targetID)
                 do {
@@ -387,6 +439,78 @@ extension AssistantTalkController {
         }
 
         return nil
+    }
+
+    nonisolated static func extractMultiMeetingQueries(
+        from input: String,
+        candidates: [JoinableMeetingCandidate],
+        skills: [AssistantSkill]
+    ) -> [String]? {
+        let foldedInput = input.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil)
+            .replacingOccurrences(of: "ё", with: "е")
+        var matchedTitles: [String] = []
+
+        // 1. Exact full-title containment
+        for candidate in candidates {
+            let title = candidate.title.trimmed
+            guard title.count >= 3 else { continue }
+            let foldedTitle = title.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil)
+                .replacingOccurrences(of: "ё", with: "е")
+            if foldedInput.contains(foldedTitle) {
+                matchedTitles.append(candidate.title)
+            }
+        }
+
+        // 2. Clause-split token matching for partial spoken names ("Daily и Design Review", "standup and planning")
+        let stopWords: Set<String> = [
+            "встреча", "встречу", "встречи", "встрече", "звонок", "созвон", "митинг", "meeting", "call",
+            "подключи", "подключить", "подключись", "зайди", "войди", "меня", "туда", "сюда",
+            "join", "connect", "rock", "рок", "как", "role", "роли", "роль", "пожалуйста", "please",
+            "текущую", "текущая", "текущей", "сейчас", "current", "now", "следующую", "следующая", "next",
+            "with", "into"
+        ]
+
+        let normalizedClauses = foldedInput
+            .replacingOccurrences(of: " и ", with: "|")
+            .replacingOccurrences(of: " and ", with: "|")
+            .replacingOccurrences(of: ",", with: "|")
+            .replacingOccurrences(of: ";", with: "|")
+            .split(separator: "|")
+            .map(String.init)
+
+        let roleMarkers = [" в роли ", " with skill ", " with role ", " как ", " as "]
+        for rawClause in normalizedClauses {
+            var clause = rawClause
+            for marker in roleMarkers {
+                if let range = clause.range(of: marker) {
+                    clause = String(clause[..<range.lowerBound])
+                }
+            }
+            let clauseTokens = clause.split(whereSeparator: { !$0.isLetter && !$0.isNumber })
+                .map(String.init)
+                .filter { $0.count >= 3 && !stopWords.contains($0) }
+            guard !clauseTokens.isEmpty else { continue }
+            var bestCandidate: (title: String, score: Int)?
+            for candidate in candidates {
+                let candidateTokens = Set(
+                    candidate.title.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil)
+                        .replacingOccurrences(of: "ё", with: "е")
+                        .split(whereSeparator: { !$0.isLetter && !$0.isNumber })
+                        .map(String.init)
+                )
+                let hits = clauseTokens.filter { candidateTokens.contains($0) }.count
+                if hits > 0, hits > (bestCandidate?.score ?? 0) {
+                    bestCandidate = (candidate.title, hits)
+                }
+            }
+            if let bestCandidate {
+                matchedTitles.append(bestCandidate.title)
+            }
+        }
+
+        var seen: Set<String> = []
+        let unique = matchedTitles.filter { seen.insert($0.lowercased()).inserted }
+        return unique.isEmpty ? nil : unique
     }
 
     private nonisolated static func extractParticipationObjective(from input: String) -> String {

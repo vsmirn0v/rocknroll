@@ -307,6 +307,33 @@ struct AttentionDecisionRecord: Codable, Equatable, Sendable {
         didSet { defaults.set(agentMeetingSendDefault.rawValue, forKey: Self.agentMeetingSendDefaultKey) }
     }
     static let agentMeetingSendDefaultKey = "assistant.agent.meetingSendDefault"
+    /// Optional WebSocket Realtime voice provider (`openai_realtime` / `gemini_live`).
+    /// Standard STT → LLM → TTS works independently whenever `.disabled` or unavailable.
+    @Published var realtimeProvider: RealtimeProviderKind {
+        didSet { defaults.set(realtimeProvider.rawValue, forKey: Self.realtimeProviderKey) }
+    }
+    static let realtimeProviderKey = "assistant.realtime.provider"
+    @Published var realtimeModel: String {
+        didSet { defaults.set(realtimeModel, forKey: Self.realtimeModelKey) }
+    }
+    static let realtimeModelKey = "assistant.realtime.model"
+    @Published var realtimeVoice: String {
+        didSet { defaults.set(realtimeVoice, forKey: Self.realtimeVoiceKey) }
+    }
+    static let realtimeVoiceKey = "assistant.realtime.voice"
+    @Published var realtimeEndpoint: String {
+        didSet { defaults.set(realtimeEndpoint, forKey: Self.realtimeEndpointKey) }
+    }
+    static let realtimeEndpointKey = "assistant.realtime.endpoint"
+    @Published var selectedSkillIDs: [String] {
+        didSet { defaults.set(selectedSkillIDs, forKey: Self.selectedSkillsKey) }
+    }
+    static let selectedSkillsKey = "assistant.skills.selected"
+    @Published var autonomousMeetingVoiceEnabled: Bool {
+        didSet { defaults.set(autonomousMeetingVoiceEnabled, forKey: Self.autonomousVoiceKey) }
+    }
+    static let autonomousVoiceKey = "assistant.autonomous.voiceEnabled"
+    @Published private(set) var keyedRealtimeProviders: Set<RealtimeProviderKind> = []
     /// Output-device UIDs the person marked with "This is a headphone".
     @Published private(set) var headphoneUIDs: Set<String>
     static let outcomesKey = "attention.outcomes.enabled", remoteOutcomesKey = "attention.outcomes.remote"
@@ -457,6 +484,12 @@ struct AttentionDecisionRecord: Codable, Equatable, Sendable {
         // direct sends to the selected meeting went through after one approval in a session.
         agentMeetingSendDefault = AssistantMeetingSendDefault(rawValue: defaults.string(forKey: Self.agentMeetingSendDefaultKey) ?? "")
             ?? .sendImmediately
+        realtimeProvider = defaults.string(forKey: Self.realtimeProviderKey).flatMap(RealtimeProviderKind.init(rawValue:)) ?? .disabled
+        realtimeModel = defaults.string(forKey: Self.realtimeModelKey) ?? ""
+        realtimeVoice = defaults.string(forKey: Self.realtimeVoiceKey) ?? ""
+        realtimeEndpoint = defaults.string(forKey: Self.realtimeEndpointKey) ?? ""
+        selectedSkillIDs = defaults.stringArray(forKey: Self.selectedSkillsKey) ?? []
+        autonomousMeetingVoiceEnabled = defaults.object(forKey: Self.autonomousVoiceKey) as? Bool ?? true
         headphoneUIDs = Set(defaults.stringArray(forKey: Self.headphoneUIDsKey) ?? [])
         provider = defaults.data(forKey: Self.providerKey).flatMap { try? JSONDecoder().decode(AttentionProvider.self, from: $0) }
             ?? AttentionProvider.defaults[.openAI]!
@@ -467,6 +500,9 @@ struct AttentionDecisionRecord: Codable, Equatable, Sendable {
             keychain.delete()
         }
         keyedKinds = Set(AttentionProvider.Kind.allCases.filter { keychain.kind($0).read()?.trimmed.isEmpty == false })
+        keyedRealtimeProviders = Set(RealtimeProviderKind.allCases.filter {
+            $0 != .disabled && realtimeKeychain($0).read()?.trimmed.isEmpty == false
+        })
         load()
         momentLoadTask = Task { @MainActor [weak self] in await self?.loadMoments() }
         installMeetingLibrary()
@@ -716,6 +752,43 @@ struct AttentionDecisionRecord: Codable, Equatable, Sendable {
         let saved = clean.isEmpty ? account.delete() : account.write(clean)
         if apiKey(for: provider) != nil { keyedKinds.insert(provider.kind) } else { keyedKinds.remove(provider.kind) }
         return saved
+    }
+    func realtimeKeychain(_ kind: RealtimeProviderKind) -> AttentionKeychain {
+        var copy = keychain
+        copy.account = "realtime-api-key." + kind.rawValue
+        return copy
+    }
+    func realtimeAPIKey(for kind: RealtimeProviderKind? = nil) -> String? {
+        let target = kind ?? realtimeProvider
+        guard target != .disabled else { return nil }
+        if let specific = realtimeKeychain(target).read().flatMap({ $0.trimmed.isEmpty ? nil : $0.trimmed }) {
+            return specific
+        }
+        // Convenience: OpenAI Realtime can reuse the saved OpenAI key if no separate key was stored.
+        if target == .openAIRealtime {
+            return keychain.kind(.openAI).read().flatMap { $0.trimmed.isEmpty ? nil : $0.trimmed }
+        }
+        return nil
+    }
+    @discardableResult func setRealtimeAPIKey(_ value: String, for kind: RealtimeProviderKind? = nil) -> Bool {
+        let target = kind ?? realtimeProvider
+        guard target != .disabled else { return false }
+        let clean = value.trimmed, account = realtimeKeychain(target)
+        let saved = clean.isEmpty ? account.delete() : account.write(clean)
+        if realtimeKeychain(target).read()?.trimmed.isEmpty == false {
+            keyedRealtimeProviders.insert(target)
+        } else {
+            keyedRealtimeProviders.remove(target)
+        }
+        return saved
+    }
+    func localAssistantSkillsRootURL() -> URL {
+        root.appendingPathComponent("Rock Assistant", isDirectory: true)
+    }
+    func localSkillRepository() -> AssistantSkillRepository {
+        let repo = AssistantSkillRepository(rootURL: localAssistantSkillsRootURL())
+        try? repo.ensureDefaultsInstalled()
+        return repo
     }
     var ready: Bool { enabled && provider.configured && (!provider.needsKey || hasKey) }
 

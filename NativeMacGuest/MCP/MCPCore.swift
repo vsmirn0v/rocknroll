@@ -253,6 +253,16 @@ struct MCPAuditEvent {
     func updateTask(_ args: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON
     func updateSettings(_ args: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON
     func runAssistant(_ args: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON
+    func createTask(_ args: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON
+    func scheduleMeeting(_ args: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON
+    func updateMeetingArtifacts(_ args: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON
+    func listSkills(_ args: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON
+    func getSkill(_ args: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON
+    func upsertSkill(_ args: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON
+    func searchKnowledge(_ args: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON
+    func managePeople(_ args: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON
+    func controlBoard(_ args: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON
+    func joinMeetings(_ args: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON
 }
 
 // MARK: - JSON-RPC server
@@ -317,6 +327,16 @@ struct MCPAuditEvent {
                 case "rocknroll_update_task": value = try await backend.updateTask(args, client: client)
                 case "rocknroll_update_settings": value = try await backend.updateSettings(args, client: client)
                 case "rocknroll_run_assistant": value = try await backend.runAssistant(args, client: client)
+                case "rocknroll_create_task": value = try await backend.createTask(args, client: client)
+                case "rocknroll_schedule_meeting": value = try await backend.scheduleMeeting(args, client: client)
+                case "rocknroll_update_meeting_artifacts": value = try await backend.updateMeetingArtifacts(args, client: client)
+                case "rocknroll_list_skills": value = try await backend.listSkills(args, client: client)
+                case "rocknroll_get_skill": value = try await backend.getSkill(args, client: client)
+                case "rocknroll_upsert_skill": value = try await backend.upsertSkill(args, client: client)
+                case "rocknroll_search_knowledge": value = try await backend.searchKnowledge(args, client: client)
+                case "rocknroll_manage_people": value = try await backend.managePeople(args, client: client)
+                case "rocknroll_control_board": value = try await backend.controlBoard(args, client: client)
+                case "rocknroll_join_meetings": value = try await backend.joinMeetings(args, client: client)
                 default: throw MCPToolFailure("CAPABILITY_UNAVAILABLE", "Unsupported tool: \(name)")
                 }
                 return rpcResult(id: request["id"], value: toolResult(value))

@@ -150,6 +150,9 @@ final class AttentionMemoryPressure: @unchecked Sendable {
     private var workspacePauseRevisions: [UUID: UUID] = [:]
 
     let store: AttentionStore
+    let boardController = AssistantBoardWindowController()
+    var facilitator: AutonomousMeetingFacilitator?
+    var cachedPromptTexts: [AssistantPromptKind: String] = [:]
     var meetings: () -> [NativeDesktopMeetingModel] = { [] }
     /// The meeting is in front of you; its mode then follows the on-screen default (Off unless changed).
     var isOnScreen: (NativeDesktopMeetingModel) -> Bool = { _ in false }
@@ -257,6 +260,10 @@ final class AttentionMemoryPressure: @unchecked Sendable {
     init(store: AttentionStore = .shared) {
         self.store = store
         ruleStore = AssistantRuleStore(root: store.root)
+        facilitator = AutonomousMeetingFacilitator(attention: self)
+        Task { @MainActor [weak self] in
+            await self?.refreshCachedPrompts()
+        }
     }
 
     /// Feed a deterministic mention event to the rule evaluator. Mentioning never
@@ -559,8 +566,9 @@ final class AttentionMemoryPressure: @unchecked Sendable {
             captured.insert(segment.sessionID)
             let draft = MeetingOutcome(meetingID: segment.sessionID, meetingTitle: segment.title,
                 invitation: segment.invitation, seriesID: segment.seriesID, endedAt: segment.endedAt, summary: "")
+            let summaryPrompt = cachedPromptTexts[.meetingSummary]
             let input = MeetingOutcomeInput(request: .init(meetingTitle: segment.title, endedAt: segment.endedAt,
-                window: window, language: language), provider: writer)
+                window: window, language: language, customInstructions: summaryPrompt), provider: writer)
             previousTask = runOutcome(for: segment.sessionID, after: previousTask) { library, owner in
                 let persisted = try await library.startOutcome(draft, input: input, owner: owner)
                 return (persisted, input)
@@ -586,8 +594,14 @@ final class AttentionMemoryPressure: @unchecked Sendable {
             defer { outcomeStatus[sessionID] = nil }
             do {
                 let writer = makeOutcomeWriter(provider, store.apiKey(for: provider))
+                let summaryPrompt: String
+                if let cached = cachedPromptTexts[.meetingSummary] {
+                    summaryPrompt = cached
+                } else {
+                    summaryPrompt = await loadAssistantPrompt(.meetingSummary).content
+                }
                 let content = try await writer.outcome(.init(meetingTitle: title, endedAt: endedAt,
-                    window: window, language: language))
+                    window: window, language: language, customInstructions: summaryPrompt))
                 historyOutcomeDrafts[sessionID] = .init(id: sessionID, content: content,
                     evidence: MeetingOutcomePrompt.verifiedEvidence(content, window: window), fingerprint: fingerprint)
             } catch {
@@ -943,6 +957,19 @@ final class AttentionMemoryPressure: @unchecked Sendable {
             let key = JiraContactMatcher.normalizedKey(cleaned)
             if byKey[key] == nil {
                 byKey[key] = AppContactPerson(key: key, displayName: cleaned, isCurrentUser: false)
+            }
+        }
+        let directory = await loadPeopleDirectory()
+        for entry in directory.entries {
+            let key = JiraContactMatcher.normalizedKey(entry.displayName)
+            let isMine = entry.approvedVoiceCommander && directory.isApprovedSpeaker(entry.displayName, localUserNames: profile.aliases)
+            if var existing = byKey[key] {
+                let mergedAliases = AssistantPersonEntry.deduped(existing.aliases + entry.aliases)
+                existing.aliases = mergedAliases
+                if existing.email == nil { existing.email = entry.email }
+                byKey[key] = existing
+            } else {
+                byKey[key] = entry.toAppContactPerson(isCurrentUser: isMine)
             }
         }
         return byKey.values.sorted {
@@ -1302,6 +1329,7 @@ final class AttentionMemoryPressure: @unchecked Sendable {
             selectedCard?.speaking = false
         }
         for model in list { observeParticipants(model, now: current) }
+        facilitator?.processTick(models: list)
         guard judging == nil else { return }
         calls.removeAll { current.timeIntervalSince($0) > 60 }
         guard calls.count < callsPerMinuteLimit else { return }
@@ -1377,7 +1405,8 @@ final class AttentionMemoryPressure: @unchecked Sendable {
             series: model.calendarSeriesID, people: model.participants.filter { !$0.isLocal }.map(\.name))
         let request = JudgeRequest(window: window, preset: preset, profile: store.profile, yourName: model.displayName,
                                    language: language, replyChannels: channels, memory: memory,
-                                   workspaceGuidance: workspaceInstructions(for: model))
+                                   workspaceGuidance: workspaceInstructions(for: model),
+                                   customInstructions: cachedPromptTexts[.attentionJudge])
         let provider = store.provider
         let decisionID = UUID()
         do {
@@ -1685,7 +1714,8 @@ final class AttentionMemoryPressure: @unchecked Sendable {
         if card.canSpeak { channels.chat = true }
         let request = ReplyRequest(judge: JudgeRequest(window: card.window, preset: preset, profile: store.profile,
             yourName: model.displayName, language: language, replyChannels: channels, memory: card.memory,
-            workspaceGuidance: workspaceInstructions(for: model)),
+            workspaceGuidance: workspaceInstructions(for: model),
+            customInstructions: cachedPromptTexts[.attentionJudge]),
             verdict: card.verdict, redraftHint: hint)
         let requestedAt = now()
         let writerInput = ReplyPrompt.messages(request).enumerated().compactMap { index, message -> MeetingWorkspaceEvent.SourceSnapshot? in
@@ -2015,7 +2045,8 @@ final class AttentionMemoryPressure: @unchecked Sendable {
         ]
         let window = AttentionWindowBuilder.build(.init(title: L("Sample meeting"), transcript: lines, chat: [], reactions: [],
             participantCount: 3, yourNames: store.profile.names(fallback: you), microphoneOn: false, soundOn: false, now: now))
-        let request = JudgeRequest(window: window, preset: nil, profile: store.profile, yourName: you, language: language)
+        let request = JudgeRequest(window: window, preset: nil, profile: store.profile, yourName: you, language: language,
+                                   customInstructions: cachedPromptTexts[.attentionJudge])
         return try await makeJudge(store.provider, store.apiKey()).judge(request).verdict
     }
 }

@@ -19,9 +19,9 @@ import Foundation
 
     private let attentionOverride: (() -> AttentionCoordinator?)?
 
-    private var app: NativeDesktopWorkspace? { workspace() }
-    private var library: NativeDesktopLibrary? { app?.library }
-    private var attention: AttentionCoordinator? { attentionOverride?() ?? app?.attention }
+    var app: NativeDesktopWorkspace? { workspace() }
+    var library: NativeDesktopLibrary? { app?.library }
+    var attention: AttentionCoordinator? { attentionOverride?() ?? app?.attention }
 
     private func envelope(_ value: MCPJSON, coverage: String = "complete", warnings: [String] = []) -> MCPJSON {
         var copy = value
@@ -304,7 +304,7 @@ import Foundation
         return item["kind"] as? String == "active" ? Date() : nil
     }
 
-    private func activeMeeting(_ id: String) throws -> NativeDesktopMeetingModel {
+    func activeMeeting(_ id: String) throws -> NativeDesktopMeetingModel {
         guard let model = app?.meetings.first(where: { mcpSessionID($0.workspaceSessionID) == id })
             ?? app?.meetings.first(where: { mcpSessionID($0.sessionID) == id }) else {
             throw MCPToolFailure("MEETING_NOT_FOUND", "The requested active meeting is unavailable.")
@@ -653,13 +653,21 @@ import Foundation
 
     // MARK: Actions
 
-    private func beginAction(_ args: MCPJSON, client: MCPClientIdentity) throws -> (id: String, replay: MCPJSON?) {
+    func beginAction(_ args: MCPJSON, client: MCPClientIdentity) throws -> (id: String, replay: MCPJSON?) {
         let id = try MCPValue.string(args["action_id"], key: "action_id")
         let payload = args.filter { $0.key != "action_id" }
         // The center returns nil for an exact replay and throws ACTION_ID_REUSED
         // when the same action_id arrives with a different payload.
         let record = try actions.begin(client: client, actionID: id, payload: payload)
         return (id, record == nil ? actions.recordedActions[id]?.result : nil)
+    }
+
+    func validateActionID(_ args: MCPJSON) throws -> String {
+        let actionID = try MCPValue.string(args["action_id"], key: "action_id")
+        guard UUID(uuidString: actionID) != nil else {
+            throw MCPToolFailure("INVALID_ARGUMENT", "action_id must be a UUID.", details: ["field": "action_id", "reason": "format"])
+        }
+        return actionID
     }
 
     private func expectRevision(_ expected: Any?, actual: String) throws {
@@ -724,6 +732,7 @@ import Foundation
     }
 
     func updateTask(_ args: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON {
+        let actionID = try validateActionID(args)
         guard let attention else { throw MCPToolFailure("APP_NOT_RUNNING", "The native workspace is unavailable.") }
         let store = attention.store
         let taskID = try MCPValue.string(args["task_id"], key: "task_id")
@@ -734,12 +743,22 @@ import Foundation
             throw MCPToolFailure("TASK_NOT_FOUND", "The requested task is unavailable.")
         }
         let text = try MCPValue.optionalString(args["text"], key: "text")
-        let owner = try MCPValue.optionalString(args["owner"], key: "owner")
+        var owner = try MCPValue.optionalString(args["owner"], key: "owner")
         let done = try MCPValue.optionalBool(args["done"], key: "done")
+        let dueDayRaw = try MCPValue.optionalString(args["due_day"], key: "due_day")
+        let jiraStatusRaw = try MCPValue.optionalString(args["jira_status"], key: "jira_status")
+        let syncToJira = try MCPValue.optionalBool(args["sync_to_jira"], key: "sync_to_jira") ?? false
+        var resolvedAssigneeID: String?
+        if let rawOwner = owner?.trimmingCharacters(in: .whitespacesAndNewlines), !rawOwner.isEmpty {
+            let directory = await attention.loadPeopleDirectory()
+            if let person = directory.resolvePerson(matching: rawOwner) {
+                owner = person.displayName
+                resolvedAssigneeID = person.jiraAccountID ?? person.jiraUsername ?? person.id
+            }
+        }
         await store.waitForMeetingLibrary()
         await store.waitForOutcomeWrites()
         let library = store.meetingLibrary.store
-        let actionID = try MCPValue.string(args["action_id"], key: "action_id")
         if actions.recordedActions[actionID] == nil {
             guard let outcome = try await library.outcome(outcomeID), outcome.tasks.contains(where: { $0.id == taskUUID }) else {
                 throw MCPToolFailure("TASK_NOT_FOUND", "The requested task is unavailable.")
@@ -749,20 +768,33 @@ import Foundation
         let (id, replay) = try beginAction(args, client: client)
         if let replay { return replay }
         do {
-            if text != nil || owner != nil || done != nil {
+            if text != nil || owner != nil || done != nil || dueDayRaw != nil || jiraStatusRaw != nil {
                 guard try await store.publishOutcomeMutation({
                     try await library.changeTask(outcomeID: outcomeID, taskID: taskUUID) { task in
                         if let text { task.text = text }
                         if let owner, owner != task.owner {
                             task.owner = owner
-                            task.assigneeID = nil
+                            task.assigneeID = resolvedAssigneeID
                             task.reminderAt = nil
+                        } else if let resolvedAssigneeID, task.assigneeID == nil {
+                            task.assigneeID = resolvedAssigneeID
                         }
                         if let done { task.setDone(done) }
+                        if let dueDayRaw {
+                            let clean = dueDayRaw.trimmingCharacters(in: .whitespacesAndNewlines)
+                            task.dueDay = clean.isEmpty ? nil : clean
+                        }
+                        if let jiraStatusRaw, let mapped = TaskWorkflowStatus.fromExternalStatus(jiraStatusRaw) {
+                            task.extended.workflowStatus = mapped
+                            task.setDone(mapped.isTerminalDone)
+                        }
                     }
                 }) != nil else { throw MCPToolFailure("TASK_NOT_FOUND", "The requested task is unavailable.") }
                 await store.meetingLibrary.refresh()
                 await attention.reconcileTaskReminderCancellations()
+            }
+            if syncToJira && attention.taskSync.preferences.jira.enabled {
+                await attention.taskSync.runSync(explicitTaskIDs: [taskUUID], automaticTrigger: true)
             }
             return actions.finish(id, client: client, type: "task", target: taskID, status: "applied",
                 result: ["action_id": id, "status": "applied", "observed_at": mcpNow(), "entity_id": taskID,

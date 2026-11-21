@@ -1717,6 +1717,151 @@ extension MeetingLibraryStore {
 
         return commits
     }
+
+    static let assistantStandaloneOutcomeID = UUID(uuidString: "A55157A7-7A5B-4000-8000-000000000001")!
+    static let assistantStandaloneSessionID = UUID(uuidString: "A55157A7-7A5B-4000-8000-000000000002")!
+
+    /// Creates a new task inside a meeting's outcome (creating one if needed) or the standalone Assistant Tasks bucket.
+    func createAssistantTask(
+        sessionID: UUID?,
+        outcomeID: UUID? = nil,
+        title: String,
+        owner: String,
+        assigneeID: String? = nil,
+        dueDay: String? = nil,
+        notes: String? = nil
+    ) throws -> (commit: MeetingOutcomeCommit, task: MeetingOutcomeTask) {
+        let cleanTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let db = try db()
+        var targetOutcome: MeetingOutcome
+        if let outcomeID, let existing = try Self.storedOutcome(db: db, id: outcomeID) {
+            targetOutcome = existing
+        } else if let sessionID {
+            if let row = try db.one("SELECT outcome_id FROM meeting_outcomes WHERE session_id=?", bind: {
+                try Self.bindText($0, sessionID.uuidString, at: 1)
+            }), let existingID = row.text(0).flatMap(UUID.init(uuidString:)),
+               let existing = try Self.storedOutcome(db: db, id: existingID) {
+                targetOutcome = existing
+            } else {
+                let sRow = try db.one("SELECT title, invitation, calendar_series_id, ended_at FROM meeting_sessions WHERE session_id=?", bind: {
+                    try Self.bindText($0, sessionID.uuidString, at: 1)
+                })
+                let sTitle = sRow?.text(0).flatMap { $0.isEmpty ? nil : $0 } ?? L("Meeting")
+                let inv = sRow?.text(1).flatMap(URL.init(string:))
+                let seriesID = sRow?.text(2)
+                let endedAt = sRow?.integer(3).flatMap(Self.date) ?? Date()
+                targetOutcome = MeetingOutcome(
+                    id: UUID(),
+                    meetingID: sessionID,
+                    meetingTitle: sTitle,
+                    invitation: inv,
+                    seriesID: seriesID,
+                    endedAt: endedAt,
+                    summary: ""
+                )
+            }
+        } else {
+            let existing = try Self.storedOutcome(db: db, id: Self.assistantStandaloneOutcomeID)
+            targetOutcome = existing ?? MeetingOutcome(
+                id: Self.assistantStandaloneOutcomeID,
+                meetingID: Self.assistantStandaloneSessionID,
+                meetingTitle: L("Assistant Tasks"),
+                endedAt: Date(),
+                summary: L("Tasks created by Rock Assistant.")
+            )
+            targetOutcome.meetingID = Self.assistantStandaloneSessionID
+        }
+
+        var ext = TaskExtendedMetadata()
+        if let notes = notes?.trimmingCharacters(in: .whitespacesAndNewlines), !notes.isEmpty {
+            ext.appendContextNote(notes)
+        }
+        let task = MeetingOutcomeTask(
+            id: UUID(),
+            text: cleanTitle,
+            owner: owner.trimmingCharacters(in: .whitespacesAndNewlines),
+            assigneeID: assigneeID,
+            dueDay: dueDay,
+            done: false,
+            extended: ext
+        )
+        targetOutcome.tasks.append(task)
+        let commit = try commitOutcome(targetOutcome, state: .ready)
+        return (commit, task)
+    }
+
+    /// Updates meeting summary, decisions, open questions, or appends tasks on a session's outcome.
+    func updateMeetingArtifacts(
+        outcomeID: UUID? = nil,
+        sessionID: UUID? = nil,
+        summaryAppend: String? = nil,
+        replaceSummary: String? = nil,
+        addDecisions: [String] = [],
+        addOpenQuestions: [String] = [],
+        addTasks: [(text: String, owner: String, assigneeID: String?, dueDay: String?)] = []
+    ) throws -> MeetingOutcomeCommit? {
+        let db = try db()
+        var targetOutcome: MeetingOutcome?
+        if let outcomeID {
+            targetOutcome = try Self.storedOutcome(db: db, id: outcomeID)
+        }
+        if targetOutcome == nil, let sessionID {
+            if let row = try db.one("SELECT outcome_id FROM meeting_outcomes WHERE session_id=?", bind: {
+                try Self.bindText($0, sessionID.uuidString, at: 1)
+            }), let existingID = row.text(0).flatMap(UUID.init(uuidString:)) {
+                targetOutcome = try Self.storedOutcome(db: db, id: existingID)
+            } else {
+                let sRow = try db.one("SELECT title, invitation, calendar_series_id, ended_at FROM meeting_sessions WHERE session_id=?", bind: {
+                    try Self.bindText($0, sessionID.uuidString, at: 1)
+                })
+                let sTitle = sRow?.text(0).flatMap { $0.isEmpty ? nil : $0 } ?? L("Meeting")
+                targetOutcome = MeetingOutcome(
+                    id: UUID(),
+                    meetingID: sessionID,
+                    meetingTitle: sTitle,
+                    invitation: sRow?.text(1).flatMap(URL.init(string:)),
+                    seriesID: sRow?.text(2),
+                    endedAt: sRow?.integer(3).flatMap(Self.date) ?? Date(),
+                    summary: ""
+                )
+            }
+        }
+        guard var outcome = targetOutcome else { return nil }
+
+        if let replaceSummary = replaceSummary?.trimmingCharacters(in: .whitespacesAndNewlines), !replaceSummary.isEmpty {
+            outcome.summary = replaceSummary
+        } else if let append = summaryAppend?.trimmingCharacters(in: .whitespacesAndNewlines), !append.isEmpty {
+            outcome.summary = outcome.summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                ? append
+                : outcome.summary.trimmingCharacters(in: .whitespacesAndNewlines) + "\n\n" + append
+        }
+
+        for d in addDecisions {
+            let clean = d.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !clean.isEmpty && !outcome.decisions.contains(clean) {
+                outcome.decisions.append(clean)
+            }
+        }
+        for q in addOpenQuestions {
+            let clean = q.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !clean.isEmpty && !outcome.openQuestions.contains(clean) {
+                outcome.openQuestions.append(clean)
+            }
+        }
+        for item in addTasks {
+            let cleanText = item.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !cleanText.isEmpty else { continue }
+            outcome.tasks.append(MeetingOutcomeTask(
+                id: UUID(),
+                text: cleanText,
+                owner: item.owner.trimmingCharacters(in: .whitespacesAndNewlines),
+                assigneeID: item.assigneeID,
+                dueDay: item.dueDay,
+                done: false
+            ))
+        }
+        return try commitOutcome(outcome, state: .ready)
+    }
 }
 
 // MARK: - Cards

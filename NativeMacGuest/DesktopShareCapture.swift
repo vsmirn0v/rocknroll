@@ -18,6 +18,7 @@ final class NativeDesktopShareCapture: GuestCameraCapture, @unchecked Sendable {
     private var latest: CMSampleBuffer?
     private var latestScene: PresenterScene?
     private var latestCamera: CVPixelBuffer?
+    private var latestExternalPixels: CVPixelBuffer?
     private var cameraRevision: UInt64 = 0
     private var cameraPrivacyEpoch: UInt64 = 0
     private var count = 0
@@ -34,6 +35,7 @@ final class NativeDesktopShareCapture: GuestCameraCapture, @unchecked Sendable {
     private lazy var compositor = PresenterCompositor()
     private var blank: CVPixelBuffer?
     private let canvasOnly: Bool
+    private let externalFrames: Bool
     private var selectionMode: MacScreenCaptureSelectionMode = .automatic
     #if DEBUG
     convenience init(source: LKRTCVideoSource, screenForTesting sample: CMSampleBuffer) {
@@ -61,21 +63,29 @@ final class NativeDesktopShareCapture: GuestCameraCapture, @unchecked Sendable {
     var onEnd: (@Sendable (Error?) -> Void)? {
         get { locked { endHandler } } set { locked { endHandler = newValue } }
     }
-    init(source: LKRTCVideoSource, canvasOnly: Bool = false) {
-        self.source = source; capturer = LKRTCVideoCapturer(delegate: source); self.canvasOnly = canvasOnly
+    init(source: LKRTCVideoSource, canvasOnly: Bool = false, externalFrames: Bool = false) {
+        self.source = source; capturer = LKRTCVideoCapturer(delegate: source); self.canvasOnly = canvasOnly; self.externalFrames = externalFrames
     }
     #if DEBUG
     init(canvasForTesting: Bool, consumer: @escaping @Sendable (LKRTCVideoFrame) -> Void) {
-        source = nil; capturer = nil; canvasOnly = canvasForTesting; testConsumer = consumer
+        source = nil; capturer = nil; canvasOnly = canvasForTesting; externalFrames = false; testConsumer = consumer
     }
     init(screenForTesting sample: CMSampleBuffer, consumer: @escaping @Sendable (LKRTCVideoFrame) -> Void) {
-        source = nil; capturer = nil; canvasOnly = false; testConsumer = consumer; syntheticScreenSample = sample
+        source = nil; capturer = nil; canvasOnly = false; externalFrames = false; testConsumer = consumer; syntheticScreenSample = sample
     }
     #endif
     private func locked<T>(_ action: () throws -> T) rethrows -> T { lock.lock(); defer { lock.unlock() }; return try action() }
     private func isActive(_ token: UInt64) -> Bool { locked { generation == token && (phase == .starting || phase == .running) } }
     func setScene(_ scene: PresenterScene?) { locked { if phase != .stopped { latestScene = scene } }; schedule() }
     func setSelectionMode(_ mode: MacScreenCaptureSelectionMode) { locked { if phase == .idle { selectionMode = mode } } }
+    func updateExternalPixelBuffer(_ pixels: CVPixelBuffer) {
+        let shouldSchedule = locked { () -> Bool in
+            guard phase == .starting || phase == .running else { return false }
+            latestExternalPixels = pixels
+            return true
+        }
+        if shouldSchedule { schedule() }
+    }
     func setCamera(_ pixels: CVPixelBuffer?) {
         locked { if phase != .stopped {
             if pixels == nil { cameraPrivacyEpoch &+= 1 }
@@ -101,7 +111,7 @@ final class NativeDesktopShareCapture: GuestCameraCapture, @unchecked Sendable {
                     timer = heartbeat; heartbeat.resume()
                     if canvasOnly { forward(token) }
                 }
-                if !canvasOnly {
+                if !canvasOnly && !externalFrames {
                     #if DEBUG
                     if let sample = syntheticScreenSample { accept(sample, token: token) }
                     else { await beforePickerForTesting?(); try await presentPicker(token) }
@@ -157,13 +167,13 @@ final class NativeDesktopShareCapture: GuestCameraCapture, @unchecked Sendable {
         if let token { queue.async { [weak self] in self?.forward(token) } }
     }
     private func forward(_ token: UInt64) {
-        let input: (CMSampleBuffer?, PresenterScene?, CVPixelBuffer?, UInt64, UInt64)? = locked {
+        let input: (CMSampleBuffer?, CVPixelBuffer?, PresenterScene?, CVPixelBuffer?, UInt64, UInt64)? = locked {
             queued = false
             guard generation == token, phase == .starting || phase == .running else { return nil }
-            return (latest, latestScene, systemOverlay ? nil : latestCamera, cameraRevision, cameraPrivacyEpoch)
+            return (latest, latestExternalPixels, latestScene, systemOverlay ? nil : latestCamera, cameraRevision, cameraPrivacyEpoch)
         }
-        guard let (sample, scene, camera, cameraRevision, cameraPrivacyEpoch) = input,
-              let screen = sample.flatMap(CMSampleBufferGetImageBuffer) ?? (canvasOnly ? blankCanvas() : nil) else { return }
+        guard let (sample, externalPixels, scene, camera, cameraRevision, cameraPrivacyEpoch) = input,
+              let screen = externalPixels ?? sample.flatMap(CMSampleBufferGetImageBuffer) ?? (canvasOnly ? blankCanvas() : nil) else { return }
         let size = CGSize(width: CVPixelBufferGetWidth(screen), height: CVPixelBufferGetHeight(screen))
         // A screen without app overlays already contains final, native pixels.
         // Preserve Retina text and avoid Core Image/copies in the common path.

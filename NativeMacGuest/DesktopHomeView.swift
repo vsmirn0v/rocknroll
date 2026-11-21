@@ -22,8 +22,9 @@ enum NativeDesktopSettingsSearch {
         let entries: [(NativeDesktopAssistantSettingsArea, [String])] = [
             (.attention, ["Attention", "Meeting instructions"]),
             (.voice, ["Voice", "Hold ⌥Space to talk to Assistant"]),
-            (.models, ["Models", "Provider", "API key"]),
+            (.models, ["Models", "Provider", "API key", "Realtime"]),
             (.replies, ["Replies", "Agent", "Meeting sends"]),
+            (.skills, ["Skills", "People", "Jira", "Board", "Obsidian"]),
             (.privacy, ["Memory", "Privacy", "What leaves this Mac"])
         ]
         return entries.compactMap { area, terms in
@@ -50,6 +51,7 @@ struct NativeDesktopHomeView: View {
     }
     @State private var bindingLink = ""
     @State private var bindingSeries = true
+    @State private var showMultiJoinSheet = false
     @FocusState private var editingName: Bool
     #if NATIVE_DIRECT_UPDATES
     @FocusState private var homeHeadingFocused: Bool
@@ -58,7 +60,7 @@ struct NativeDesktopHomeView: View {
     #endif
     private var blocksScheduledJoining: Bool {
         editingName || addingFavorite || editRoom != nil || library.calendar.choosingMeeting != nil ||
-        library.calendar.reminders.editing != nil || library.setup.isPresented
+        library.calendar.reminders.editing != nil || library.setup.isPresented || showMultiJoinSheet
     }
     /// Discoveries apply immediately; only rows under the pointer or behind an
     /// open editor are held, so a card cannot move as it is clicked.
@@ -267,6 +269,9 @@ struct NativeDesktopHomeView: View {
         .sheet(isPresented: Binding(get: { library.setup.isPresented }, set: { if !$0 { library.setup.finishLater() } }), onDismiss: { library.setup.presentationDidDismiss() }) {
             NativeDesktopSetupView(library: library)
         }
+        .sheet(isPresented: $showMultiJoinSheet) {
+            MultiMeetingRockJoinSheet(attention: workspace.attention, isPresented: $showMultiJoinSheet)
+        }
         .alert(alertTitle, isPresented: alertShown) {
             Button(L("OK")) { dismissAlert() }
         } message: { Text(alertMessage) }
@@ -292,6 +297,7 @@ struct NativeDesktopHomeView: View {
         ToolbarItemGroup(placement: .primaryAction) {
             if let meeting = embeddedMeeting {
                 NativeDesktopMeetingsButton(workspace: workspace, current: meeting)
+                NativeMeetingAssistantMenu(meeting: meeting, attention: workspace.attention)
                 Button { meeting.panel = meeting.panel == .participants ? nil : .participants } label: { Label(L("Participants"), systemImage: "person.2") }
                     .help(L("Participants"))
                 Button { meeting.panel = meeting.panel == .conversation ? nil : .conversation } label: { Label(L("Conversation"), systemImage: "bubble.left") }
@@ -311,6 +317,8 @@ struct NativeDesktopHomeView: View {
                 Button { workspace.toggleWindow(meeting) } label: { Label(L("Open in New Window"), systemImage: "macwindow.on.rectangle") }
                     .help(L("Open in New Window"))
             } else if workspace.selectedMeeting == nil {
+                Button { showMultiJoinSheet = true } label: { Label(L("Join with Rock…"), systemImage: "sparkles") }
+                    .help(L("Join one or more meetings with an Obsidian skill"))
                 Button { addingFavorite = true } label: { Label(L("Add favorite"), systemImage: "plus") }
                     .help(L("Save a meeting invitation"))
             }
@@ -622,6 +630,7 @@ struct NativeDesktopSettingsView: View {
             items.insert(.init(tab: 6, title: "Meeting alerts", symbol: "bell.badge", group: "Assistant", area: .attention), at: 4)
             items.append(contentsOf: [
                 .init(tab: 6, title: "Replies & actions", symbol: "text.bubble", group: "Assistant", area: .replies),
+                .init(tab: 6, title: "Skills & roles", symbol: "doc.text.magnifyingglass", group: "Assistant", area: .skills),
                 .init(tab: 6, title: "Voice & speaking", symbol: "waveform", group: "Assistant", area: .voice),
                 .init(tab: 6, title: "AI providers", symbol: "cpu", group: "Assistant", area: .models),
                 .init(tab: 6, title: "Memory & privacy", symbol: "lock.shield", group: "Assistant", area: .privacy)
