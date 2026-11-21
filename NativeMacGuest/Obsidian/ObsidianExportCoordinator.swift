@@ -17,6 +17,7 @@ import Foundation
     private var settingsWrite: Task<Void, Never>?
     private var settingsWriteGeneration = 0
     private var statusLoop: Task<Void, Never>?
+    var onDestinationChanged: (@MainActor () async -> Void)?
 
     var isEnabled: Bool { destination?.enabled == true }
     var saveAfterMeeting: Bool { destination?.saveAfterMeeting == true }
@@ -108,6 +109,7 @@ import Foundation
                 try await library.store.saveDestination(record)
                 await worker.start()
                 await refreshStatus()
+                await onDestinationChanged?()
             } catch {
                 if destination?.configRevision == record.configRevision {
                     destination = try? await library.store.destination()

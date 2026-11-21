@@ -20,7 +20,10 @@ final class AutonomousMeetingFacilitator: ObservableObject {
         var audioChunks: [Data] = []
         var transcriptBuffer = ""
         var lastTurnAllowWrites = false
+        var lastApprovedTranscriptAt: Date?
+        var lastRemoteAudioAt: Date?
         var activeSkillID: String
+        var approvedSpeakersOnly = true
         var turnTimeoutTask: Task<Void, Never>?
 
         init(activeSkillID: String) {
@@ -60,12 +63,21 @@ final class AutonomousMeetingFacilitator: ObservableObject {
         }
     }
 
+    private func resolveSkillID(explicitSkillID: String?, meetingTitle: String) -> String {
+        if let explicit = explicitSkillID.map(AssistantSkill.sanitizedSlug(from:)), !explicit.isEmpty {
+            return explicit
+        }
+        if let autoMatched = cachedSkills.first(where: {
+            $0.enabled && $0.matches(meetingTitle: meetingTitle, commandText: "")
+        })?.id {
+            return autoMatched
+        }
+        return attention?.store.selectedSkillIDs.first ?? "scrum-master"
+    }
+
     func enable(for model: NativeDesktopMeetingModel, skillID: String? = nil) {
         manuallyDisabledSessions.remove(model.sessionID)
-        let chosen = (skillID.map(AssistantSkill.sanitizedSlug(from:))).flatMap { $0.isEmpty ? nil : $0 }
-            ?? attention?.store.selectedSkillIDs.first
-            ?? cachedSkills.first(where: { $0.enabled && $0.matches(meetingTitle: model.title, commandText: "") })?.id
-            ?? "scrum-master"
+        var chosen = resolveSkillID(explicitSkillID: skillID, meetingTitle: model.title)
         activeSessionSkills[model.sessionID] = chosen
         // Skip pre-existing lines at activation time so Rock responds to new spoken instructions.
         processedLineIDsBySession[model.sessionID] = Set(model.transcript.map(\.id))
@@ -73,6 +85,11 @@ final class AutonomousMeetingFacilitator: ObservableObject {
         Task { @MainActor [weak self, weak model] in
             guard let self, let model, !model.isClosed else { return }
             await self.refreshSkillsCache()
+            if skillID == nil {
+                chosen = self.resolveSkillID(explicitSkillID: nil, meetingTitle: model.title)
+                self.activeSessionSkills[model.sessionID] = chosen
+                self.lastStatusBySession[model.sessionID] = L("Autonomous voice facilitator active (%@)", chosen)
+            }
             let skill = self.cachedSkills.first(where: { $0.id == chosen })
             await self.maybeConnectRealtime(for: model, skill: skill, skillID: chosen)
             if skill?.autoGreet == true {
@@ -228,7 +245,9 @@ final class AutonomousMeetingFacilitator: ObservableObject {
         if let rtState = realtimeSessions[model.sessionID],
            await rtState.router.isRealtimeConnected {
             rtState.lastTurnAllowWrites = allowWrites
+            rtState.lastApprovedTranscriptAt = allowWrites ? Date() : nil
             rtState.activeSkillID = skillID
+            rtState.approvedSpeakersOnly = skill?.approvedSpeakersOnly ?? true
             rtState.audioChunks.removeAll()
             rtState.transcriptBuffer = ""
             let prefixedPrompt = "[\(speakerName) (approved=\(allowWrites)) in “\(model.title)”]: \(commandText)"
@@ -385,6 +404,7 @@ final class AutonomousMeetingFacilitator: ObservableObject {
         )
 
         let state = SessionRealtimeState(activeSkillID: skillID)
+        state.approvedSpeakersOnly = skill?.approvedSpeakersOnly ?? true
         realtimeSessions[model.sessionID] = state
         let sessionID = model.sessionID
         await state.router.start(
@@ -408,11 +428,29 @@ final class AutonomousMeetingFacilitator: ObservableObject {
     private func attachAudioTap(to model: NativeDesktopMeetingModel, state: SessionRealtimeState) {
         let router = state.router
         let sessionID = model.sessionID
-        model.onRealtimeAudioPCM16 = { [weak self, weak model] _, trackID, pcm in
-            Task { @MainActor [weak self, weak model] in
+        model.onRealtimeAudioPCM16 = { [weak self, weak model, weak state] _, trackID, pcm in
+            Task { @MainActor [weak self, weak model, weak state] in
                 if trackID == MeetingTranscriber.localTrackID {
                     if model?.isVoiceReplyInFlight == true || self?.isInAudioEchoCooldown(sessionID: sessionID) == true {
                         return
+                    }
+                    if let state {
+                        let recentRemote = state.lastRemoteAudioAt.map { Date().timeIntervalSince($0) <= 3.0 } ?? false
+                        if !recentRemote {
+                            state.lastTurnAllowWrites = true
+                        }
+                    }
+                } else if let state {
+                    state.lastRemoteAudioAt = Date()
+                    if state.approvedSpeakersOnly {
+                        let recentApprovedTranscript = state.lastApprovedTranscriptAt.map {
+                            Date().timeIntervalSince($0) <= 8.0
+                        } ?? false
+                        if !recentApprovedTranscript {
+                            state.lastTurnAllowWrites = false
+                        }
+                    } else {
+                        state.lastTurnAllowWrites = true
                     }
                 }
                 _ = await router.sendAudioPCM16(pcm)

@@ -290,6 +290,13 @@ struct IOSAssistantSkillsView: View {
                             }
                         }
                         .buttonStyle(.plain)
+                        .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                            Button(role: .destructive) {
+                                try? skills.removePerson(id: person.id)
+                            } label: {
+                                Label(L("Delete"), systemImage: "trash")
+                            }
+                        }
                     }
                 }
             } header: {

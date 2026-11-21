@@ -77,6 +77,7 @@ import FoundationModels
     var onSendChat: ((UUID, String) async throws -> Void)?
     var onRequestParticipation: ((UUID, String) -> Void)?
     var llmResponderOverride: ((String) async throws -> String)?
+    var customRealtimeTransportFactory: (@Sendable () -> any RealtimeVoiceTransport)?
 
     private var auditionTask: Task<Void, Never>?
     private var holdLimitTask: Task<Void, Never>?
@@ -603,18 +604,27 @@ import FoundationModels
         ]
             .filter { !$0.isEmpty }
             .joined(separator: "\n\n")
+        let tools = IOSAutonomousMeetingFacilitator.buildToolDeclarations(
+            allowedGroups: nil,
+            includeDirectTalkTools: true
+        )
         let config = RealtimeSessionConfig(
             provider: kind,
             apiKey: apiKey,
             model: skills.realtimeModel,
             voice: skills.realtimeVoice,
             endpointOverride: skills.realtimeEndpoint,
-            systemInstructions: instructions
+            systemInstructions: instructions,
+            tools: tools
         )
         let router = RealtimeVoiceRouter()
         await router.start(
             config: config,
-            executeTool: { _, _ in "{}" },
+            customTransport: customRealtimeTransportFactory?(),
+            executeTool: { [weak self] name, argsJSON in
+                guard let self else { return "{}" }
+                return await self.executeDirectRealtimeTool(name: name, argumentsJSON: argsJSON)
+            },
             onEvent: { event in
                 await MainActor.run {
                     switch event {
@@ -673,6 +683,54 @@ import FoundationModels
             }
         }
         return true
+    }
+
+    private func executeDirectRealtimeTool(name: String, argumentsJSON: String) async -> String {
+        guard let skills else { return "{\"error\":\"Skills unavailable\"}" }
+        let targetSessionID = resolvedTargetMeetingID().flatMap { id in
+            activeMeetingsProvider().first(where: { $0.id == id })?.sessionID
+                ?? workspace?.workspaceSessionID(forControllerID: id)
+        } ?? activeMeetingsProvider().first?.sessionID
+        let snapshotNow = now()
+        return await IOSAutonomousMeetingFacilitator.executeSharedTool(
+            name: name,
+            argumentsJSON: argumentsJSON,
+            sessionID: targetSessionID,
+            allowWrites: true,
+            allowedGroups: nil,
+            skills: skills,
+            workspace: workspace,
+            board: board,
+            directTalkJoinHandler: { [weak self] query, skillID in
+                guard let self else { return "{\"error\":\"Unavailable\"}" }
+                let candidates = self.joinableTargets(snapshotNow)
+                let needle = query.trimmingCharacters(in: .whitespacesAndNewlines)
+                    .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil)
+                let candidate: JoinableMeetingCandidate?
+                if needle.isEmpty {
+                    candidate = CurrentMeetingTargetResolver.bestCurrentMeeting(from: candidates, now: snapshotNow)
+                } else {
+                    candidate = candidates.first(where: {
+                        $0.title.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil).contains(needle)
+                    }) ?? CurrentMeetingTargetResolver.bestCurrentMeeting(from: candidates, now: snapshotNow)
+                }
+                guard let candidate else {
+                    return "{\"joined\":false,\"error\":\"No matching meeting found\"}"
+                }
+                if let skillID, !skillID.isEmpty {
+                    self.facilitator?.queuePendingSkill(skillID, title: candidate.title, invitation: candidate.invitation)
+                }
+                let ok = self.onJoinCandidate?(candidate) ?? false
+                return IOSAutonomousMeetingFacilitator.jsonString([
+                    "joined": ok,
+                    "title": candidate.title,
+                    "skill_id": skillID ?? ""
+                ])
+            },
+            joinableTargetsProvider: { [weak self] in
+                self?.joinableTargets(snapshotNow) ?? []
+            }
+        )
     }
 
     private func answerWithWorkspaceOrAI(_ query: String) async -> String {

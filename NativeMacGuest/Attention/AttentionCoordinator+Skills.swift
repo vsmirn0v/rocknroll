@@ -178,6 +178,9 @@ extension AttentionCoordinator {
         }
         watcher.start()
         skillFolderWatcher = watcher
+        await refreshCachedPrompts()
+        facilitator?.invalidateSkillCache()
+        objectWillChange.send()
     }
 
     func stopSkillFolderWatcher() {

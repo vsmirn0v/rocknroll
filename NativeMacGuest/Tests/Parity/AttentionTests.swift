@@ -2342,6 +2342,24 @@ import XCTest
             "Quit before load does not replace assistant.json with an empty document")
     }
 
+    func testAutonomousFacilitatorPrefersMeetingTitleMatchedSkillOverDefaultSelection() async throws {
+        let testStore = store()
+        testStore.selectedSkillIDs = ["scrum-master"]
+        let coordinator = AttentionCoordinator(store: testStore)
+        defer { coordinator.stop() }
+        let facilitator = try XCTUnwrap(coordinator.facilitator)
+
+        let (retroMeeting, _) = try await meeting("Sprint Retro")
+        facilitator.enable(for: retroMeeting, skillID: nil)
+        try await spin {
+            facilitator.activeSessionSkills[retroMeeting.sessionID] == "retro-and-planning"
+        }
+
+        // Explicit override still takes precedence over auto-matching
+        facilitator.enable(for: retroMeeting, skillID: "task-manager")
+        XCTAssertEqual(facilitator.activeSessionSkills[retroMeeting.sessionID], "task-manager")
+    }
+
     private func spin(_ predicate: () -> Bool) async throws {
         for _ in 0..<200 where !predicate() { try await Task.sleep(for: .milliseconds(10)) }
         XCTAssertTrue(predicate())

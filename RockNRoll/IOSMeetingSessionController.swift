@@ -117,8 +117,9 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
     private var providerTranscriptActive = false
     private var providerCanManageTranscript = false
     private var didAutoStartLocalTranscription = false
-    private var assistantStartedLocalTranscription = false
+    private var assistantTranscriptionConsumers: Set<String> = []
     private var voiceReplyTask: Task<Void, Error>?
+    var isVoiceReplyInFlight: Bool { voiceReplyTask != nil }
     private var assistantHUDContext: (talk: IOSAssistantTalkController, speech: IOSAssistantSpeechCoordinator)?
     private var micActiveStart: Date?
     private var micActiveIntervals: [DateInterval] = []
@@ -918,7 +919,6 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
                     didAutoStartLocalTranscription = true
                     Task { @MainActor [weak self] in
                         guard let self, self.phase == .connected, !self.leaving else { return }
-                        self.assistantStartedLocalTranscription = false
                         _ = await self.localTranscriber.start()
                         self.refreshLocalAudioSink()
                         self.syncCatchUpTranscript()
@@ -1112,12 +1112,13 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
             guard let self else { return }
             Task { @MainActor [weak self] in
                 guard let self, !self.leaving else { return }
-                self.assistantStartedLocalTranscription = false
                 if enabled {
+                    self.assistantTranscriptionConsumers.insert("user")
                     _ = await self.localTranscriber.start()
                     self.refreshLocalAudioSink()
                     self.syncCatchUpTranscript()
                 } else {
+                    self.assistantTranscriptionConsumers.removeAll()
                     let wasLocalRunning = self.localTranscriber.state.isRunning
                     await self.localTranscriber.stop()
                     self.refreshLocalAudioSink()
@@ -1241,21 +1242,36 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
     }
 
     func ensureTranscriptionRunningForAssistant() async {
+        await ensureTranscriptionRunning(consumer: "assistant")
+    }
+
+    func releaseAssistantTranscription() async {
+        await releaseTranscription(consumer: "assistant")
+    }
+
+    func ensureTranscriptionRunning(consumer: String) async {
         guard !leaving, phase == .connected else { return }
-        guard !(providerTranscriptActive && providerCanViewTranscript == true),
+        assistantTranscriptionConsumers.insert(consumer)
+        let needsRawAudioTap = consumer == "facilitator"
+        guard needsRawAudioTap || !(providerTranscriptActive && providerCanViewTranscript == true),
               !localTranscriber.state.isRunning else { return }
-        assistantStartedLocalTranscription = true
         _ = await localTranscriber.start()
         refreshLocalAudioSink()
         syncCatchUpTranscript()
     }
 
-    func releaseAssistantTranscription() async {
-        guard assistantStartedLocalTranscription, !leaving else { return }
-        assistantStartedLocalTranscription = false
-        await localTranscriber.stop()
-        refreshLocalAudioSink()
-        syncCatchUpTranscript()
+    func releaseTranscription(consumer: String) async {
+        assistantTranscriptionConsumers.remove(consumer)
+        guard assistantTranscriptionConsumers.isEmpty, !didAutoStartLocalTranscription, !leaving else { return }
+        if localTranscriber.state.isRunning {
+            await localTranscriber.stop()
+            refreshLocalAudioSink()
+            syncCatchUpTranscript()
+        }
+    }
+
+    func setRealtimeAudioTap(_ handler: (@Sendable (String, Data) -> Void)?) {
+        localTranscriber.setPCM16AudioHandler(handler)
     }
 
     func sendAssistantChat(_ text: String) async throws {

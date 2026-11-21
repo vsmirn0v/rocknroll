@@ -122,8 +122,13 @@ private final class AudioIngressRouter: @unchecked Sendable {
     private var timeline = IOSSpeakingTimeline()
 
     var onText: (@Sendable (String, String?, String, Bool, Date) -> Void)?
+    private var onPCM16Audio: (@Sendable (String, Data) -> Void)?
 
     init() {}
+
+    func setPCM16AudioHandler(_ handler: (@Sendable (String, Data) -> Void)?) {
+        lock.withLock { onPCM16Audio = handler }
+    }
 
     func updateMetadata(
         running: Bool,
@@ -244,7 +249,16 @@ private final class AudioIngressRouter: @unchecked Sendable {
                 backend: backend,
                 language: language,
                 gigaam: gigaam,
-                workerQueue: workerQueue
+                workerQueue: workerQueue,
+                onSamples16k: { [weak self] stream, samples in
+                    guard let self else { return }
+                    guard let handler = self.lock.withLock({ self.onPCM16Audio }),
+                          !samples.isEmpty else { return }
+                    let pcmData = RealtimeVoiceAudio.floatSamplesToPCM16Data(samples)
+                    if !pcmData.isEmpty {
+                        handler(stream, pcmData)
+                    }
+                }
             ) { [weak self] stream, speaker, text, isFinal, spokenAt in
                 guard let self else { return }
                 let resolvedSpeaker = speaker ?? self.timeline.speaker(near: spokenAt)
@@ -316,6 +330,10 @@ final class IOSMeetingTranscriber: ObservableObject {
                 )
             }
         }
+    }
+
+    func setPCM16AudioHandler(_ handler: (@Sendable (String, Data) -> Void)?) {
+        router.setPCM16AudioHandler(handler)
     }
 
     func updateRemoteSources(_ sources: [MeetingAudioSource]) {
@@ -400,6 +418,7 @@ final class IOSMeetingTranscriber: ObservableObject {
 
     func reset() async {
         await stop()
+        router.setPCM16AudioHandler(nil)
         router.stopAll(resetTimeline: true)
         finalizedSegments.removeAll()
         activeUtteranceByStream.removeAll()
@@ -568,6 +587,7 @@ private final class SpeakerPipeline {
     private let language: IOSTranscriptionLanguage
     private let gigaam: CoreMLGigaAMRecognizer?
     private let workerQueue: DispatchQueue
+    private let onSamples16k: (@Sendable (String, [Float]) -> Void)?
     private let onText: (String, String?, String, Bool, Date) -> Void
 
     private let converter = IOSPCM16kConverter()
@@ -592,6 +612,7 @@ private final class SpeakerPipeline {
         language: IOSTranscriptionLanguage,
         gigaam: CoreMLGigaAMRecognizer?,
         workerQueue: DispatchQueue,
+        onSamples16k: (@Sendable (String, [Float]) -> Void)? = nil,
         onText: @escaping (String, String?, String, Bool, Date) -> Void
     ) {
         self.streamID = streamID
@@ -600,6 +621,7 @@ private final class SpeakerPipeline {
         self.language = language
         self.gigaam = gigaam
         self.workerQueue = workerQueue
+        self.onSamples16k = onSamples16k
         self.onText = onText
         if backend == .appleSpeech {
             let recognizer = SFSpeechRecognizer(locale: language.locale)
@@ -619,6 +641,7 @@ private final class SpeakerPipeline {
         guard !stopped else { return }
         let samples = converter.convert(buffer)
         guard !samples.isEmpty else { return }
+        onSamples16k?(streamID, samples)
 
         if backend == .appleSpeech {
             processAppleSpeech(samples16k: samples, originalBuffer: buffer)

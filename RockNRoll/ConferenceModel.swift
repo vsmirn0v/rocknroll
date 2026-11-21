@@ -901,6 +901,18 @@ final class ConferenceModel: ObservableObject {
             releaseTranscription: { [weak controller] in
                 await controller?.releaseAssistantTranscription()
             },
+            ensureFacilitatorTranscription: { [weak controller] in
+                await controller?.ensureTranscriptionRunning(consumer: "facilitator")
+            },
+            releaseFacilitatorTranscription: { [weak controller] in
+                await controller?.releaseTranscription(consumer: "facilitator")
+            },
+            isVoiceReplyInFlight: { [weak controller] in
+                controller?.isVoiceReplyInFlight ?? false
+            },
+            setRealtimeAudioTap: { [weak controller] handler in
+                controller?.setRealtimeAudioTap(handler)
+            },
             sendChat: { [weak controller] text in
                 guard let controller else { throw MeetingSessionError.notConnected }
                 try await controller.sendAssistantChat(text)
@@ -1553,6 +1565,7 @@ final class ConferenceModel: ObservableObject {
         }
         syncSwitcherItems()
         workspace.updateSessionTitle(cleanTitle, controllerID: controller.id)
+        assistantFacilitator.sessionTitleUpdated(controllerID: controller.id, title: cleanTitle)
         continuation.updateCurrent(continuationSnapshot())
         updateContinuationActivity()
     }
@@ -1644,6 +1657,7 @@ final class ConferenceModel: ObservableObject {
             syncSwitcherItems()
             assistant.activePresentationChanged(foregroundControllerID: isCallMinimized ? nil : foregroundSessionID)
             assistant.refreshMode(for: id, ensureTranscription: true)
+            assistantFacilitator.sessionConnected(controllerID: id)
             refreshReminders()
             objectWillChange.send()
 
@@ -1653,6 +1667,7 @@ final class ConferenceModel: ObservableObject {
             }
             workspace.finishSession(controllerID: id, endedAt: Date())
             assistant.sessionEnded(controllerID: id)
+            assistantFacilitator.sessionEnded(controllerID: id)
             recordDisconnect(for: id)
             if broadcastOwnerSessionID == id {
                 broadcastOwnerSessionID = nil

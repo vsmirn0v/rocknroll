@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#endif
 import XCTest
 @testable import ConferenceCore
 
@@ -301,5 +304,120 @@ final class AssistantSkillsAndPeopleTests: XCTestCase {
         let comments = await connector.storage.comments
         XCTAssertEqual(comments.first?.key, "ENG-42")
         XCTAssertEqual(comments.first?.comment, "Pushed fix to staging.")
+    }
+
+    func testSkillFolderWatcherDetectsInPlaceNonAtomicFileEditsAndNewFiles() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("skill-watcher-inplace-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let repo = AssistantSkillRepository(rootURL: dir)
+        try repo.ensureDefaultsInstalled()
+
+        final class WatcherState: @unchecked Sendable {
+            private let lock = NSLock()
+            var fireCount = 0
+            var fulfillStage = 0
+            func setStage(_ next: Int) {
+                lock.lock(); fulfillStage = next; lock.unlock()
+            }
+            func handleFire() -> Int {
+                lock.lock()
+                defer { lock.unlock() }
+                fireCount += 1
+                let current = fulfillStage
+                if current == 1 || current == 3 || current == 5 {
+                    fulfillStage = current + 1
+                }
+                return current
+            }
+            func count() -> Int {
+                lock.lock(); defer { lock.unlock() }
+                return fireCount
+            }
+        }
+        let state = WatcherState()
+        let firstEditExp = expectation(description: "existing file in-place edit fires")
+        let newFileExp = expectation(description: "new file creation fires")
+        let secondEditExp = expectation(description: "newly created file in-place edit fires")
+
+        let watcher = AssistantSkillFolderWatcher(rootURL: dir, debounceInterval: 0.08) {
+            let stage = state.handleFire()
+            if stage == 1 {
+                firstEditExp.fulfill()
+            } else if stage == 3 {
+                newFileExp.fulfill()
+            } else if stage == 5 {
+                secondEditExp.fulfill()
+            }
+        }
+        watcher.start()
+        defer { watcher.stop() }
+
+        func writeInPlace(_ url: URL, text: String) throws {
+            let data = Data(text.utf8)
+            let fd = Darwin.open(url.path, O_WRONLY | O_TRUNC)
+            XCTAssertGreaterThanOrEqual(fd, 0)
+            defer { Darwin.close(fd) }
+            data.withUnsafeBytes { raw in
+                if let base = raw.baseAddress {
+                    _ = Darwin.write(fd, base, raw.count)
+                }
+            }
+        }
+
+        // 1. Modify an existing file in place (same inode, no directory entry rename)
+        state.setStage(1)
+        let scrumURL = dir.appendingPathComponent("Skills/scrum-master.md")
+        let existing = try String(contentsOf: scrumURL, encoding: .utf8)
+        try writeInPlace(scrumURL, text: existing + "\n- Keep updates crisp.\n")
+        wait(for: [firstEditExp], timeout: 3.0)
+
+        // 2. Create a brand new skill file (triggers directory watch & rebuildSourcesLocked)
+        state.setStage(3)
+        let releaseSkill = AssistantSkill(
+            id: "release-captain",
+            name: "Release Captain",
+            role: "Coordinate release trains",
+            instructions: "Track blockers before cut."
+        )
+        _ = try repo.saveSkill(releaseSkill)
+        wait(for: [newFileExp], timeout: 3.0)
+
+        // 3. Edit the newly created file in place (verifies rebuildSourcesLocked watched its FD)
+        state.setStage(5)
+        let releaseURL = dir.appendingPathComponent("Skills/release-captain.md")
+        let releaseText = try String(contentsOf: releaseURL, encoding: .utf8)
+        try writeInPlace(releaseURL, text: releaseText + "\n- Freeze branch at 18:00.\n")
+        wait(for: [secondEditExp], timeout: 3.0)
+
+        XCTAssertGreaterThanOrEqual(state.count(), 3)
+    }
+
+    func testRemovePersonAndFloatPCM16RoundTrip() throws {
+        let root = try makeTempDir()
+        let repo = AssistantSkillRepository(rootURL: root)
+        try repo.ensureDefaultsInstalled()
+
+        let entry = AssistantPersonEntry(
+            id: "sasha-1",
+            displayName: "Sasha",
+            jiraUsername: "sasha",
+            approvedVoiceCommander: true
+        )
+        _ = try repo.upsertPerson(entry)
+        XCTAssertEqual(repo.loadPeople().entries.count, 1)
+
+        let afterRemoval = try repo.removePerson(id: "sasha-1")
+        XCTAssertTrue(afterRemoval.entries.isEmpty)
+        XCTAssertTrue(repo.loadPeople().entries.isEmpty)
+
+        XCTAssertTrue(RealtimeVoiceAudio.floatSamplesToPCM16Data([]).isEmpty)
+        let samples: [Float] = [0.0, 0.5, -0.5, 1.0, -1.0]
+        let pcm = RealtimeVoiceAudio.floatSamplesToPCM16Data(samples)
+        XCTAssertEqual(pcm.count, samples.count * MemoryLayout<Int16>.size)
+        let buffer = try XCTUnwrap(RealtimeVoiceAudio.pcm16ToAudioBuffer(data: pcm, sampleRate: 16_000))
+        XCTAssertEqual(Int(buffer.frameLength), samples.count)
+        XCTAssertEqual(buffer.format.sampleRate, 16_000, accuracy: 0.1)
     }
 }

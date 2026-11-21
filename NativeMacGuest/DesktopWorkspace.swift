@@ -44,7 +44,13 @@ import UserNotifications
     /// The local MCP server that lets AI clients work with meetings; set once it starts.
     var mcpService: NativeDesktopMCPService?
     /// Obsidian one-way export coordinator, created with the meeting library.
-    lazy var obsidian = ObsidianExportCoordinator(library: attention.store.meetingLibrary, archive: transcriptArchive)
+    lazy var obsidian: ObsidianExportCoordinator = {
+        let coord = ObsidianExportCoordinator(library: attention.store.meetingLibrary, archive: transcriptArchive)
+        coord.onDestinationChanged = { [weak self] in
+            await self?.attention.startSkillFolderWatcher()
+        }
+        return coord
+    }()
     private lazy var transcriptArchive = TranscriptArchiveStore()
     /// CloudKit workspace, transcript, task, context-settings and calendar schedule sync coordinator.
     lazy var workspaceSync = MacWorkspaceSyncCoordinator(

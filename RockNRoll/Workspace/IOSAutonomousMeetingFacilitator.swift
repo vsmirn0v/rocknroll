@@ -2,10 +2,14 @@ import AVFoundation
 import ConferenceCore
 import Foundation
 import MeetingEngine
+#if canImport(FoundationModels)
+import FoundationModels
+#endif
 
 /// Runs autonomous in-meeting voice facilitation on iOS using Obsidian-backed skills,
 /// `People.md` speaker approval (owner is always approved), optional `OpenAI Realtime` /
-/// `Gemini Live` WebSocket acceleration, and local STT -> LLM -> TTS fallback.
+/// `Gemini Live` WebSocket acceleration with live PCM16 audio streaming, and local
+/// STT -> LLM (with function calling / Apple FoundationModels) -> TTS fallback.
 @MainActor
 final class IOSAutonomousMeetingFacilitator: ObservableObject {
     @Published private(set) var activeSessionSkills: [UUID: String] = [:]
@@ -14,13 +18,19 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
     @Published private(set) var lastSpokenAnswerBySession: [UUID: String] = [:]
     @Published private(set) var realtimeActive = false
 
+    var customRealtimeTransportFactory: (@Sendable () -> any RealtimeVoiceTransport)?
+    var llmURLSession: URLSession = .shared
+
     private final class SessionRealtimeState {
         let router = RealtimeVoiceRouter()
         var connected = false
         var audioChunks: [Data] = []
         var transcriptBuffer = ""
         var lastTurnAllowWrites = false
+        var lastApprovedTranscriptAt: Date?
+        var lastRemoteAudioAt: Date?
         var activeSkillID: String
+        var approvedSpeakersOnly = true
         var turnTimeoutTask: Task<Void, Never>?
 
         init(activeSkillID: String) {
@@ -64,20 +74,33 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
         }
     }
 
+    private func resolveSkillID(explicitSkillID: String?, meetingTitle: String) -> String {
+        if let explicit = explicitSkillID.map(AssistantSkill.sanitizedSlug(from:)), !explicit.isEmpty {
+            return explicit
+        }
+        if let autoMatched = skills?.skills.first(where: {
+            $0.enabled && $0.matches(meetingTitle: meetingTitle, commandText: "")
+        })?.id {
+            return autoMatched
+        }
+        return skills?.selectedSkillIDs.first ?? "scrum-master"
+    }
+
     func enable(controllerID: UUID, title: String, skillID: String? = nil) {
         manuallyDisabledSessions.remove(controllerID)
-        let candidateSlug = skillID.map(AssistantSkill.sanitizedSlug(from:)).flatMap { $0.isEmpty ? nil : $0 }
-        let autoMatched = skills?.skills.first(where: {
-            $0.enabled && $0.matches(meetingTitle: title, commandText: "")
-        })?.id
-        let chosen = candidateSlug ?? skills?.selectedSkillIDs.first ?? autoMatched ?? "scrum-master"
+        let chosen = resolveSkillID(explicitSkillID: skillID, meetingTitle: title)
         activeSessionSkills[controllerID] = chosen
         seenEventIDsBySession[controllerID] = Set((recentEventsBySession[controllerID] ?? []).map(\.id))
         lastStatusBySession[controllerID] = L("Autonomous voice facilitator active (%@)", chosen)
         let skill = skills?.skills.first(where: { $0.id == chosen })
         Task { @MainActor [weak self] in
             guard let self else { return }
+            await self.resolveBridge(controllerID)?.ensureFacilitatorTranscription()
+            guard !self.manuallyDisabledSessions.contains(controllerID),
+                  self.activeSessionSkills[controllerID] == chosen else { return }
             await self.maybeConnectRealtime(controllerID: controllerID, title: title, skill: skill, skillID: chosen)
+            guard !self.manuallyDisabledSessions.contains(controllerID),
+                  self.activeSessionSkills[controllerID] == chosen else { return }
             if skill?.autoGreet == true {
                 await self.kickOffSkill(controllerID: controllerID, title: title, skillID: chosen)
             }
@@ -93,6 +116,49 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
         lastSpokeAtBySession.removeValue(forKey: controllerID)
         lastVoiceDeliveryEndedAtBySession.removeValue(forKey: controllerID)
         busySessions.remove(controllerID)
+        resolveBridge(controllerID)?.setRealtimeAudioTap(nil)
+        if let state = realtimeSessions.removeValue(forKey: controllerID) {
+            state.turnTimeoutTask?.cancel()
+            Task { await state.router.stop() }
+        }
+        syncRealtimeActiveFlag()
+        Task { @MainActor [weak self] in
+            await self?.resolveBridge(controllerID)?.releaseFacilitatorTranscription()
+        }
+    }
+
+    /// Attaches any queued skill or matching voice-activated skill immediately on call connect.
+    func sessionConnected(controllerID: UUID) {
+        guard let bridge = resolveBridge(controllerID) else { return }
+        attachPendingSkillIfNeeded(
+            controllerID: controllerID,
+            title: bridge.title,
+            roomURLString: bridge.roomKey
+        )
+    }
+
+    /// Re-evaluates queued/title-matched skills when a room reports a real title after connect.
+    func sessionTitleUpdated(controllerID: UUID, title: String) {
+        let roomKey = resolveBridge(controllerID)?.roomKey ?? ""
+        attachPendingSkillIfNeeded(
+            controllerID: controllerID,
+            title: title,
+            roomURLString: roomKey
+        )
+    }
+
+    /// Cleans up per-session buffers and Realtime WebSockets when a meeting ends.
+    func sessionEnded(controllerID: UUID) {
+        manuallyDisabledSessions.remove(controllerID)
+        activeSessionSkills.removeValue(forKey: controllerID)
+        seenEventIDsBySession.removeValue(forKey: controllerID)
+        recentEventsBySession.removeValue(forKey: controllerID)
+        lastStatusBySession.removeValue(forKey: controllerID)
+        lastSpokeAtBySession.removeValue(forKey: controllerID)
+        lastSpokenAnswerBySession.removeValue(forKey: controllerID)
+        lastVoiceDeliveryEndedAtBySession.removeValue(forKey: controllerID)
+        busySessions.remove(controllerID)
+        resolveBridge(controllerID)?.setRealtimeAudioTap(nil)
         if let state = realtimeSessions.removeValue(forKey: controllerID) {
             state.turnTimeoutTask?.cancel()
             Task { await state.router.stop() }
@@ -122,20 +188,11 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
         events: [SyncedTranscriptEvent],
         localNames: [String]
     ) {
-        if activeSessionSkills[controllerID] == nil {
-            let urlKey = invitationURL?.absoluteString.lowercased() ?? ""
-            let titleKey = title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            if let queued = pendingSkillByTitleOrURL.removeValue(forKey: urlKey)
-                ?? pendingSkillByTitleOrURL.removeValue(forKey: titleKey) {
-                enable(controllerID: controllerID, title: title, skillID: queued)
-            } else if skills?.autonomousMeetingVoiceEnabled == true,
-                      !manuallyDisabledSessions.contains(controllerID),
-                      let matched = skills?.skills.first(where: {
-                          $0.enabled && $0.voiceActivation && $0.matches(meetingTitle: title, commandText: "")
-                      }) {
-                enable(controllerID: controllerID, title: title, skillID: matched.id)
-            }
-        }
+        attachPendingSkillIfNeeded(
+            controllerID: controllerID,
+            title: title,
+            roomURLString: invitationURL?.absoluteString ?? ""
+        )
 
         recentEventsBySession[controllerID] = Array(events.suffix(30))
         guard let skillID = activeSessionSkills[controllerID],
@@ -197,6 +254,26 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
         }
     }
 
+    private func attachPendingSkillIfNeeded(
+        controllerID: UUID,
+        title: String,
+        roomURLString: String
+    ) {
+        guard activeSessionSkills[controllerID] == nil else { return }
+        let urlKey = roomURLString.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let titleKey = title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if let queued = (!urlKey.isEmpty ? pendingSkillByTitleOrURL.removeValue(forKey: urlKey) : nil)
+            ?? (!titleKey.isEmpty ? pendingSkillByTitleOrURL.removeValue(forKey: titleKey) : nil) {
+            enable(controllerID: controllerID, title: title, skillID: queued)
+        } else if skills?.autonomousMeetingVoiceEnabled == true,
+                  !manuallyDisabledSessions.contains(controllerID),
+                  let matched = skills?.skills.first(where: {
+                      $0.enabled && $0.voiceActivation && $0.matches(meetingTitle: title, commandText: "")
+                  }) {
+            enable(controllerID: controllerID, title: title, skillID: matched.id)
+        }
+    }
+
     // MARK: - Authorization & Execution
 
     func isSpeakerAuthorized(
@@ -241,7 +318,9 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
         if let rtState = realtimeSessions[controllerID],
            await rtState.router.isRealtimeConnected {
             rtState.lastTurnAllowWrites = allowWrites
+            rtState.lastApprovedTranscriptAt = allowWrites ? Date() : nil
             rtState.activeSkillID = skillID
+            rtState.approvedSpeakersOnly = skill?.approvedSpeakersOnly ?? true
             rtState.audioChunks.removeAll()
             rtState.transcriptBuffer = ""
             let prefixedPrompt = "[\(speakerName) (approved=\(allowWrites)) in “\(title)”]: \(commandText)"
@@ -275,7 +354,7 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
         }
     }
 
-    private func executeStandardTurn(
+    func executeStandardTurn(
         controllerID: UUID,
         title: String,
         skillID: String,
@@ -290,6 +369,7 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
             meetingTitle: title,
             commandText: commandText
         )
+        let skillToolSet = rendered.selectedSkills.first.map { Set($0.tools) }
         let allowedGroups = Set(rendered.selectedSkills.flatMap(\.tools))
         let resolvedSessionID = workspace.workspaceSessionID(forControllerID: controllerID)
 
@@ -333,7 +413,7 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
 
         Keep spoken replies crisp (1–3 sentences) in the meeting language so they sound natural over voice.
         Speaker: \(speakerName) (authorized_for_writes=\(allowWrites)).
-        Never claim to have modified external tasks unless explicitly confirmed above.
+        Never claim to have modified external tasks, summaries, calendar events, or People.md unless confirmed by a tool call result.
         """
         let usr = """
         Meeting: \(title)
@@ -346,12 +426,27 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
         Request: \(commandText)
         """
 
+        let toolDeclarations = Self.buildToolDeclarations(allowedGroups: skillToolSet)
         if let config = try? workspace.permittedAIConfiguration(),
-           let answer = await Self.callLLM(
+           let answer = await callLLMWithTools(
             systemPrompt: sys,
             userPrompt: usr,
             configuration: config,
-            apiKey: workspace.readAPIKey(for: config.providerKind)
+            apiKey: workspace.readAPIKey(for: config.providerKind),
+            tools: toolDeclarations,
+            toolExecutor: { [weak self] name, argsJSON in
+                guard let self else { return "{}" }
+                return await Self.executeSharedTool(
+                    name: name,
+                    argumentsJSON: argsJSON,
+                    sessionID: resolvedSessionID,
+                    allowWrites: allowWrites,
+                    allowedGroups: skillToolSet,
+                    skills: skills,
+                    workspace: self.workspace,
+                    board: self.board
+                )
+            }
            ),
            !answer.isEmpty {
             return answer
@@ -389,7 +484,7 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
         let instructions = [rendered.basePersona, rendered.instructions]
             .filter { !$0.isEmpty }
             .joined(separator: "\n\n")
-        let tools = Self.buildRealtimeToolDeclarations(allowedGroups: skill.map { Set($0.tools) })
+        let tools = Self.buildToolDeclarations(allowedGroups: skill.map { Set($0.tools) })
         let config = RealtimeSessionConfig(
             provider: kind,
             apiKey: apiKey,
@@ -401,9 +496,11 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
         )
 
         let state = SessionRealtimeState(activeSkillID: skillID)
+        state.approvedSpeakersOnly = skill?.approvedSpeakersOnly ?? true
         realtimeSessions[controllerID] = state
         await state.router.start(
             config: config,
+            customTransport: customRealtimeTransportFactory?(),
             executeTool: { [weak self] name, argsJSON in
                 guard let self else { return "{}" }
                 return await self.executeRealtimeTool(controllerID: controllerID, name: name, argumentsJSON: argsJSON)
@@ -414,29 +511,106 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
             }
         )
         state.connected = await state.router.isRealtimeConnected
+        if state.connected {
+            attachAudioTap(controllerID: controllerID, state: state)
+        }
         syncRealtimeActiveFlag()
     }
 
+    private func attachAudioTap(controllerID: UUID, state: SessionRealtimeState) {
+        let router = state.router
+        resolveBridge(controllerID)?.setRealtimeAudioTap { [weak self, weak state] streamID, pcm in
+            Task { @MainActor [weak self, weak state] in
+                guard let self else { return }
+                if streamID == "local" {
+                    if self.resolveBridge(controllerID)?.isVoiceReplyInFlight() == true
+                        || self.isInAudioEchoCooldown(controllerID: controllerID) {
+                        return
+                    }
+                    if let state {
+                        let recentRemote = state.lastRemoteAudioAt.map { Date().timeIntervalSince($0) <= 3.0 } ?? false
+                        if !recentRemote {
+                            state.lastTurnAllowWrites = true
+                        }
+                    }
+                } else if let state {
+                    state.lastRemoteAudioAt = Date()
+                    if state.approvedSpeakersOnly {
+                        let recentApprovedTranscript = state.lastApprovedTranscriptAt.map {
+                            Date().timeIntervalSince($0) <= 8.0
+                        } ?? false
+                        if !recentApprovedTranscript {
+                            state.lastTurnAllowWrites = false
+                        }
+                    } else {
+                        state.lastTurnAllowWrites = true
+                    }
+                }
+                _ = await router.sendAudioPCM16(pcm)
+            }
+        }
+    }
+
+    private func isInAudioEchoCooldown(controllerID: UUID) -> Bool {
+        guard let ended = lastVoiceDeliveryEndedAtBySession[controllerID] else { return false }
+        return Date().timeIntervalSince(ended) < 1.5
+    }
+
     private func executeRealtimeTool(controllerID: UUID, name: String, argumentsJSON: String) async -> String {
-        guard let skills, let workspace else { return "{\"error\":\"Workspace unavailable\"}" }
+        guard let skills else { return "{\"error\":\"Workspace unavailable\"}" }
         guard let state = realtimeSessions[controllerID] else { return "{\"error\":\"Session closed\"}" }
-        let allowWrites = state.lastTurnAllowWrites
         let skill = skills.skills.first(where: { $0.id == state.activeSkillID })
         let allowedGroups = skill.map { Set($0.tools) }
+        let sid = workspace?.workspaceSessionID(forControllerID: controllerID)
+        return await Self.executeSharedTool(
+            name: name,
+            argumentsJSON: argumentsJSON,
+            sessionID: sid,
+            allowWrites: state.lastTurnAllowWrites,
+            allowedGroups: allowedGroups,
+            skills: skills,
+            workspace: workspace,
+            board: board
+        )
+    }
+
+    static func executeSharedTool(
+        name: String,
+        argumentsJSON: String,
+        sessionID: UUID?,
+        allowWrites: Bool,
+        allowedGroups: Set<AssistantSkillToolGroup>?,
+        skills: IOSAssistantSkillsController,
+        workspace: IOSWorkspaceCoordinator?,
+        board: IOSAssistantBoardController?,
+        directTalkJoinHandler: ((String, String?) async -> String)? = nil,
+        joinableTargetsProvider: (() -> [JoinableMeetingCandidate])? = nil
+    ) async -> String {
         func allows(_ group: AssistantSkillToolGroup) -> Bool {
             allowedGroups?.contains(group) ?? true
         }
 
         let args = (try? JSONSerialization.jsonObject(with: Data(argumentsJSON.utf8)) as? [String: Any]) ?? [:]
-        let sid = workspace.workspaceSessionID(forControllerID: controllerID)
 
         switch name {
         case "rocknroll_search_knowledge":
             let q = (args["query"] as? String) ?? ""
-            let hits = skills.searchKnowledge(query: q, limit: (args["limit"] as? Int) ?? 8).map {
-                ["title": $0.title, "path": $0.relativePath, "excerpt": $0.excerpt]
+            let limit = (args["limit"] as? Int) ?? 8
+            var items = skills.searchKnowledge(query: q, limit: limit).map {
+                ["source": "obsidian", "title": $0.title, "path": $0.relativePath, "excerpt": $0.excerpt]
             }
-            return Self.jsonString(["items": hits])
+            if let workspace, items.count < limit {
+                let hits = await workspace.search(query: q)
+                for hit in hits.prefix(max(0, limit - items.count)) {
+                    items.append([
+                        "source": "meeting",
+                        "title": hit.title,
+                        "path": hit.startedAt.formatted(date: .abbreviated, time: .shortened),
+                        "excerpt": hit.snippet
+                    ])
+                }
+            }
+            return jsonString(["items": items])
 
         case "rocknroll_manage_people":
             let op = (args["operation"] as? String) ?? "lookup"
@@ -457,13 +631,31 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
                     notes: args["notes"] as? String
                 )
                 let updated = try? skills.upsertPerson(entry)
-                return Self.jsonString(["saved": updated != nil, "display_name": display])
+                return jsonString(["saved": updated != nil, "display_name": display])
+            } else if op == "remove" {
+                guard allowWrites else { return "{\"error\":\"Approved speaker required\"}" }
+                let id = (args["id"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+                let targetName = (args["display_name"] as? String) ?? (args["query"] as? String) ?? ""
+                let personID = id ?? skills.people.resolvePerson(matching: targetName)?.id
+                guard let personID, !personID.isEmpty else {
+                    return "{\"error\":\"Person not found\"}"
+                }
+                let updated = try? skills.removePerson(id: personID)
+                return jsonString(["removed": updated != nil, "id": personID])
             }
             let q = ((args["query"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             let matches: [AssistantPersonEntry] = q.isEmpty
                 ? skills.people.entries
                 : (skills.people.resolvePerson(matching: q).map { [$0] } ?? [])
-            return Self.jsonString(["items": matches.map { ["display_name": $0.displayName, "jira_username": $0.jiraUsername ?? "", "approved": $0.approvedVoiceCommander] }])
+            return jsonString(["items": matches.map {
+                [
+                    "id": $0.id,
+                    "display_name": $0.displayName,
+                    "jira_username": $0.jiraUsername ?? "",
+                    "jira_account_id": $0.jiraAccountID ?? "",
+                    "approved": $0.approvedVoiceCommander
+                ] as [String: Any]
+            }])
 
         case "rocknroll_create_task":
             guard allowWrites && (allows(.tasks) || allows(.jira)) else { return "{\"error\":\"Task creation not allowed\"}" }
@@ -471,24 +663,64 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
                 return "{\"error\":\"title required\"}"
             }
             let created = await skills.createTaskWithPeopleResolution(
-                sessionID: sid,
+                sessionID: sessionID,
                 title: title,
                 owner: args["owner"] as? String,
                 dueDay: args["due_day"] as? String,
                 syncToJira: (args["sync_to_jira"] as? Bool) ?? false
             )
-            return Self.jsonString(["created": created != nil, "title": created?.resolvedTitle ?? title, "owner": created?.resolvedOwner ?? ""])
+            return jsonString([
+                "created": created != nil,
+                "title": created?.resolvedTitle ?? title,
+                "owner": created?.resolvedOwner ?? ""
+            ])
+
+        case "rocknroll_update_task":
+            guard allowWrites && (allows(.tasks) || allows(.jira)) else { return "{\"error\":\"Task updates not allowed\"}" }
+            guard let updated = await skills.updateTaskWithPeopleResolution(
+                taskID: args["task_id"] as? String,
+                query: args["query"] as? String,
+                done: args["done"] as? Bool,
+                newTitle: args["title"] as? String,
+                owner: args["owner"] as? String,
+                dueDay: args["due_day"] as? String,
+                syncToJira: (args["sync_to_jira"] as? Bool) ?? false
+            ) else {
+                return "{\"error\":\"Matching task not found\"}"
+            }
+            return jsonString([
+                "updated": true,
+                "task_id": updated.id.uuidString,
+                "title": updated.title,
+                "done": updated.done,
+                "owner": updated.owner
+            ])
 
         case "rocknroll_update_meeting_artifacts":
             guard allowWrites && allows(.meetingSummary) else { return "{\"error\":\"Summary update not allowed\"}" }
+            var actionItems: [(text: String, owner: String, dueDay: String?)] = []
+            if let rawItems = args["action_items"] as? [[String: Any]] {
+                for raw in rawItems {
+                    let text = (raw["text"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                    guard !text.isEmpty else { continue }
+                    let owner = (raw["owner"] as? String) ?? ""
+                    let dueDay = raw["due_day"] as? String
+                    actionItems.append((text: text, owner: owner, dueDay: dueDay))
+                }
+            } else if let rawStrings = args["action_items"] as? [String] {
+                for raw in rawStrings where !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    actionItems.append((text: raw.trimmingCharacters(in: .whitespacesAndNewlines), owner: "", dueDay: nil))
+                }
+            }
             let ok = await skills.updateMeetingArtifacts(
-                sessionID: sid,
+                sessionID: sessionID,
                 summaryAppend: args["summary_append"] as? String,
                 replaceSummary: args["replace_summary"] as? String,
                 decisions: args["decisions"] as? [String] ?? [],
-                openQuestions: args["open_questions"] as? [String] ?? []
+                openQuestions: args["open_questions"] as? [String] ?? [],
+                actionItems: actionItems
             )
-            return Self.jsonString(["updated": ok])
+            return jsonString(["updated": ok, "action_items_added": actionItems.count])
 
         case "rocknroll_schedule_meeting":
             guard allowWrites && allows(.calendarSchedule) else { return "{\"error\":\"Calendar scheduling not allowed\"}" }
@@ -506,7 +738,7 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
                 meetingURL: args["meeting_url"] as? String,
                 agendaNotes: (args["agenda_notes"] as? String) ?? ""
             ) {
-                return Self.jsonString(["scheduled": true, "title": linked.title])
+                return jsonString(["scheduled": true, "title": linked.title])
             }
             return "{\"error\":\"Calendar creation failed\"}"
 
@@ -520,9 +752,9 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
                 }
                 do {
                     try await skills.commentOnJiraIssue(key: key, comment: comment)
-                    return Self.jsonString(["commented": true, "issue_key": key])
+                    return jsonString(["commented": true, "issue_key": key])
                 } catch {
-                    return Self.jsonString(["error": error.localizedDescription])
+                    return jsonString(["error": error.localizedDescription])
                 }
             }
             do {
@@ -531,9 +763,9 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
                     query: args["query"] as? String,
                     maxResults: (args["max_results"] as? Int) ?? 15
                 )
-                return Self.jsonString(["issues": issues.map { ["key": $0.key, "summary": $0.summary, "status": $0.statusName, "assignee": $0.assigneeName ?? ""] }])
+                return jsonString(["issues": issues.map { ["key": $0.key, "summary": $0.summary, "status": $0.statusName, "assignee": $0.assigneeName ?? ""] }])
             } catch {
-                return Self.jsonString(["error": error.localizedDescription])
+                return jsonString(["error": error.localizedDescription])
             }
 
         case "rocknroll_control_board":
@@ -545,30 +777,64 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
                     let url = ((args["url"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)).flatMap { $0.isEmpty ? nil : $0 }
                         ?? skills.teamContext.defaultJiraBoardURL
                     let msg = try await board.open(urlString: url)
-                    return Self.jsonString(["message": msg])
+                    return jsonString(["message": msg])
                 case "filter":
-                    return Self.jsonString(["message": try await board.filter(query: (args["query"] as? String) ?? (args["text"] as? String) ?? "")])
+                    return jsonString(["message": try await board.filter(query: (args["query"] as? String) ?? (args["text"] as? String) ?? "")])
                 case "scroll":
-                    return Self.jsonString(["message": try await board.scroll(deltaY: (args["delta_y"] as? Int) ?? 450)])
+                    return jsonString(["message": try await board.scroll(deltaY: (args["delta_y"] as? Int) ?? 450)])
                 case "click":
-                    return Self.jsonString(["message": try await board.click(selector: args["selector"] as? String, text: args["text"] as? String)])
+                    return jsonString(["message": try await board.click(selector: args["selector"] as? String, text: args["text"] as? String)])
                 case "click_at":
                     let x = (args["x"] as? NSNumber)?.doubleValue ?? 0.5
                     let y = (args["y"] as? NSNumber)?.doubleValue ?? 0.5
-                    return Self.jsonString(["message": try await board.clickAt(x: x, y: y, normalized: (args["normalized"] as? Bool) ?? true)])
+                    return jsonString(["message": try await board.clickAt(x: x, y: y, normalized: (args["normalized"] as? Bool) ?? true)])
                 case "highlight":
-                    return Self.jsonString(["message": try await board.highlight(text: (args["text"] as? String) ?? (args["query"] as? String) ?? "")])
+                    return jsonString(["message": try await board.highlight(text: (args["text"] as? String) ?? (args["query"] as? String) ?? "")])
                 case "inspect":
-                    return Self.jsonString(await board.inspect())
+                    return jsonString(await board.inspect())
                 case "snapshot":
                     let snap = try await board.snapshotBase64()
-                    return Self.jsonString(["width": snap.width, "height": snap.height, "image_base64": snap.jpegBase64])
+                    return jsonString(["width": snap.width, "height": snap.height, "image_base64": snap.jpegBase64])
                 default:
                     return "{\"error\":\"Unsupported command\"}"
                 }
             } catch {
-                return Self.jsonString(["error": error.localizedDescription])
+                return jsonString(["error": error.localizedDescription])
             }
+
+        case "rocknroll_workspace_overview":
+            let cal = Calendar.current
+            let now = Date()
+            let monthSessions = workspace?.historySessions.filter {
+                cal.isDate($0.startedAt, equalTo: now, toGranularity: .month)
+            } ?? []
+            let openTasks = workspace?.tasks.filter {
+                !$0.done && workspace?.taskArchivedAt($0) == nil
+            }.prefix(15).map {
+                ["id": $0.id.uuidString, "title": $0.text, "owner": $0.owner, "due_day": $0.dueDay ?? ""]
+            } ?? []
+            let upcoming = (joinableTargetsProvider?() ?? []).prefix(8).map {
+                ["title": $0.title, "url": $0.invitation.absoluteString]
+            }
+            return jsonString([
+                "meetings_this_month_count": monthSessions.count,
+                "meetings_this_month": monthSessions.prefix(10).map(\.title),
+                "open_tasks": openTasks,
+                "joinable_meetings": upcoming
+            ])
+
+        case "rocknroll_join_meetings":
+            guard let directTalkJoinHandler else { return "{\"error\":\"Join handler unavailable\"}" }
+            let skillID = args["skill_id"] as? String
+            if let queries = args["queries"] as? [String], !queries.isEmpty {
+                var results: [String] = []
+                for q in queries {
+                    results.append(await directTalkJoinHandler(q, skillID))
+                }
+                return jsonString(["results": results])
+            }
+            let query = (args["query"] as? String) ?? ""
+            return await directTalkJoinHandler(query, skillID)
 
         default:
             return "{\"error\":\"Unsupported tool\"}"
@@ -676,7 +942,7 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
 
     // MARK: - Helpers
 
-    private nonisolated static func extractDirectTaskInstruction(
+    nonisolated static func extractDirectTaskInstruction(
         from input: String,
         lower: String
     ) -> (title: String, owner: String?)? {
@@ -685,58 +951,175 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
                 let tailIdx = input.index(input.startIndex, offsetBy: lower.distance(from: lower.startIndex, to: range.upperBound))
                 let raw = String(input[tailIdx...]).trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !raw.isEmpty else { return nil }
+                for prep in [" на ", " для ", " for "] {
+                    if let pRange = raw.range(of: prep, options: [.caseInsensitive, .backwards]) {
+                        let title = String(raw[..<pRange.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+                        let owner = String(raw[pRange.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+                        if !title.isEmpty && !owner.isEmpty && owner.count <= 40 {
+                            return (title, owner)
+                        }
+                    }
+                }
                 return (raw, nil)
             }
         }
         return nil
     }
 
-    private static func callLLM(
+    private func callLLMWithTools(
+        systemPrompt: String,
+        userPrompt: String,
+        configuration: PortableOutcomeConfiguration,
+        apiKey: String,
+        tools: [RealtimeToolDeclaration],
+        toolExecutor: @escaping (String, String) async -> String
+    ) async -> String? {
+        switch configuration.providerKind {
+        case .preferMac, .appleOnDevice:
+            #if canImport(FoundationModels)
+            if #available(iOS 26.0, macOS 26.0, *),
+               SystemLanguageModel.default.availability == .available {
+                do {
+                    let session = LanguageModelSession(instructions: systemPrompt)
+                    let response = try await session.respond(to: userPrompt)
+                    let trimmed = response.content.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !trimmed.isEmpty { return trimmed }
+                } catch {}
+            }
+            #endif
+            return nil
+
+        case .openAI, .openRouter, .custom:
+            guard let endpoint = configuration.endpoint, !configuration.resolvedModel.isEmpty else { return nil }
+            let openAITools: [[String: Any]] = tools.map { decl in
+                [
+                    "type": "function",
+                    "function": [
+                        "name": decl.name,
+                        "description": decl.description,
+                        "parameters": decl.parametersDictionary()
+                    ]
+                ]
+            }
+
+            var conversation: [[String: Any]] = [
+                ["role": "system", "content": systemPrompt],
+                ["role": "user", "content": userPrompt]
+            ]
+
+            for iteration in 0..<5 {
+                var body: [String: Any] = [
+                    "model": configuration.resolvedModel,
+                    "messages": conversation
+                ]
+                if configuration.providerKind == .openAI {
+                    body["max_completion_tokens"] = 500
+                } else {
+                    body["max_tokens"] = 500
+                    body["temperature"] = 0.25
+                }
+                if !openAITools.isEmpty {
+                    body["tools"] = openAITools
+                }
+
+                var req = URLRequest(url: endpoint)
+                req.httpMethod = "POST"
+                req.timeoutInterval = 30
+                req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                if !apiKey.isEmpty { req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization") }
+                guard let bodyData = try? JSONSerialization.data(withJSONObject: body) else { return nil }
+                req.httpBody = bodyData
+
+                guard let (data, response) = try? await MeetingAITransfer.send(req, using: llmURLSession),
+                      let http = response as? HTTPURLResponse else {
+                    return nil
+                }
+
+                // Some custom/legacy OpenAI-compatible proxies reject `tools`; retry once plain text.
+                if !(200..<300).contains(http.statusCode) {
+                    if iteration == 0 && !openAITools.isEmpty {
+                        return await callLLMPlainText(
+                            systemPrompt: systemPrompt,
+                            userPrompt: userPrompt,
+                            configuration: configuration,
+                            apiKey: apiKey
+                        )
+                    }
+                    return nil
+                }
+
+                guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let choices = root["choices"] as? [[String: Any]],
+                      let message = choices.first?["message"] as? [String: Any] else {
+                    return nil
+                }
+
+                if let toolCalls = message["tool_calls"] as? [[String: Any]], !toolCalls.isEmpty {
+                    conversation.append(message)
+                    for call in toolCalls {
+                        let callID = (call["id"] as? String) ?? UUID().uuidString
+                        let fn = call["function"] as? [String: Any]
+                        let name = (fn?["name"] as? String) ?? ""
+                        let argsJSON = (fn?["arguments"] as? String) ?? "{}"
+                        let output = await toolExecutor(name, argsJSON)
+                        conversation.append([
+                            "role": "tool",
+                            "tool_call_id": callID,
+                            "content": output
+                        ])
+                    }
+                    continue
+                }
+
+                if let content = message["content"] as? String {
+                    let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
+                    return trimmed.isEmpty ? nil : trimmed
+                }
+                return nil
+            }
+            return nil
+        }
+    }
+
+    private func callLLMPlainText(
         systemPrompt: String,
         userPrompt: String,
         configuration: PortableOutcomeConfiguration,
         apiKey: String
     ) async -> String? {
-        switch configuration.providerKind {
-        case .preferMac, .appleOnDevice:
+        guard let endpoint = configuration.endpoint, !configuration.resolvedModel.isEmpty else { return nil }
+        let messages: [[String: String]] = [
+            ["role": "system", "content": systemPrompt],
+            ["role": "user", "content": userPrompt]
+        ]
+        var body = PortableOutcomeService.requestBody(
+            messages: messages,
+            model: configuration.resolvedModel,
+            provider: configuration.providerKind,
+            tokenLimit: 500,
+            temperature: 0.25
+        )
+        body.removeValue(forKey: "response_format")
+        var req = URLRequest(url: endpoint)
+        req.httpMethod = "POST"
+        req.timeoutInterval = 30
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if !apiKey.isEmpty { req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization") }
+        guard let bodyData = try? JSONSerialization.data(withJSONObject: body) else { return nil }
+        req.httpBody = bodyData
+        guard let (data, response) = try? await MeetingAITransfer.send(req, using: llmURLSession),
+              let http = response as? HTTPURLResponse,
+              (200..<300).contains(http.statusCode),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let choices = root["choices"] as? [[String: Any]],
+              let message = choices.first?["message"] as? [String: Any],
+              let content = message["content"] as? String else {
             return nil
-        case .openAI, .openRouter, .custom:
-            guard let endpoint = configuration.endpoint, !configuration.resolvedModel.isEmpty else { return nil }
-            let messages: [[String: String]] = [
-                ["role": "system", "content": systemPrompt],
-                ["role": "user", "content": userPrompt]
-            ]
-            var body = PortableOutcomeService.requestBody(
-                messages: messages,
-                model: configuration.resolvedModel,
-                provider: configuration.providerKind,
-                tokenLimit: 500,
-                temperature: 0.25
-            )
-            body.removeValue(forKey: "response_format")
-            var req = URLRequest(url: endpoint)
-            req.httpMethod = "POST"
-            req.timeoutInterval = 30
-            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            if !apiKey.isEmpty { req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization") }
-            guard let bodyData = try? JSONSerialization.data(withJSONObject: body),
-                  let (data, response) = try? await {
-                      req.httpBody = bodyData
-                      return try await MeetingAITransfer.send(req, using: .shared)
-                  }(),
-                  let http = response as? HTTPURLResponse,
-                  (200..<300).contains(http.statusCode),
-                  let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let choices = root["choices"] as? [[String: Any]],
-                  let message = choices.first?["message"] as? [String: Any],
-                  let content = message["content"] as? String else {
-                return nil
-            }
-            return content.trimmingCharacters(in: .whitespacesAndNewlines)
         }
+        return content.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    private nonisolated static func jsonString(_ object: Any) -> String {
+    nonisolated static func jsonString(_ object: Any) -> String {
         guard let data = try? JSONSerialization.data(withJSONObject: object),
               let str = String(data: data, encoding: .utf8) else {
             return "{}"
@@ -744,25 +1127,32 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
         return str
     }
 
-    private nonisolated static func buildRealtimeToolDeclarations(allowedGroups: Set<AssistantSkillToolGroup>?) -> [RealtimeToolDeclaration] {
+    nonisolated static func buildToolDeclarations(
+        allowedGroups: Set<AssistantSkillToolGroup>?,
+        includeDirectTalkTools: Bool = false
+    ) -> [RealtimeToolDeclaration] {
         func allows(_ g: AssistantSkillToolGroup) -> Bool { allowedGroups?.contains(g) ?? true }
         var tools: [RealtimeToolDeclaration] = [
             .init(
                 name: "rocknroll_search_knowledge",
-                description: "Search Obsidian vault Markdown files, People.md, and TeamContext.md.",
+                description: "Search Obsidian vault Markdown files, People.md, TeamContext.md, and workspace meeting transcripts.",
                 parametersJSONSchema: [
                     "type": "object",
-                    "properties": ["query": ["type": "string"]],
+                    "properties": [
+                        "query": ["type": "string"],
+                        "limit": ["type": "integer"]
+                    ],
                     "required": ["query"]
                 ]
             ),
             .init(
                 name: "rocknroll_manage_people",
-                description: "Look up or remember member name-to-Jira mappings and voice approval in People.md.",
+                description: "Look up, remember, or remove member name-to-Jira mappings and voice approval in People.md.",
                 parametersJSONSchema: [
                     "type": "object",
                     "properties": [
-                        "operation": ["type": "string", "enum": ["lookup", "upsert"]],
+                        "operation": ["type": "string", "enum": ["lookup", "upsert", "remove"]],
+                        "id": ["type": "string"],
                         "query": ["type": "string"],
                         "display_name": ["type": "string"],
                         "jira_username": ["type": "string"],
@@ -786,6 +1176,22 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
                         "sync_to_jira": ["type": "boolean"]
                     ],
                     "required": ["title"]
+                ]
+            ))
+            tools.append(.init(
+                name: "rocknroll_update_task",
+                description: "Update, complete, rename, or reassign an existing workspace task (resolving owner via People.md).",
+                parametersJSONSchema: [
+                    "type": "object",
+                    "properties": [
+                        "task_id": ["type": "string"],
+                        "query": ["type": "string"],
+                        "done": ["type": "boolean"],
+                        "title": ["type": "string"],
+                        "owner": ["type": "string"],
+                        "due_day": ["type": "string"],
+                        "sync_to_jira": ["type": "boolean"]
+                    ]
                 ]
             ))
         }
@@ -826,14 +1232,25 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
         if allows(.meetingSummary) {
             tools.append(.init(
                 name: "rocknroll_update_meeting_artifacts",
-                description: "Update the meeting summary, decisions, or open questions.",
+                description: "Update the meeting summary, decisions, open questions, or action items.",
                 parametersJSONSchema: [
                     "type": "object",
                     "properties": [
                         "summary_append": ["type": "string"],
                         "replace_summary": ["type": "string"],
                         "decisions": ["type": "array", "items": ["type": "string"]],
-                        "open_questions": ["type": "array", "items": ["type": "string"]]
+                        "open_questions": ["type": "array", "items": ["type": "string"]],
+                        "action_items": [
+                            "type": "array",
+                            "items": [
+                                "type": "object",
+                                "properties": [
+                                    "text": ["type": "string"],
+                                    "owner": ["type": "string"],
+                                    "due_day": ["type": "string"]
+                                ]
+                            ]
+                        ]
                     ]
                 ]
             ))
@@ -855,6 +1272,28 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
                         "normalized": ["type": "boolean"]
                     ],
                     "required": ["command"]
+                ]
+            ))
+        }
+        if includeDirectTalkTools {
+            tools.append(.init(
+                name: "rocknroll_workspace_overview",
+                description: "Get monthly meeting count, open tasks, and upcoming joinable meetings.",
+                parametersJSONSchema: [
+                    "type": "object",
+                    "properties": [:]
+                ]
+            ))
+            tools.append(.init(
+                name: "rocknroll_join_meetings",
+                description: "Join one or more upcoming/ongoing meetings with an optional skill role.",
+                parametersJSONSchema: [
+                    "type": "object",
+                    "properties": [
+                        "query": ["type": "string"],
+                        "queries": ["type": "array", "items": ["type": "string"]],
+                        "skill_id": ["type": "string"]
+                    ]
                 ]
             ))
         }

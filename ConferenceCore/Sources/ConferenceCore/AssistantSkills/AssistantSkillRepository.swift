@@ -298,6 +298,14 @@ public struct AssistantSkillRepository: Sendable {
         return directory
     }
 
+    @discardableResult
+    public func removePerson(id: String) throws -> AssistantPeopleDirectory {
+        var directory = loadPeople()
+        directory.remove(id: id)
+        try savePeople(directory)
+        return directory
+    }
+
     public func loadTeamContext() -> AssistantTeamContextDocument {
         try? ensureDefaultsInstalled()
         guard let text = try? String(contentsOf: teamContextFileURL, encoding: .utf8) else {

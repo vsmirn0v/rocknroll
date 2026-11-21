@@ -22,6 +22,17 @@ public enum RealtimeVoiceAudio {
         return buffer
     }
 
+    public static func floatSamplesToPCM16Data(_ samples: [Float]) -> Data {
+        guard !samples.isEmpty else { return Data() }
+        var pcmData = Data(capacity: samples.count * MemoryLayout<Int16>.size)
+        for sample in samples {
+            let clamped = max(-1.0 as Float, min(1.0 as Float, sample))
+            var intSample = Int16((clamped * Float(Int16.max)).rounded()).littleEndian
+            withUnsafeBytes(of: &intSample) { pcmData.append(contentsOf: $0) }
+        }
+        return pcmData
+    }
+
     public static func validateBoardURL(_ raw: String) -> URL? {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty,

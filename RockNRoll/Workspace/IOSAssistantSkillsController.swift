@@ -283,6 +283,15 @@ final class IOSAssistantSkillsController: ObservableObject {
         refresh()
     }
 
+    @discardableResult
+    func removePerson(id: String) throws -> AssistantPeopleDirectory {
+        let updated = try withRepository { repo, _ in
+            try repo.removePerson(id: id)
+        }
+        refresh()
+        return updated
+    }
+
     func saveTeamContext(_ doc: AssistantTeamContextDocument) throws {
         try withRepository { repo, _ in
             try repo.saveTeamContext(doc)
@@ -391,6 +400,58 @@ final class IOSAssistantSkillsController: ObservableObject {
             syncedJira = true
         }
         return (cleanTitle, ownerName, syncedJira)
+    }
+
+    func updateTaskWithPeopleResolution(
+        taskID: String? = nil,
+        query: String? = nil,
+        done: Bool? = nil,
+        newTitle: String? = nil,
+        owner: String? = nil,
+        dueDay: String? = nil,
+        syncToJira: Bool = false
+    ) async -> (id: UUID, title: String, done: Bool, owner: String)? {
+        guard let workspace else { return nil }
+        var matched: IOSMeetingTaskItem?
+        if let rawID = taskID?.trimmingCharacters(in: .whitespacesAndNewlines),
+           let uuid = UUID(uuidString: rawID) {
+            matched = workspace.tasks.first(where: { $0.id == uuid })
+        }
+        if matched == nil,
+           let q = query?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !q.isEmpty {
+            let needle = q.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil)
+            let openFirst = workspace.tasks.filter { !$0.done } + workspace.tasks.filter(\.done)
+            matched = openFirst.first(where: {
+                $0.text.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil).contains(needle)
+            })
+        }
+        guard var task = matched else { return nil }
+
+        let now = Date()
+        if let newTitle, !newTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            task.text = newTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        if let owner, !owner.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            task.owner = resolvedOwnerName(owner)
+        }
+        if let dueDay {
+            let cleanDue = dueDay.trimmingCharacters(in: .whitespacesAndNewlines)
+            task.dueDay = cleanDue.isEmpty ? nil : cleanDue
+        }
+        if let done {
+            task.done = done
+            task.completedAt = done ? now : nil
+            if done { task.reminderAt = nil }
+            task.extended.applyDoneFlag(done)
+        }
+        task.updatedAt = now
+
+        guard await workspace.updateTask(task) else { return nil }
+        if syncToJira && workspace.taskSync.preferences.jira.enabled {
+            await workspace.taskSync.runSync(explicitTaskIDs: [task.id], automaticTrigger: true)
+        }
+        return (task.id, task.text, task.done, task.owner)
     }
 
     func updateMeetingArtifacts(
