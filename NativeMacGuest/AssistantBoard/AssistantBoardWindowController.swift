@@ -90,6 +90,7 @@ final class AssistantBoardWindowController: NSObject, ObservableObject, WKNaviga
         if let activeModel = sharedMeetingModel, activeModel.sessionID != model.sessionID {
             activeModel.onExternalShareStopped = nil
             await activeModel.stopSharing()
+            stopSharing(notifyModel: false)
         }
         guard model.startBoardSharing() else {
             throw NativeDesktopError.unavailable(L("Stop the active screen share before sharing the Assistant Board."))
@@ -420,11 +421,14 @@ final class AssistantBoardWindowController: NSObject, ObservableObject, WKNaviga
         spinner.style = .spinning
         spinner.controlSize = .small
         spinner.isDisplayedWhenStopped = false
+        spinner.isHidden = true
+        spinner.setContentHuggingPriority(.required, for: .horizontal)
 
         let banner = NSTextField(labelWithString: "")
         banner.font = .systemFont(ofSize: 11, weight: .medium)
         banner.textColor = .secondaryLabelColor
         banner.lineBreakMode = .byTruncatingTail
+        banner.setContentHuggingPriority(.defaultHigh, for: .horizontal)
         banner.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
         let stopBtn = NSButton(title: L("Stop Share"), target: self, action: #selector(handleStopShare(_:)))
@@ -435,6 +439,7 @@ final class AssistantBoardWindowController: NSObject, ObservableObject, WKNaviga
         toolbarStack.orientation = .horizontal
         toolbarStack.alignment = .centerY
         toolbarStack.spacing = 8
+        toolbarStack.detachesHiddenViews = true
         toolbarStack.edgeInsets = NSEdgeInsets(top: 6, left: 12, bottom: 6, right: 12)
         toolbarStack.translatesAutoresizingMaskIntoConstraints = false
 
@@ -484,7 +489,21 @@ final class AssistantBoardWindowController: NSObject, ObservableObject, WKNaviga
         } else {
             loadError = nil
             refreshBanner()
-            webView?.reload()
+            if webView?.url != nil {
+                webView?.reload()
+            } else if let candidate = [urlField?.stringValue, currentURL?.absoluteString]
+                .compactMap({ $0?.trimmingCharacters(in: .whitespacesAndNewlines) })
+                .first(where: { !$0.isEmpty }) {
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    do {
+                        _ = try await self.open(urlString: candidate)
+                    } catch {
+                        self.loadError = error.localizedDescription
+                        self.refreshBanner()
+                    }
+                }
+            }
         }
     }
 
@@ -508,10 +527,11 @@ final class AssistantBoardWindowController: NSObject, ObservableObject, WKNaviga
     private func refreshNavigationUI() {
         backButton?.isEnabled = webView?.canGoBack ?? false
         forwardButton?.isEnabled = webView?.canGoForward ?? false
+        loadingIndicator?.isHidden = !isLoading
         if isLoading {
             loadingIndicator?.startAnimation(nil)
-            reloadButton?.image = NSImage(systemSymbolName: "xmark", accessibilityDescription: L("Close"))
-            reloadButton?.setAccessibilityLabel(L("Close"))
+            reloadButton?.image = NSImage(systemSymbolName: "xmark", accessibilityDescription: L("Stop"))
+            reloadButton?.setAccessibilityLabel(L("Stop"))
         } else {
             loadingIndicator?.stopAnimation(nil)
             reloadButton?.image = NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: L("Reload"))

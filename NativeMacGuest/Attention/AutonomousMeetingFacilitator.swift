@@ -75,7 +75,7 @@ final class AutonomousMeetingFacilitator: ObservableObject {
         return attention?.store.selectedSkillIDs.first ?? "scrum-master"
     }
 
-    func enable(for model: NativeDesktopMeetingModel, skillID: String? = nil) {
+    func enable(for model: NativeDesktopMeetingModel, skillID: String? = nil, suppressAutoGreet: Bool = false) {
         manuallyDisabledSessions.remove(model.sessionID)
         var chosen = resolveSkillID(explicitSkillID: skillID, meetingTitle: model.title)
         activeSessionSkills[model.sessionID] = chosen
@@ -93,7 +93,7 @@ final class AutonomousMeetingFacilitator: ObservableObject {
             let skill = self.cachedSkills.first(where: { $0.id == chosen })
             self.lastStatusBySession[model.sessionID] = L("Autonomous voice facilitator active (%@)", skill?.name ?? chosen)
             await self.maybeConnectRealtime(for: model, skill: skill, skillID: chosen)
-            if skill?.autoGreet == true {
+            if !suppressAutoGreet, skill?.autoGreet == true {
                 await self.kickOffSkill(for: model, skillID: chosen)
             }
         }

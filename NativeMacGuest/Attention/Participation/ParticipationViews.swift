@@ -30,25 +30,30 @@ struct ParticipationSetupView: View {
                 .buttonStyle(.borderless)
             Text(participation.status == .inactive ? L("Participate in this meeting") : participation.status.title)
                 .font(.headline)
-            ScrollView {
-                VStack(alignment: .leading, spacing: 10) {
-                    if let reviewed {
-                        settings(reviewed)
-                    } else {
-                        Text(unavailableReason)
-                            .foregroundStyle(.secondary)
-                    }
-                    if let startFailure {
-                        Text(startFailure.message).foregroundStyle(.orange)
-                    } else if scopeChanged {
-                        Text(L("Review the updated participation settings before continuing."))
-                            .foregroundStyle(.orange)
-                    }
-                    activity
+            let content = VStack(alignment: .leading, spacing: 10) {
+                if let reviewed {
+                    settings(reviewed)
+                } else {
+                    Text(unavailableReason)
+                        .foregroundStyle(.secondary)
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
+                if let startFailure {
+                    Text(startFailure.message).foregroundStyle(.orange)
+                } else if scopeChanged {
+                    Text(L("Review the updated participation settings before continuing."))
+                        .foregroundStyle(.orange)
+                }
+                activity
             }
-            .frame(maxHeight: 430)
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            ViewThatFits(in: .vertical) {
+                content
+                ScrollView {
+                    content
+                }
+                .frame(maxHeight: 430)
+            }
             HStack {
                 Button(L("Close"), action: close)
                 Spacer()

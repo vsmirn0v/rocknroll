@@ -341,6 +341,75 @@ final class MeetingAccessTests: XCTestCase {
         }
     }
 
+    func testRTLInlineToolbarAndParticipantStripDoNotOverlapAndScrollFromRightEdge() {
+        let host = UIView(frame: CGRect(x: 0, y: 0, width: 768, height: 1024))
+        host.semanticContentAttribute = .forceRightToLeft
+        let buttons = (0..<6).map { _ in AlignedCallButton() }
+        let toolbar = CallToolbar(items: buttons)
+        toolbar.semanticContentAttribute = .forceRightToLeft
+        let controls = MeetingAccessControls()
+        controls.semanticContentAttribute = .forceRightToLeft
+        host.addSubview(toolbar)
+        host.addSubview(controls)
+
+        let base = CallPresentationGeometry(
+            bounds: host.bounds,
+            insets: .zero,
+            headerHeight: 80,
+            toolbarHeight: toolbar.preferredHeight,
+            hidden: false,
+            largeText: false,
+            floating: true
+        )
+        let geometry = MeetingAccessGeometry(
+            base: base,
+            bounds: host.bounds,
+            insets: .zero,
+            accessSize: controls.fittingSize(availableWidth: base.toolbar.width),
+            largeText: false,
+            isRightToLeft: true
+        )
+        XCTAssertTrue(geometry.inline)
+        toolbar.frame = geometry.toolbar
+        toolbar.arrange(rail: false, largeText: false)
+        toolbar.separatesLast = geometry.inline
+        toolbar.inlineAccessWidth = geometry.access.width + 8
+        toolbar.placeAccessControls(controls, geometry: geometry, in: host)
+        toolbar.layoutIfNeeded()
+        controls.layoutIfNeeded()
+
+        XCTAssertLessThan(controls.frame.maxX, toolbar.frame.midX, "RTL inline access controls should sit left of primary actions")
+        for button in buttons {
+            let rect = host.convert(button.bounds, from: button)
+            let overlap = rect.intersection(controls.frame)
+            XCTAssertFalse(overlap.width > 0.01 && overlap.height > 0.01, "Toolbar button \(rect) overlaps RTL access controls \(controls.frame)")
+        }
+
+        let strip = MeetingParticipantStrip(frame: CGRect(x: 0, y: 0, width: 240, height: 96))
+        strip.semanticContentAttribute = .forceRightToLeft
+        strip.update(
+            (1...4).map { idx in
+                MeetingStripItem(
+                    id: "p\(idx)",
+                    name: "Person \(idx)",
+                    isShare: false,
+                    audio: ParticipantAudioState(microphoneOn: true, speaking: false)
+                )
+            },
+            selected: nil
+        )
+        strip.layoutIfNeeded()
+        XCTAssertEqual(strip.contentSize.width, 448, accuracy: 0.5)
+        XCTAssertEqual(strip.contentOffset.x, 448 - 240, accuracy: 0.5)
+        let firstButton = strip.subviews.compactMap { $0 as? UIButton }.first { $0.accessibilityIdentifier == "Focus participant.p1" }
+        let secondButton = strip.subviews.compactMap { $0 as? UIButton }.first { $0.accessibilityIdentifier == "Focus participant.p2" }
+        XCTAssertNotNil(firstButton)
+        XCTAssertNotNil(secondButton)
+        if let firstButton, let secondButton {
+            XCTAssertGreaterThan(firstButton.frame.minX, secondButton.frame.minX)
+        }
+    }
+
     private func descendants(_ view: UIView) -> [UIView] { [view] + view.subviews.flatMap(descendants) }
 
     private func waitUntil(_ condition: () -> Bool, file: StaticString = #filePath, line: UInt = #line) async {

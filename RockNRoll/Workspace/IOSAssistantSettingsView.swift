@@ -104,6 +104,8 @@ struct IOSAssistantSettingsView: View {
                         configuration.contextTokens = nil
                         workspace.outcomeConfig = configuration
                         apiKeyDraft = workspace.readAPIKey(for: kind)
+                        keyFeedback = nil
+                        keyFeedbackIsError = false
                     }
                 )) {
                     ForEach(PortableOutcomeProviderKind.allCases, id: \.self) { kind in
@@ -271,7 +273,11 @@ struct IOSAssistantSettingsView: View {
         .navigationTitle(L("Assistant & Sync"))
         .sheet(isPresented: $choosingModel) {
             let configuration = workspace.outcomeConfig
-            IOSSummaryModelPicker(configuration: configuration, key: workspace.readAPIKey(for: configuration.providerKind)) { model in
+            let trimmedDraft = apiKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+            let effectiveKey = trimmedDraft.isEmpty
+                ? workspace.readAPIKey(for: configuration.providerKind)
+                : trimmedDraft
+            IOSSummaryModelPicker(configuration: configuration, key: effectiveKey) { model in
                 var current = workspace.outcomeConfig
                 guard current.providerKind == configuration.providerKind,
                       current.modelCatalogEndpoint == configuration.modelCatalogEndpoint else { return }

@@ -56,6 +56,7 @@ struct IOSMeetingDetailView: View {
     @State private var peopleDraft = ""
     @State private var newRuleDraft = ""
     @State private var settingsSaved = false
+    @State private var isLoadingContext = false
 
     private var session: IOSMeetingSessionItem? {
         workspace.sessions.first { $0.id == sessionID }
@@ -628,6 +629,10 @@ struct IOSMeetingDetailView: View {
                         Text(mode.title).tag(IOSSameRoomTransitionMode?.some(mode))
                     }
                 }
+                .onChange(of: transitionChoice) { _, _ in
+                    guard !isLoadingContext else { return }
+                    saveCurrentContextSettings()
+                }
             }
 
             Section(L("Assistant Context")) {
@@ -713,6 +718,8 @@ struct IOSMeetingDetailView: View {
     }
 
     private func loadContextFields() {
+        isLoadingContext = true
+        defer { isLoadingContext = false }
         let settings = workspace.settings(for: contextScopeKey)
         transitionChoice = settings?.sameRoomTransition?.value.flatMap(IOSSameRoomTransitionMode.init(rawValue:))
         aboutDraft = settings?.about?.value ?? ""

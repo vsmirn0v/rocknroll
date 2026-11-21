@@ -281,7 +281,7 @@ struct MeetingAccessGeometry {
         return max(88, width - (gallery ? 160 : 0))
     }
     init(base: CallPresentationGeometry, bounds: CGRect, insets: UIEdgeInsets, accessSize: CGSize, largeText: Bool,
-         gallery: Bool = false, focusedShare: Bool = false) {
+         gallery: Bool = false, focusedShare: Bool = false, isRightToLeft: Bool = false) {
         let safe = CallPresentationGeometry.safeContentRect(bounds: bounds, insets: insets)
         combinedShareDock = focusedShare && !gallery && base.fold == nil && bounds.height > bounds.width &&
             safe.width >= 228 && safe.width < CallPresentationGeometry.singleRowWidth
@@ -305,8 +305,13 @@ struct MeetingAccessGeometry {
         } else if gallery {
             toolbar = base.toolbar
             let y = base.rail ? safe.maxY - accessSize.height : toolbar.minY - accessSize.height - 8
-            access = CGRect(x: base.stage.maxX - accessSize.width, y: y, width: accessSize.width, height: accessSize.height)
-            pagination = CGRect(x: base.stage.minX, y: y, width: max(0, access.minX - base.stage.minX - 8), height: accessSize.height)
+            if isRightToLeft && !base.rail {
+                access = CGRect(x: base.stage.minX, y: y, width: accessSize.width, height: accessSize.height)
+                pagination = CGRect(x: access.maxX + 8, y: y, width: max(0, base.stage.maxX - access.maxX - 8), height: accessSize.height)
+            } else {
+                access = CGRect(x: base.stage.maxX - accessSize.width, y: y, width: accessSize.width, height: accessSize.height)
+                pagination = CGRect(x: base.stage.minX, y: y, width: max(0, access.minX - base.stage.minX - 8), height: accessSize.height)
+            }
             stage = CGRect(x: base.stage.minX, y: base.stage.minY, width: base.stage.width,
                 height: max(0, y - base.stage.minY - 8))
         } else if base.rail {
@@ -321,14 +326,19 @@ struct MeetingAccessGeometry {
             let width = min(440, safe.width - accessSize.width - 8)
             let x = safe.midX - (width + accessSize.width + 8) / 2
             toolbar = CGRect(x: x, y: base.toolbar.minY, width: width + accessSize.width + 8, height: base.toolbar.height)
-            access = CGRect(x: toolbar.maxX - 54 - 8 - accessSize.width, y: toolbar.midY - accessSize.height / 2,
+            let accessX = isRightToLeft
+                ? toolbar.minX + 54 + 8
+                : toolbar.maxX - 54 - 8 - accessSize.width
+            access = CGRect(x: accessX, y: toolbar.midY - accessSize.height / 2,
                 width: accessSize.width, height: accessSize.height)
             stage = base.stage
         } else {
             pagination = .zero
             toolbar = base.toolbar
-            access = CGRect(x: toolbar.maxX - min(accessSize.width, toolbar.width),
-                y: toolbar.minY - accessSize.height - 8, width: min(accessSize.width, toolbar.width), height: accessSize.height)
+            let clampedWidth = min(accessSize.width, toolbar.width)
+            let accessX = isRightToLeft ? toolbar.minX : toolbar.maxX - clampedWidth
+            access = CGRect(x: accessX,
+                y: toolbar.minY - accessSize.height - 8, width: clampedWidth, height: accessSize.height)
             stage = CGRect(x: base.stage.minX, y: base.stage.minY, width: base.stage.width,
                 height: max(0, access.minY - base.stage.minY - 8))
         }

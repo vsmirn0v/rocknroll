@@ -147,20 +147,15 @@ struct IOSWorkspaceHubView: View {
                 }
             }
         }
-        .sheet(isPresented: Binding(
-            get: { showingBoardSheet || (board?.isPresented == true && board?.isInlineSheetActive == false && !showingSkillsSheet && !showingSettings) },
-            set: { newValue in
-                showingBoardSheet = newValue
-                if !newValue { board?.isPresented = false }
-            }
-        )) {
-            if let board {
-                IOSAssistantBoardSheet(
-                    controller: board,
-                    defaultBoardURL: skills?.teamContext.defaultJiraBoardURL ?? ""
-                )
-            }
-        }
+        .modifier(
+            IOSOptionalObservedBoardSheetModifier(
+                board: board,
+                showingBoardSheet: $showingBoardSheet,
+                showingSkillsSheet: showingSkillsSheet,
+                showingSettings: showingSettings,
+                defaultBoardURL: skills?.teamContext.defaultJiraBoardURL ?? ""
+            )
+        )
         .confirmationDialog(
             L("Delete Meeting?"),
             isPresented: Binding(
@@ -534,5 +529,52 @@ private struct IOSStandaloneAskView: View {
 
     var body: some View {
         IOSAssistantTalkView(talk: talk, speech: speech)
+    }
+}
+
+private struct IOSOptionalObservedBoardSheetModifier: ViewModifier {
+    var board: IOSAssistantBoardController?
+    @Binding var showingBoardSheet: Bool
+    let showingSkillsSheet: Bool
+    let showingSettings: Bool
+    let defaultBoardURL: String
+
+    func body(content: Content) -> some View {
+        if let board {
+            content.modifier(
+                IOSObservedBoardSheetModifier(
+                    board: board,
+                    showingBoardSheet: $showingBoardSheet,
+                    showingSkillsSheet: showingSkillsSheet,
+                    showingSettings: showingSettings,
+                    defaultBoardURL: defaultBoardURL
+                )
+            )
+        } else {
+            content
+        }
+    }
+}
+
+private struct IOSObservedBoardSheetModifier: ViewModifier {
+    @ObservedObject var board: IOSAssistantBoardController
+    @Binding var showingBoardSheet: Bool
+    let showingSkillsSheet: Bool
+    let showingSettings: Bool
+    let defaultBoardURL: String
+
+    func body(content: Content) -> some View {
+        content.sheet(isPresented: Binding(
+            get: { showingBoardSheet || (board.isPresented && !board.isInlineSheetActive && !showingSkillsSheet && !showingSettings) },
+            set: { newValue in
+                showingBoardSheet = newValue
+                if !newValue { board.isPresented = false }
+            }
+        )) {
+            IOSAssistantBoardSheet(
+                controller: board,
+                defaultBoardURL: defaultBoardURL
+            )
+        }
     }
 }

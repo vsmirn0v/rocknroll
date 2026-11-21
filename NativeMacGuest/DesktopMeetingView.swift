@@ -431,7 +431,7 @@ struct NativeDesktopMeetingView: View {
                 if let workspace {
                     NativeDesktopMeetingsButton(workspace: workspace, current: model)
                     if !embedded {
-                        NativeMeetingAssistantMenu(meeting: model, attention: workspace.attention)
+                        NativeMeetingAssistantMenu(meeting: model, attention: workspace.attention, compactChrome: true)
                     }
                 }
                 iconButton("person.2", L("Participants")) { togglePanel(.participants) }
@@ -1505,18 +1505,29 @@ struct NativeDesktopMeetingsPopover: View {
                 NativeDesktopMeetingRow(workspace: workspace, model: model, index: index, current: model === current, close: close)
             }
             Divider().padding(.vertical, 6)
-            Button(L("Leave all meetings")) {
-                if workspace.meetings.count > 1 {
-                    confirmLeaveAll = true
-                } else {
-                    close(); workspace.leaveAllNow()
+            if confirmLeaveAll {
+                HStack(spacing: 8) {
+                    Button(L("Leave all meetings"), role: .destructive) {
+                        close()
+                        workspace.leaveAllNow()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.red)
+                    Button(L("Cancel")) {
+                        confirmLeaveAll = false
+                    }
                 }
-            }
-            .buttonStyle(.plain)
-            .foregroundStyle(.red)
-            .confirmationDialog(L("Leave all meetings"), isPresented: $confirmLeaveAll, titleVisibility: .visible) {
-                Button(L("Leave all meetings"), role: .destructive) { close(); workspace.leaveAllNow() }
-                Button(L("Cancel"), role: .cancel) {}
+            } else {
+                Button(L("Leave all meetings")) {
+                    if workspace.meetings.count > 1 {
+                        confirmLeaveAll = true
+                    } else {
+                        close()
+                        workspace.leaveAllNow()
+                    }
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.red)
             }
             Text(L("Your microphone and camera work in one meeting at a time. Use headphones to avoid echo between meetings."))
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true).padding(.top, 4)

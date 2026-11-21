@@ -249,16 +249,6 @@ struct CalendarSettingsView: View {
                         Button(L("Forget room associations"), role: .destructive) {
                             confirmingForgetBindings = true
                         }
-                        .confirmationDialog(
-                            L("Forget room associations?"),
-                            isPresented: $confirmingForgetBindings,
-                            titleVisibility: .visible
-                        ) {
-                            Button(L("Forget room associations"), role: .destructive) {
-                                calendar.forgetBindings()
-                            }
-                            Button(L("Cancel"), role: .cancel) {}
-                        }
                     } footer: {
                         Text(L("Calendar selection and room associations belong to this device. Saved favorites use your existing iCloud Sync preference."))
                     }
@@ -269,6 +259,16 @@ struct CalendarSettingsView: View {
         }
         .navigationTitle(L("Calendars"))
         .onAppear { calendar.refresh() }
+        .confirmationDialog(
+            L("Forget room associations?"),
+            isPresented: $confirmingForgetBindings,
+            titleVisibility: .visible
+        ) {
+            Button(L("Forget room associations"), role: .destructive) {
+                calendar.forgetBindings()
+            }
+            Button(L("Cancel"), role: .cancel) {}
+        }
     }
 }
 

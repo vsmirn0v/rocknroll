@@ -72,17 +72,25 @@ final class MeetingWorkspaceViewState: ObservableObject {
             if participation.workspacePauseID == token { participation.resume() }
             attention.resumeWorkspaceFollowing(model, pause: following)
         case .facilitator(let skillID):
-            attention.facilitator?.enable(for: model, skillID: skillID)
+            if attention.facilitator?.activeSessionSkills[model.sessionID] == nil {
+                attention.facilitator?.enable(for: model, skillID: skillID, suppressAutoGreet: true)
+            }
         case .participationAndFacilitator(let token, let skillID):
             if participation.workspacePauseID == token { participation.resume() }
-            attention.facilitator?.enable(for: model, skillID: skillID)
+            if attention.facilitator?.activeSessionSkills[model.sessionID] == nil {
+                attention.facilitator?.enable(for: model, skillID: skillID, suppressAutoGreet: true)
+            }
         case .followingAndFacilitator(let token, let skillID):
             attention.resumeWorkspaceFollowing(model, pause: token)
-            attention.facilitator?.enable(for: model, skillID: skillID)
+            if attention.facilitator?.activeSessionSkills[model.sessionID] == nil {
+                attention.facilitator?.enable(for: model, skillID: skillID, suppressAutoGreet: true)
+            }
         case .all(let token, let following, let skillID):
             if participation.workspacePauseID == token { participation.resume() }
             attention.resumeWorkspaceFollowing(model, pause: following)
-            attention.facilitator?.enable(for: model, skillID: skillID)
+            if attention.facilitator?.activeSessionSkills[model.sessionID] == nil {
+                attention.facilitator?.enable(for: model, skillID: skillID, suppressAutoGreet: true)
+            }
         }
     }
 

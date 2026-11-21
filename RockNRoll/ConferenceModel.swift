@@ -491,6 +491,8 @@ final class ConferenceModel: ObservableObject {
 
         assistantBoard.$isPresented
             .sink { [weak self] shouldPresent in
+                guard let self else { return }
+                self.objectWillChange.send()
                 guard shouldPresent else { return }
                 Task { @MainActor [weak self] in
                     guard let self,
@@ -1193,6 +1195,7 @@ final class ConferenceModel: ObservableObject {
                            backgroundJoin: Bool = false,
                            allowAlongside: Bool = false,
                            allowWhileLeaving: Bool = false,
+                           allowConcurrentSessionConnect: Bool = false,
                            requestedWorkspaceID: UUID? = nil,
                            scheduledAdmission: (() -> Bool)? = nil) {
         if !allowAlongside {
@@ -1201,7 +1204,10 @@ final class ConferenceModel: ObservableObject {
                 return
             }
         } else {
-            guard !isJoining || allowWhileLeaving, nonLeavingSessions.count < Self.maxConcurrentMeetings else {
+            let canStartAlongside = allowConcurrentSessionConnect
+                ? (joinTask == nil || allowWhileLeaving) && (phase != .leaving || allowWhileLeaving)
+                : (!isJoining || allowWhileLeaving)
+            guard canStartAlongside, nonLeavingSessions.count < Self.maxConcurrentMeetings else {
                 if scheduledAdmission != nil && !scheduledJoinPending { calendar.finishScheduledTransportPreparation() }
                 return
             }
@@ -1220,6 +1226,7 @@ final class ConferenceModel: ObservableObject {
                     engineWasChosen: engineWasChosen,
                     backgroundJoin: backgroundJoin,
                     allowAlongside: allowAlongside,
+                    allowConcurrentSessionConnect: allowConcurrentSessionConnect,
                     scheduledAdmission: scheduledAdmission
                 )
             }
@@ -1906,6 +1913,14 @@ final class ConferenceModel: ObservableObject {
     }
 
     func joinCandidatesAlongside(_ candidates: [JoinableMeetingCandidate]) async {
+        var seenURLs: Set<String> = []
+        var seenRooms: Set<String> = []
+        var activeRooms: Set<String> = Set(
+            sessions.map { session in
+                MeetingRoomIdentity(session.invitationURL, engine: session.kind)?.workspaceKey
+                    ?? session.invitationURL.absoluteString
+            }
+        )
         for (index, candidate) in candidates.enumerated() {
             if let activeID = candidate.activeSessionID,
                sessions.contains(where: { $0.id == activeID }) {
@@ -1914,18 +1929,24 @@ final class ConferenceModel: ObservableObject {
                 }
                 continue
             }
+            guard seenURLs.insert(candidate.invitation.absoluteString).inserted else { continue }
             guard nonLeavingSessions.count < Self.maxConcurrentMeetings else { break }
             do {
                 let target = try destination(for: candidate.invitation.absoluteString, verifiedEngine: nil)
-                let backgroundJoin = !sessions.isEmpty || index > 0
+                let roomKey = MeetingRoomIdentity(target.invitationURL, engine: target.engineKind)?.workspaceKey
+                    ?? target.invitationURL.absoluteString
+                guard seenRooms.insert(roomKey).inserted, !activeRooms.contains(roomKey) else { continue }
+                let backgroundJoin = !sessions.isEmpty
                 startJoin(
                     target,
                     quiet: false,
                     title: candidate.title,
                     backgroundJoin: backgroundJoin,
-                    allowAlongside: true
+                    allowAlongside: true,
+                    allowConcurrentSessionConnect: true
                 )
                 await joinTask?.value
+                activeRooms.insert(roomKey)
                 if joinAwaitingName != nil || siteSelection != nil || engineSelection != nil {
                     break
                 }

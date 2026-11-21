@@ -563,10 +563,17 @@ struct IOSPersonalTasksView: View {
             .accessibilityValue(task.done ? L("Done") : L("Open"))
 
             VStack(alignment: .leading, spacing: 4) {
-                Text(task.text)
-                    .font(.body)
-                    .strikethrough(task.done)
-                    .foregroundStyle(task.done ? .secondary : .primary)
+                Button {
+                    editingTask = task
+                } label: {
+                    Text(task.text)
+                        .font(.body)
+                        .strikethrough(task.done)
+                        .foregroundStyle(task.done ? .secondary : .primary)
+                        .multilineTextAlignment(.leading)
+                }
+                .buttonStyle(.plain)
+                .accessibilityHint(L("Edit"))
 
                 IOSTaskBadgeFlowLayout(spacing: 6, lineSpacing: 4) {
                     if task.extended.issueKind != .task {
@@ -666,8 +673,6 @@ struct IOSPersonalTasksView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .contentShape(Rectangle())
             .onTapGesture { editingTask = task }
-            .accessibilityAddTraits(.isButton)
-            .accessibilityHint(L("Edit"))
         }
         .padding(.vertical, 2)
         .contextMenu {
@@ -800,21 +805,23 @@ private struct IOSTaskBadgeFlowLayout: Layout {
 
     func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
         let maxWidth = proposal.width ?? .infinity
+        let budget = ProposedViewSize(width: maxWidth.isFinite ? maxWidth : nil, height: nil)
         var currentX: CGFloat = 0
         var currentY: CGFloat = 0
         var lineHeight: CGFloat = 0
         var usedWidth: CGFloat = 0
 
         for subview in subviews {
-            let size = subview.sizeThatFits(.unspecified)
-            if currentX > 0 && currentX + size.width > maxWidth {
+            let measured = subview.sizeThatFits(budget)
+            let itemWidth = maxWidth.isFinite ? min(measured.width, maxWidth) : measured.width
+            if currentX > 0 && currentX + itemWidth > maxWidth {
                 currentY += lineHeight + lineSpacing
                 currentX = 0
                 lineHeight = 0
             }
-            usedWidth = max(usedWidth, currentX + size.width)
-            currentX += size.width + spacing
-            lineHeight = max(lineHeight, size.height)
+            usedWidth = max(usedWidth, currentX + itemWidth)
+            currentX += itemWidth + spacing
+            lineHeight = max(lineHeight, measured.height)
         }
         return CGSize(
             width: maxWidth.isFinite ? max(usedWidth, maxWidth) : usedWidth,
@@ -823,23 +830,26 @@ private struct IOSTaskBadgeFlowLayout: Layout {
     }
 
     func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        let maxLineWidth = bounds.width
+        let budget = ProposedViewSize(width: maxLineWidth.isFinite ? maxLineWidth : nil, height: nil)
         var currentX = bounds.minX
         var currentY = bounds.minY
         var lineHeight: CGFloat = 0
 
         for subview in subviews {
-            let size = subview.sizeThatFits(.unspecified)
-            if currentX > bounds.minX && currentX + size.width > bounds.maxX {
+            let measured = subview.sizeThatFits(budget)
+            let itemWidth = maxLineWidth.isFinite ? min(measured.width, maxLineWidth) : measured.width
+            if currentX > bounds.minX && currentX + itemWidth > bounds.maxX {
                 currentY += lineHeight + lineSpacing
                 currentX = bounds.minX
                 lineHeight = 0
             }
             subview.place(
                 at: CGPoint(x: currentX, y: currentY),
-                proposal: ProposedViewSize(width: size.width, height: size.height)
+                proposal: ProposedViewSize(width: itemWidth, height: measured.height)
             )
-            currentX += size.width + spacing
-            lineHeight = max(lineHeight, size.height)
+            currentX += itemWidth + spacing
+            lineHeight = max(lineHeight, measured.height)
         }
     }
 }

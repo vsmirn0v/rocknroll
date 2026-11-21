@@ -41,7 +41,7 @@ struct ObsidianSettingsView: View {
                 ) {
                     coordinator.chooseVault()
                 }
-                if coordinator.vaultName != nil {
+                if coordinator.vaultName != nil || coordinator.hasVaultBookmark {
                     Button(L("Disconnect Vault"), role: .destructive) {
                         confirmDisconnectVault = true
                     }

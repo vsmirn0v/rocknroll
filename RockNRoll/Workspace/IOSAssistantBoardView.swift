@@ -351,7 +351,8 @@ struct IOSAssistantBoardSheet: View {
                         controller.goBack()
                     } label: {
                         Image(systemName: "chevron.backward")
-                            .frame(minWidth: 36, minHeight: 44)
+                            .frame(minWidth: 44, minHeight: 44)
+                            .contentShape(Rectangle())
                     }
                     .disabled(!controller.canGoBack)
                     .accessibilityLabel(L("Back"))
@@ -360,7 +361,8 @@ struct IOSAssistantBoardSheet: View {
                         controller.goForward()
                     } label: {
                         Image(systemName: "chevron.forward")
-                            .frame(minWidth: 36, minHeight: 44)
+                            .frame(minWidth: 44, minHeight: 44)
+                            .contentShape(Rectangle())
                     }
                     .disabled(!controller.canGoForward)
                     .accessibilityLabel(L("Forward"))

@@ -523,7 +523,8 @@ final class RockCallViewController: UIViewController, UIScrollViewDelegate, UICo
         let accessWidth = MeetingAccessGeometry.availableAccessWidth(base: geometry, gallery: gallery)
         let access = MeetingAccessGeometry(base: geometry, bounds: view.bounds, insets: view.safeAreaInsets,
             accessSize: accessControls.fittingSize(availableWidth: accessWidth), largeText: large, gallery: gallery,
-            focusedShare: sharing && textCapture == nil)
+            focusedShare: sharing && textCapture == nil,
+            isRightToLeft: view.effectiveUserInterfaceLayoutDirection == .rightToLeft)
         let pin = currentPrimaryKey.flatMap { videoTiles[$0]?.pin }
         accessControls.setSharePin(from: access.combinedShareDock ? pin : nil)
         toolbar.frame = access.toolbar

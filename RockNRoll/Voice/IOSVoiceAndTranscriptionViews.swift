@@ -265,16 +265,6 @@ struct TranscriptionAndVoiceSettingsView: View {
                             confirmingDeleteGigaAM = true
                         }
                     }
-                    .confirmationDialog(
-                        L("Delete transcription model?"),
-                        isPresented: $confirmingDeleteGigaAM,
-                        titleVisibility: .visible
-                    ) {
-                        Button(L("Delete"), role: .destructive) {
-                            modelStore.deleteGigaAM()
-                        }
-                        Button(L("Cancel"), role: .cancel) {}
-                    }
                 case .failed(let message):
                     VStack(alignment: .leading, spacing: 6) {
                         Text(message)
@@ -399,6 +389,16 @@ struct TranscriptionAndVoiceSettingsView: View {
         }
         .sheet(isPresented: $showingEnrollmentSheet) {
             IOSVoiceEnrollmentSheet(voxStore: voxStore)
+        }
+        .confirmationDialog(
+            L("Delete transcription model?"),
+            isPresented: $confirmingDeleteGigaAM,
+            titleVisibility: .visible
+        ) {
+            Button(L("Delete"), role: .destructive) {
+                modelStore.deleteGigaAM()
+            }
+            Button(L("Cancel"), role: .cancel) {}
         }
         .confirmationDialog(
             L("Delete VoxCPM2 model?"),

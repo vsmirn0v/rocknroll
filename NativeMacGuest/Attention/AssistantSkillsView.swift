@@ -324,7 +324,7 @@ struct AssistantSkillsView: View {
                         }
 
                         Spacer()
-                        if !draftSkill.id.isEmpty {
+                        if selectedSkillID != nil {
                             Button(L("Delete"), role: .destructive) {
                                 confirmDeleteSkill = true
                             }
@@ -381,6 +381,7 @@ struct AssistantSkillsView: View {
                                 )
                         }
                         .buttonStyle(.plain)
+                        .accessibilityAddTraits(selectedPromptKind == kind ? .isSelected : [])
                     }
                 }
             }
@@ -776,13 +777,20 @@ struct AssistantSkillsView: View {
 struct NativeMeetingAssistantMenu: View {
     @ObservedObject var meeting: NativeDesktopMeetingModel
     @ObservedObject var attention: AttentionCoordinator
+    var compactChrome: Bool = false
+
     @ObservedObject private var facilitator: AutonomousMeetingFacilitator
     @ObservedObject private var board: AssistantBoardWindowController
     @State private var skills: [AssistantSkill] = []
 
-    init(meeting: NativeDesktopMeetingModel, attention: AttentionCoordinator) {
+    init(
+        meeting: NativeDesktopMeetingModel,
+        attention: AttentionCoordinator,
+        compactChrome: Bool = false
+    ) {
         self.meeting = meeting
         self.attention = attention
+        self.compactChrome = compactChrome
         self._facilitator = ObservedObject(wrappedValue: attention.facilitator ?? AutonomousMeetingFacilitator(attention: attention))
         self._board = ObservedObject(wrappedValue: attention.boardController)
     }
@@ -796,7 +804,7 @@ struct NativeMeetingAssistantMenu: View {
     }
 
     var body: some View {
-        Menu {
+        let menu = Menu {
             Button(isFacilitatorActive ? L("Stop Voice Facilitator") : L("Start Voice Facilitator")) {
                 if isFacilitatorActive {
                     facilitator.disable(for: meeting.sessionID)
@@ -855,13 +863,30 @@ struct NativeMeetingAssistantMenu: View {
                 }
             }
         } label: {
-            Label(
-                L("Rock Assistant"),
-                systemImage: isFacilitatorActive ? "sparkles.rectangle.stack.fill" : "sparkles"
-            )
+            if compactChrome {
+                Image(systemName: isFacilitatorActive ? "sparkles.rectangle.stack.fill" : "sparkles")
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundStyle(isFacilitatorActive ? Color.accentColor : Color.primary)
+                    .frame(width: 36, height: 36)
+                    .contentShape(Circle())
+            } else {
+                Label(
+                    L("Rock Assistant"),
+                    systemImage: isFacilitatorActive ? "sparkles.rectangle.stack.fill" : "sparkles"
+                )
+            }
         }
+        .accessibilityLabel(L("Rock Assistant"))
         .help(L("Facilitate this meeting with Rock skills & Jira Board"))
         .task { skills = await attention.listAssistantSkills() }
+
+        if compactChrome {
+            menu
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+        } else {
+            menu
+        }
     }
 }
 

@@ -223,6 +223,7 @@ final class MeetingParticipantStrip: UIScrollView, UIScrollViewDelegate {
     private var previews: [String: UIView] = [:]
     private var observers: [NSObjectProtocol] = []
     private(set) var visiblePreviewIDs = Set<String>()
+    private var lastRTLOverflowWidth: CGFloat = 0
     override var isHidden: Bool { didSet { if oldValue != isHidden { refreshPreviews() } } }
     var vertical = false { didSet { if oldValue != vertical { setNeedsLayout() } } }
     override init(frame: CGRect) {
@@ -309,6 +310,14 @@ final class MeetingParticipantStrip: UIScrollView, UIScrollViewDelegate {
         }
         contentSize = vertical ? CGSize(width: bounds.width, height: CGFloat(items.count) * 100) :
             CGSize(width: totalHorizontalWidth, height: bounds.height)
+        if !vertical && isRTL && bounds.width > 0 && totalHorizontalWidth > bounds.width {
+            if lastRTLOverflowWidth == 0 {
+                contentOffset = CGPoint(x: totalHorizontalWidth - bounds.width, y: 0)
+            }
+            lastRTLOverflowWidth = totalHorizontalWidth
+        } else {
+            lastRTLOverflowWidth = 0
+        }
         refreshPreviews()
     }
     override func didMoveToWindow() { super.didMoveToWindow(); refreshPreviews() }

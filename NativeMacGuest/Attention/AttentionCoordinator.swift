@@ -1,4 +1,5 @@
 import AVFoundation
+import Combine
 import ConferenceCore
 import Foundation
 import UserNotifications
@@ -151,7 +152,18 @@ final class AttentionMemoryPressure: @unchecked Sendable {
 
     let store: AttentionStore
     let boardController = AssistantBoardWindowController()
-    var facilitator: AutonomousMeetingFacilitator?
+    private var facilitatorSubscription: AnyCancellable?
+    var facilitator: AutonomousMeetingFacilitator? {
+        didSet {
+            bindFacilitatorObserver()
+        }
+    }
+
+    private func bindFacilitatorObserver() {
+        facilitatorSubscription = facilitator?.$activeSessionSkills.sink { [weak self] _ in
+            self?.objectWillChange.send()
+        }
+    }
     var cachedPromptTexts: [AssistantPromptKind: String] = [:]
     var skillFolderWatcher: AssistantSkillFolderWatcher?
     var watchedSkillVaultURL: URL?
@@ -263,6 +275,7 @@ final class AttentionMemoryPressure: @unchecked Sendable {
         self.store = store
         ruleStore = AssistantRuleStore(root: store.root)
         facilitator = AutonomousMeetingFacilitator(attention: self)
+        bindFacilitatorObserver()
         Task { @MainActor [weak self] in
             await self?.refreshCachedPrompts()
         }

@@ -22,6 +22,7 @@ import Foundation
     var isEnabled: Bool { destination?.enabled == true }
     var saveAfterMeeting: Bool { destination?.saveAfterMeeting == true }
     var syncChanges: Bool { destination?.syncChanges == true }
+    var hasVaultBookmark: Bool { destination?.vaultBookmark != nil }
 
     init(library: MeetingLibraryController, worker: ObsidianExportWorker? = nil,
          archive: TranscriptArchiveStore = TranscriptArchiveStore()) {

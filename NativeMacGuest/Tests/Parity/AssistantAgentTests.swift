@@ -1,6 +1,8 @@
 import AVFoundation
+import Combine
 import ConferenceCore
 import Foundation
+import LiveKitWebRTC
 import XCTest
 @testable import MeetingEngine
 @testable import RockNativeDesktop
@@ -1146,5 +1148,97 @@ final class AssistantAgentTests: XCTestCase {
             exp.fulfill()
         }
         wait(for: [exp], timeout: 5.0)
+    }
+
+    func testWorkspacePauseRestoreFacilitatorForwardsChangesAndSuppressesAutoGreet() {
+        @MainActor final class PauseRestoreTestEngine: NativeDesktopMeetingEngine {
+            var onState: ((NativeDesktopExternalSnapshot) -> Void)?
+            var onVideo: (([NativeDesktopExternalVideo]) -> Void)?
+            var onLocalCamera: ((LKRTCVideoTrack?) -> Void)?
+            var onTitle: ((String) -> Void)?
+            var factory: LKRTCPeerConnectionFactory? { nil }
+            private(set) var snapshot = NativeDesktopExternalSnapshot()
+            var incomingVideo: [NativeDesktopExternalVideo] { [] }
+            func connect(invitation: URL, name: String, quiet: Bool) async throws {
+                snapshot = .init(
+                    phase: .connected,
+                    playoutOn: !quiet,
+                    participants: [.init(id: "me", name: name, isLocal: true)]
+                )
+                onState?(snapshot)
+            }
+            func reconnect() async throws {}
+            func setMicrophone(_ enabled: Bool) async throws { snapshot.microphoneOn = enabled; onState?(snapshot) }
+            func setCamera(_ enabled: Bool) async throws {}
+            func setPlayout(_ enabled: Bool) async throws { snapshot.playoutOn = enabled; onState?(snapshot) }
+            func setScreenTrack(_ track: LKRTCVideoTrack?) async throws {}
+            func leave() async -> Bool { snapshot.phase = .left; onState?(snapshot); return true }
+        }
+
+        let defaults = UserDefaults(suiteName: "pause-restore-facil-\(UUID().uuidString)")!
+        let keychain = AttentionKeychain(service: "dev.vsmirn0v.conferenceguest.pauserestore.\(UUID().uuidString)")
+        let tempRoot = FileManager.default.temporaryDirectory.appendingPathComponent("pause-restore-\(UUID().uuidString)", isDirectory: true)
+        addTeardownBlock {
+            keychain.deleteAll()
+            try? FileManager.default.removeItem(at: tempRoot)
+        }
+
+        let exp = expectation(description: "pause-restore-verified")
+        Task { @MainActor in
+            let store = AttentionStore(root: tempRoot, defaults: defaults, keychain: keychain)
+            let coordinator = AttentionCoordinator(store: store)
+            var coordinatorChangeCount = 0
+            let subscription = coordinator.objectWillChange.sink { _ in
+                coordinatorChangeCount += 1
+            }
+
+            let greetSkill = AssistantSkill(
+                id: "standup-greet",
+                name: "Standup Greet",
+                role: "Standup lead",
+                triggers: ["standup"],
+                autoGreet: true,
+                instructions: "# Role\nGreet on join"
+            )
+            _ = try await coordinator.saveAssistantSkill(greetSkill)
+            let url = URL(string: "https://example.test/calls/standup-restore")!
+            let model = NativeDesktopMeetingModel(
+                destination: try .verified(url, engine: .guest),
+                name: "Vitalii",
+                title: "Standup",
+                engine: PauseRestoreTestEngine()
+            )
+            try await model.connect()
+            coordinator.meetings = { [model] }
+            let state = MeetingWorkspaceViewState()
+
+            coordinator.facilitator?.enable(for: model, skillID: "standup-greet")
+            let deadline = Date().addingTimeInterval(2.5)
+            while coordinator.talk.targetMeetingID != model.sessionID && Date() < deadline {
+                try await Task.sleep(for: .milliseconds(25))
+            }
+            XCTAssertGreaterThanOrEqual(coordinatorChangeCount, 1)
+            XCTAssertEqual(coordinator.facilitator?.activeSessionSkills[model.sessionID], "standup-greet")
+            XCTAssertEqual(coordinator.talk.targetMeetingID, model.sessionID)
+
+            // Pause All -> Facilitator disabled, restorePauses captured.
+            state.toggleAll([model], attention: coordinator)
+            XCTAssertNil(coordinator.facilitator?.activeSessionSkills[model.sessionID])
+            XCTAssertFalse(state.restorePauses.isEmpty)
+
+            // Reset marker and Restore -> facilitator re-enabled WITHOUT re-triggering autoGreet kickoff.
+            coordinator.talk.targetMeetingID = nil
+            state.toggleAll([model], attention: coordinator)
+            try await Task.sleep(for: .milliseconds(300))
+            XCTAssertEqual(coordinator.facilitator?.activeSessionSkills[model.sessionID], "standup-greet")
+            XCTAssertTrue(state.restorePauses.isEmpty)
+            XCTAssertNil(coordinator.talk.targetMeetingID, "Restoring a paused facilitator must suppress autoGreet")
+
+            withExtendedLifetime(subscription) {}
+            _ = await model.leave()
+            coordinator.stop()
+            exp.fulfill()
+        }
+        wait(for: [exp], timeout: 10.0)
     }
 }

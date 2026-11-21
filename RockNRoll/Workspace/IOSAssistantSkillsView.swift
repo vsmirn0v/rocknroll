@@ -591,7 +591,15 @@ struct IOSAssistantSkillsView: View {
     }
 
     private func saveRealtimeAPIKey() {
-        if skills.setRealtimeAPIKey(realtimeKeyDraft, for: skills.realtimeProvider) {
+        let trimmed = realtimeKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        let ok = skills.setRealtimeAPIKey(trimmed, for: skills.realtimeProvider)
+        if trimmed.isEmpty {
+            if ok {
+                showStatus(L("Removed API key from Keychain."))
+            } else {
+                showStatus(L("Could not remove the API key from the Keychain."), isError: true)
+            }
+        } else if ok {
             showStatus(L("Saved API key to Keychain."))
         } else {
             showStatus(L("Could not save the API key to the Keychain."), isError: true)

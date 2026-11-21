@@ -558,6 +558,7 @@ struct WorkspaceComposer: View {
     var maximum: Int?
     let symbol: String
     let perform: () -> Void
+    @FocusState private var isFocused: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
@@ -565,16 +566,27 @@ struct WorkspaceComposer: View {
             HStack(alignment: .bottom, spacing: 8) {
                 TextField(placeholder, text: $text, axis: .vertical)
                     .textFieldStyle(.roundedBorder).lineLimit(1...3).accessibilityLabel(title)
+                    .focused($isFocused)
                     .accessibilityIdentifier(symbol == "lock" ? "meetingWorkspace.privateGuidance" : "meetingWorkspace.manualMessage")
-                Button(actionTitle, action: perform).buttonStyle(.borderedProminent)
-                    .keyboardShortcut(.return, modifiers: .command)
-                    .accessibilityIdentifier(symbol == "lock" ? "meetingWorkspace.applyGuidance" : "meetingWorkspace.sendManualMessage")
-                    .disabled(!canSubmit || text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                              || maximum.map { text.count > $0 } == true)
+                submitButton
             }
             if let maximum, text.count > maximum {
                 Text(L("Use up to %ld characters per instruction.", maximum)).font(.caption).foregroundStyle(.orange)
             }
+        }
+    }
+
+    @ViewBuilder
+    private var submitButton: some View {
+        let base = Button(actionTitle, action: perform)
+            .buttonStyle(.borderedProminent)
+            .accessibilityIdentifier(symbol == "lock" ? "meetingWorkspace.applyGuidance" : "meetingWorkspace.sendManualMessage")
+            .disabled(!canSubmit || text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                      || maximum.map { text.count > $0 } == true)
+        if isFocused {
+            base.keyboardShortcut(.return, modifiers: .command)
+        } else {
+            base
         }
     }
 }

@@ -1209,6 +1209,36 @@ final class IOSMultiMeetingTests: XCTestCase {
         XCTAssertEqual(h.model.sessions.count, 2)
     }
 
+    func testJoinCandidatesAlongsideJoinsMultipleRoomsWhileEarlierSessionIsStillConnecting() async throws {
+        let h = makeModel(lobbyForGuest: true)
+        defer {
+            h.model.workspaceAudio.systemCall.markEnded(reason: .remoteEnded)
+            withExtendedLifetime(h.container) {}
+        }
+
+        let now = Date()
+        let guestURL = URL(string: "https://meeting.example.test/calls/standup")!
+        let telemostURL = URL(string: "https://telemost.yandex.ru/j/9876543210")!
+        let trueconfURL = URL(string: "https://trueconf.example.com/c/trueconf-room")!
+
+        let candidates = [
+            JoinableMeetingCandidate(id: UUID(), title: "Standup", invitation: guestURL, source: .ongoingCalendar, start: now),
+            JoinableMeetingCandidate(id: UUID(), title: "Standup Duplicate", invitation: guestURL, source: .upcomingCalendar, start: now),
+            JoinableMeetingCandidate(id: UUID(), title: "Telemost Sync", invitation: telemostURL, source: .upcomingCalendar, start: now),
+            JoinableMeetingCandidate(id: UUID(), title: "TrueConf Review", invitation: trueconfURL, source: .recentRoom, start: nil),
+        ]
+
+        await h.model.joinCandidatesAlongside(candidates)
+        try await waitUntil {
+            h.model.sessions.count == 3 &&
+            h.model.sessions.filter { $0.phase == .connected }.count == 2
+        }
+
+        XCTAssertEqual(h.model.sessions.count, 3)
+        XCTAssertEqual(h.model.sessions.first?.phase, .lobby)
+        XCTAssertEqual(h.model.sessions.filter { $0.phase == .connected }.count, 2)
+    }
+
     private static func findScrollView(id: String, in root: UIView) -> UIScrollView? {
         if let scroll = root as? UIScrollView, scroll.accessibilityIdentifier == id {
             return scroll
