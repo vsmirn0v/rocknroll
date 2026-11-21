@@ -45,8 +45,11 @@ struct IOSMeetingDetailView: View {
     @State private var newTaskReminder = Date().addingTimeInterval(3600)
 
     @State private var transcriptEvents: [SyncedTranscriptEvent] = []
+    @State private var foldedTranscriptIndex: [String: String] = [:]
     @State private var transcriptIsLocalOnly = false
     @State private var transcriptSearch = ""
+    @State private var cachedPreviewMarkdown: AttributedString?
+    @State private var cachedPreviewSource = ""
 
     @State private var transitionChoice: IOSSameRoomTransitionMode?
     @State private var useSeriesScope = false
@@ -157,6 +160,12 @@ struct IOSMeetingDetailView: View {
         .onChange(of: sessionID) { _, _ in
             loadInitialState()
             Task { await loadTranscript() }
+        }
+        .onChange(of: previewNotes) { _, isPreview in
+            if isPreview { refreshNotePreviewIfNeeded() }
+        }
+        .onChange(of: noteText) { _, _ in
+            if previewNotes { refreshNotePreviewIfNeeded() }
         }
         .task(id: sessionID) {
             await loadTranscript()
@@ -532,7 +541,9 @@ struct IOSMeetingDetailView: View {
 
             if previewNotes {
                 ScrollView {
-                    if let attributed = try? AttributedString(markdown: noteText.isEmpty ? L("_No notes yet._") : noteText) {
+                    let source = noteText.isEmpty ? L("_No notes yet._") : noteText
+                    if let attributed = (cachedPreviewSource == source ? cachedPreviewMarkdown : nil)
+                        ?? (try? AttributedString(markdown: source)) {
                         Text(attributed)
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .padding()
@@ -560,8 +571,10 @@ struct IOSMeetingDetailView: View {
 
     private var transcriptView: some View {
         let trimmed = transcriptSearch.trimmingCharacters(in: .whitespacesAndNewlines).workspaceFolded
-        let filtered = trimmed.isEmpty ? transcriptEvents : transcriptEvents.filter {
-            $0.text.workspaceFolded.contains(trimmed) || ($0.speaker?.workspaceFolded.contains(trimmed) ?? false)
+        let filtered = trimmed.isEmpty ? transcriptEvents : transcriptEvents.filter { event in
+            let haystack = foldedTranscriptIndex[event.id]
+                ?? "\((event.speaker ?? "")) \(event.text)".workspaceFolded
+            return haystack.contains(trimmed)
         }
 
         return VStack(spacing: 8) {
@@ -715,6 +728,14 @@ struct IOSMeetingDetailView: View {
         noteText = workspace.noteDraft(for: sessionID)
         useSeriesScope = (session?.calendarSeriesID?.isEmpty == false)
         loadContextFields()
+        if previewNotes { refreshNotePreviewIfNeeded() }
+    }
+
+    private func refreshNotePreviewIfNeeded() {
+        let source = noteText.isEmpty ? L("_No notes yet._") : noteText
+        guard source != cachedPreviewSource || cachedPreviewMarkdown == nil else { return }
+        cachedPreviewSource = source
+        cachedPreviewMarkdown = try? AttributedString(markdown: source)
     }
 
     private func loadContextFields() {
@@ -730,7 +751,12 @@ struct IOSMeetingDetailView: View {
 
     private func loadTranscript() async {
         let (events, isLocal) = await workspace.historyTranscriptForDisplay(sessionID: sessionID)
+        var index: [String: String] = Dictionary(minimumCapacity: events.count)
+        for event in events {
+            index[event.id] = "\((event.speaker ?? "")) \(event.text)".workspaceFolded
+        }
         transcriptEvents = events
+        foldedTranscriptIndex = index
         transcriptIsLocalOnly = isLocal
     }
 

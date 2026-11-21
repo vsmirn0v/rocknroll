@@ -95,6 +95,7 @@ enum VoiceSynthesisError: LocalizedError, Equatable {
     private var player: AVAudioPlayerNode?
     private var generation = UUID()
     private var completionHandler: (() -> Void)?
+    private var streamFormat: AVAudioFormat?
 
     func play(_ buffer: AVAudioPCMBuffer, onComplete: (() -> Void)? = nil) throws {
         stop()
@@ -114,6 +115,7 @@ enum VoiceSynthesisError: LocalizedError, Equatable {
                 self.player = nil
                 self.engine?.stop()
                 self.engine = nil
+                self.streamFormat = nil
                 self.isPlaying = false
                 completion?()
             }
@@ -121,6 +123,60 @@ enum VoiceSynthesisError: LocalizedError, Equatable {
         player.play()
         self.engine = engine
         self.player = player
+        self.streamFormat = buffer.format
+    }
+
+    @discardableResult
+    func beginStreaming(format: AVAudioFormat, onComplete: (() -> Void)? = nil) throws -> UUID {
+        stop()
+        let token = UUID()
+        generation = token
+        completionHandler = onComplete
+        let engine = AVAudioEngine(), player = AVAudioPlayerNode()
+        engine.attach(player)
+        engine.connect(player, to: engine.mainMixerNode, format: format)
+        try engine.start()
+        player.play()
+        self.engine = engine
+        self.player = player
+        self.streamFormat = format
+        isPlaying = true
+        return token
+    }
+
+    func enqueueStreamBuffer(_ buffer: AVAudioPCMBuffer, sessionToken: UUID) {
+        guard generation == sessionToken, let player else { return }
+        if !player.isPlaying {
+            player.play()
+        }
+        player.scheduleBuffer(buffer, completionHandler: nil)
+    }
+
+    func finishStreaming(sessionToken: UUID) {
+        guard generation == sessionToken, let player, let streamFormat,
+              let sentinel = AVAudioPCMBuffer(pcmFormat: streamFormat, frameCapacity: 1) else {
+            return
+        }
+        sentinel.frameLength = 1
+        if let channel = sentinel.floatChannelData?[0] {
+            channel[0] = 0
+        }
+        player.scheduleBuffer(sentinel) { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self, self.generation == sessionToken else { return }
+                let completion = self.completionHandler
+                self.completionHandler = nil
+                self.player = nil
+                self.engine?.stop()
+                self.engine = nil
+                self.streamFormat = nil
+                self.isPlaying = false
+                completion?()
+            }
+        }
+        if !player.isPlaying {
+            player.play()
+        }
     }
 
     func stop() {
@@ -129,6 +185,7 @@ enum VoiceSynthesisError: LocalizedError, Equatable {
         player = nil
         engine?.stop()
         engine = nil
+        streamFormat = nil
         let hadCompletion = completionHandler
         completionHandler = nil
         isPlaying = false
@@ -310,10 +367,13 @@ enum VoiceSynthesis {
         }
     }
 
-    /// Reads WAV (or any format AVAudioFile knows) through a private temporary file.
+    /// Parses uncompressed RIFF/WAVE in-memory without temp-file overhead, falling back to `AVAudioFile` for other formats.
     static func buffer(fromAudio data: Data) throws -> AVAudioPCMBuffer {
         let maxAudioBytes = 32 * 1024 * 1024
         guard !data.isEmpty, data.count <= maxAudioBytes else { throw VoiceSynthesisError.audio }
+        if let parsed = parseWAVInMemory(data) {
+            return parsed
+        }
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("voice-reply-\(UUID().uuidString).wav")
         defer { try? FileManager.default.removeItem(at: url) }
         do {
@@ -329,5 +389,85 @@ enum VoiceSynthesis {
             return buffer
         } catch let error as VoiceSynthesisError { throw error }
         catch { throw VoiceSynthesisError.audio }
+    }
+
+    private static func parseWAVInMemory(_ data: Data) -> AVAudioPCMBuffer? {
+        guard data.count >= 44 else { return nil }
+        func ascii(_ offset: Int, _ target: String) -> Bool {
+            guard offset + 4 <= data.count else { return false }
+            return Data(data[offset..<(offset + 4)]) == Data(target.utf8)
+        }
+        func u16(_ offset: Int) -> UInt16 {
+            data.withUnsafeBytes { raw in UInt16(littleEndian: raw.loadUnaligned(fromByteOffset: offset, as: UInt16.self)) }
+        }
+        func u32(_ offset: Int) -> UInt32 {
+            data.withUnsafeBytes { raw in UInt32(littleEndian: raw.loadUnaligned(fromByteOffset: offset, as: UInt32.self)) }
+        }
+        guard ascii(0, "RIFF"), ascii(8, "WAVE") else { return nil }
+        var offset = 12
+        var audioFormat: UInt16 = 0
+        var channels: UInt16 = 0
+        var sampleRate: UInt32 = 0
+        var bitsPerSample: UInt16 = 0
+        var dataRange: Range<Int>?
+
+        while offset + 8 <= data.count {
+            let chunkSize = Int(u32(offset + 4))
+            let bodyStart = offset + 8
+            guard chunkSize >= 0, bodyStart + chunkSize <= data.count else { break }
+            if ascii(offset, "fmt ") && chunkSize >= 16 {
+                audioFormat = u16(bodyStart)
+                channels = u16(bodyStart + 2)
+                sampleRate = u32(bodyStart + 4)
+                bitsPerSample = u16(bodyStart + 14)
+            } else if ascii(offset, "data") {
+                dataRange = bodyStart..<(bodyStart + chunkSize)
+                break
+            }
+            offset = bodyStart + chunkSize + (chunkSize & 1)
+        }
+        guard let dataRange, channels >= 1, channels <= 2, sampleRate >= 8_000 else { return nil }
+        let bytesPerSample = Int(bitsPerSample) / 8
+        let frameSize = bytesPerSample * Int(channels)
+        guard frameSize > 0 else { return nil }
+        let frameCount = dataRange.count / frameSize
+        let maxFrames = Int(Double(sampleRate) * 120.0)
+        guard frameCount > 0, frameCount <= maxFrames,
+              let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: Double(sampleRate), channels: 1, interleaved: false),
+              let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(frameCount)),
+              let out = buffer.floatChannelData?[0] else {
+            return nil
+        }
+        buffer.frameLength = AVAudioFrameCount(frameCount)
+        let chCount = Int(channels)
+        if audioFormat == 1 && bitsPerSample == 16 {
+            data.withUnsafeBytes { raw in
+                let scale: Float = 1.0 / 32768.0
+                for frame in 0..<frameCount {
+                    var sum: Float = 0
+                    let frameBase = dataRange.lowerBound + frame * frameSize
+                    for ch in 0..<chCount {
+                        let s = Int16(littleEndian: raw.loadUnaligned(fromByteOffset: frameBase + ch * 2, as: Int16.self))
+                        sum += Float(s) * scale
+                    }
+                    out[frame] = sum / Float(chCount)
+                }
+            }
+            return buffer
+        } else if audioFormat == 3 && bitsPerSample == 32 {
+            data.withUnsafeBytes { raw in
+                for frame in 0..<frameCount {
+                    var sum: Float = 0
+                    let frameBase = dataRange.lowerBound + frame * frameSize
+                    for ch in 0..<chCount {
+                        let bits = UInt32(littleEndian: raw.loadUnaligned(fromByteOffset: frameBase + ch * 4, as: UInt32.self))
+                        sum += Float(bitPattern: bits)
+                    }
+                    out[frame] = sum / Float(chCount)
+                }
+            }
+            return buffer
+        }
+        return nil
     }
 }

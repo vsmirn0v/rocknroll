@@ -191,13 +191,43 @@ public struct MeetingWorkspaceSyncDocument: Codable, Equatable, Sendable {
             .sorted { ($0.startedAt, $0.id.uuidString) < ($1.startedAt, $1.id.uuidString) }
         var redirects: [(loser: UUID, winner: UUID)] = []
         var consumed: Set<UUID> = []
+        var activeByOccurrence: [String: [Int]] = [:]
+        var activeByCalKey: [String: [Int]] = [:]
+        var activeByRoom: [String: [Int]] = [:]
+        for (idx, item) in active.enumerated() {
+            if let occID = item.calendarAssociation?.value?.occurrenceID {
+                activeByOccurrence[occID, default: []].append(idx)
+            }
+            if item.occurrenceKey.hasPrefix("cal:") {
+                activeByCalKey[item.occurrenceKey, default: []].append(idx)
+            }
+            if !item.roomIdentity.isEmpty {
+                activeByRoom[item.roomIdentity, default: []].append(idx)
+            }
+        }
 
         for i in active.indices {
             let first = active[i]
             if consumed.contains(first.id) { continue }
-            for j in active.indices where j > i {
+            var candidateIndices: [Int] = []
+            if let calAssoc = first.calendarAssociation {
+                guard let occID = calAssoc.value?.occurrenceID else { continue }
+                candidateIndices = activeByOccurrence[occID] ?? []
+            } else if first.occurrenceKey.hasPrefix("cal:") {
+                candidateIndices = activeByCalKey[first.occurrenceKey] ?? []
+            } else if !first.roomIdentity.isEmpty {
+                candidateIndices = activeByRoom[first.roomIdentity] ?? []
+            } else {
+                continue
+            }
+
+            for j in candidateIndices where j > i {
                 let second = active[j]
                 if consumed.contains(second.id) { continue }
+                if first.calendarAssociation == nil && !first.occurrenceKey.hasPrefix("cal:") &&
+                    second.startedAt.timeIntervalSince(first.startedAt) > 900 {
+                    break
+                }
                 guard shouldCoalesce(first, second, transitionMode: respectingTransitionMode) else { continue }
                 consumed.insert(second.id)
                 let version = nextVersion()
@@ -243,11 +273,12 @@ public struct MeetingWorkspaceSyncDocument: Codable, Equatable, Sendable {
     /// Repair only an unambiguous room and time match, preserving explicit unlink choices.
     public mutating func inferCalendarAssociations(from calendar: [MeetingCalendarAssociation] = []) -> Set<UUID> {
         let known = calendar + sessions.values.compactMap { $0.calendarAssociation?.value }
+        let knownByRoom = Dictionary(grouping: known, by: \.roomKey)
         var changed: Set<UUID> = []
         for session in sessions.values where !session.isDeleted.value && session.canonicalSessionID == nil &&
             session.calendarAssociation == nil && session.historyGroupParent == nil {
             guard let invitation = session.invitation.value, let room = MeetingRoomIdentity(invitation) else { continue }
-            let sameRoom = known.filter { $0.roomKey == room.workspaceKey }
+            let sameRoom = knownByRoom[room.workspaceKey] ?? []
             let candidates = sameRoom.filter { candidate in
                 let next = sameRoom.filter { $0.start > candidate.start && !$0.matches(candidate) }.map(\.start).min()
                 return candidate.allowsRejoin(at: session.startedAt, before: next)
@@ -500,15 +531,20 @@ public struct MeetingWorkspaceSyncDocument: Codable, Equatable, Sendable {
         }
         // Redirects may arrive after a local edit or before their child records.
         // Normalize existing source content after the entire incoming batch.
-        for session in sessions.values where session.canonicalSessionID != nil {
-            let target = resolveCanonicalSessionID(for: session.id)
-            guard target != session.id,
-                  notes[session.id] != nil || outcomes[session.id] != nil ||
-                    tasks.values.contains(where: { $0.sessionID == session.id }) ||
-                    transcriptChunks.values.contains(where: { $0.sessionID == session.id }) else { continue }
-            let version = nextVersion()
-            reattributeChildren(from: session.id, to: target, version: version)
-            report.changedSessions.formUnion([session.id, target])
+        let redirectedSessions = sessions.values.filter { $0.canonicalSessionID != nil }
+        if !redirectedSessions.isEmpty {
+            let sessionsWithTasks = Set(tasks.values.map(\.sessionID))
+            let sessionsWithChunks = Set(transcriptChunks.values.map(\.sessionID))
+            for session in redirectedSessions {
+                let target = resolveCanonicalSessionID(for: session.id)
+                guard target != session.id,
+                      notes[session.id] != nil || outcomes[session.id] != nil ||
+                        sessionsWithTasks.contains(session.id) ||
+                        sessionsWithChunks.contains(session.id) else { continue }
+                let version = nextVersion()
+                reattributeChildren(from: session.id, to: target, version: version)
+                report.changedSessions.formUnion([session.id, target])
+            }
         }
         return report
     }

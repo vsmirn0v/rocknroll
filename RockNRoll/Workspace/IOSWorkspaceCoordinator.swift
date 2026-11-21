@@ -114,6 +114,7 @@ final class IOSWorkspaceCoordinator: ObservableObject {
     private var dirtyNoteSessions: Set<UUID> = []
     private var noteDebounceTasks: [UUID: Task<Void, Never>] = [:]
     private var liveEventsBySession: [UUID: [SyncedTranscriptEvent]] = [:]
+    private var lastPersistedEventsBySession: [UUID: [String: SyncedTranscriptEvent]] = [:]
     private var micIntervalsBySession: [UUID: [DateInterval]] = [:]
     private var transcriptWriteTasks: [UUID: Task<Void, Never>] = [:]
     private var lastLocalSchedule: (meetings: [CalendarMeeting], bindings: [String: URL], suppressed: [String: Date])?
@@ -435,7 +436,16 @@ final class IOSWorkspaceCoordinator: ObservableObject {
             guard !Task.isCancelled, let self else { return }
             let latest = self.liveEventsBySession[canonical] ?? events
             self.transcriptWriteTasks[canonical] = nil
-            try? await self.store.appendTranscriptEvents(sessionID: canonical, events: latest)
+            var previous = self.lastPersistedEventsBySession[canonical] ?? [:]
+            let delta = latest.filter { previous[$0.id] != $0 }
+            guard !delta.isEmpty else { return }
+            do {
+                try await self.store.appendTranscriptEvents(sessionID: canonical, events: delta)
+                for ev in delta {
+                    previous[ev.id] = ev
+                }
+                self.lastPersistedEventsBySession[canonical] = previous
+            } catch {}
         }
     }
 
@@ -483,6 +493,7 @@ final class IOSWorkspaceCoordinator: ObservableObject {
             }
             let finalMicIntervals = self.micIntervalsBySession[sid] ?? []
             self.liveEventsBySession.removeValue(forKey: sid)
+            self.lastPersistedEventsBySession.removeValue(forKey: sid)
             self.micIntervalsBySession.removeValue(forKey: sid)
             if !finalEvents.isEmpty {
                 for (idx, start) in stride(from: 0, to: finalEvents.count, by: chunkSize).enumerated() {
@@ -953,6 +964,7 @@ final class IOSWorkspaceCoordinator: ObservableObject {
 
     func deleteSession(_ id: UUID) async {
         let sid = replica.workspaceDoc.resolveCanonicalSessionID(for: id)
+        lastPersistedEventsBySession.removeValue(forKey: sid)
         try? await store.deleteSession(sid)
         if var existing = replica.workspaceDoc.sessions[sid] {
             existing.isDeleted = SyncValue(true, version: replica.workspaceDoc.nextVersion())

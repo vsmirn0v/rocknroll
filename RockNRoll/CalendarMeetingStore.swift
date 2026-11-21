@@ -30,12 +30,18 @@ final class CalendarMeetingStore: ObservableObject {
     @Published private(set) var automaticJoinPausedUntil: Date?
     @Published private(set) var selected: Set<String>
     @Published private(set) var calendars: [MeetingCalendar] = []
-    @Published private(set) var meetings: [CalendarMeeting] = []
+    @Published private(set) var meetings: [CalendarMeeting] = [] {
+        didSet { rebuildUpcomingCache() }
+    }
     @Published private(set) var syncedRemoteMeetings: [CalendarMeeting] = []
     @Published private(set) var access: CalendarAccess = .notDetermined
     @Published private(set) var loading = false
     @Published private(set) var error: String?
-    @Published private(set) var now = Date()
+    @Published private(set) var now = Date() {
+        didSet { rebuildUpcomingCache() }
+    }
+    private var cachedUpcoming: [CalendarMeeting] = []
+    private var cachedUpcomingByIdentity: [MeetingRoomIdentity: CalendarMeeting] = [:]
     @Published private(set) var countdown: Int?
     @Published private(set) var joiningMeeting: CalendarMeeting?
     @Published var choosingMeeting: CalendarMeeting? {
@@ -449,7 +455,19 @@ final class CalendarMeetingStore: ObservableObject {
         }
     }
 
-    var upcoming: [CalendarMeeting] { meetings.filter { $0.end > now && $0.hasResolvedInvitation } }
+    private func rebuildUpcomingCache() {
+        let filtered = meetings.filter { $0.end > now && $0.hasResolvedInvitation }
+        cachedUpcoming = filtered
+        var byIdentity: [MeetingRoomIdentity: CalendarMeeting] = Dictionary(minimumCapacity: filtered.count)
+        for candidate in filtered {
+            if let identity = candidate.roomIdentity, byIdentity[identity] == nil {
+                byIdentity[identity] = candidate
+            }
+        }
+        cachedUpcomingByIdentity = byIdentity
+    }
+
+    var upcoming: [CalendarMeeting] { cachedUpcoming }
     var next: CalendarMeeting? {
         let timely = upcoming.filter { $0.isTimely(now) }
         return timely.count == 1 ? timely[0] : nil
@@ -462,6 +480,12 @@ final class CalendarMeetingStore: ObservableObject {
         onLocalScheduleSnapshot?(localMeetings, state.bindings, state.suppressed)
     }
     func forgetBindings() { state.bindings = [:]; persist(); refresh() }
+    private func upcomingMeeting(matching invitation: URL, engine: MeetingEngineKind?) -> CalendarMeeting? {
+        if let engine, let identity = MeetingRoomIdentity(invitation, engine: engine) {
+            return cachedUpcomingByIdentity[identity]
+        }
+        return meeting(matching: invitation, engine: engine, in: cachedUpcoming)
+    }
     private func meeting(matching invitation: URL, engine: MeetingEngineKind?, in candidates: [CalendarMeeting]) -> CalendarMeeting? {
         candidates.first { candidate in
             candidate.hasResolvedInvitation &&
@@ -470,7 +494,7 @@ final class CalendarMeetingStore: ObservableObject {
     }
     func subtitle(for room: RecentRoom) -> String? {
         guard (enabled && access == .allowed) || !syncedRemoteMeetings.isEmpty else { return nil }
-        if let meeting = meeting(matching: room.joinURL, engine: room.engine, in: upcoming) {
+        if let meeting = upcomingMeeting(matching: room.joinURL, engine: room.engine) {
             return CalendarMeetingPresentation.subtitle(meeting, at: now, roomTitle: room.displayTitle)
         }
         if let visit = state.visits[room.id] {
@@ -480,7 +504,7 @@ final class CalendarMeetingStore: ObservableObject {
     }
     func timing(for room: RecentRoom) -> String? {
         guard (enabled && access == .allowed) || !syncedRemoteMeetings.isEmpty else { return nil }
-        if let meeting = meeting(matching: room.joinURL, engine: room.engine, in: upcoming) {
+        if let meeting = upcomingMeeting(matching: room.joinURL, engine: room.engine) {
             return CalendarMeetingPresentation.timeRange(meeting)
         }
         return state.visits[room.id].map { $0.start.formatted(date: .abbreviated, time: .shortened) }
@@ -550,10 +574,10 @@ final class CalendarMeetingStore: ObservableObject {
         if changed { persist() }
     }
     func preferredInvitation(for room: RecentRoom) -> URL {
-        meeting(matching: room.joinURL, engine: room.engine, in: upcoming)?.invitation ?? room.joinURL
+        upcomingMeeting(matching: room.joinURL, engine: room.engine)?.invitation ?? room.joinURL
     }
     func preferredEngine(for room: RecentRoom) -> MeetingEngineKind? {
-        meeting(matching: room.joinURL, engine: room.engine, in: upcoming)?.engine ?? room.engine
+        upcomingMeeting(matching: room.joinURL, engine: room.engine)?.engine ?? room.engine
     }
     func cancelAutomaticJoin(suppress: Bool = false, preservingActivity: Bool = false) {
         if suppress { invalidateScheduledAdmission() }

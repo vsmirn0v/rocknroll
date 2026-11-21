@@ -272,6 +272,8 @@ struct MeetingWorkspaceSession: Codable, Equatable, Identifiable {
             attributes: [.posixPermissions: 0o700])
         let db = try MeetingSQLiteConnection(path: directory.appendingPathComponent("journal.sqlite3"))
         try db.execute("""
+        PRAGMA journal_mode=WAL;
+        PRAGMA synchronous=NORMAL;
         PRAGMA secure_delete=ON;
         CREATE TABLE IF NOT EXISTS workspace_sessions(id TEXT PRIMARY KEY NOT NULL, payload BLOB NOT NULL);
         CREATE TABLE IF NOT EXISTS workspace_events(
@@ -308,16 +310,24 @@ struct MeetingWorkspaceSession: Codable, Equatable, Identifiable {
 
     @discardableResult private func store(sessionID: UUID, events: [MeetingWorkspaceEvent]) -> Bool {
         guard !events.isEmpty, let session = session(id: sessionID) else { return false }
-        return commit(session: session, events: events)
+        return commit(session: session, events: events, updateSessionRow: false)
     }
 
-    @discardableResult private func commit(session: MeetingWorkspaceSession, events: [MeetingWorkspaceEvent]) -> Bool {
-        let encoder = JSONEncoder()
+    private let jsonEncoder = JSONEncoder()
+
+    @discardableResult private func commit(
+        session: MeetingWorkspaceSession,
+        events: [MeetingWorkspaceEvent],
+        updateSessionRow: Bool = true
+    ) -> Bool {
+        let encoder = jsonEncoder
         let saved = write { db in
             try db.transaction {
-                try db.run("INSERT INTO workspace_sessions(id,payload) VALUES(?,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload") {
-                    try MeetingSQLiteConnection.bindText($0, session.id.uuidString, at: 1)
-                    try MeetingSQLiteConnection.bindBlob($0, encoder.encode(session), at: 2)
+                if updateSessionRow {
+                    try db.run("INSERT INTO workspace_sessions(id,payload) VALUES(?,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload") {
+                        try MeetingSQLiteConnection.bindText($0, session.id.uuidString, at: 1)
+                        try MeetingSQLiteConnection.bindBlob($0, encoder.encode(session), at: 2)
+                    }
                 }
                 for event in events {
                     try db.run("""

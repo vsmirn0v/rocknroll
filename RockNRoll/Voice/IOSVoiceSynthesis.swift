@@ -1,3 +1,4 @@
+import Accelerate
 import AVFoundation
 import Combine
 import ConferenceCore
@@ -324,6 +325,9 @@ enum IOSVoiceSynthesis {
     }
 
     static func buffer(fromAudio data: Data) throws -> AVAudioPCMBuffer {
+        if let fastBuffer = parseWAVInMemory(data) {
+            return fastBuffer
+        }
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("ios-voice-reply-\(UUID().uuidString).wav")
         defer { try? FileManager.default.removeItem(at: url) }
@@ -348,6 +352,106 @@ enum IOSVoiceSynthesis {
             throw IOSVoiceSynthesisError.audio
         }
     }
+
+    /// Fast-path in-memory RIFF/WAVE 16-bit PCM decoder so synthesized WAV bytes skip temp-file disk I/O.
+    private static func parseWAVInMemory(_ data: Data) -> AVAudioPCMBuffer? {
+        guard data.count >= 44 else { return nil }
+        return data.withUnsafeBytes { raw -> AVAudioPCMBuffer? in
+            guard let base = raw.baseAddress else { return nil }
+            func fourCC(_ offset: Int) -> UInt32 {
+                var value: UInt32 = 0
+                memcpy(&value, base.advanced(by: offset), 4)
+                return value.bigEndian
+            }
+            func le16(_ offset: Int) -> UInt16 {
+                var value: UInt16 = 0
+                memcpy(&value, base.advanced(by: offset), 2)
+                return UInt16(littleEndian: value)
+            }
+            func le32(_ offset: Int) -> UInt32 {
+                var value: UInt32 = 0
+                memcpy(&value, base.advanced(by: offset), 4)
+                return UInt32(littleEndian: value)
+            }
+
+            guard fourCC(0) == 0x52494646, fourCC(8) == 0x57415645 else { return nil } // RIFF / WAVE
+            var offset = 12
+            var audioFormat: UInt16 = 0
+            var channels: UInt16 = 0
+            var sampleRate: UInt32 = 0
+            var bitsPerSample: UInt16 = 0
+            var pcmRange: Range<Int>?
+
+            while offset + 8 <= data.count {
+                let chunkID = fourCC(offset)
+                let chunkSize = Int(le32(offset + 4))
+                let payloadStart = offset + 8
+                guard chunkSize >= 0, payloadStart + chunkSize <= data.count else { break }
+                if chunkID == 0x666D7420, chunkSize >= 16 { // "fmt "
+                    audioFormat = le16(payloadStart)
+                    channels = le16(payloadStart + 2)
+                    sampleRate = le32(payloadStart + 4)
+                    bitsPerSample = le16(payloadStart + 14)
+                } else if chunkID == 0x64617461 { // "data"
+                    pcmRange = payloadStart..<(payloadStart + chunkSize)
+                }
+                let paddedSize = chunkSize + (chunkSize & 1)
+                offset = payloadStart + paddedSize
+            }
+
+            guard audioFormat == 1,
+                  bitsPerSample == 16,
+                  channels == 1 || channels == 2,
+                  sampleRate > 0,
+                  let pcmRange else {
+                return nil
+            }
+            let bytesPerFrame = Int(channels) * 2
+            let frameCount = pcmRange.count / bytesPerFrame
+            guard frameCount > 0,
+                  frameCount <= 48_000 * 600,
+                  let avFrameCount = AVAudioFrameCount(exactly: frameCount),
+                  let format = AVAudioFormat(
+                      commonFormat: .pcmFormatFloat32,
+                      sampleRate: Double(sampleRate),
+                      channels: AVAudioChannelCount(channels),
+                      interleaved: false
+                  ),
+                  let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: avFrameCount),
+                  let channelData = buffer.floatChannelData else {
+                return nil
+            }
+            buffer.frameLength = avFrameCount
+            let srcBytes = base.advanced(by: pcmRange.lowerBound)
+            var scale: Float = 1.0 / 32768.0
+            if channels == 1 {
+                let dst = channelData[0]
+                if Int(bitPattern: srcBytes) & 1 == 0 {
+                    let src16 = srcBytes.assumingMemoryBound(to: Int16.self)
+                    vDSP_vflt16(src16, 1, dst, 1, vDSP_Length(frameCount))
+                    vDSP_vsmul(dst, 1, &scale, dst, 1, vDSP_Length(frameCount))
+                } else {
+                    for i in 0..<frameCount {
+                        var s: Int16 = 0
+                        memcpy(&s, srcBytes.advanced(by: i * 2), 2)
+                        dst[i] = Float(Int16(littleEndian: s)) * scale
+                    }
+                }
+            } else {
+                let dstL = channelData[0]
+                let dstR = channelData[1]
+                for i in 0..<frameCount {
+                    var l: Int16 = 0
+                    var r: Int16 = 0
+                    memcpy(&l, srcBytes.advanced(by: i * 4), 2)
+                    memcpy(&r, srcBytes.advanced(by: i * 4 + 2), 2)
+                    dstL[i] = Float(Int16(littleEndian: l)) * scale
+                    dstR[i] = Float(Int16(littleEndian: r)) * scale
+                }
+            }
+            return buffer
+        }
+    }
 }
 
 @MainActor
@@ -360,12 +464,56 @@ final class IOSVoicePreviewPlayer: ObservableObject {
     private var generation = UUID()
     private var completionHandler: (() -> Void)?
     private var activatedPlaybackSession = false
+    private var scheduledStreamBuffers = 0
+    private var streamFinishing = false
 
     func play(_ buffer: AVAudioPCMBuffer, onComplete: (() -> Void)? = nil) throws {
+        let token = try startPlaybackGraph(format: buffer.format, onComplete: onComplete)
+        guard let player else { return }
+        player.scheduleBuffer(buffer) { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self, self.generation == token else { return }
+                self.stop()
+            }
+        }
+        player.play()
+    }
+
+    func beginStreaming(format: AVAudioFormat, onFinish: (() -> Void)? = nil) throws -> UUID {
+        let token = try startPlaybackGraph(format: format, onComplete: onFinish)
+        player?.play()
+        return token
+    }
+
+    func enqueueStreamBuffer(_ buffer: AVAudioPCMBuffer, token: UUID) {
+        guard generation == token, let player else { return }
+        scheduledStreamBuffers += 1
+        player.scheduleBuffer(buffer) { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self, self.generation == token else { return }
+                self.scheduledStreamBuffers = max(0, self.scheduledStreamBuffers - 1)
+                if self.streamFinishing && self.scheduledStreamBuffers == 0 {
+                    self.stop()
+                }
+            }
+        }
+    }
+
+    func finishStreaming(token: UUID) {
+        guard generation == token else { return }
+        streamFinishing = true
+        if scheduledStreamBuffers == 0 {
+            stop()
+        }
+    }
+
+    private func startPlaybackGraph(format: AVAudioFormat, onComplete: (() -> Void)?) throws -> UUID {
         stop()
         let token = UUID()
         generation = token
         completionHandler = onComplete
+        scheduledStreamBuffers = 0
+        streamFinishing = false
         let session = AVAudioSession.sharedInstance()
         let inCall = session.mode == .voiceChat || session.mode == .videoChat ||
             (IOSWorkspaceAudioCoordinator.sharedForVoiceCheck?.activeSessionCount ?? 0) > 0
@@ -377,22 +525,18 @@ final class IOSVoicePreviewPlayer: ObservableObject {
         let engine = AVAudioEngine()
         let player = AVAudioPlayerNode()
         engine.attach(player)
-        engine.connect(player, to: engine.mainMixerNode, format: buffer.format)
+        engine.connect(player, to: engine.mainMixerNode, format: format)
         try engine.start()
         self.engine = engine
         self.player = player
         isPlaying = true
-        player.scheduleBuffer(buffer) { [weak self] in
-            Task { @MainActor [weak self] in
-                guard let self, self.generation == token else { return }
-                self.stop()
-            }
-        }
-        player.play()
+        return token
     }
 
     func stop() {
         generation = UUID()
+        scheduledStreamBuffers = 0
+        streamFinishing = false
         player?.stop()
         engine?.stop()
         player = nil
@@ -541,15 +685,22 @@ final class IOSVoiceStore: ObservableObject {
         }
     }
 
+    private static var cachedSystemVoices: (key: String, voices: [AVSpeechSynthesisVoice])?
+
     static func availableSystemVoices() -> [AVSpeechSynthesisVoice] {
+        let localizations = Bundle.main.preferredLocalizations + Locale.preferredLanguages
+        let key = localizations.joined(separator: ",")
+        if let cachedSystemVoices, cachedSystemVoices.key == key {
+            return cachedSystemVoices.voices
+        }
         var preferredLanguages: [String] = []
-        for lang in Bundle.main.preferredLocalizations + Locale.preferredLanguages {
+        for lang in localizations {
             let prefix = String(lang.split(separator: "-").first ?? Substring(lang)).lowercased()
             if !prefix.isEmpty && !preferredLanguages.contains(prefix) {
                 preferredLanguages.append(prefix)
             }
         }
-        return AVSpeechSynthesisVoice.speechVoices()
+        let voices = AVSpeechSynthesisVoice.speechVoices()
             .filter { voice in
                 if #available(iOS 17.0, *) {
                     return !voice.voiceTraits.contains(.isPersonalVoice)
@@ -564,5 +715,7 @@ final class IOSVoiceStore: ObservableObject {
                 if a.language != b.language { return a.language < b.language }
                 return a.name.localizedStandardCompare(b.name) == .orderedAscending
             }
+        cachedSystemVoices = (key, voices)
+        return voices
     }
 }

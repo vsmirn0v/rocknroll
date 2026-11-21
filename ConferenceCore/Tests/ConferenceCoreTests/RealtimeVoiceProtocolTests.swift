@@ -172,4 +172,140 @@ final class RealtimeVoiceProtocolTests: XCTestCase {
         let shouldFallbackAfterClose = await router.shouldFallbackToStandardPipeline
         XCTAssertTrue(shouldFallbackAfterClose)
     }
+
+    func testRealtimeAudioResamplingMixingAndCoalescer() async throws {
+        var tone16k = Data()
+        for idx in 0..<160 {
+            let value = Int16((sin(Double(idx) * 2.0 * .pi * 440.0 / 16_000.0) * 12_000.0).rounded())
+            var le = value.littleEndian
+            withUnsafeBytes(of: &le) { tone16k.append(contentsOf: $0) }
+        }
+        XCTAssertEqual(RealtimeVoiceAudio.resamplePCM16Mono(data: tone16k, fromRate: 16_000, toRate: 16_000), tone16k)
+
+        let upsampled24k = RealtimeVoiceAudio.resamplePCM16Mono(data: tone16k, fromRate: 16_000, toRate: 24_000)
+        XCTAssertEqual(upsampled24k.count, 240 * 2)
+        XCTAssertTrue(upsampled24k.contains { $0 != 0 })
+
+        var hotA = Data()
+        var hotB = Data()
+        for sampleA: Int16 in [25_000, -25_000, 1_000] {
+            var le = sampleA.littleEndian
+            withUnsafeBytes(of: &le) { hotA.append(contentsOf: $0) }
+        }
+        for sampleB: Int16 in [25_000, -25_000, 2_000] {
+            var le = sampleB.littleEndian
+            withUnsafeBytes(of: &le) { hotB.append(contentsOf: $0) }
+        }
+        let mixed = RealtimeVoiceAudio.mixPCM16Mono([hotA, hotB])
+        let mixedSamples: [Int16] = mixed.withUnsafeBytes { raw in
+            (0..<3).map { i in Int16(littleEndian: raw.loadUnaligned(fromByteOffset: i * 2, as: Int16.self)) }
+        }
+        XCTAssertEqual(mixedSamples, [Int16.max, Int16.min, 3_000])
+
+        let coalescer = RealtimeAudioCoalescer(inputSampleRate: 16_000, targetSampleRate: 24_000, windowMs: 30)
+        for _ in 0..<3 {
+            coalescer.append(trackID: "local", pcm16: tone16k)
+            coalescer.append(trackID: "remote", pcm16: tone16k)
+        }
+        var batches: [Data] = []
+        for await batch in coalescer.stream {
+            batches.append(batch)
+            if batches.count == 1 {
+                coalescer.finish()
+            }
+        }
+        let firstBatch = try XCTUnwrap(batches.first)
+        XCTAssertEqual(firstBatch.count % 2, 0)
+        XCTAssertEqual(firstBatch.count, upsampled24k.count * 3)
+    }
+
+    func testNonBlockingRealtimeRouterToolCalls() async {
+        final class FakeTransport: @unchecked Sendable, RealtimeVoiceTransport {
+            private let continuation: AsyncStream<RealtimeVoiceEvent>.Continuation
+            let events: AsyncStream<RealtimeVoiceEvent>
+            var sentToolResults: [(String, String, String)] = []
+
+            init() {
+                var cont: AsyncStream<RealtimeVoiceEvent>.Continuation!
+                self.events = AsyncStream { cont = $0 }
+                self.continuation = cont
+            }
+
+            func connect(config: RealtimeSessionConfig) async throws {
+                continuation.yield(.connected)
+            }
+            func emit(_ event: RealtimeVoiceEvent) { continuation.yield(event) }
+            func sendAudioPCM16(_ data: Data) async throws {}
+            func sendTextTurn(_ text: String) async throws {}
+            func sendToolResult(callID: String, name: String, jsonOutput: String) async throws {
+                sentToolResults.append((callID, name, jsonOutput))
+            }
+            func updateInstructions(_ instructions: String) async throws {}
+            func disconnect() async { continuation.yield(.disconnected(nil)) }
+        }
+
+        final class GateBox: @unchecked Sendable {
+            private let lock = NSLock()
+            private var continuation: CheckedContinuation<Void, Never>?
+            private var released = false
+
+            func wait() async {
+                await withCheckedContinuation { cont in
+                    lock.lock()
+                    if released {
+                        lock.unlock()
+                        cont.resume()
+                    } else {
+                        continuation = cont
+                        lock.unlock()
+                    }
+                }
+            }
+
+            func release() {
+                lock.lock()
+                released = true
+                let cont = continuation
+                continuation = nil
+                lock.unlock()
+                cont?.resume()
+            }
+        }
+
+        let fake = FakeTransport()
+        let gate = GateBox()
+        let toolStarted = expectation(description: "tool started")
+        let audioDeliveredEarly = expectation(description: "audio delivered while tool suspended")
+        let toolCompleted = expectation(description: "tool completed after release")
+        let router = RealtimeVoiceRouter()
+
+        await router.start(
+            config: RealtimeSessionConfig(provider: .openAIRealtime, apiKey: "sk-test"),
+            customTransport: fake,
+            executeTool: { name, _ in
+                toolStarted.fulfill()
+                await gate.wait()
+                toolCompleted.fulfill()
+                return "{\"ok\":true,\"tool\":\"\(name)\"}"
+            },
+            onEvent: { event in
+                if case .audioPCM16(let bytes, _) = event, bytes == Data([1, 2, 3, 4]) {
+                    audioDeliveredEarly.fulfill()
+                }
+            }
+        )
+
+        fake.emit(.toolCall(callID: "slow-1", name: "rocknroll_search", argumentsJSON: "{}"))
+        await fulfillment(of: [toolStarted], timeout: 2.0)
+
+        fake.emit(.audioPCM16(Data([1, 2, 3, 4]), sampleRate: 24_000))
+        await fulfillment(of: [audioDeliveredEarly], timeout: 2.0)
+
+        gate.release()
+        await fulfillment(of: [toolCompleted], timeout: 2.0)
+        try? await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual(fake.sentToolResults.count, 1)
+        XCTAssertEqual(fake.sentToolResults.first?.0, "slow-1")
+        await router.stop()
+    }
 }

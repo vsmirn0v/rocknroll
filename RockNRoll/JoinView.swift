@@ -729,15 +729,16 @@ struct JoinView: View {
     private func roomSection(_ title: String, rooms: [RecentRoom]) -> some View {
         Section {
             ForEach(rooms) { room in
+                let presentation = RoomRowPresentation(room: room, calendar: calendar)
                 HStack(spacing: 10) {
                     Button { model.rejoin(room) } label: {
-                        RoomRowText(presentation: RoomRowPresentation(room: room, calendar: calendar))
+                        RoomRowText(presentation: presentation)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
                     .accessibilityLabel(L("Rejoin %@ on %@", room.displayTitle, room.invitationURL.host() ?? L("meeting website")))
-                    .accessibilityValue(RoomRowPresentation(room: room, calendar: calendar).details)
+                    .accessibilityValue(presentation.details)
                     .contextMenu {
                         Button { startRename(room) } label: {
                             Label(L("Rename"), systemImage: "pencil")

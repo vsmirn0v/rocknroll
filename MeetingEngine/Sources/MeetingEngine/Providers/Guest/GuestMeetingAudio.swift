@@ -9,6 +9,7 @@ import LiveKitWebRTC
     var factory: LKRTCPeerConnectionFactory { get }
     var profile: GuestAudioProfile { get }
     var snapshot: [String: Any] { get }
+    var isMicrophoneMuted: Bool { get }
     var playoutEpoch: UUID? { get }
     var startupAudioObservation: GuestStartupAudioObservation { get }
     var canUnmuteMicrophone: Bool { get }
@@ -56,6 +57,7 @@ import LiveKitWebRTC
 
 /// The same defaults `GuestSystemAudio` declares, for calls through the protocol.
 public extension GuestMeetingAudio {
+    var isMicrophoneMuted: Bool { snapshot["microphoneMuted"] as? Bool != false }
     var hasParticipationVoiceGraph: Bool { false }
     var participationVoiceGateClosed: Bool { false }
     var participationSenderPhysicallyMuted: Bool { false }

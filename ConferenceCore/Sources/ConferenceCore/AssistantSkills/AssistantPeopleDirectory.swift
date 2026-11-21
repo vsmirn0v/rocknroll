@@ -87,10 +87,14 @@ public struct AssistantPersonEntry: Identifiable, Codable, Equatable, Sendable {
         return 0
     }
 
+    private static let posixLocale = Locale(identifier: "en_US_POSIX")
+
     static func fold(_ value: String) -> String {
-        value
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: Locale(identifier: "en_US_POSIX"))
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.utf8.allSatisfy({ $0 < 0x80 }) {
+            return trimmed.lowercased()
+        }
+        return trimmed.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: posixLocale)
     }
 
     public static func deduped(_ items: [String]) -> [String] {

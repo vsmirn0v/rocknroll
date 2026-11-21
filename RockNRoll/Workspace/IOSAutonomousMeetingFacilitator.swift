@@ -21,16 +21,86 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
     var customRealtimeTransportFactory: (@Sendable () -> any RealtimeVoiceTransport)?
     var llmURLSession: URLSession = .shared
 
+    private final class AudioTapGate: @unchecked Sendable {
+        private let lock = NSLock()
+        private var voiceDeliveryInFlight = false
+        private var lastVoiceDeliveryEndedAt: Date?
+        private var approvedSpeakersOnly = true
+        private var lastApprovedTranscriptAt: Date?
+        private var lastRemoteAudioAt: Date?
+        private var lastTurnAllowWrites = false
+        var coalescer: RealtimeAudioCoalescer?
+        var senderTask: Task<Void, Never>?
+
+        func setApprovedSpeakersOnly(_ enabled: Bool) {
+            lock.lock()
+            approvedSpeakersOnly = enabled
+            lock.unlock()
+        }
+
+        func setTurnApproval(allowWrites: Bool, approvedTranscriptAt: Date?) {
+            lock.lock()
+            lastTurnAllowWrites = allowWrites
+            lastApprovedTranscriptAt = approvedTranscriptAt
+            lock.unlock()
+        }
+
+        func markVoiceDeliveryStarted() {
+            lock.lock()
+            voiceDeliveryInFlight = true
+            lastVoiceDeliveryEndedAt = nil
+            lock.unlock()
+        }
+
+        func markVoiceDeliveryEnded(at date: Date) {
+            lock.lock()
+            voiceDeliveryInFlight = false
+            lastVoiceDeliveryEndedAt = date
+            lock.unlock()
+        }
+
+        func currentAllowWrites() -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return lastTurnAllowWrites
+        }
+
+        func shouldAcceptAudio(isLocal: Bool) -> Bool {
+            let now = Date()
+            lock.lock()
+            defer { lock.unlock() }
+            if isLocal {
+                if voiceDeliveryInFlight { return false }
+                if let ended = lastVoiceDeliveryEndedAt, now.timeIntervalSince(ended) < 1.5 {
+                    return false
+                }
+                let recentRemote = lastRemoteAudioAt.map { now.timeIntervalSince($0) <= 3.0 } ?? false
+                if !recentRemote {
+                    lastTurnAllowWrites = true
+                }
+                return true
+            } else {
+                lastRemoteAudioAt = now
+                if approvedSpeakersOnly {
+                    let recentApproved = lastApprovedTranscriptAt.map { now.timeIntervalSince($0) <= 8.0 } ?? false
+                    if !recentApproved {
+                        lastTurnAllowWrites = false
+                    }
+                } else {
+                    lastTurnAllowWrites = true
+                }
+                return true
+            }
+        }
+    }
+
     private final class SessionRealtimeState {
         let router = RealtimeVoiceRouter()
+        let gate = AudioTapGate()
         var connected = false
         var audioChunks: [Data] = []
         var transcriptBuffer = ""
-        var lastTurnAllowWrites = false
-        var lastApprovedTranscriptAt: Date?
-        var lastRemoteAudioAt: Date?
         var activeSkillID: String
-        var approvedSpeakersOnly = true
         var turnTimeoutTask: Task<Void, Never>?
 
         init(activeSkillID: String) {
@@ -38,12 +108,15 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
         }
     }
 
+    private static let maxSeenEventIDsPerSession = 2_000
+
     private weak var skills: IOSAssistantSkillsController?
     private weak var workspace: IOSWorkspaceCoordinator?
     private weak var board: IOSAssistantBoardController?
     private let resolveBridge: (UUID) -> IOSAssistantSessionBridge?
 
     private var seenEventIDsBySession: [UUID: Set<String>] = [:]
+    private var seenEventOrderBySession: [UUID: [String]] = [:]
     private var recentEventsBySession: [UUID: [SyncedTranscriptEvent]] = [:]
     private var busySessions: Set<UUID> = []
     private var manuallyDisabledSessions: Set<UUID> = []
@@ -90,7 +163,9 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
         manuallyDisabledSessions.remove(controllerID)
         let chosen = resolveSkillID(explicitSkillID: skillID, meetingTitle: title)
         activeSessionSkills[controllerID] = chosen
-        seenEventIDsBySession[controllerID] = Set((recentEventsBySession[controllerID] ?? []).map(\.id))
+        let recentIDs = (recentEventsBySession[controllerID] ?? []).map(\.id)
+        seenEventIDsBySession[controllerID] = Set(recentIDs)
+        seenEventOrderBySession[controllerID] = recentIDs
         let skill = skills?.skills.first(where: { $0.id == chosen })
         lastStatusBySession[controllerID] = L("Autonomous voice facilitator active (%@)", skill?.name ?? chosen)
         Task { @MainActor [weak self] in
@@ -107,10 +182,21 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
         }
     }
 
+    private func teardownRealtimeSession(controllerID: UUID) async {
+        resolveBridge(controllerID)?.setRealtimeAudioTap(nil)
+        if let state = realtimeSessions.removeValue(forKey: controllerID) {
+            state.turnTimeoutTask?.cancel()
+            state.gate.senderTask?.cancel()
+            state.gate.coalescer?.finish()
+            await state.router.stop()
+        }
+    }
+
     func disable(controllerID: UUID) {
         manuallyDisabledSessions.insert(controllerID)
         activeSessionSkills.removeValue(forKey: controllerID)
         seenEventIDsBySession.removeValue(forKey: controllerID)
+        seenEventOrderBySession.removeValue(forKey: controllerID)
         recentEventsBySession.removeValue(forKey: controllerID)
         lastStatusBySession.removeValue(forKey: controllerID)
         lastSpokeAtBySession.removeValue(forKey: controllerID)
@@ -119,6 +205,8 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
         resolveBridge(controllerID)?.setRealtimeAudioTap(nil)
         if let state = realtimeSessions.removeValue(forKey: controllerID) {
             state.turnTimeoutTask?.cancel()
+            state.gate.senderTask?.cancel()
+            state.gate.coalescer?.finish()
             Task { await state.router.stop() }
         }
         syncRealtimeActiveFlag()
@@ -152,6 +240,7 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
         manuallyDisabledSessions.remove(controllerID)
         activeSessionSkills.removeValue(forKey: controllerID)
         seenEventIDsBySession.removeValue(forKey: controllerID)
+        seenEventOrderBySession.removeValue(forKey: controllerID)
         recentEventsBySession.removeValue(forKey: controllerID)
         lastStatusBySession.removeValue(forKey: controllerID)
         lastSpokeAtBySession.removeValue(forKey: controllerID)
@@ -161,6 +250,8 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
         resolveBridge(controllerID)?.setRealtimeAudioTap(nil)
         if let state = realtimeSessions.removeValue(forKey: controllerID) {
             state.turnTimeoutTask?.cancel()
+            state.gate.senderTask?.cancel()
+            state.gate.coalescer?.finish()
             Task { await state.router.stop() }
         }
         syncRealtimeActiveFlag()
@@ -199,13 +290,26 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
               !busySessions.contains(controllerID) else { return }
 
         var seen = seenEventIDsBySession[controllerID] ?? []
+        var order = seenEventOrderBySession[controllerID] ?? []
         let unseen = events.filter {
             !seen.contains($0.id) && ($0.kind == "transcript" || $0.kind == "chat")
                 && !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         }
         guard !unseen.isEmpty else { return }
-        for line in unseen { seen.insert(line.id) }
+        for line in unseen {
+            if seen.insert(line.id).inserted {
+                order.append(line.id)
+            }
+        }
+        if order.count > Self.maxSeenEventIDsPerSession {
+            let overflow = order.count - Self.maxSeenEventIDsPerSession
+            for staleID in order.prefix(overflow) {
+                seen.remove(staleID)
+            }
+            order.removeFirst(overflow)
+        }
         seenEventIDsBySession[controllerID] = seen
+        seenEventOrderBySession[controllerID] = order
 
         let now = Date()
         let inFollowUpWindow = lastSpokeAtBySession[controllerID].map { now.timeIntervalSince($0) <= 20 } ?? false
@@ -317,10 +421,9 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
         // 1. Optional Realtime acceleration if connected for this call.
         if let rtState = realtimeSessions[controllerID],
            await rtState.router.isRealtimeConnected {
-            rtState.lastTurnAllowWrites = allowWrites
-            rtState.lastApprovedTranscriptAt = allowWrites ? Date() : nil
+            rtState.gate.setTurnApproval(allowWrites: allowWrites, approvedTranscriptAt: allowWrites ? Date() : nil)
             rtState.activeSkillID = skillID
-            rtState.approvedSpeakersOnly = skill?.approvedSpeakersOnly ?? true
+            rtState.gate.setApprovedSpeakersOnly(skill?.approvedSpeakersOnly ?? true)
             rtState.audioChunks.removeAll()
             rtState.transcriptBuffer = ""
             let prefixedPrompt = "[\(speakerName) (approved=\(allowWrites)) in “\(title)”]: \(commandText)"
@@ -398,7 +501,7 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
         }
 
         // LLM answer grounded in transcript + Obsidian knowledge + BasePersona + skill instructions
-        let knowledgeHits = skills.searchKnowledge(query: commandText, limit: 5)
+        let knowledgeHits = await skills.searchKnowledgeAsync(query: commandText, limit: 5)
             .map { "[\($0.kind)] \($0.title): \($0.excerpt)" }
             .joined(separator: "\n")
         let transcriptLines = (recentEventsBySession[controllerID] ?? []).suffix(18).map { ev in
@@ -475,16 +578,14 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
             return
         }
 
-        if let old = realtimeSessions.removeValue(forKey: controllerID) {
-            old.turnTimeoutTask?.cancel()
-            await old.router.stop()
-        }
+        await teardownRealtimeSession(controllerID: controllerID)
 
         let rendered = skills.renderPromptContext(explicitSkillIDs: [skillID], meetingTitle: title)
         let instructions = [rendered.basePersona, rendered.instructions]
             .filter { !$0.isEmpty }
             .joined(separator: "\n\n")
         let tools = Self.buildToolDeclarations(allowedGroups: skill.map { Set($0.tools) })
+        let targetInputRate = kind == .openAIRealtime ? 24_000 : 16_000
         let config = RealtimeSessionConfig(
             provider: kind,
             apiKey: apiKey,
@@ -492,11 +593,12 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
             voice: skills.realtimeVoice,
             endpointOverride: skills.realtimeEndpoint,
             systemInstructions: instructions,
+            inputSampleRate: targetInputRate,
             tools: tools
         )
 
         let state = SessionRealtimeState(activeSkillID: skillID)
-        state.approvedSpeakersOnly = skill?.approvedSpeakersOnly ?? true
+        state.gate.setApprovedSpeakersOnly(skill?.approvedSpeakersOnly ?? true)
         realtimeSessions[controllerID] = state
         await state.router.start(
             config: config,
@@ -512,48 +614,32 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
         )
         state.connected = await state.router.isRealtimeConnected
         if state.connected {
-            attachAudioTap(controllerID: controllerID, state: state)
+            attachAudioTap(controllerID: controllerID, state: state, targetSampleRate: targetInputRate)
         }
         syncRealtimeActiveFlag()
     }
 
-    private func attachAudioTap(controllerID: UUID, state: SessionRealtimeState) {
+    private func attachAudioTap(controllerID: UUID, state: SessionRealtimeState, targetSampleRate: Int) {
         let router = state.router
-        resolveBridge(controllerID)?.setRealtimeAudioTap { [weak self, weak state] streamID, pcm in
-            Task { @MainActor [weak self, weak state] in
-                guard let self else { return }
-                if streamID == "local" {
-                    if self.resolveBridge(controllerID)?.isVoiceReplyInFlight() == true
-                        || self.isInAudioEchoCooldown(controllerID: controllerID) {
-                        return
-                    }
-                    if let state {
-                        let recentRemote = state.lastRemoteAudioAt.map { Date().timeIntervalSince($0) <= 3.0 } ?? false
-                        if !recentRemote {
-                            state.lastTurnAllowWrites = true
-                        }
-                    }
-                } else if let state {
-                    state.lastRemoteAudioAt = Date()
-                    if state.approvedSpeakersOnly {
-                        let recentApprovedTranscript = state.lastApprovedTranscriptAt.map {
-                            Date().timeIntervalSince($0) <= 8.0
-                        } ?? false
-                        if !recentApprovedTranscript {
-                            state.lastTurnAllowWrites = false
-                        }
-                    } else {
-                        state.lastTurnAllowWrites = true
-                    }
-                }
-                _ = await router.sendAudioPCM16(pcm)
+        let gate = state.gate
+        let coalescer = RealtimeAudioCoalescer(
+            inputSampleRate: 16_000,
+            targetSampleRate: targetSampleRate,
+            windowMs: 80
+        )
+        gate.coalescer = coalescer
+        gate.senderTask?.cancel()
+        gate.senderTask = Task.detached(priority: .userInitiated) {
+            for await batch in coalescer.stream {
+                if Task.isCancelled { break }
+                _ = await router.sendAudioPCM16(batch)
             }
         }
-    }
-
-    private func isInAudioEchoCooldown(controllerID: UUID) -> Bool {
-        guard let ended = lastVoiceDeliveryEndedAtBySession[controllerID] else { return false }
-        return Date().timeIntervalSince(ended) < 1.5
+        resolveBridge(controllerID)?.setRealtimeAudioTap { [weak gate] streamID, pcm in
+            guard let gate else { return }
+            guard gate.shouldAcceptAudio(isLocal: streamID == "local") else { return }
+            coalescer.append(trackID: streamID, pcm16: pcm)
+        }
     }
 
     private func executeRealtimeTool(controllerID: UUID, name: String, argumentsJSON: String) async -> String {
@@ -566,7 +652,7 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
             name: name,
             argumentsJSON: argumentsJSON,
             sessionID: sid,
-            allowWrites: state.lastTurnAllowWrites,
+            allowWrites: state.gate.currentAllowWrites(),
             allowedGroups: allowedGroups,
             skills: skills,
             workspace: workspace,
@@ -596,7 +682,7 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
         case "rocknroll_search_knowledge":
             let q = (args["query"] as? String) ?? ""
             let limit = (args["limit"] as? Int) ?? 8
-            var items = skills.searchKnowledge(query: q, limit: limit).map {
+            var items = await skills.searchKnowledgeAsync(query: q, limit: limit).map {
                 ["source": "obsidian", "title": $0.title, "path": $0.relativePath, "excerpt": $0.excerpt]
             }
             if let workspace, items.count < limit {
@@ -860,13 +946,20 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
             state.turnTimeoutTask?.cancel()
             state.turnTimeoutTask = nil
             busySessions.remove(controllerID)
-            let combined = state.audioChunks.reduce(into: Data()) { $0.append($1) }
+            let totalBytes = state.audioChunks.reduce(0) { $0 + $1.count }
+            var combined = Data()
+            combined.reserveCapacity(totalBytes)
+            for chunk in state.audioChunks {
+                combined.append(chunk)
+            }
             state.audioChunks.removeAll()
             let text = state.transcriptBuffer.trimmingCharacters(in: .whitespacesAndNewlines)
             state.transcriptBuffer = ""
             if let buffer = RealtimeVoiceAudio.pcm16ToAudioBuffer(data: combined, sampleRate: 24_000) {
+                state.gate.markVoiceDeliveryStarted()
                 await deliverSpokenBuffer(buffer, fallbackText: text, controllerID: controllerID)
             } else if !text.isEmpty {
+                state.gate.markVoiceDeliveryStarted()
                 await speakIntoMeeting(text, controllerID: controllerID)
             }
         case .error(let msg):
@@ -892,7 +985,12 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
         guard !clean.isEmpty else { return }
         lastSpokeAtBySession[controllerID] = Date()
         lastSpokenAnswerBySession[controllerID] = clean
-        defer { lastVoiceDeliveryEndedAtBySession[controllerID] = Date() }
+        realtimeSessions[controllerID]?.gate.markVoiceDeliveryStarted()
+        defer {
+            let endedAt = Date()
+            lastVoiceDeliveryEndedAtBySession[controllerID] = endedAt
+            realtimeSessions[controllerID]?.gate.markVoiceDeliveryEnded(at: endedAt)
+        }
 
         if let bridge = resolveBridge(controllerID) {
             do {
@@ -914,7 +1012,12 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
         if !fallbackText.isEmpty {
             lastSpokenAnswerBySession[controllerID] = fallbackText
         }
-        defer { lastVoiceDeliveryEndedAtBySession[controllerID] = Date() }
+        realtimeSessions[controllerID]?.gate.markVoiceDeliveryStarted()
+        defer {
+            let endedAt = Date()
+            lastVoiceDeliveryEndedAtBySession[controllerID] = endedAt
+            realtimeSessions[controllerID]?.gate.markVoiceDeliveryEnded(at: endedAt)
+        }
 
         if let bridge = resolveBridge(controllerID) {
             if let speakBuffer = bridge.speakAudioBuffer {

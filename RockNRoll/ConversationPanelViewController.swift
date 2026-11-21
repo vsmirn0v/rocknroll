@@ -90,6 +90,8 @@ final class ConversationPanelViewController: UIViewController, UITextViewDelegat
     private var catchUpHost: UIHostingController<CatchUpCardsView>!
     private var timeline = CatchUpTimeline()
     private var renderedTranscript: LiveTranscriptPresentation?
+    private var lastRenderedTailUTF16Length = 0
+    private static let shortTimeFormat: Date.FormatStyle = Date.FormatStyle(date: .omitted, time: .shortened)
     private var canViewTranscript: Bool?
     private var transcriptionEnabled = false
     private var lastMessageIDs = [String]()
@@ -363,6 +365,9 @@ final class ConversationPanelViewController: UIViewController, UITextViewDelegat
         panelVisible = true; contentVisible = true
         applicationActive = UIApplication.shared.applicationState == .active
         requestContentRender(messages: false, transcript: false); markVisibleReactions()
+        if followButton.isHidden && renderedTranscript != nil {
+            scrollTranscriptToBottom()
+        }
     }
 
     override func viewWillDisappear(_ animated: Bool) {
@@ -1027,31 +1032,57 @@ final class ConversationPanelViewController: UIViewController, UITextViewDelegat
         let offset = transcript.contentOffset
         isRenderingTranscript = true
         if let presentation = liveTranscriptPresentation() {
-            if let previous = renderedTranscript,
+            let count = presentation.rows.count
+            if let previous = renderedTranscript, previous == presentation {
+                // Presentation unchanged; keep existing attributedText intact.
+            } else if let previous = renderedTranscript,
                previous.context == presentation.context,
-               presentation.rows.count >= previous.rows.count,
+               count == previous.rows.count,
+               count > 0,
+               presentation.rows.dropLast() == previous.rows.dropLast(),
+               lastRenderedTailUTF16Length <= transcript.textStorage.length {
+                let updatedTail = transcriptRows(presentation.rows.suffix(1), precedingRows: count - 1)
+                let start = transcript.textStorage.length - lastRenderedTailUTF16Length
+                transcript.textStorage.replaceCharacters(
+                    in: NSRange(location: start, length: lastRenderedTailUTF16Length),
+                    with: updatedTail
+                )
+                lastRenderedTailUTF16Length = updatedTail.length
+            } else if let previous = renderedTranscript,
+               previous.context == presentation.context,
+               count >= previous.rows.count,
                presentation.rows.starts(with: previous.rows) {
-                if presentation.rows.count > previous.rows.count {
-                    transcript.textStorage.append(transcriptRows(presentation.rows.dropFirst(previous.rows.count),
-                                                                 precedingRows: previous.rows.count))
+                if count > previous.rows.count {
+                    let appended = transcriptRows(presentation.rows.dropFirst(previous.rows.count),
+                                                  precedingRows: previous.rows.count)
+                    transcript.textStorage.append(appended)
+                    lastRenderedTailUTF16Length = (count - previous.rows.count == 1)
+                        ? appended.length
+                        : transcriptRows(presentation.rows.suffix(1), precedingRows: count - 1).length
                 }
             } else {
                 transcript.attributedText = liveTranscript(presentation)
+                lastRenderedTailUTF16Length = count == 0
+                    ? 0
+                    : transcriptRows(presentation.rows.suffix(1), precedingRows: count - 1).length
             }
             renderedTranscript = presentation
         } else {
             renderedTranscript = nil
+            lastRenderedTailUTF16Length = 0
             transcript.font = .preferredFont(forTextStyle: .body)
             transcript.textColor = .white
             let message = catchUp.transcriptUnavailableReason ?? CatchUpText.live(timeline: timeline, canView: canViewTranscript,
                                            enabled: transcriptionEnabled)
             if transcript.text != message { transcript.text = message }
         }
-        transcript.layoutIfNeeded()
-        if nearBottom { scrollTranscriptToBottom() }
-        else {
-            transcript.setContentOffset(offset, animated: false)
-            followButton.isHidden = false
+        if transcript.window != nil {
+            transcript.layoutIfNeeded()
+            if nearBottom { scrollTranscriptToBottom() }
+            else {
+                transcript.setContentOffset(offset, animated: false)
+                followButton.isHidden = false
+            }
         }
         isRenderingTranscript = false
     }
@@ -1110,7 +1141,7 @@ final class ConversationPanelViewController: UIViewController, UITextViewDelegat
             switch row {
             case .line(let line):
                 if let time = line.spokenAt {
-                    result.append(NSAttributedString(string: "\(time.formatted(date: .omitted, time: .shortened))  ",
+                    result.append(NSAttributedString(string: "\(time.formatted(Self.shortTimeFormat))  ",
                         attributes: [.font: caption, .foregroundColor: UIColor.lightGray]))
                 }
                 result.append(NSAttributedString(string: line.speaker ?? L("Participant"),
@@ -1119,7 +1150,7 @@ final class ConversationPanelViewController: UIViewController, UITextViewDelegat
                 result.append(NSAttributedString(string: "\n\(line.text)",
                     attributes: [.font: body, .foregroundColor: UIColor.white]))
             case .reaction(let event):
-                result.append(NSAttributedString(string: "\(event.timestamp.formatted(date: .omitted, time: .shortened))  ",
+                result.append(NSAttributedString(string: "\(event.timestamp.formatted(Self.shortTimeFormat))  ",
                     attributes: [.font: caption, .foregroundColor: UIColor.lightGray]))
                 let name = event.isOwn ? L("You") : (event.displayName ?? L("Participant"))
                 result.append(NSAttributedString(string: "\(event.kind.emoji)  \(name)",

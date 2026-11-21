@@ -326,19 +326,25 @@ struct IOSWorkspaceHubView: View {
 
     @ViewBuilder
     private var historyList: some View {
-        if workspace.historySessions.isEmpty {
+        let history = workspace.historySessions
+        if history.isEmpty {
             ContentUnavailableView(
                 L("No Meetings Yet"),
                 systemImage: "note.text",
                 description: Text(L("Start or join a meeting on iPhone or Mac to capture synced notes, summaries, and tasks."))
             )
         } else {
+            let openTaskCounts = workspace.tasks.reduce(into: [UUID: Int]()) { counts, task in
+                if !task.done {
+                    counts[task.sessionID, default: 0] += 1
+                }
+            }
             List(selection: sizeClass == .regular ? $selectedSessionID : .constant(nil)) {
-                ForEach(workspace.historySessions) { session in
+                ForEach(history) { session in
                     Button {
                         openMeeting(session.id)
                     } label: {
-                        meetingRow(session)
+                        meetingRow(session, openTasks: openTaskCounts[session.id] ?? 0)
                     }
                     .buttonStyle(.plain)
                     .tag(session.id)
@@ -365,10 +371,9 @@ struct IOSWorkspaceHubView: View {
         }
     }
 
-    private func meetingRow(_ session: IOSMeetingSessionItem) -> some View {
+    private func meetingRow(_ session: IOSMeetingSessionItem, openTasks: Int) -> some View {
         let outcome = workspace.outcomesBySession[session.id]
         let note = workspace.notesBySession[session.id]
-        let openTasks = workspace.tasks.filter { $0.sessionID == session.id && !$0.done }.count
 
         return VStack(alignment: .leading, spacing: 5) {
             HStack(alignment: .firstTextBaseline) {
@@ -464,8 +469,14 @@ struct IOSWorkspaceHubView: View {
             .background(.secondary.opacity(0.12), in: RoundedRectangle(cornerRadius: 10))
             .padding(.horizontal)
             .padding(.bottom, 8)
-            .onChange(of: searchQuery) { _, newValue in
-                Task { searchHits = await workspace.search(query: newValue) }
+            .task(id: searchQuery) {
+                if searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    searchHits = []
+                    return
+                }
+                try? await Task.sleep(for: .milliseconds(150))
+                guard !Task.isCancelled else { return }
+                searchHits = await workspace.search(query: searchQuery)
             }
 
             if searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {

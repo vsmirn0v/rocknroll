@@ -893,19 +893,31 @@ actor IOSWorkspaceStore {
     func appendTranscriptEvents(sessionID: UUID, events: [SyncedTranscriptEvent]) throws {
         try prepare()
         guard !events.isEmpty else { return }
+        guard let handle else { throw IOSWorkspaceStoreError.openFailed("Database not open") }
         try exec("BEGIN IMMEDIATE TRANSACTION")
         do {
             try ensureSessionExists(sessionID)
+            let sql = """
+                INSERT INTO local_transcript_events(session_id,event_id,payload_json,occurred_at) VALUES(?,?,?,?)
+                ON CONFLICT(session_id,event_id) DO UPDATE SET payload_json=excluded.payload_json,occurred_at=excluded.occurred_at
+                """
+            var stmt: OpaquePointer?
+            guard sqlite3_prepare_v2(handle, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else {
+                throw IOSWorkspaceStoreError.prepareFailed(String(cString: sqlite3_errmsg(handle)))
+            }
+            defer { sqlite3_finalize(stmt) }
+            let sidText = sessionID.uuidString
             for event in events {
                 let data = try encoder.encode(event)
-                try run("""
-                    INSERT INTO local_transcript_events(session_id,event_id,payload_json,occurred_at) VALUES(?,?,?,?)
-                    ON CONFLICT(session_id,event_id) DO UPDATE SET payload_json=excluded.payload_json,occurred_at=excluded.occurred_at
-                    """) { stmt in
-                    bindText(stmt, sessionID.uuidString, at: 1)
-                    bindText(stmt, event.id, at: 2)
-                    bindBlob(stmt, data, at: 3)
-                    bindInt(stmt, event.occurredAt.syncMilliseconds, at: 4)
+                sqlite3_reset(stmt)
+                sqlite3_clear_bindings(stmt)
+                bindText(stmt, sidText, at: 1)
+                bindText(stmt, event.id, at: 2)
+                bindBlob(stmt, data, at: 3)
+                bindInt(stmt, event.occurredAt.syncMilliseconds, at: 4)
+                let rc = sqlite3_step(stmt)
+                guard rc == SQLITE_DONE || rc == SQLITE_ROW else {
+                    throw IOSWorkspaceStoreError.stepFailed(String(cString: sqlite3_errmsg(handle)))
                 }
             }
             try exec("COMMIT")

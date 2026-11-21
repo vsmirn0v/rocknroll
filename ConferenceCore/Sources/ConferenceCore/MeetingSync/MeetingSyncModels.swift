@@ -1305,7 +1305,12 @@ public extension Date {
 }
 
 public extension String {
+    private static let workspaceFoldLocale = Locale(identifier: "en_US_POSIX")
+
     var workspaceFolded: String {
-        folding(options: [.caseInsensitive, .diacriticInsensitive], locale: Locale(identifier: "en_US_POSIX"))
+        if utf8.allSatisfy({ $0 < 0x80 }) {
+            return lowercased()
+        }
+        return folding(options: [.caseInsensitive, .diacriticInsensitive], locale: Self.workspaceFoldLocale)
     }
 }

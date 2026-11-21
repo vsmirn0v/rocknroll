@@ -1018,21 +1018,47 @@ final class IOSAssistantCoordinator: ObservableObject {
 
     // MARK: - Mention Detection & Helpers
 
+    private static let mentionRegexLock = NSLock()
+    private static var mentionRegexCache: [String: NSRegularExpression] = [:]
+
+    private static func compiledMentionRegex(for alias: String) -> NSRegularExpression? {
+        mentionRegexLock.lock()
+        if let cached = mentionRegexCache[alias] {
+            mentionRegexLock.unlock()
+            return cached
+        }
+        mentionRegexLock.unlock()
+
+        let escaped = NSRegularExpression.escapedPattern(for: alias)
+        let pattern = "(?i)(?:^|[^\\p{L}\\p{N}])@?" + escaped + "(?:$|[^\\p{L}\\p{N}])"
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
+
+        mentionRegexLock.lock()
+        if mentionRegexCache.count >= 128 {
+            mentionRegexCache.removeAll()
+        }
+        mentionRegexCache[alias] = regex
+        mentionRegexLock.unlock()
+        return regex
+    }
+
     static func findMention(in events: [SyncedTranscriptEvent], aliases: [String]) -> (event: SyncedTranscriptEvent, alias: String)? {
         let cleanAliases = aliases
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { $0.count >= 2 }
         guard !cleanAliases.isEmpty else { return nil }
+        let aliasMatchers = cleanAliases.compactMap { alias in
+            compiledMentionRegex(for: alias).map { (alias, $0) }
+        }
+        guard !aliasMatchers.isEmpty else { return nil }
 
         for ev in events.reversed() {
             guard !ev.isOwn else { continue }
             let text = ev.text.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !text.isEmpty else { continue }
-            for alias in cleanAliases {
-                let escaped = NSRegularExpression.escapedPattern(for: alias)
-                let pattern = "(?i)(?:^|[^\\p{L}\\p{N}])@?" + escaped + "(?:$|[^\\p{L}\\p{N}])"
-                if let regex = try? NSRegularExpression(pattern: pattern),
-                   regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)) != nil {
+            let range = NSRange(text.startIndex..., in: text)
+            for (alias, regex) in aliasMatchers {
+                if regex.firstMatch(in: text, range: range) != nil {
                     return (ev, alias)
                 }
             }

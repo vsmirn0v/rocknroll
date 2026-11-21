@@ -420,4 +420,40 @@ final class AssistantSkillsAndPeopleTests: XCTestCase {
         XCTAssertEqual(Int(buffer.frameLength), samples.count)
         XCTAssertEqual(buffer.format.sampleRate, 16_000, accuracy: 0.1)
     }
+
+    func testReadOperationsDoNotRewriteSeededMarkerOrSelfTriggerFolderWatcher() throws {
+        let root = try makeTempDir()
+        let repo = AssistantSkillRepository(rootURL: root)
+        try repo.ensureDefaultsInstalled()
+
+        let markerURL = root.appendingPathComponent(".seeded-defaults.json")
+        var beforeStat = Darwin.stat()
+        XCTAssertEqual(Darwin.lstat(markerURL.path, &beforeStat), 0)
+
+        let unexpectedWatcherFire = expectation(description: "Read-only operations must not trigger watcher")
+        unexpectedWatcherFire.isInverted = true
+        let watcher = AssistantSkillFolderWatcher(rootURL: root) {
+            unexpectedWatcherFire.fulfill()
+        }
+        watcher.start()
+        defer { watcher.stop() }
+
+        for _ in 0..<3 {
+            _ = try? repo.ensureDefaultsInstalled()
+            XCTAssertFalse(repo.listSkills().isEmpty)
+            _ = repo.loadPeople()
+            _ = repo.loadTeamContext()
+            XCTAssertFalse(repo.listPrompts().isEmpty)
+            _ = repo.renderPromptContext(meetingTitle: "Daily Standup", commandText: "status")
+            _ = repo.searchKnowledge(query: "scrum")
+        }
+
+        wait(for: [unexpectedWatcherFire], timeout: 0.35)
+
+        var afterStat = Darwin.stat()
+        XCTAssertEqual(Darwin.lstat(markerURL.path, &afterStat), 0)
+        XCTAssertEqual(afterStat.st_mtimespec.tv_sec, beforeStat.st_mtimespec.tv_sec)
+        XCTAssertEqual(afterStat.st_mtimespec.tv_nsec, beforeStat.st_mtimespec.tv_nsec)
+        XCTAssertEqual(afterStat.st_ino, beforeStat.st_ino)
+    }
 }

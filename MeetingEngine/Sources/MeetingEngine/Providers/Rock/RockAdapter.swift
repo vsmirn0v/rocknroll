@@ -194,6 +194,9 @@ import LiveKitWebRTC
     private let playbackGainQueue = DispatchQueue(label: "rock.remote-audio.gain")
     private let subscriptions = MediaConfigurationCoordinator<ObjectIdentifier, NativeRockTrackDemand>()
     private var subscriptionFailure: Error?
+    private var lastAppliedDemands: [String: NativeRockTrackDemand]?
+    private var lastEmittedSnapshot: NativeDesktopExternalSnapshot?
+    private var lastEmittedSessionSnapshot: MeetingSessionSnapshot?
     private var visibleParticipantIDs: Set<String>?
     private var focusedParticipantID: String?
     private var receivesCameras = true
@@ -1071,6 +1074,7 @@ import LiveKitWebRTC
         chatServiceImpl.cancelApprovedOutputs()
         revision = UUID(); snapshot.phase = .leaving; emit()
         subscriptions.reset(); subscriptionFailure = nil
+        lastAppliedDemands = nil
         audioPreparation?.cancel(); _ = try? await audioPreparation?.value; audioPreparation = nil
         let room = room; self.room = nil
         if transcriptionSourceIDs?.isEmpty == false { transcriptionSourceIDs = []; transcriptionHandler?([]) }
@@ -1086,6 +1090,9 @@ import LiveKitWebRTC
         registeredSenderTrackIDs = []
         if clearChat { chat.clear() } else { chat.canSend = false }
         let error = snapshot.lastError
+        lastAppliedDemands = nil
+        lastEmittedSnapshot = nil
+        lastEmittedSessionSnapshot = nil
         snapshot = .init(phase: clean ? .left : .failed, playoutOn: playoutIntent,
             lastError: clean ? nil : error); emit()
         leaving = false
@@ -1122,20 +1129,35 @@ import LiveKitWebRTC
     }
 
     private func emit() {
-        onState?(snapshot)
-        onSessionSnapshot?(sessionSnapshot)
+        if lastEmittedSnapshot != snapshot {
+            lastEmittedSnapshot = snapshot
+            onState?(snapshot)
+        }
+        let nextSessionSnapshot = sessionSnapshot
+        if lastEmittedSessionSnapshot != nextSessionSnapshot {
+            lastEmittedSessionSnapshot = nextSessionSnapshot
+            onSessionSnapshot?(nextSessionSnapshot)
+        }
     }
 
     private func identifier(_ participant: Participant) -> String {
         participant.identity?.stringValue ?? participant.sid?.stringValue ?? "local"
     }
 
-    private func subscribe(_ room: Room) async throws {
+    private func subscribe(_ room: Room, values precomputedValues: [String: NativeRockTrackDemand]? = nil) async throws {
         let token = revision
-        let values = demands(in: room)
-        let requests = room.remoteParticipants.values.flatMap { $0.trackPublications.values }.compactMap { publication
+        let values = precomputedValues ?? demands(in: room)
+        var allPublications: [RemoteTrackPublication] = []
+        for participant in room.remoteParticipants.values {
+            for publication in participant.trackPublications.values {
+                if let remote = publication as? RemoteTrackPublication {
+                    allPublications.append(remote)
+                }
+            }
+        }
+        let requests = allPublications.compactMap { remote
             -> MediaConfigurationCoordinator<ObjectIdentifier, NativeRockTrackDemand>.Request? in
-            guard let remote = publication as? RemoteTrackPublication, let demand = values[remote.sid.stringValue] else { return nil }
+            guard let demand = values[remote.sid.stringValue] else { return nil }
             return .init(key: ObjectIdentifier(remote), value: demand) { [weak self] requested in
                 guard let self, self.revision == token, self.room === room else { throw CancellationError() }
                 try await remote.set(subscribed: requested.subscribed)
@@ -1151,20 +1173,26 @@ import LiveKitWebRTC
         await subscriptions.waitForReconciliation()
         guard revision == token, self.room === room else { return }
         let current = demands(in: room)
-        if room.remoteParticipants.values.flatMap({ $0.trackPublications.values }).contains(where: { publication in
-            current[publication.sid.stringValue].map { subscriptions.didFail(ObjectIdentifier(publication), value: $0) } == true
-        }) {
-            throw subscriptionFailure ?? NativeDesktopRockError.staleOperation
+        for remote in allPublications {
+            if current[remote.sid.stringValue].map({ subscriptions.didFail(ObjectIdentifier(remote), value: $0) }) == true {
+                throw subscriptionFailure ?? NativeDesktopRockError.staleOperation
+            }
         }
     }
 
     private func demands(in room: Room) -> [String: NativeRockTrackDemand] {
-        let tracks = room.remoteParticipants.values.flatMap { participant in
-            participant.trackPublications.values.compactMap { publication -> NativeRockRemoteTrack? in
-                guard publication.kind == .audio || publication.kind == .video else { return nil }
-                return NativeRockRemoteTrack(id: publication.sid.stringValue, participantID: identifier(participant),
+        var tracks: [NativeRockRemoteTrack] = []
+        for participant in room.remoteParticipants.values {
+            let pid = identifier(participant)
+            for publication in participant.trackPublications.values {
+                guard publication.kind == .audio || publication.kind == .video else { continue }
+                tracks.append(NativeRockRemoteTrack(
+                    id: publication.sid.stringValue,
+                    participantID: pid,
                     kind: publication.kind == .audio ? .audio : publication.source == .screenShareVideo ? .screen : .camera,
-                    muted: publication.isMuted, ready: publication.track != nil)
+                    muted: publication.isMuted,
+                    ready: publication.track != nil
+                ))
             }
         }
         return NativeRockVideoPolicy.demand(for: tracks, visible: visibleParticipantIDs,
@@ -1184,9 +1212,10 @@ import LiveKitWebRTC
         snapshot.playoutOn = playoutIntent
         snapshot.microphoneLevel = connected ? room.localParticipant.audioLevel : nil
         publishAudioSources(room)
-        let people: [Participant] = [room.localParticipant] + room.remoteParticipants.values.sorted {
+        let sortedRemotes = room.remoteParticipants.values.sorted {
             identifier($0) < identifier($1)
         }
+        let people: [Participant] = [room.localParticipant] + sortedRemotes
         snapshot.participants = people.map { participant in
             NativeDesktopParticipant(id: identifier(participant), name: participant.name ?? L("Musician"),
                 isLocal: participant === room.localParticipant, microphoneOn: participant.isMicrophoneEnabled(),
@@ -1194,7 +1223,8 @@ import LiveKitWebRTC
         }
         var active = Set<String>(), videos: [NativeDesktopExternalVideo] = []
         let demanded = demands(in: room)
-        for participant in room.remoteParticipants.values.sorted(by: { identifier($0) < identifier($1) }) {
+        for participant in sortedRemotes {
+            let pid = identifier(participant)
             for publication in participant.videoTracks.sorted(by: { $0.sid.stringValue < $1.sid.stringValue }) {
                 guard demanded[publication.sid.stringValue]?.subscribed == true,
                       !publication.isMuted, let track = publication.track as? VideoTrack else { continue }
@@ -1205,7 +1235,7 @@ import LiveKitWebRTC
                     renderers[id] = renderer; Task { await renderer.attach() }
                 }
                 if let renderer = renderers[id] {
-                    videos.append(.init(id: id, participantID: identifier(participant),
+                    videos.append(.init(id: id, participantID: pid,
                         source: publication.source == .screenShareVideo ? .screen : .camera, track: renderer.track))
                 }
             }
@@ -1220,10 +1250,23 @@ import LiveKitWebRTC
             if let renderer = localRenderer { Task { await renderer.attach() } }
             onLocalCamera?(localRenderer?.track)
         }
-        incomingVideo = videos; onVideo?(videos); emit()
-        Task { [weak self] in
-            do { try await self?.subscribe(room) }
-            catch { guard let self, self.room === room else { return }; self.snapshot.lastError = error.localizedDescription; self.emit() }
+        let videoChanged = !NativeDesktopExternalVideo.listEquals(incomingVideo, videos)
+        if videoChanged {
+            incomingVideo = videos
+            onVideo?(videos)
+        }
+        emit()
+        if demanded != lastAppliedDemands || subscriptionFailure != nil {
+            lastAppliedDemands = demanded
+            Task { [weak self] in
+                do { try await self?.subscribe(room, values: demanded) }
+                catch {
+                    guard let self, self.room === room else { return }
+                    self.lastAppliedDemands = nil
+                    self.snapshot.lastError = error.localizedDescription
+                    self.emit()
+                }
+            }
         }
     }
 
@@ -1311,13 +1354,13 @@ import LiveKitWebRTC
             case .connecting:
                 snapshot.phase = .connecting; chat.canSend = false; microphoneDiagnosticsGeneration = UUID()
             case .reconnecting:
-                snapshot.phase = .reconnecting; chat.canSend = false; subscriptions.reset(); microphoneDiagnosticsGeneration = UUID()
+                snapshot.phase = .reconnecting; chat.canSend = false; subscriptions.reset(); lastAppliedDemands = nil; microphoneDiagnosticsGeneration = UUID()
                 attachment?.suppress()
             case .disconnecting:
                 snapshot.phase = .leaving; chat.canSend = false; microphoneDiagnosticsGeneration = UUID()
                 attachment?.suppress()
             case .disconnected:
-                snapshot.phase = .failed; chat.canSend = false; microphoneDiagnosticsGeneration = UUID()
+                snapshot.phase = .failed; chat.canSend = false; lastAppliedDemands = nil; microphoneDiagnosticsGeneration = UUID()
                 attachment?.suppress()
             @unknown default: break
             }

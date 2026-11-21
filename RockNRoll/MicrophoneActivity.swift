@@ -1,3 +1,4 @@
+import Accelerate
 import AVFoundation
 import Combine
 import UIKit
@@ -86,16 +87,31 @@ final class MicrophoneSampleSink: @unchecked Sendable {
         let frames = Int(buffer.frameLength), channels = Int(buffer.format.channelCount)
         guard frames > 0, channels > 0 else { return }
         var energy: Double = 0
+        let stride = Int(buffer.stride)
         if let data = buffer.floatChannelData {
-            for channel in 0..<channels { for frame in 0..<frames {
-                let v = Double(data[buffer.format.isInterleaved ? 0 : channel][frame * Int(buffer.stride) + (buffer.format.isInterleaved ? channel : 0)])
-                energy += v * v
-            } }
+            for channel in 0..<channels {
+                let ptr = data[buffer.format.isInterleaved ? 0 : channel]
+                if stride == 1 && !buffer.format.isInterleaved {
+                    var meanSquare: Float = 0
+                    vDSP_measqv(ptr, 1, &meanSquare, vDSP_Length(frames))
+                    energy += Double(meanSquare) * Double(frames)
+                } else {
+                    let baseOffset = buffer.format.isInterleaved ? channel : 0
+                    for frame in 0..<frames {
+                        let v = Double(ptr[frame * stride + baseOffset])
+                        energy += v * v
+                    }
+                }
+            }
         } else if let data = buffer.int16ChannelData {
-            for channel in 0..<channels { for frame in 0..<frames {
-                let v = Double(data[buffer.format.isInterleaved ? 0 : channel][frame * Int(buffer.stride) + (buffer.format.isInterleaved ? channel : 0)]) / 32768
-                energy += v * v
-            } }
+            for channel in 0..<channels {
+                let ptr = data[buffer.format.isInterleaved ? 0 : channel]
+                let baseOffset = buffer.format.isInterleaved ? channel : 0
+                for frame in 0..<frames {
+                    let v = Double(ptr[frame * stride + baseOffset]) / 32768
+                    energy += v * v
+                }
+            }
         } else { return }
         deliver(Float(sqrt(energy / Double(frames * channels))))
     }

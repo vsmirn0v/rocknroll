@@ -23,7 +23,9 @@ import UIKit
         case audioUnavailable
     }
 
-    @Published private(set) var mode: Mode = .idle
+    @Published private(set) var mode: Mode = .idle {
+        didSet { syncCaptureMode() }
+    }
     @Published private(set) var wakeArmed = false
     @Published private(set) var livePartialText = ""
     @Published private(set) var lastHeardCommand: String?
@@ -396,6 +398,10 @@ import UIKit
         }
     }
 
+    private func syncCaptureMode() {
+        processor.setCapturesRawChunks(mode == .dictating || mode == .pushToTalk)
+    }
+
     private func handleCompletedSegment(_ samples: [Float]) async {
         guard samples.count >= 3_200 else { return }
         switch mode {
@@ -623,9 +629,16 @@ private final class IOSAssistantAudioProcessor: @unchecked Sendable {
     private var vad = IOSVoiceActivityDetector()
     private var preRoll: [Float] = []
     private let preRollLimit = 24_000
+    private var capturesRawChunks = false
 
     var onCompletedSegment: (([Float]) -> Void)?
     var onSamplesChunk: (([Float]) -> Void)?
+
+    func setCapturesRawChunks(_ enabled: Bool) {
+        lock.lock()
+        capturesRawChunks = enabled
+        lock.unlock()
+    }
 
     func resetVAD() {
         lock.lock()
@@ -641,10 +654,11 @@ private final class IOSAssistantAudioProcessor: @unchecked Sendable {
     }
 
     func enqueueShared(_ buffer: AVAudioPCMBuffer) {
+        guard let copied = MeetingAudioSink.copy(buffer) else { return }
         let converter = self.converter
         queue.async { [weak self] in
             guard let self else { return }
-            let mono16k = converter.convert(buffer)
+            let mono16k = converter.convert(copied)
             guard !mono16k.isEmpty else { return }
             self.ingest(mono16k)
         }
@@ -658,12 +672,16 @@ private final class IOSAssistantAudioProcessor: @unchecked Sendable {
     }
 
     private func ingest(_ samples: [Float]) {
-        onSamplesChunk?(samples)
+        let shouldForwardChunks: Bool
         let segments: [IOSVoiceActivityDetector.CompletedSegment]
         lock.lock()
+        shouldForwardChunks = capturesRawChunks
         appendPreRollLocked(samples)
         segments = vad.append(samples)
         lock.unlock()
+        if shouldForwardChunks {
+            onSamplesChunk?(samples)
+        }
         for segment in segments {
             onCompletedSegment?(segment.samples)
         }

@@ -322,7 +322,8 @@ public final class NativeGuestEngine {
                 nonLobbyDeadline = deadline
                 guard now < deadline else { throw GuestTransportError.timedOut }
             }
-            try await Task.sleep(nanoseconds: 50_000_000)
+            let intervalNs: UInt64 = (lobbyState.inLobby && !joined) ? 200_000_000 : 50_000_000
+            try await Task.sleep(nanoseconds: intervalNs)
         }
     }
 
@@ -536,6 +537,7 @@ public final class NativeGuestEngine {
 
     private func updateParticipants(_ participants: [[String: Any]]) async throws {
         meetingFeatures.updateRTC(participants); emitMeetingChange()
+        var videoChanged = false
         for participant in participants {
             try checkActive()
             #if DEBUG
@@ -591,8 +593,9 @@ public final class NativeGuestEngine {
             if previousParticipants != connectedRemoteParticipants || previousTracks != remoteTrackIDs { remoteMediaGeneration &+= 1 }
             remoteVideoMetadata = remoteVideoMetadata.filter { $0.value.participant != sid }
             remoteTracks = remoteTracks.filter { $0.value.participant != sid }
+            videoChanged = true
             guard participant["state"] as? String != "DISCONNECTED" else {
-                onIncomingVideoChange?(incomingVideo); continue
+                continue
             }
             for track in participant["tracks"] as? [[String: Any]] ?? [] {
                 guard let trackSID = track["sid"] as? String,
@@ -606,6 +609,8 @@ public final class NativeGuestEngine {
                     remoteVideoMetadata[trackSID] = (sid, participant["name"] as? String, source)
                 }
             }
+        }
+        if videoChanged {
             onIncomingVideoChange?(incomingVideo)
         }
         // A receiver can attach before its publication metadata names the speaker.

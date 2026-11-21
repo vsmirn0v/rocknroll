@@ -81,6 +81,23 @@ import FoundationModels
 
     private var auditionTask: Task<Void, Never>?
     private var holdLimitTask: Task<Void, Never>?
+    private struct WarmRealtimeConfigKey: Equatable {
+        let provider: RealtimeProviderKind
+        let apiKey: String
+        let model: String
+        let voice: String
+        let endpointOverride: String
+        let instructions: String
+        let toolCount: Int
+    }
+    @MainActor
+    private final class RealtimeTurnSinkBox {
+        var handler: (@MainActor (RealtimeVoiceEvent) -> Void)?
+    }
+    private var warmRealtimeRouter: RealtimeVoiceRouter?
+    private var warmRealtimeConfigKey: WarmRealtimeConfigKey?
+    private var warmRealtimeIdleTask: Task<Void, Never>?
+    private let realtimeTurnSinkBox = RealtimeTurnSinkBox()
 
     init(
         workspace: IOSWorkspaceCoordinator? = nil,
@@ -97,6 +114,21 @@ import FoundationModels
     deinit {
         auditionTask?.cancel()
         holdLimitTask?.cancel()
+        warmRealtimeIdleTask?.cancel()
+        if let router = warmRealtimeRouter {
+            Task { await router.stop() }
+        }
+    }
+
+    func invalidateWarmRealtimeRouter() {
+        warmRealtimeIdleTask?.cancel()
+        warmRealtimeIdleTask = nil
+        warmRealtimeConfigKey = nil
+        realtimeTurnSinkBox.handler = nil
+        if let router = warmRealtimeRouter {
+            warmRealtimeRouter = nil
+            Task { await router.stop() }
+        }
     }
 
     func submitDraft() {
@@ -587,15 +619,6 @@ import FoundationModels
             return false
         }
 
-        @MainActor
-        final class Collector {
-            var chunks: [Data] = []
-            var transcript = ""
-            var finished = false
-            var failed = false
-        }
-
-        let collector = Collector()
         let rendered = skills.renderPromptContext(commandText: input)
         let instructions = [
             rendered.basePersona,
@@ -617,69 +640,212 @@ import FoundationModels
             systemInstructions: instructions,
             tools: tools
         )
-        let router = RealtimeVoiceRouter()
-        await router.start(
-            config: config,
-            customTransport: customRealtimeTransportFactory?(),
-            executeTool: { [weak self] name, argsJSON in
-                guard let self else { return "{}" }
-                return await self.executeDirectRealtimeTool(name: name, argumentsJSON: argsJSON)
-            },
-            onEvent: { event in
-                await MainActor.run {
-                    switch event {
-                    case .audioPCM16(let pcm, _):
-                        collector.chunks.append(pcm)
-                    case .assistantTranscriptDelta(let delta):
-                        collector.transcript += delta
-                    case .assistantTranscriptDone(let full):
-                        collector.transcript = full
-                    case .audioDone:
-                        collector.finished = true
-                    case .error, .disconnected:
-                        collector.failed = true
-                    default:
-                        break
-                    }
+        let configKey = WarmRealtimeConfigKey(
+            provider: kind,
+            apiKey: apiKey,
+            model: skills.realtimeModel,
+            voice: skills.realtimeVoice,
+            endpointOverride: skills.realtimeEndpoint,
+            instructions: instructions,
+            toolCount: tools.count
+        )
+
+        @MainActor
+        final class TurnState {
+            var chunks: [Data] = []
+            var bufferedBytes = 0
+            var transcript = ""
+            var finished = false
+            var failed = false
+            var streamToken: UUID?
+            var streamMessageID: UUID?
+            var streamingFailed = false
+            var continuation: CheckedContinuation<Void, Never>?
+
+            func resumeIfDone() {
+                if let cont = continuation {
+                    continuation = nil
+                    cont.resume()
                 }
             }
-        )
+        }
+
+        let state = TurnState()
+        let canPlayLocally = !isInActiveCall() || !Self.isSpeakerOutputActive
+        let streamFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 24_000, channels: 1, interleaved: false)
+        let handleEvent: @MainActor (RealtimeVoiceEvent) -> Void = { [weak self, weak state] event in
+            guard let state else { return }
+            switch event {
+            case .audioPCM16(let pcm, _):
+                state.chunks.append(pcm)
+                state.bufferedBytes += pcm.count
+                if canPlayLocally, !state.streamingFailed, let streamFormat {
+                    if let token = state.streamToken {
+                        if let buf = RealtimeVoiceAudio.pcm16ToAudioBuffer(data: pcm, sampleRate: 24_000) {
+                            IOSVoicePreviewPlayer.shared.enqueueStreamBuffer(buf, token: token)
+                        }
+                    } else if state.bufferedBytes >= 7_200, let self {
+                        let msgID = UUID()
+                        state.streamMessageID = msgID
+                        self.stopAudition()
+                        self.auditioningMessageID = msgID
+                        self.speech?.setSpeakingResponse(true)
+                        do {
+                            let token = try IOSVoicePreviewPlayer.shared.beginStreaming(format: streamFormat) { [weak self] in
+                                Task { @MainActor [weak self] in
+                                    guard let self, self.auditioningMessageID == msgID else { return }
+                                    self.auditioningMessageID = nil
+                                    self.speech?.setSpeakingResponse(false)
+                                }
+                            }
+                            state.streamToken = token
+                            for queued in state.chunks {
+                                if let buf = RealtimeVoiceAudio.pcm16ToAudioBuffer(data: queued, sampleRate: 24_000) {
+                                    IOSVoicePreviewPlayer.shared.enqueueStreamBuffer(buf, token: token)
+                                }
+                            }
+                        } catch {
+                            state.streamingFailed = true
+                            self.stopAudition()
+                        }
+                    }
+                }
+            case .assistantTranscriptDelta(let delta):
+                state.transcript += delta
+            case .assistantTranscriptDone(let full):
+                state.transcript = full
+            case .audioDone:
+                state.finished = true
+                state.resumeIfDone()
+            case .error, .disconnected:
+                state.failed = true
+                state.resumeIfDone()
+            default:
+                break
+            }
+        }
+
+        let usesWarmRouter = customRealtimeTransportFactory == nil
+        let router: RealtimeVoiceRouter
+        if usesWarmRouter {
+            warmRealtimeIdleTask?.cancel()
+            warmRealtimeIdleTask = nil
+            realtimeTurnSinkBox.handler = handleEvent
+            if let existing = warmRealtimeRouter,
+               warmRealtimeConfigKey == configKey,
+               await existing.isRealtimeConnected {
+                router = existing
+            } else {
+                if let existing = warmRealtimeRouter {
+                    warmRealtimeRouter = nil
+                    await existing.stop()
+                }
+                let created = RealtimeVoiceRouter()
+                let box = realtimeTurnSinkBox
+                await created.start(
+                    config: config,
+                    customTransport: nil,
+                    executeTool: { [weak self] name, argsJSON in
+                        guard let self else { return "{}" }
+                        return await self.executeDirectRealtimeTool(name: name, argumentsJSON: argsJSON)
+                    },
+                    onEvent: { event in
+                        await MainActor.run { box.handler?(event) }
+                    }
+                )
+                warmRealtimeRouter = created
+                warmRealtimeConfigKey = configKey
+                router = created
+            }
+        } else {
+            let isolated = RealtimeVoiceRouter()
+            await isolated.start(
+                config: config,
+                customTransport: customRealtimeTransportFactory?(),
+                executeTool: { [weak self] name, argsJSON in
+                    guard let self else { return "{}" }
+                    return await self.executeDirectRealtimeTool(name: name, argumentsJSON: argsJSON)
+                },
+                onEvent: { event in
+                    await MainActor.run { handleEvent(event) }
+                }
+            )
+            router = isolated
+        }
+
         guard await router.isRealtimeConnected, await router.sendText(input) else {
-            await router.stop()
+            if usesWarmRouter {
+                invalidateWarmRealtimeRouter()
+            } else {
+                await router.stop()
+            }
+            if state.streamToken != nil { stopAudition() }
             return false
         }
-        for _ in 0..<200 {
-            if collector.finished || collector.failed || Task.isCancelled { break }
-            try? await Task.sleep(for: .milliseconds(100))
-        }
-        await router.stop()
 
-        let text = collector.transcript.trimmingCharacters(in: .whitespacesAndNewlines)
-        let audioData = collector.chunks.reduce(into: Data()) { $0.append($1) }
-        guard !collector.failed, (!text.isEmpty || !audioData.isEmpty) else {
+        if !state.finished && !state.failed && !Task.isCancelled {
+            let timeoutTask = Task { @MainActor in
+                try? await Task.sleep(for: .seconds(20))
+                state.resumeIfDone()
+            }
+            await withCheckedContinuation { continuation in
+                if state.finished || state.failed || Task.isCancelled {
+                    continuation.resume()
+                } else {
+                    state.continuation = continuation
+                }
+            }
+            timeoutTask.cancel()
+        }
+        await router.waitForPendingToolCalls(timeoutSeconds: 3.0)
+
+        if usesWarmRouter {
+            realtimeTurnSinkBox.handler = nil
+            if state.failed {
+                invalidateWarmRealtimeRouter()
+            } else {
+                warmRealtimeIdleTask = Task { @MainActor [weak self] in
+                    try? await Task.sleep(for: .seconds(90))
+                    guard !Task.isCancelled else { return }
+                    self?.invalidateWarmRealtimeRouter()
+                }
+            }
+        } else {
+            await router.stop()
+        }
+
+        let text = state.transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !state.failed, (!text.isEmpty || state.bufferedBytes > 0) else {
+            if state.streamToken != nil { stopAudition() }
             return false
         }
 
         let displayAnswer = text.isEmpty ? L("Spoken response played.") : text
-        let message = Message(role: .assistant, text: displayAnswer, at: now())
+        let message = Message(id: state.streamMessageID ?? UUID(), role: .assistant, text: displayAnswer, at: now())
         messages.append(message)
         if source.isVoice { lastVoiceAnswer = displayAnswer }
-        if let buffer = RealtimeVoiceAudio.pcm16ToAudioBuffer(data: audioData, sampleRate: 24_000),
-           !isInActiveCall() || !Self.isSpeakerOutputActive {
-            stopAudition()
-            auditioningMessageID = message.id
-            speech?.setSpeakingResponse(true)
-            do {
-                try IOSVoicePreviewPlayer.shared.play(buffer) { [weak self] in
-                    Task { @MainActor [weak self] in
-                        guard let self, self.auditioningMessageID == message.id else { return }
-                        self.auditioningMessageID = nil
-                        self.speech?.setSpeakingResponse(false)
+        if let token = state.streamToken {
+            IOSVoicePreviewPlayer.shared.finishStreaming(token: token)
+        } else if state.bufferedBytes > 0 && canPlayLocally {
+            var audioData = Data()
+            audioData.reserveCapacity(state.bufferedBytes)
+            for chunk in state.chunks { audioData.append(chunk) }
+            if let buffer = RealtimeVoiceAudio.pcm16ToAudioBuffer(data: audioData, sampleRate: 24_000) {
+                stopAudition()
+                auditioningMessageID = message.id
+                speech?.setSpeakingResponse(true)
+                do {
+                    try IOSVoicePreviewPlayer.shared.play(buffer) { [weak self] in
+                        Task { @MainActor [weak self] in
+                            guard let self, self.auditioningMessageID == message.id else { return }
+                            self.auditioningMessageID = nil
+                            self.speech?.setSpeakingResponse(false)
+                        }
                     }
+                } catch {
+                    auditioningMessageID = nil
+                    speech?.setSpeakingResponse(false)
                 }
-            } catch {
-                auditioningMessageID = nil
-                speech?.setSpeakingResponse(false)
             }
         }
         return true
@@ -735,7 +901,7 @@ import FoundationModels
 
     private func answerWithWorkspaceOrAI(_ query: String) async -> String {
         let hits = await (workspace?.search(query: query) ?? [])
-        let knowledgeHits = skills?.searchKnowledge(query: query, limit: 5) ?? []
+        let knowledgeHits = await (skills?.searchKnowledgeAsync(query: query, limit: 5) ?? [])
         let rendered = skills?.renderPromptContext(commandText: query)
         let cal = Calendar.current
         let currentNow = now()

@@ -281,6 +281,7 @@ struct NativeDesktopMeetingView: View {
     @Namespace private var speakerViewport
     @State private var chromeVisible = true
     @State private var chromeTask: Task<Void, Never>?
+    @State private var lastChromeRevealUptime: TimeInterval = 0
     @State private var immersiveHint = false
     /// Immersive view keeps only the content until the pointer moves.
     private var chromeShown: Bool { !model.immersive || chromeVisible }
@@ -289,6 +290,11 @@ struct NativeDesktopMeetingView: View {
     private static let stageVerticalInset: CGFloat = 12
     private func revealChrome() {
         guard model.immersive else { return }
+        let uptime = ProcessInfo.processInfo.systemUptime
+        if chromeVisible && (uptime - lastChromeRevealUptime) < 0.25 {
+            return
+        }
+        lastChromeRevealUptime = uptime
         chromeVisible = true; chromeTask?.cancel()
         chromeTask = Task { @MainActor in
             try? await Task.sleep(for: .seconds(3))

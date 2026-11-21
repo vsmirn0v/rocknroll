@@ -42,7 +42,12 @@ public actor OpenAIRealtimeClient: RealtimeVoiceTransport {
 
     public func sendAudioPCM16(_ data: Data) async throws {
         guard let ws = task else { throw RealtimeTransportError.notConnected }
-        try await sendJSON(Self.inputAudioAppendPayload(pcm16Data: data), on: ws)
+        let b64 = data.base64EncodedString()
+        var text = "{\"type\":\"input_audio_buffer.append\",\"audio\":\""
+        text.reserveCapacity(text.count + b64.count + 2)
+        text += b64
+        text += "\"}"
+        try await ws.send(.string(text))
     }
 
     public func sendTextTurn(_ text: String) async throws {
@@ -82,7 +87,7 @@ public actor OpenAIRealtimeClient: RealtimeVoiceTransport {
                 let message = try await ws.receive()
                 let data: Data?
                 switch message {
-                case .string(let text): data = text.data(using: .utf8)
+                case .string(let text): data = Data(text.utf8)
                 case .data(let raw): data = raw
                 @unknown default: data = nil
                 }

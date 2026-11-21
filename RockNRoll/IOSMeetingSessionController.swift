@@ -933,9 +933,8 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
                         self.syncCatchUpTranscript()
                     }
                 }
+                syncCatchUpTranscript()
             }
-            syncCatchUpTranscript()
-            updateVideoDemand()
         case .reconnecting:
             callView?.sharingAvailable = false
             callView?.showMediaStatus(L("Restoring meeting media…"))

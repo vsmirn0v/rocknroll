@@ -116,6 +116,17 @@ struct AttentionProvider: Codable, Equatable, Sendable {
 /// API keys, kept in the login keychain for this app only: one account per provider
 /// kind, so a judge, writer and escalation at different providers each send their own.
 struct AttentionKeychain: Sendable {
+    private struct CacheKey: Hashable {
+        let service: String
+        let account: String
+    }
+
+    private final class MemoryCache: @unchecked Sendable {
+        static let shared = MemoryCache()
+        let lock = NSLock()
+        var values: [CacheKey: String?] = [:]
+    }
+
     var service = "dev.vsmirn0v.conferenceguest.attention"
     /// Before beta 71 a single key served every provider.
     var account = "judge-api-key"
@@ -124,10 +135,30 @@ struct AttentionKeychain: Sendable {
         [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: account]
     }
     func read() -> String? {
+        let key = CacheKey(service: service, account: account)
+        let cache = MemoryCache.shared
+        cache.lock.lock()
+        if let hit = cache.values[key] {
+            cache.lock.unlock()
+            return hit
+        }
+        cache.lock.unlock()
+
         var item = query; item[kSecReturnData as String] = true; item[kSecMatchLimit as String] = kSecMatchLimitOne
         var result: CFTypeRef?
-        guard SecItemCopyMatching(item as CFDictionary, &result) == errSecSuccess, let data = result as? Data else { return nil }
-        return String(data: data, encoding: .utf8)
+        let status = SecItemCopyMatching(item as CFDictionary, &result)
+        let resolved: String?
+        if status == errSecSuccess, let data = result as? Data {
+            resolved = String(data: data, encoding: .utf8)
+        } else {
+            resolved = nil
+        }
+        if status == errSecSuccess || status == errSecItemNotFound {
+            cache.lock.lock()
+            cache.values[key] = resolved
+            cache.lock.unlock()
+        }
+        return resolved
     }
     @discardableResult func write(_ value: String) -> Bool {
         let data = Data(value.utf8)
@@ -137,14 +168,38 @@ struct AttentionKeychain: Sendable {
             addition[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
             status = SecItemAdd(addition as CFDictionary, nil)
         }
-        return status == errSecSuccess
+        let ok = status == errSecSuccess
+        if ok {
+            let key = CacheKey(service: service, account: account)
+            let cache = MemoryCache.shared
+            cache.lock.lock()
+            cache.values[key] = value
+            cache.lock.unlock()
+        }
+        return ok
     }
     @discardableResult func delete() -> Bool {
         let status = SecItemDelete(query as CFDictionary)
-        return status == errSecSuccess || status == errSecItemNotFound
+        let ok = status == errSecSuccess || status == errSecItemNotFound
+        if ok {
+            let key = CacheKey(service: service, account: account)
+            let cache = MemoryCache.shared
+            cache.lock.lock()
+            cache.values[key] = .some(nil)
+            cache.lock.unlock()
+        }
+        return ok
     }
     /// The legacy key and every provider kind's key.
-    func deleteAll() { delete(); for kind in AttentionProvider.Kind.allCases { self.kind(kind).delete() } }
+    func deleteAll() {
+        delete()
+        for kind in AttentionProvider.Kind.allCases { self.kind(kind).delete() }
+        for realtime in RealtimeProviderKind.allCases where realtime != .disabled {
+            var copy = self
+            copy.account = "realtime-api-key." + realtime.rawValue
+            copy.delete()
+        }
+    }
 }
 
 /// One judged window and what you did with it; replayed to tune prompts.

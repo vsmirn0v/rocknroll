@@ -233,6 +233,8 @@ public enum CalendarAutoJoinPolicy {
 }
 
 public enum CalendarLinkDiscovery {
+    private static let linkDetector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue)
+
     /// Formal URLs only; event-title words never identify a room.
     public static func links(url: URL?, location: String?, notes: String?,
                              knownOrigins: Set<String>, hintedHostFragments: [String],
@@ -247,7 +249,7 @@ public enum CalendarLinkDiscovery {
                               knownOrigins: Set<String>, hintedHostFragments: [String],
                               aliases: [String: URL] = [:], title: String? = nil,
                               nativeSchemes: Set<String> = []) -> [CalendarLinkGroup] {
-        let detector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue)
+        let detector = linkDetector
         func extract(_ field: String?) -> [URL] {
             guard let field else { return [] }
             let text = String(field.prefix(32_768))

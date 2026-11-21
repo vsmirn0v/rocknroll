@@ -5,6 +5,7 @@ public actor GeminiLiveClient: RealtimeVoiceTransport {
     private var task: URLSessionWebSocketTask?
     private var session: URLSession?
     private var receiveTask: Task<Void, Never>?
+    private var inputSampleRate: Int = 16_000
     private let continuation: AsyncStream<RealtimeVoiceEvent>.Continuation
     public nonisolated let events: AsyncStream<RealtimeVoiceEvent>
 
@@ -27,6 +28,7 @@ public actor GeminiLiveClient: RealtimeVoiceTransport {
         ws.resume()
         self.session = urlSession
         self.task = ws
+        self.inputSampleRate = max(8_000, config.inputSampleRate)
 
         try await sendJSON(Self.setupPayload(config: config), on: ws)
         continuation.yield(.connected)
@@ -38,7 +40,12 @@ public actor GeminiLiveClient: RealtimeVoiceTransport {
 
     public func sendAudioPCM16(_ data: Data) async throws {
         guard let ws = task else { throw RealtimeTransportError.notConnected }
-        try await sendJSON(Self.realtimeAudioPayload(pcm16Data: data), on: ws)
+        let b64 = data.base64EncodedString()
+        var text = "{\"realtimeInput\":{\"mediaChunks\":[{\"mimeType\":\"audio/pcm;rate=\(inputSampleRate)\",\"data\":\""
+        text.reserveCapacity(text.count + b64.count + 6)
+        text += b64
+        text += "\"}]}}"
+        try await ws.send(.string(text))
     }
 
     public func sendTextTurn(_ text: String) async throws {
@@ -79,7 +86,7 @@ public actor GeminiLiveClient: RealtimeVoiceTransport {
                 let message = try await ws.receive()
                 let data: Data?
                 switch message {
-                case .string(let text): data = text.data(using: .utf8)
+                case .string(let text): data = Data(text.utf8)
                 case .data(let raw): data = raw
                 @unknown default: data = nil
                 }

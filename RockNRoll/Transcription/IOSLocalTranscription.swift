@@ -41,6 +41,7 @@ final class IOSPCM16kConverter {
 
     private var sourceFormatKey: String?
     private var converter: AVAudioConverter?
+    private var outputBuffer: AVAudioPCMBuffer?
 
     func convert(_ buffer: AVAudioPCMBuffer) -> [Float] {
         let format = buffer.format
@@ -63,8 +64,16 @@ final class IOSPCM16kConverter {
 
         let ratio = Self.targetFormat.sampleRate / max(1, format.sampleRate)
         let capacity = AVAudioFrameCount(max(64, Int(ceil(Double(frameCount) * ratio)) + 32))
-        guard let converted = AVAudioPCMBuffer(pcmFormat: Self.targetFormat, frameCapacity: capacity) else {
-            return []
+        let converted: AVAudioPCMBuffer
+        if let existing = outputBuffer, existing.frameCapacity >= capacity {
+            existing.frameLength = 0
+            converted = existing
+        } else {
+            guard let created = AVAudioPCMBuffer(pcmFormat: Self.targetFormat, frameCapacity: capacity) else {
+                return []
+            }
+            outputBuffer = created
+            converted = created
         }
 
         var fed = false
@@ -155,6 +164,10 @@ private final class AudioIngressRouter: @unchecked Sendable {
                 }
             }
         }
+    }
+
+    func canAcceptRemote() -> Bool {
+        lock.withLock { running && pendingWorkCount < Self.maxPendingWorkCount }
     }
 
     func enqueueLocal(_ buffer: AVAudioPCMBuffer) {
@@ -298,6 +311,7 @@ final class IOSMeetingTranscriber: ObservableObject {
     private var running: Bool { activeRun != nil }
     private var segmentOrder = 0
     private var activeUtteranceByStream: [String: TranscriptSegment] = [:]
+    private var partialPublishTask: Task<Void, Never>?
     var partialSegmentIDs: [String] { activeUtteranceByStream.values.map(\.id) }
     private var finalizedSegments: [TranscriptSegment] = []
 
@@ -405,6 +419,8 @@ final class IOSMeetingTranscriber: ObservableObject {
     }
 
     func stop() async {
+        partialPublishTask?.cancel()
+        partialPublishTask = nil
         guard running || state != .off else { return }
         activeRun = nil
         detachAllTaps()
@@ -491,8 +507,10 @@ final class IOSMeetingTranscriber: ObservableObject {
         }
         let audioRouter = router
         for source in remoteSources where taps[source.id] == nil {
-            let sink = MeetingAudioSink(trackID: source.id) { id, pcm in
-                audioRouter.enqueueRemote(streamID: id, buffer: pcm)
+            let sink = MeetingAudioSink(borrowingBuffersFor: source.id) { id, borrowed in
+                guard audioRouter.canAcceptRemote(),
+                      let copy = MeetingAudioSink.copy(borrowed) else { return }
+                audioRouter.enqueueRemote(streamID: id, buffer: copy)
             }
             source.attach(sink)
             taps[source.id] = (source, sink)
@@ -529,6 +547,8 @@ final class IOSMeetingTranscriber: ObservableObject {
         guard !clean.isEmpty else {
             if isFinal {
                 activeUtteranceByStream.removeValue(forKey: streamID)
+                partialPublishTask?.cancel()
+                partialPublishTask = nil
                 publishSegments()
             }
             return
@@ -564,10 +584,20 @@ final class IOSMeetingTranscriber: ObservableObject {
                     finalizedSegments.removeFirst(finalizedSegments.count - 400)
                 }
             }
+            partialPublishTask?.cancel()
+            partialPublishTask = nil
+            publishSegments()
         } else {
             activeUtteranceByStream[streamID] = segment
+            if partialPublishTask == nil {
+                partialPublishTask = Task { @MainActor [weak self] in
+                    try? await Task.sleep(for: .milliseconds(120))
+                    guard let self, !Task.isCancelled, self.running else { return }
+                    self.partialPublishTask = nil
+                    self.publishSegments()
+                }
+            }
         }
-        publishSegments()
     }
 
     private func publishSegments() {

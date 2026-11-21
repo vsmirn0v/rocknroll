@@ -54,30 +54,30 @@ enum SyntheticVoiceReplyPlayer {
         _ = localGain
         #endif
 
-        // Pad two silent 10ms frames on normal completion so Opus flushes the tail.
-        let padded = speechSamples + [Int16](repeating: 0, count: frameSamples * 2)
+        // Pad remainder of final 10ms chunk plus two silent 10ms frames so Opus flushes the tail cleanly.
         let totalSpeech = speechSamples.count
+        let remainder = totalSpeech % frameSamples
+        let alignmentPad = remainder == 0 ? 0 : (frameSamples - remainder)
+        let padded = speechSamples + [Int16](repeating: 0, count: alignmentPad + frameSamples * 2)
         let clock = ContinuousClock()
         var nextDeadline = clock.now
         var offset = 0
+        var frameCounter = 0
 
         while offset < padded.count {
             if Task.isCancelled { return false }
-            guard await MainActor.run(body: canContinue) else {
-                return false
+            if frameCounter % 10 == 0 {
+                guard await MainActor.run(body: canContinue) else {
+                    return false
+                }
             }
-            let remaining = padded.count - offset
-            let chunkCount = min(frameSamples, remaining)
-            var frame = [Int16](repeating: 0, count: frameSamples)
-            for index in 0..<chunkCount {
-                frame[index] = padded[offset + index]
-            }
-            frame.withUnsafeBufferPointer { ptr in
+            padded.withUnsafeBufferPointer { ptr in
                 if let base = ptr.baseAddress {
-                    deliverFrame(base, frameSamples)
+                    deliverFrame(base + offset, frameSamples)
                 }
             }
             offset += frameSamples
+            frameCounter += 1
             if offset < padded.count {
                 nextDeadline = nextDeadline.advanced(by: .milliseconds(10))
                 if nextDeadline > clock.now {

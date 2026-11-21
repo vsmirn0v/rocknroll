@@ -524,6 +524,31 @@ public enum TaskSyncPlanner {
         var matchedRemoteJiraIDs: Set<String> = []
         var matchedReminderIDs: Set<String> = []
 
+        var jiraByID: [String: JiraRemoteIssue] = [:]
+        var jiraByKey: [String: JiraRemoteIssue] = [:]
+        if includeJira && !jiraIssues.isEmpty {
+            jiraByID.reserveCapacity(jiraIssues.count)
+            jiraByKey.reserveCapacity(jiraIssues.count)
+            for issue in jiraIssues {
+                if jiraByID[issue.id] == nil { jiraByID[issue.id] = issue }
+                if jiraByKey[issue.key] == nil { jiraByKey[issue.key] = issue }
+            }
+        }
+        var reminderByExternalID: [String: ReminderItemSnapshot] = [:]
+        var reminderByID: [String: ReminderItemSnapshot] = [:]
+        if includeReminders && !reminders.isEmpty {
+            reminderByExternalID.reserveCapacity(reminders.count)
+            reminderByID.reserveCapacity(reminders.count)
+            for reminder in reminders {
+                if reminderByExternalID[reminder.externalIdentifier] == nil {
+                    reminderByExternalID[reminder.externalIdentifier] = reminder
+                }
+                if reminderByID[reminder.id] == nil {
+                    reminderByID[reminder.id] = reminder
+                }
+            }
+        }
+
         if direction.includesExport {
             let scopedTasks = localTasks.filter {
                 inExportScope($0, preferences: preferences, myAliases: myAliases, explicitTaskIDs: explicitTaskIDs)
@@ -543,7 +568,7 @@ public enum TaskSyncPlanner {
 
                     if let binding = task.extended.binding(for: .jira) {
                         let remoteKey = binding.externalKey ?? binding.externalID
-                        let matchedIssue = jiraIssues.first(where: { $0.id == binding.externalID || $0.key == remoteKey })
+                        let matchedIssue = jiraByID[binding.externalID] ?? jiraByKey[remoteKey]
                         if let matchedIssue { matchedRemoteJiraIDs.insert(matchedIssue.key) }
 
                         let localDigestChanged = binding.lastSyncedDigest != nil && binding.lastSyncedDigest != task.syncDigest
@@ -642,7 +667,7 @@ public enum TaskSyncPlanner {
                 let targetListName = preferences.reminders.listTitle
                 for task in remindersScopedTasks {
                     if let binding = task.extended.binding(for: .appleReminders) {
-                        let matchedReminder = reminders.first(where: { $0.externalIdentifier == binding.externalID || $0.id == binding.externalID })
+                        let matchedReminder = reminderByExternalID[binding.externalID] ?? reminderByID[binding.externalID]
                         if let matchedReminder {
                             matchedReminderIDs.insert(matchedReminder.externalIdentifier)
                             matchedReminderIDs.insert(matchedReminder.id)
@@ -711,14 +736,26 @@ public enum TaskSyncPlanner {
 
         // Handle explicit imports / updates from Jira and Reminders when not already bound to local tasks.
         if direction.includesImport && explicitTaskIDs == nil {
-            let boundJiraIDs = Set(localTasks.compactMap { $0.extended.binding(for: .jira)?.externalID })
-            let boundJiraKeys = Set(localTasks.compactMap { $0.extended.binding(for: .jira)?.externalKey })
+            var localByJiraKey: [String: WorkspaceTaskRecord] = [:]
+            var localByJiraID: [String: WorkspaceTaskRecord] = [:]
+            var localByReminderID: [String: WorkspaceTaskRecord] = [:]
+            for local in localTasks {
+                if let jira = local.extended.binding(for: .jira) {
+                    if let key = jira.externalKey, !key.isEmpty, localByJiraKey[key] == nil {
+                        localByJiraKey[key] = local
+                    }
+                    if localByJiraID[jira.externalID] == nil {
+                        localByJiraID[jira.externalID] = local
+                    }
+                }
+                if let reminder = local.extended.binding(for: .appleReminders),
+                   localByReminderID[reminder.externalID] == nil {
+                    localByReminderID[reminder.externalID] = local
+                }
+            }
             if includeJira {
                 for issue in jiraIssues where !matchedRemoteJiraIDs.contains(issue.key) {
-                    if let existingLocal = localTasks.first(where: {
-                        $0.extended.binding(for: .jira)?.externalKey == issue.key ||
-                            $0.extended.binding(for: .jira)?.externalID == issue.id
-                    }) {
+                    if let existingLocal = localByJiraKey[issue.key] ?? localByJiraID[issue.id] {
                         let binding = existingLocal.extended.binding(for: .jira)!
                         if let remoteUpdated = issue.updatedAt,
                            remoteUpdated > (binding.remoteUpdatedAt ?? binding.lastSyncedAt).addingTimeInterval(1) {
@@ -730,7 +767,6 @@ public enum TaskSyncPlanner {
                         }
                         continue
                     }
-                    guard !boundJiraIDs.contains(issue.id), !boundJiraKeys.contains(issue.key) else { continue }
                     operations.append(TaskSyncOperation(
                         provider: .jira,
                         kind: .importToLocal,
@@ -753,10 +789,7 @@ public enum TaskSyncPlanner {
 
             if includeReminders {
                 for reminder in reminders where !matchedReminderIDs.contains(reminder.externalIdentifier) && !matchedReminderIDs.contains(reminder.id) {
-                    if let existingLocal = localTasks.first(where: {
-                        let ext = $0.extended.binding(for: .appleReminders)?.externalID
-                        return ext == reminder.externalIdentifier || ext == reminder.id
-                    }) {
+                    if let existingLocal = localByReminderID[reminder.externalIdentifier] ?? localByReminderID[reminder.id] {
                         let binding = existingLocal.extended.binding(for: .appleReminders)!
                         if let remoteUpdated = reminder.lastModifiedAt,
                            remoteUpdated > (binding.remoteUpdatedAt ?? binding.lastSyncedAt).addingTimeInterval(1) {

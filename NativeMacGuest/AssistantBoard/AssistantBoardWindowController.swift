@@ -2,7 +2,19 @@ import AppKit
 import ConferenceCore
 import CoreVideo
 import Foundation
+import ImageIO
+import UniformTypeIdentifiers
 import WebKit
+
+private final class BoardDirtyScriptHandlerProxy: NSObject, WKScriptMessageHandler {
+    weak var owner: AssistantBoardWindowController?
+    init(owner: AssistantBoardWindowController) { self.owner = owner }
+    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        Task { @MainActor [weak owner] in
+            owner?.markBoardDirty()
+        }
+    }
+}
 
 /// Sandbox-safe Computer Use controller for sharing and interacting with Jira or
 /// project boards inside an in-app WKWebView window without Accessibility permissions.
@@ -29,6 +41,19 @@ final class AssistantBoardWindowController: NSObject, ObservableObject, WKNaviga
     private var frameTask: Task<Void, Never>?
     private var navigationContinuation: CheckedContinuation<Void, Never>?
     private weak var sharedMeetingModel: NativeDesktopMeetingModel?
+    private var lastDirtyUptime: TimeInterval = 0
+    private var lastCaptureUptime: TimeInterval = 0
+    private static let shareRenderQueue = DispatchQueue(label: "RockNRoll.board-share-render", qos: .userInitiated)
+    private final class PixelPoolState: @unchecked Sendable {
+        static let shared = PixelPoolState()
+        var pool: CVPixelBufferPool?
+        var width = 0
+        var height = 0
+    }
+
+    func markBoardDirty() {
+        lastDirtyUptime = ProcessInfo.processInfo.systemUptime
+    }
 
     static func validateBoardURL(_ raw: String) -> URL? {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -106,6 +131,8 @@ final class AssistantBoardWindowController: NSObject, ObservableObject, WKNaviga
 
         let targetSessionID = model.sessionID
         let shareStartedAt = Date()
+        markBoardDirty()
+        lastCaptureUptime = 0
         frameTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
                 guard let self,
@@ -121,10 +148,14 @@ final class AssistantBoardWindowController: NSObject, ObservableObject, WKNaviga
                     self.stopSharing(notifyModel: false)
                     return
                 }
-                if let buffer = await self.captureFrameBuffer() {
+                let uptime = ProcessInfo.processInfo.systemUptime
+                let isDirty = (uptime - self.lastDirtyUptime) <= 1.0 || self.isLoading
+                let due = isDirty || (uptime - self.lastCaptureUptime) >= 1.0
+                if due, let buffer = await self.captureFrameBuffer() {
+                    self.lastCaptureUptime = ProcessInfo.processInfo.systemUptime
                     meeting.pushBoardShareFrame(buffer)
                 }
-                try? await Task.sleep(for: .milliseconds(200))
+                try? await Task.sleep(for: .milliseconds(isDirty ? 200 : 500))
             }
         }
         lastActionSummary = L("Sharing board to %@", model.title)
@@ -157,6 +188,7 @@ final class AssistantBoardWindowController: NSObject, ObservableObject, WKNaviga
         }
         let clamped = max(-4000, min(4000, deltaY))
         _ = try await evaluateJS(webView: webView, script: "window.scrollBy({top: \(clamped), behavior: 'smooth'}); return window.scrollY;")
+        markBoardDirty()
         lastActionSummary = L("Scrolled board by %ld px", clamped)
         return L("Scrolled the board by %ld px.", clamped)
     }
@@ -181,6 +213,7 @@ final class AssistantBoardWindowController: NSObject, ObservableObject, WKNaviga
         return { matched: true };
         """
         let res = try await evaluateJS(webView: webView, script: js)
+        markBoardDirty()
         let ok = (res as? [String: Any])?["matched"] as? Bool ?? false
         lastActionSummary = ok ? L("Filtered board: %@", clean) : L("No search box found on board")
         return ok ? L("Applied board filter “%@”.", clean) : L("No search input was found on the current board page.")
@@ -207,6 +240,7 @@ final class AssistantBoardWindowController: NSObject, ObservableObject, WKNaviga
         return { clicked: true, label: (el.innerText || el.textContent || '').trim().slice(0, 80) };
         """
         let res = try await evaluateJS(webView: webView, script: js)
+        markBoardDirty()
         let dict = res as? [String: Any]
         let clicked = dict?["clicked"] as? Bool ?? false
         let label = (dict?["label"] as? String) ?? selector ?? text ?? ""
@@ -245,6 +279,7 @@ final class AssistantBoardWindowController: NSObject, ObservableObject, WKNaviga
         };
         """
         let res = try await evaluateJS(webView: webView, script: js)
+        markBoardDirty()
         let dict = res as? [String: Any]
         let clicked = dict?["clicked"] as? Bool ?? false
         let px = dict?["x"] as? Int ?? Int(clampedX)
@@ -277,38 +312,48 @@ final class AssistantBoardWindowController: NSObject, ObservableObject, WKNaviga
               let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
             throw NativeDesktopError.unavailable(L("Could not capture the Assistant Board snapshot."))
         }
-        let targetWidth = min(CGFloat(cg.width), maxWidth)
-        let scale = CGFloat(cg.width) > 0 ? targetWidth / CGFloat(cg.width) : 1.0
-        let targetHeight = max(2, Int((CGFloat(cg.height) * scale).rounded()))
+        let encoded = await withCheckedContinuation { continuation in
+            Self.shareRenderQueue.async {
+                continuation.resume(returning: Self.encodeJPEG(cgImage: cg, maxWidth: maxWidth))
+            }
+        }
+        guard let encoded else {
+            throw NativeDesktopError.unavailable(L("Could not encode the Assistant Board snapshot."))
+        }
+        lastActionSummary = L("Captured board snapshot (%ld×%ld)", encoded.width, encoded.height)
+        return encoded
+    }
+
+    nonisolated private static func encodeJPEG(cgImage: CGImage, maxWidth: CGFloat) -> (width: Int, height: Int, jpegBase64: String)? {
+        let targetWidth = min(CGFloat(cgImage.width), maxWidth)
+        let scale = CGFloat(cgImage.width) > 0 ? targetWidth / CGFloat(cgImage.width) : 1.0
+        let targetHeight = max(2, Int((CGFloat(cgImage.height) * scale).rounded()))
         let intWidth = max(2, Int(targetWidth.rounded()))
 
-        let rep = NSBitmapImageRep(
-            bitmapDataPlanes: nil,
-            pixelsWide: intWidth,
-            pixelsHigh: targetHeight,
-            bitsPerSample: 8,
-            samplesPerPixel: 4,
-            hasAlpha: true,
-            isPlanar: false,
-            colorSpaceName: .deviceRGB,
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        let bitmapInfo = CGBitmapInfo.byteOrder32Little.rawValue | CGImageAlphaInfo.premultipliedFirst.rawValue
+        guard let ctx = CGContext(
+            data: nil,
+            width: intWidth,
+            height: targetHeight,
+            bitsPerComponent: 8,
             bytesPerRow: 0,
-            bitsPerPixel: 0
-        )
-        guard let rep, let ctx = NSGraphicsContext(bitmapImageRep: rep) else {
-            throw NativeDesktopError.unavailable(L("Could not encode the Assistant Board snapshot."))
+            space: colorSpace,
+            bitmapInfo: bitmapInfo
+        ) else {
+            return nil
         }
-        NSGraphicsContext.saveGraphicsState()
-        NSGraphicsContext.current = ctx
-        ctx.imageInterpolation = .high
-        NSImage(cgImage: cg, size: NSSize(width: intWidth, height: targetHeight))
-            .draw(in: NSRect(x: 0, y: 0, width: intWidth, height: targetHeight))
-        NSGraphicsContext.restoreGraphicsState()
-
-        guard let jpegData = rep.representation(using: .jpeg, properties: [.compressionFactor: 0.72]) else {
-            throw NativeDesktopError.unavailable(L("Could not encode the Assistant Board snapshot."))
+        ctx.interpolationQuality = .high
+        ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: intWidth, height: targetHeight))
+        guard let scaled = ctx.makeImage(),
+              let jpegData = CFDataCreateMutable(nil, 0),
+              let dest = CGImageDestinationCreateWithData(jpegData, UTType.jpeg.identifier as CFString, 1, nil) else {
+            return nil
         }
-        lastActionSummary = L("Captured board snapshot (%ld×%ld)", intWidth, targetHeight)
-        return (intWidth, targetHeight, jpegData.base64EncodedString())
+        let opts: [CFString: Any] = [kCGImageDestinationLossyCompressionQuality: 0.72]
+        CGImageDestinationAddImage(dest, scaled, opts as CFDictionary)
+        guard CGImageDestinationFinalize(dest) else { return nil }
+        return (intWidth, targetHeight, (jpegData as Data).base64EncodedString())
     }
 
     func highlight(text: String) async throws -> String {
@@ -334,6 +379,7 @@ final class AssistantBoardWindowController: NSObject, ObservableObject, WKNaviga
         return { found: true, snippet: (match.innerText || '').trim().slice(0, 120) };
         """
         let res = try await evaluateJS(webView: webView, script: js)
+        markBoardDirty()
         let found = (res as? [String: Any])?["found"] as? Bool ?? false
         lastActionSummary = found ? L("Highlighted %@", text) : L("Item %@ not visible", text)
         return found ? L("Highlighted “%@” on the board.", text) : L("Could not find “%@” on the visible board.", text)
@@ -445,6 +491,37 @@ final class AssistantBoardWindowController: NSObject, ObservableObject, WKNaviga
 
         let config = WKWebViewConfiguration()
         config.websiteDataStore = .default()
+        let controller = WKUserContentController()
+        let dirtyJS = """
+        (function(){
+          if (window.__rnrDirtyInstalled) return;
+          window.__rnrDirtyInstalled = true;
+          var scheduled = false;
+          function notify() {
+            if (scheduled) return;
+            scheduled = true;
+            requestAnimationFrame(function(){
+              scheduled = false;
+              try { window.webkit.messageHandlers.boardDirty.postMessage(1); } catch (_) {}
+            });
+          }
+          window.addEventListener('scroll', notify, { passive: true, capture: true });
+          window.addEventListener('input', notify, { passive: true, capture: true });
+          window.addEventListener('resize', notify, { passive: true });
+          window.addEventListener('transitionend', notify, { passive: true, capture: true });
+          var mo = new MutationObserver(notify);
+          if (document.documentElement) {
+            mo.observe(document.documentElement, { childList: true, subtree: true, attributes: true, characterData: true });
+          } else {
+            document.addEventListener('DOMContentLoaded', function(){
+              if (document.documentElement) mo.observe(document.documentElement, { childList: true, subtree: true, attributes: true, characterData: true });
+            }, { once: true });
+          }
+        })();
+        """
+        controller.addUserScript(WKUserScript(source: dirtyJS, injectionTime: .atDocumentStart, forMainFrameOnly: false))
+        controller.add(BoardDirtyScriptHandlerProxy(owner: self), name: "boardDirty")
+        config.userContentController = controller
         let web = WKWebView(frame: .zero, configuration: config)
         web.translatesAutoresizingMaskIntoConstraints = false
         web.navigationDelegate = self
@@ -561,39 +638,63 @@ final class AssistantBoardWindowController: NSObject, ObservableObject, WKNaviga
         guard let webView, webView.bounds.width >= 8, webView.bounds.height >= 8 else { return nil }
         let config = WKSnapshotConfiguration()
         config.afterScreenUpdates = false
-        return await withCheckedContinuation { continuation in
+        let cg: CGImage? = await withCheckedContinuation { continuation in
             webView.takeSnapshot(with: config) { image, _ in
-                guard let image,
-                      let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
-                    continuation.resume(returning: nil)
-                    return
-                }
+                continuation.resume(returning: image?.cgImage(forProposedRect: nil, context: nil, hints: nil))
+            }
+        }
+        guard let cg else { return nil }
+        return await withCheckedContinuation { continuation in
+            Self.shareRenderQueue.async {
                 continuation.resume(returning: Self.makePixelBuffer(from: cg))
             }
         }
     }
 
     nonisolated private static func makePixelBuffer(from cgImage: CGImage) -> CVPixelBuffer? {
-        let width = cgImage.width & ~1
-        let height = cgImage.height & ~1
-        guard width >= 2, height >= 2 else { return nil }
+        let srcW = CGFloat(cgImage.width)
+        let srcH = CGFloat(cgImage.height)
+        guard srcW >= 2, srcH >= 2 else { return nil }
+        let scale = min(1.0, min(1920.0 / srcW, 1080.0 / srcH))
+        let width = max(2, Int(floor(srcW * scale / 2.0) * 2.0))
+        let height = max(2, Int(floor(srcH * scale / 2.0) * 2.0))
 
-        let attrs: [CFString: Any] = [
-            kCVPixelBufferCGImageCompatibilityKey: true,
-            kCVPixelBufferCGBitmapContextCompatibilityKey: true,
-            kCVPixelBufferIOSurfacePropertiesKey: [:],
-        ]
-        var pixelBuffer: CVPixelBuffer?
-        guard CVPixelBufferCreate(
-            kCFAllocatorDefault,
-            width,
-            height,
-            kCVPixelFormatType_32BGRA,
-            attrs as CFDictionary,
-            &pixelBuffer
-        ) == kCVReturnSuccess, let buffer = pixelBuffer else {
-            return nil
+        let poolState = PixelPoolState.shared
+        if poolState.pool == nil || poolState.width != width || poolState.height != height {
+            var newPool: CVPixelBufferPool?
+            let attrs: [CFString: Any] = [
+                kCVPixelBufferWidthKey: width,
+                kCVPixelBufferHeightKey: height,
+                kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA,
+                kCVPixelBufferCGImageCompatibilityKey: true,
+                kCVPixelBufferCGBitmapContextCompatibilityKey: true,
+                kCVPixelBufferIOSurfacePropertiesKey: [:],
+            ]
+            if CVPixelBufferPoolCreate(nil, nil, attrs as CFDictionary, &newPool) == kCVReturnSuccess {
+                poolState.pool = newPool
+                poolState.width = width
+                poolState.height = height
+            }
         }
+
+        var pixelBuffer: CVPixelBuffer?
+        if let pool = poolState.pool {
+            _ = CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(
+                nil,
+                pool,
+                [kCVPixelBufferPoolAllocationThresholdKey: 6] as CFDictionary,
+                &pixelBuffer
+            )
+        }
+        if pixelBuffer == nil {
+            let attrs: [CFString: Any] = [
+                kCVPixelBufferCGImageCompatibilityKey: true,
+                kCVPixelBufferCGBitmapContextCompatibilityKey: true,
+                kCVPixelBufferIOSurfacePropertiesKey: [:],
+            ]
+            CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA, attrs as CFDictionary, &pixelBuffer)
+        }
+        guard let buffer = pixelBuffer else { return nil }
 
         CVPixelBufferLockBaseAddress(buffer, [])
         defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
@@ -612,6 +713,7 @@ final class AssistantBoardWindowController: NSObject, ObservableObject, WKNaviga
         ) else {
             return nil
         }
+        ctx.interpolationQuality = .high
         ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
         return buffer
     }
@@ -623,6 +725,7 @@ final class AssistantBoardWindowController: NSObject, ObservableObject, WKNaviga
         loadError = nil
         currentURL = webView.url
         if let u = webView.url { urlField?.stringValue = u.absoluteString }
+        markBoardDirty()
         refreshNavigationUI()
         refreshBanner()
     }
@@ -633,6 +736,7 @@ final class AssistantBoardWindowController: NSObject, ObservableObject, WKNaviga
         currentURL = webView.url
         if let u = webView.url { urlField?.stringValue = u.absoluteString }
         if let title = webView.title, !title.trimmed.isEmpty { pageTitle = title }
+        markBoardDirty()
         refreshNavigationUI()
         refreshBanner()
         finishPendingNavigation()
@@ -664,6 +768,10 @@ final class AssistantBoardWindowController: NSObject, ObservableObject, WKNaviga
         finishPendingNavigation()
         isWindowVisible = false
         stopSharing()
+    }
+
+    func windowDidResize(_ notification: Notification) {
+        markBoardDirty()
     }
 
     // MARK: - Helpers

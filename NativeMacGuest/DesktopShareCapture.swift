@@ -19,6 +19,9 @@ final class NativeDesktopShareCapture: GuestCameraCapture, @unchecked Sendable {
     private var latestScene: PresenterScene?
     private var latestCamera: CVPixelBuffer?
     private var latestExternalPixels: CVPixelBuffer?
+    private var externalRevision: UInt64 = 0
+    private var lastDeliveredExternalRevision: UInt64 = 0
+    private var lastDeliveredExternalUptime: TimeInterval = 0
     private var cameraRevision: UInt64 = 0
     private var cameraPrivacyEpoch: UInt64 = 0
     private var count = 0
@@ -82,6 +85,7 @@ final class NativeDesktopShareCapture: GuestCameraCapture, @unchecked Sendable {
         let shouldSchedule = locked { () -> Bool in
             guard phase == .starting || phase == .running else { return false }
             latestExternalPixels = pixels
+            externalRevision &+= 1
             return true
         }
         if shouldSchedule { schedule() }
@@ -167,19 +171,25 @@ final class NativeDesktopShareCapture: GuestCameraCapture, @unchecked Sendable {
         if let token { queue.async { [weak self] in self?.forward(token) } }
     }
     private func forward(_ token: UInt64) {
-        let input: (CMSampleBuffer?, CVPixelBuffer?, PresenterScene?, CVPixelBuffer?, UInt64, UInt64)? = locked {
+        let now = ProcessInfo.processInfo.systemUptime
+        let input: (CMSampleBuffer?, CVPixelBuffer?, UInt64, PresenterScene?, CVPixelBuffer?, UInt64, UInt64)? = locked {
             queued = false
             guard generation == token, phase == .starting || phase == .running else { return nil }
-            return (latest, latestExternalPixels, latestScene, systemOverlay ? nil : latestCamera, cameraRevision, cameraPrivacyEpoch)
+            if externalFrames,
+               latestExternalPixels != nil,
+               externalRevision == lastDeliveredExternalRevision,
+               (now - lastDeliveredExternalUptime) < 1.0 {
+                return nil
+            }
+            return (latest, latestExternalPixels, externalRevision, latestScene, systemOverlay ? nil : latestCamera, cameraRevision, cameraPrivacyEpoch)
         }
-        guard let (sample, externalPixels, scene, camera, cameraRevision, cameraPrivacyEpoch) = input,
+        guard let (sample, externalPixels, extRev, scene, camera, cameraRevision, cameraPrivacyEpoch) = input,
               let screen = externalPixels ?? sample.flatMap(CMSampleBufferGetImageBuffer) ?? (canvasOnly ? blankCanvas() : nil) else { return }
         let size = CGSize(width: CVPixelBufferGetWidth(screen), height: CVPixelBufferGetHeight(screen))
         // A screen without app overlays already contains final, native pixels.
         // Preserve Retina text and avoid Core Image/copies in the common path.
         let compose = canvasOnly || camera != nil || !(scene?.strokes.isEmpty ?? true) || !(scene?.draftStroke.isEmpty ?? true)
         let outputSize = scene != nil && compose ? Self.compositionSize(size) : size
-        let now = ProcessInfo.processInfo.systemUptime
         let output: CVPixelBuffer
         if let scene, compose {
             compositor.resize(to: outputSize)
@@ -200,9 +210,13 @@ final class NativeDesktopShareCapture: GuestCameraCapture, @unchecked Sendable {
             let resized = dimensions != outputSize
             if resized {
                 dimensions = outputSize
-                source?.adaptOutputFormat(toWidth: Int32(outputSize.width), height: Int32(outputSize.height), fps: 30)
+                source?.adaptOutputFormat(toWidth: Int32(outputSize.width), height: Int32(outputSize.height), fps: externalFrames ? 10 : 30)
             }
             if let source, let capturer { source.capturer(capturer, didCapture: frame) }
+            if externalFrames {
+                lastDeliveredExternalRevision = extRev
+                lastDeliveredExternalUptime = now
+            }
             #if DEBUG
             testConsumer?(frame)
             #endif

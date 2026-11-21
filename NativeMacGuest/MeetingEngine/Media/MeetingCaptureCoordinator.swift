@@ -279,7 +279,9 @@ final class MeetingCaptureCoordinator {
                     throw NativeDesktopRTCError.cleanupFailed
                 }
                 guard let activeEngine = engine() else { throw CancellationError() }
-                let profile = GuestVideoProfile(width: 3840, height: 2160, fps: 30, maximumBitrate: 18_000_000)
+                let profile = externalFrames
+                    ? GuestVideoProfile(width: 1920, height: 1080, fps: 10, maximumBitrate: 3_000_000)
+                    : GuestVideoProfile(width: 3840, height: 2160, fps: 30, maximumBitrate: 18_000_000)
                 if let session = activeEngine as? MeetingSession, session.supportsScreenSharePublication {
                     try await session.startScreenShare(.init(profile: profile) { [weak self] source in
                         let capture = NativeDesktopShareCapture(source: source, canvasOnly: canvas, externalFrames: externalFrames)

@@ -27,6 +27,7 @@ struct PersonalTasksView: View {
     @State private var aliases = ""
     @State private var error: String?
     @State private var undo: PersonalTaskRow?
+    @State private var referenceNow = Date()
 
     init(attention: AttentionCoordinator, openOutcome: @escaping (UUID, UUID?) -> Void) {
         self.attention = attention
@@ -304,6 +305,14 @@ struct PersonalTasksView: View {
             await attention.store.waitForMeetingLibrary()
             await reload()
         }
+        .task {
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(30))
+                if !Task.isCancelled {
+                    referenceNow = Date()
+                }
+            }
+        }
         .task(id: undo?.id) {
             guard undo != nil else { return }
             do {
@@ -544,12 +553,11 @@ struct PersonalTasksView: View {
                             .foregroundStyle(.tertiary)
                     }
                     if let due = row.task.dateForDisplay(calendar: displayCalendar) {
-                        TimelineView(.periodic(from: .now, by: 30)) { context in
-                            let overdue = !row.task.done && (row.task.deadline(calendar: displayCalendar) ?? .distantFuture) <= context.date
-                            let date = due.formatted(date: .abbreviated, time: row.task.dueDay == nil ? .shortened : .omitted)
-                            Text(overdue ? L("Overdue · %@", date) : L("Due %@", date))
-                                .foregroundStyle(overdue ? Color.red : Color.secondary)
-                        }.font(.caption)
+                        let overdue = !row.task.done && (row.task.deadline(calendar: displayCalendar) ?? .distantFuture) <= referenceNow
+                        let date = due.formatted(date: .abbreviated, time: row.task.dueDay == nil ? .shortened : .omitted)
+                        Text(overdue ? L("Overdue · %@", date) : L("Due %@", date))
+                            .font(.caption)
+                            .foregroundStyle(overdue ? Color.red : Color.secondary)
                     }
                     if let reminderAt = row.task.reminderAt, !row.task.done {
                         let repeatIcon = (row.task.extended.reminderRule?.repeatRule ?? .none) != .none ? "repeat" : "bell.fill"

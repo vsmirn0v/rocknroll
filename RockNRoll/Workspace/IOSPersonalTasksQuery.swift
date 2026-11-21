@@ -45,7 +45,7 @@ enum IOSPersonalTasksQuery {
                       search: String = "", assignee: IOSTaskAssigneeFilter = .all) -> [IOSMeetingTaskItem] {
         let meetings = Dictionary(sessions.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         let needle = folded(search.trimmingCharacters(in: .whitespacesAndNewlines))
-        return tasks.filter { task in
+        let filtered = tasks.filter { task in
             let archived = archiveDates[task.id] != nil
             switch filter {
             case .archived: guard archived else { return false }
@@ -68,22 +68,24 @@ enum IOSPersonalTasksQuery {
                 task.extended.parentEpicKey ?? "",
                 task.extended.externalBindings.compactMap { $0.externalKey ?? $0.externalID }.joined(separator: " ")
             ].contains { folded($0).contains(needle) }
-        }.sorted { lhs, rhs in
-            if lhs.done != rhs.done { return !lhs.done }
-            let lhsMeeting = meetings[lhs.sessionID]?.startedAt ?? .distantPast
-            let rhsMeeting = meetings[rhs.sessionID]?.startedAt ?? .distantPast
-            if lhs.done {
-                let l = lhs.completedAt ?? lhsMeeting
-                let r = rhs.completedAt ?? rhsMeeting
+        }
+        let decorated: [(task: IOSMeetingTaskItem, meetingDate: Date, deadline: Date)] = filtered.map { task in
+            let meetingDate = meetings[task.sessionID]?.startedAt ?? .distantPast
+            let deadline = task.done ? .distantFuture : (task.deadline(calendar: calendar) ?? .distantFuture)
+            return (task, meetingDate, deadline)
+        }
+        return decorated.sorted { lhs, rhs in
+            if lhs.task.done != rhs.task.done { return !lhs.task.done }
+            if lhs.task.done {
+                let l = lhs.task.completedAt ?? lhs.meetingDate
+                let r = rhs.task.completedAt ?? rhs.meetingDate
                 if l != r { return l > r }
             } else {
-                let l = lhs.deadline(calendar: calendar) ?? .distantFuture
-                let r = rhs.deadline(calendar: calendar) ?? .distantFuture
-                if l != r { return l < r }
-                if lhsMeeting != rhsMeeting { return lhsMeeting > rhsMeeting }
+                if lhs.deadline != rhs.deadline { return lhs.deadline < rhs.deadline }
+                if lhs.meetingDate != rhs.meetingDate { return lhs.meetingDate > rhs.meetingDate }
             }
-            return lhs.id.uuidString < rhs.id.uuidString
-        }
+            return lhs.task.id.uuidString < rhs.task.id.uuidString
+        }.map(\.task)
     }
 
     static func groupedByMeeting(_ tasks: [IOSMeetingTaskItem], sessions: [IOSMeetingSessionItem]) -> [IOSTaskMeetingGroup] {
@@ -115,6 +117,8 @@ extension IOSTaskProfile {
 }
 
 extension IOSMeetingTaskItem {
+    private static let gregorianBase = Calendar(identifier: .gregorian)
+
     private func dueDayDate(calendar: Calendar) -> Date? {
         guard let dueDay else { return nil }
         let parts = dueDay.split(separator: "-", omittingEmptySubsequences: false)
@@ -122,7 +126,7 @@ extension IOSMeetingTaskItem {
               let year = Int(parts[0]), let month = Int(parts[1]), let day = Int(parts[2]), year > 0,
               (1...12).contains(month), (1...31).contains(day) else { return nil }
         let components = DateComponents(year: year, month: month, day: day)
-        var gregorian = Calendar(identifier: .gregorian)
+        var gregorian = Self.gregorianBase
         gregorian.timeZone = calendar.timeZone
         guard components.isValidDate(in: gregorian) else { return nil }
         return gregorian.date(from: components)

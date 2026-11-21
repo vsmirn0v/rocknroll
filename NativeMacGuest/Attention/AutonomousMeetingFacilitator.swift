@@ -14,16 +14,86 @@ final class AutonomousMeetingFacilitator: ObservableObject {
     @Published private(set) var lastSpokenAnswerBySession: [UUID: String] = [:]
     @Published private(set) var realtimeActive = false
 
+    private final class AudioTapGate: @unchecked Sendable {
+        private let lock = NSLock()
+        private var lastVoiceDeliveryEndedAt: Date?
+        private var approvedSpeakersOnly = true
+        private var lastApprovedTranscriptAt: Date?
+        private var lastRemoteAudioAt: Date?
+        private var lastTurnAllowWrites = false
+        private var voiceDeliveryInFlight = false
+        var coalescer: RealtimeAudioCoalescer?
+        var senderTask: Task<Void, Never>?
+
+        func setApprovedSpeakersOnly(_ enabled: Bool) {
+            lock.lock()
+            approvedSpeakersOnly = enabled
+            lock.unlock()
+        }
+
+        func setTurnApproval(allowWrites: Bool, approvedTranscriptAt: Date?) {
+            lock.lock()
+            lastTurnAllowWrites = allowWrites
+            lastApprovedTranscriptAt = approvedTranscriptAt
+            lock.unlock()
+        }
+
+        func markVoiceDeliveryStarted() {
+            lock.lock()
+            voiceDeliveryInFlight = true
+            lastVoiceDeliveryEndedAt = nil
+            lock.unlock()
+        }
+
+        func markVoiceDeliveryEnded(at date: Date) {
+            lock.lock()
+            voiceDeliveryInFlight = false
+            lastVoiceDeliveryEndedAt = date
+            lock.unlock()
+        }
+
+        func currentAllowWrites() -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return lastTurnAllowWrites
+        }
+
+        func shouldAcceptAudio(isLocal: Bool) -> Bool {
+            let now = Date()
+            lock.lock()
+            defer { lock.unlock() }
+            if isLocal {
+                if voiceDeliveryInFlight { return false }
+                if let ended = lastVoiceDeliveryEndedAt, now.timeIntervalSince(ended) < 1.5 {
+                    return false
+                }
+                let recentRemote = lastRemoteAudioAt.map { now.timeIntervalSince($0) <= 3.0 } ?? false
+                if !recentRemote {
+                    lastTurnAllowWrites = true
+                }
+                return true
+            } else {
+                lastRemoteAudioAt = now
+                if approvedSpeakersOnly {
+                    let recentApproved = lastApprovedTranscriptAt.map { now.timeIntervalSince($0) <= 8.0 } ?? false
+                    if !recentApproved {
+                        lastTurnAllowWrites = false
+                    }
+                } else {
+                    lastTurnAllowWrites = true
+                }
+                return true
+            }
+        }
+    }
+
     private final class SessionRealtimeState {
         let router = RealtimeVoiceRouter()
+        let gate = AudioTapGate()
         var connected = false
         var audioChunks: [Data] = []
         var transcriptBuffer = ""
-        var lastTurnAllowWrites = false
-        var lastApprovedTranscriptAt: Date?
-        var lastRemoteAudioAt: Date?
         var activeSkillID: String
-        var approvedSpeakersOnly = true
         var turnTimeoutTask: Task<Void, Never>?
 
         init(activeSkillID: String) {
@@ -33,6 +103,8 @@ final class AutonomousMeetingFacilitator: ObservableObject {
 
     private weak var attention: AttentionCoordinator?
     private var processedLineIDsBySession: [UUID: Set<String>] = [:]
+    private var processedLineOrderBySession: [UUID: [String]] = [:]
+    private var pendingTranscriptObservationSessions: Set<UUID> = []
     private var busySessions: Set<UUID> = []
     private var manuallyDisabledSessions: Set<UUID> = []
     private var lastSpokeAtBySession: [UUID: Date] = [:]
@@ -80,7 +152,13 @@ final class AutonomousMeetingFacilitator: ObservableObject {
         var chosen = resolveSkillID(explicitSkillID: skillID, meetingTitle: model.title)
         activeSessionSkills[model.sessionID] = chosen
         // Skip pre-existing lines at activation time so Rock responds to new spoken instructions.
-        processedLineIDsBySession[model.sessionID] = Set(model.transcript.map(\.id))
+        let initialIDs = model.transcript.map(\.id)
+        processedLineIDsBySession[model.sessionID] = Set(initialIDs)
+        processedLineOrderBySession[model.sessionID] = initialIDs
+        model.onTranscriptChanged = { [weak self, weak model] in
+            guard let self, let model else { return }
+            self.observeTranscriptChanged(for: model)
+        }
         let initialTitle = cachedSkills.first(where: { $0.id == chosen })?.name ?? chosen
         lastStatusBySession[model.sessionID] = L("Autonomous voice facilitator active (%@)", initialTitle)
         Task { @MainActor [weak self, weak model] in
@@ -103,14 +181,21 @@ final class AutonomousMeetingFacilitator: ObservableObject {
         manuallyDisabledSessions.insert(sessionID)
         activeSessionSkills.removeValue(forKey: sessionID)
         processedLineIDsBySession.removeValue(forKey: sessionID)
+        processedLineOrderBySession.removeValue(forKey: sessionID)
+        pendingTranscriptObservationSessions.remove(sessionID)
         lastStatusBySession.removeValue(forKey: sessionID)
         lastSpokeAtBySession.removeValue(forKey: sessionID)
         busySessions.remove(sessionID)
         if let model = attention?.meetings().first(where: { $0.sessionID == sessionID }) {
             model.onRealtimeAudioPCM16 = nil
+            model.onTranscriptChanged = nil
         }
         if let state = realtimeSessions.removeValue(forKey: sessionID) {
             state.turnTimeoutTask?.cancel()
+            state.gate.coalescer?.finish()
+            state.gate.coalescer = nil
+            state.gate.senderTask?.cancel()
+            state.gate.senderTask = nil
             Task { await state.router.stop() }
         }
         syncRealtimeActiveFlag()
@@ -130,6 +215,21 @@ final class AutonomousMeetingFacilitator: ObservableObject {
             isLocalSpeaker: true,
             commandText: prompt
         )
+    }
+
+    /// Event-driven trigger invoked when new transcript lines arrive on `@MainActor`,
+    /// avoiding 0-2,000 ms polling latency before wake-phrase activation.
+    func observeTranscriptChanged(for model: NativeDesktopMeetingModel) {
+        let sid = model.sessionID
+        guard activeSessionSkills[sid] != nil, !model.isClosed, model.connected else { return }
+        guard pendingTranscriptObservationSessions.insert(sid).inserted else { return }
+        Task { @MainActor [weak self, weak model] in
+            guard let self else { return }
+            self.pendingTranscriptObservationSessions.remove(sid)
+            guard let model, !model.isClosed, model.connected,
+                  let skillID = self.activeSessionSkills[sid] else { return }
+            self.evaluateTranscriptLines(for: model, skillID: skillID, now: Date())
+        }
     }
 
     func processTick(models: [NativeDesktopMeetingModel]) {
@@ -159,53 +259,69 @@ final class AutonomousMeetingFacilitator: ObservableObject {
 
         let now = Date()
         for model in models where !model.isClosed && model.connected {
-            guard let skillID = activeSessionSkills[model.sessionID],
-                  !busySessions.contains(model.sessionID) else { continue }
-            var seen = processedLineIDsBySession[model.sessionID] ?? []
-            let unseen = model.transcript.filter { !seen.contains($0.id) }
-            guard !unseen.isEmpty else { continue }
-            for line in unseen { seen.insert(line.id) }
-            processedLineIDsBySession[model.sessionID] = seen
+            guard let skillID = activeSessionSkills[model.sessionID] else { continue }
+            evaluateTranscriptLines(for: model, skillID: skillID, now: now)
+        }
+    }
 
-            let inFollowUpWindow = lastSpokeAtBySession[model.sessionID].map { now.timeIntervalSince($0) <= 20 } ?? false
-            let inEchoWindow = lastVoiceDeliveryEndedAtBySession[model.sessionID].map { now.timeIntervalSince($0) <= 6 } ?? false
-            let lastSpoken = lastSpokenAnswerBySession[model.sessionID]?.trimmed ?? ""
-
-            var matchedLine = unseen.first { _ in false }
-            var matchedCommand = ""
-            for line in unseen.reversed() {
-                let text = line.text.trimmed
-                guard !text.isEmpty else { continue }
-                if Self.isLikelySelfEcho(candidate: text, lastSpoken: lastSpoken, isLocal: line.isOwn, withinEchoWindow: inEchoWindow) {
-                    continue
-                }
-                if case .command(let cmd) = AssistantWakePhraseMatcher.match(text),
-                   !cmd.trimmed.isEmpty {
-                    matchedLine = line
-                    matchedCommand = cmd.trimmed
-                    break
-                }
-                // Within a 20s active follow-up window, accept direct follow-up utterances from approved/local speakers.
-                if inFollowUpWindow && text.count >= 4 {
-                    matchedLine = line
-                    matchedCommand = text
-                    break
-                }
+    private func evaluateTranscriptLines(for model: NativeDesktopMeetingModel, skillID: String, now: Date) {
+        guard !busySessions.contains(model.sessionID) else { return }
+        var seen = processedLineIDsBySession[model.sessionID] ?? []
+        var order = processedLineOrderBySession[model.sessionID] ?? []
+        let unseen = model.transcript.suffix(80).filter { !seen.contains($0.id) }
+        guard !unseen.isEmpty else { return }
+        for line in unseen {
+            seen.insert(line.id)
+            order.append(line.id)
+        }
+        if order.count > 2_000 {
+            let overflow = order.count - 2_000
+            for evicted in order.prefix(overflow) {
+                seen.remove(evicted)
             }
-            guard let triggerLine = matchedLine, !matchedCommand.isEmpty else { continue }
+            order.removeFirst(overflow)
+        }
+        processedLineIDsBySession[model.sessionID] = seen
+        processedLineOrderBySession[model.sessionID] = order
 
-            busySessions.insert(model.sessionID)
-            let commandText = matchedCommand
-            Task { @MainActor [weak self, weak model] in
-                guard let self, let model else { return }
-                await self.handleVoiceTurn(
-                    model: model,
-                    skillID: skillID,
-                    speakerName: triggerLine.participantName,
-                    isLocalSpeaker: triggerLine.isOwn,
-                    commandText: commandText
-                )
+        let inFollowUpWindow = lastSpokeAtBySession[model.sessionID].map { now.timeIntervalSince($0) <= 20 } ?? false
+        let inEchoWindow = lastVoiceDeliveryEndedAtBySession[model.sessionID].map { now.timeIntervalSince($0) <= 6 } ?? false
+        let lastSpoken = lastSpokenAnswerBySession[model.sessionID]?.trimmed ?? ""
+
+        var matchedLine = unseen.first { _ in false }
+        var matchedCommand = ""
+        for line in unseen.reversed() {
+            let text = line.text.trimmed
+            guard !text.isEmpty else { continue }
+            if Self.isLikelySelfEcho(candidate: text, lastSpoken: lastSpoken, isLocal: line.isOwn, withinEchoWindow: inEchoWindow) {
+                continue
             }
+            if case .command(let cmd) = AssistantWakePhraseMatcher.match(text),
+               !cmd.trimmed.isEmpty {
+                matchedLine = line
+                matchedCommand = cmd.trimmed
+                break
+            }
+            // Within a 20s active follow-up window, accept direct follow-up utterances from approved/local speakers.
+            if inFollowUpWindow && text.count >= 4 {
+                matchedLine = line
+                matchedCommand = text
+                break
+            }
+        }
+        guard let triggerLine = matchedLine, !matchedCommand.isEmpty else { return }
+
+        busySessions.insert(model.sessionID)
+        let commandText = matchedCommand
+        Task { @MainActor [weak self, weak model] in
+            guard let self, let model else { return }
+            await self.handleVoiceTurn(
+                model: model,
+                skillID: skillID,
+                speakerName: triggerLine.participantName,
+                isLocalSpeaker: triggerLine.isOwn,
+                commandText: commandText
+            )
         }
     }
 
@@ -245,10 +361,9 @@ final class AutonomousMeetingFacilitator: ObservableObject {
         // falls back immediately to standard agent + local VoiceSynthesis otherwise.
         if let rtState = realtimeSessions[model.sessionID],
            await rtState.router.isRealtimeConnected {
-            rtState.lastTurnAllowWrites = allowWrites
-            rtState.lastApprovedTranscriptAt = allowWrites ? Date() : nil
+            rtState.gate.setTurnApproval(allowWrites: allowWrites, approvedTranscriptAt: allowWrites ? Date() : nil)
             rtState.activeSkillID = skillID
-            rtState.approvedSpeakersOnly = skill?.approvedSpeakersOnly ?? true
+            rtState.gate.setApprovedSpeakersOnly(skill?.approvedSpeakersOnly ?? true)
             rtState.audioChunks.removeAll()
             rtState.transcriptBuffer = ""
             let prefixedPrompt = "[\(speakerName) (approved=\(allowWrites)) in “\(model.title)”]: \(commandText)"
@@ -359,6 +474,10 @@ final class AutonomousMeetingFacilitator: ObservableObject {
 
         if let old = realtimeSessions.removeValue(forKey: model.sessionID) {
             old.turnTimeoutTask?.cancel()
+            old.gate.coalescer?.finish()
+            old.gate.coalescer = nil
+            old.gate.senderTask?.cancel()
+            old.gate.senderTask = nil
             await old.router.stop()
         }
 
@@ -394,6 +513,7 @@ final class AutonomousMeetingFacilitator: ObservableObject {
         let skillsText = promptCtx["obsidian_skills"] ?? "Facilitate the meeting concisely in the user's language."
         let instructions = [basePersona, skillsText].filter { !$0.isEmpty }.joined(separator: "\n\n")
         let tools = AssistantSkillToolRegistrar.exportRealtimeTools(from: registry)
+        let targetInputRate = kind == .openAIRealtime ? 24_000 : 16_000
         let config = RealtimeSessionConfig(
             provider: kind,
             apiKey: apiKey,
@@ -401,11 +521,12 @@ final class AutonomousMeetingFacilitator: ObservableObject {
             voice: attention.store.realtimeVoice,
             endpointOverride: attention.store.realtimeEndpoint,
             systemInstructions: instructions,
+            inputSampleRate: targetInputRate,
             tools: tools
         )
 
         let state = SessionRealtimeState(activeSkillID: skillID)
-        state.approvedSpeakersOnly = skill?.approvedSpeakersOnly ?? true
+        state.gate.setApprovedSpeakersOnly(skill?.approvedSpeakersOnly ?? true)
         realtimeSessions[model.sessionID] = state
         let sessionID = model.sessionID
         await state.router.start(
@@ -421,47 +542,35 @@ final class AutonomousMeetingFacilitator: ObservableObject {
         )
         state.connected = await state.router.isRealtimeConnected
         if state.connected {
-            attachAudioTap(to: model, state: state)
+            attachAudioTap(to: model, state: state, targetSampleRate: targetInputRate)
         }
         syncRealtimeActiveFlag()
     }
 
-    private func attachAudioTap(to model: NativeDesktopMeetingModel, state: SessionRealtimeState) {
+    private func attachAudioTap(to model: NativeDesktopMeetingModel, state: SessionRealtimeState, targetSampleRate: Int) {
         let router = state.router
-        let sessionID = model.sessionID
-        model.onRealtimeAudioPCM16 = { [weak self, weak model, weak state] _, trackID, pcm in
-            Task { @MainActor [weak self, weak model, weak state] in
-                if trackID == MeetingTranscriber.localTrackID {
-                    if model?.isVoiceReplyInFlight == true || self?.isInAudioEchoCooldown(sessionID: sessionID) == true {
-                        return
-                    }
-                    if let state {
-                        let recentRemote = state.lastRemoteAudioAt.map { Date().timeIntervalSince($0) <= 3.0 } ?? false
-                        if !recentRemote {
-                            state.lastTurnAllowWrites = true
-                        }
-                    }
-                } else if let state {
-                    state.lastRemoteAudioAt = Date()
-                    if state.approvedSpeakersOnly {
-                        let recentApprovedTranscript = state.lastApprovedTranscriptAt.map {
-                            Date().timeIntervalSince($0) <= 8.0
-                        } ?? false
-                        if !recentApprovedTranscript {
-                            state.lastTurnAllowWrites = false
-                        }
-                    } else {
-                        state.lastTurnAllowWrites = true
-                    }
-                }
-                _ = await router.sendAudioPCM16(pcm)
+        let gate = state.gate
+        let coalescer = RealtimeAudioCoalescer(
+            inputSampleRate: 16_000,
+            targetSampleRate: targetSampleRate,
+            windowMs: 80
+        )
+        gate.coalescer = coalescer
+        gate.senderTask?.cancel()
+        gate.senderTask = Task.detached(priority: .userInitiated) {
+            for await batch in coalescer.stream {
+                if Task.isCancelled { break }
+                _ = await router.sendAudioPCM16(batch)
             }
         }
-    }
-
-    private func isInAudioEchoCooldown(sessionID: UUID) -> Bool {
-        guard let ended = lastVoiceDeliveryEndedAtBySession[sessionID] else { return false }
-        return Date().timeIntervalSince(ended) < 1.5
+        model.onRealtimeAudioPCM16 = { [weak gate] _, trackID, pcm in
+            guard let gate else { return }
+            let isLocal = trackID == MeetingTranscriber.localTrackID
+            guard gate.shouldAcceptAudio(isLocal: isLocal) else {
+                return
+            }
+            coalescer.append(trackID: trackID, pcm16: pcm)
+        }
     }
 
     private func executeRealtimeTool(sessionID: UUID, name: String, argumentsJSON: String) async -> String {
@@ -470,7 +579,7 @@ final class AutonomousMeetingFacilitator: ObservableObject {
             return "{\"error\":\"Session closed\"}"
         }
         // Strictly enforce People.md approval and skill capability scopes for Realtime tool calls.
-        let allowWrites = state.lastTurnAllowWrites
+        let allowWrites = state.gate.currentAllowWrites()
         let skill = await attention.withSkillRepository { repo, _ in repo.skill(id: state.activeSkillID) }
         let allowedGroups: Set<AssistantSkillToolGroup>? = skill.map { Set($0.tools) }
 
@@ -519,14 +628,16 @@ final class AutonomousMeetingFacilitator: ObservableObject {
             if let sessionID = model?.sessionID {
                 busySessions.remove(sessionID)
             }
-            let combined = state.audioChunks.reduce(into: Data()) { $0.append($1) }
+            let combined = Self.combinePCMChunks(state.audioChunks)
             state.audioChunks.removeAll()
             let text = state.transcriptBuffer.trimmed
             state.transcriptBuffer = ""
             if let model, !model.isClosed {
                 if let buffer = Self.pcm16ToAudioBuffer(data: combined, sampleRate: 24_000) {
+                    state.gate.markVoiceDeliveryStarted()
                     await deliverSpokenBuffer(buffer, fallbackText: text, model: model)
                 } else if !text.isEmpty {
+                    state.gate.markVoiceDeliveryStarted()
                     await speakIntoMeeting(text, model: model)
                 }
             }
@@ -570,8 +681,11 @@ final class AutonomousMeetingFacilitator: ObservableObject {
         if !fallbackText.isEmpty {
             lastSpokenAnswerBySession[model.sessionID] = fallbackText
         }
+        realtimeSessions[model.sessionID]?.gate.markVoiceDeliveryStarted()
         defer {
-            lastVoiceDeliveryEndedAtBySession[model.sessionID] = Date()
+            let endedAt = Date()
+            lastVoiceDeliveryEndedAtBySession[model.sessionID] = endedAt
+            realtimeSessions[model.sessionID]?.gate.markVoiceDeliveryEnded(at: endedAt)
         }
         if model.supportsVoiceReply && model.snapshot.playoutOn {
             if !model.ownsMicrophone, let arbiter = model.microphoneArbiter {
@@ -614,6 +728,16 @@ final class AutonomousMeetingFacilitator: ObservableObject {
 
     nonisolated static func pcm16ToAudioBuffer(data: Data, sampleRate: Double) -> AVAudioPCMBuffer? {
         RealtimeVoiceAudio.pcm16ToAudioBuffer(data: data, sampleRate: sampleRate)
+    }
+
+    nonisolated private static func combinePCMChunks(_ chunks: [Data]) -> Data {
+        guard !chunks.isEmpty else { return Data() }
+        if chunks.count == 1 { return chunks[0] }
+        let total = chunks.reduce(0) { $0 + $1.count }
+        var combined = Data()
+        combined.reserveCapacity(total)
+        for chunk in chunks { combined.append(chunk) }
+        return combined
     }
 
     static func isLikelySelfEcho(

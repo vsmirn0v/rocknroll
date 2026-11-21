@@ -87,29 +87,62 @@ public enum TranscriptMergeEngine {
         }
 
         var transcriptKept: [SyncedTranscriptEvent] = []
+        var transcriptCache: [(speaker: String, tokens: Set<String>)] = []
         var nonTranscriptKept: [SyncedTranscriptEvent] = []
+        var nonTranscriptIndexByKey: [String: Int] = [:]
+        transcriptKept.reserveCapacity(ordered.count)
+        transcriptCache.reserveCapacity(ordered.count)
 
         for event in ordered {
             if event.kind != "transcript" {
-                if let duplicateIndex = nonTranscriptKept.firstIndex(where: {
-                    $0.kind == event.kind && $0.id == event.id
-                }) {
+                let key = "\(event.kind)|\(event.id)"
+                if let duplicateIndex = nonTranscriptIndexByKey[key] {
                     nonTranscriptKept[duplicateIndex] = mergeSameProviderEvent(nonTranscriptKept[duplicateIndex], event)
                 } else {
+                    nonTranscriptIndexByKey[key] = nonTranscriptKept.count
                     nonTranscriptKept.append(event)
                 }
                 continue
             }
 
-            if let matchIndex = transcriptKept.lastIndex(where: { existing in
-                abs(existing.occurredAt.timeIntervalSince(event.occurredAt)) <= 4.0 &&
-                    (existing.deviceID != event.deviceID || existing.id == event.id) &&
-                    isFuzzyTranscriptMatch(existing, event)
-            }) {
+            let eventSpeaker = normalizedSpeaker(event.speaker)
+            var eventTokenSet: Set<String>?
+            var matchedIndex: Int?
+            for idx in stride(from: transcriptKept.count - 1, through: 0, by: -1) {
+                let existing = transcriptKept[idx]
+                if event.occurredAt.timeIntervalSince(existing.occurredAt) > 4.0 {
+                    break
+                }
+                guard existing.deviceID != event.deviceID || existing.id == event.id else { continue }
+                if existing.id == event.id {
+                    matchedIndex = idx
+                    break
+                }
+                let cached = transcriptCache[idx]
+                if !cached.speaker.isEmpty && !eventSpeaker.isEmpty && cached.speaker != eventSpeaker {
+                    continue
+                }
+                if eventTokenSet == nil {
+                    eventTokenSet = Set(tokens(event.text))
+                }
+                guard let tokB = eventTokenSet, isFuzzyTokenMatch(cached.tokens, tokB) else { continue }
+                matchedIndex = idx
+                break
+            }
+
+            if let matchIndex = matchedIndex {
                 let winner = pickBetterTranscript(transcriptKept[matchIndex], event)
                 transcriptKept[matchIndex] = winner
+                transcriptCache[matchIndex] = (
+                    speaker: normalizedSpeaker(winner.speaker),
+                    tokens: Set(tokens(winner.text))
+                )
             } else {
                 transcriptKept.append(event)
+                transcriptCache.append((
+                    speaker: eventSpeaker,
+                    tokens: eventTokenSet ?? Set(tokens(event.text))
+                ))
             }
         }
 
@@ -118,10 +151,28 @@ public enum TranscriptMergeEngine {
             guard event.kind == "captureGap" else { return true }
             let gapStart = event.occurredAt
             let gapEnd = max(event.occurredAt, event.endedAt ?? event.occurredAt)
-            let coveredByOtherSpeech = transcriptKept.contains { speech in
-                speech.deviceID != event.deviceID &&
-                    speech.occurredAt >= gapStart.addingTimeInterval(-3.0) &&
-                    speech.occurredAt <= gapEnd.addingTimeInterval(3.0)
+            let windowStart = gapStart.addingTimeInterval(-3.0)
+            let windowEnd = gapEnd.addingTimeInterval(3.0)
+
+            // Binary search for first transcript event with occurredAt >= windowStart.
+            var lo = 0
+            var hi = transcriptKept.count
+            while lo < hi {
+                let mid = (lo + hi) / 2
+                if transcriptKept[mid].occurredAt < windowStart {
+                    lo = mid + 1
+                } else {
+                    hi = mid
+                }
+            }
+            var coveredByOtherSpeech = false
+            for idx in lo..<transcriptKept.count {
+                let speech = transcriptKept[idx]
+                if speech.occurredAt > windowEnd { break }
+                if speech.deviceID != event.deviceID {
+                    coveredByOtherSpeech = true
+                    break
+                }
             }
             if coveredByOtherSpeech { return false }
             let coveredByOtherLeg = legIntervalsByDevice.contains { deviceID, span in
@@ -186,21 +237,8 @@ public enum TranscriptMergeEngine {
         return winner
     }
 
-    private static func isFuzzyTranscriptMatch(
-        _ lhs: SyncedTranscriptEvent,
-        _ rhs: SyncedTranscriptEvent
-    ) -> Bool {
-        if lhs.id == rhs.id { return true }
-        let speakerA = normalizedSpeaker(lhs.speaker)
-        let speakerB = normalizedSpeaker(rhs.speaker)
-        if !speakerA.isEmpty && !speakerB.isEmpty && speakerA != speakerB {
-            return false
-        }
-        let tokensA = tokens(lhs.text)
-        let tokensB = tokens(rhs.text)
-        guard !tokensA.isEmpty && !tokensB.isEmpty else { return false }
-        let setA = Set(tokensA)
-        let setB = Set(tokensB)
+    private static func isFuzzyTokenMatch(_ setA: Set<String>, _ setB: Set<String>) -> Bool {
+        guard !setA.isEmpty && !setB.isEmpty else { return false }
         let intersection = setA.intersection(setB).count
         let union = setA.union(setB).count
         let jaccard = union > 0 ? Double(intersection) / Double(union) : 0
@@ -209,6 +247,8 @@ public enum TranscriptMergeEngine {
         let containment = minCount > 0 ? Double(intersection) / Double(minCount) : 0
         return minCount >= 3 && containment >= 0.80
     }
+
+    private static let nonAlphanumerics = CharacterSet.alphanumerics.inverted
 
     private static func normalizedSpeaker(_ speaker: String?) -> String {
         guard let speaker else { return "" }
@@ -221,7 +261,7 @@ public enum TranscriptMergeEngine {
 
     private static func tokens(_ text: String) -> [String] {
         text.workspaceFolded
-            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .components(separatedBy: nonAlphanumerics)
             .filter { !$0.isEmpty }
     }
 }

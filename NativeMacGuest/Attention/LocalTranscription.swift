@@ -487,13 +487,7 @@ final class MeetingTranscriber: @unchecked Sendable {
     private func receiveOnQueue(_ trackID: String, _ buffer: AVAudioPCMBuffer, receivedAt: Date) {
         guard !stopped, let speaker = speaker(trackID), let samples = convert(buffer, speaker) else { return }
         if let handler = ingressLock.withLock({ onPCM16Audio }), !samples.isEmpty {
-            var pcmData = Data(capacity: samples.count * MemoryLayout<Int16>.size)
-            for sample in samples {
-                let clamped = max(-1.0 as Float, min(1.0 as Float, sample))
-                var intSample = Int16((clamped * Float(Int16.max)).rounded()).littleEndian
-                withUnsafeBytes(of: &intSample) { pcmData.append(contentsOf: $0) }
-            }
-            handler(trackID, pcmData)
+            handler(trackID, RealtimeVoiceAudio.floatSamplesToPCM16Data(samples))
         }
         // Sample counts advance only while audio flows; a playout stall (device change,
         // audio service restart) would date every later line early by the gap. Each

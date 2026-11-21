@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 /// Structured + freeform team settings stored in `Rock Assistant/Knowledge/TeamContext.md`.
@@ -139,19 +140,127 @@ public struct AssistantSkillRepository: Sendable {
         rootURL.appendingPathComponent(".seeded-defaults.json", isDirectory: false)
     }
 
+    private struct FileStamp: Equatable, Sendable {
+        let sec: Int
+        let nsec: Int
+        let size: Int64
+        let ino: UInt64
+    }
+
+    private struct CachedKnowledgeEntry: Sendable {
+        let stamp: FileStamp
+        let title: String
+        let text: String
+        let foldedTitle: String
+        let foldedText: String
+    }
+
+    private final class RepositoryCache: @unchecked Sendable {
+        static let shared = RepositoryCache()
+        let lock = NSLock()
+        var verifiedRoots: Set<String> = []
+        var skillsByPath: [String: (stamp: FileStamp, skill: AssistantSkill)] = [:]
+        var peopleByPath: [String: (stamp: FileStamp, directory: AssistantPeopleDirectory)] = [:]
+        var teamContextByPath: [String: (stamp: FileStamp, doc: AssistantTeamContextDocument)] = [:]
+        var promptsByPath: [String: (stamp: FileStamp, doc: AssistantPromptDocument)] = [:]
+        var knowledgeByPath: [String: CachedKnowledgeEntry] = [:]
+        var knowledgeOrder: [String] = []
+        var knowledgeBytes: Int = 0
+        private let maxKnowledgeEntries = 512
+        private let maxKnowledgeBytes = 24 * 1024 * 1024
+
+        func storeKnowledge(_ entry: CachedKnowledgeEntry, forKey key: String) {
+            let entryBytes = entry.text.utf8.count + entry.foldedText.utf8.count
+            guard entryBytes <= 2 * 1024 * 1024 else { return }
+            if let existing = knowledgeByPath[key] {
+                knowledgeBytes -= existing.text.utf8.count + existing.foldedText.utf8.count
+                knowledgeOrder.removeAll { $0 == key }
+            }
+            knowledgeByPath[key] = entry
+            knowledgeOrder.append(key)
+            knowledgeBytes += entryBytes
+            while (knowledgeByPath.count > maxKnowledgeEntries || knowledgeBytes > maxKnowledgeBytes),
+                  !knowledgeOrder.isEmpty {
+                let oldest = knowledgeOrder.removeFirst()
+                if let removed = knowledgeByPath.removeValue(forKey: oldest) {
+                    knowledgeBytes -= removed.text.utf8.count + removed.foldedText.utf8.count
+                }
+            }
+        }
+    }
+
+    private static func fileStamp(for url: URL) -> FileStamp? {
+        var st = Darwin.stat()
+        guard Darwin.lstat(url.path, &st) == 0 else { return nil }
+        return FileStamp(
+            sec: st.st_mtimespec.tv_sec,
+            nsec: st.st_mtimespec.tv_nsec,
+            size: Int64(st.st_size),
+            ino: UInt64(st.st_ino)
+        )
+    }
+
+    private func cacheKey(for url: URL) -> String {
+        url.standardizedFileURL.path
+    }
+
+    private func invalidateFileCache(at url: URL) {
+        let key = cacheKey(for: url)
+        let cache = RepositoryCache.shared
+        cache.lock.lock()
+        cache.skillsByPath.removeValue(forKey: key)
+        cache.peopleByPath.removeValue(forKey: key)
+        cache.teamContextByPath.removeValue(forKey: key)
+        cache.promptsByPath.removeValue(forKey: key)
+        if let removed = cache.knowledgeByPath.removeValue(forKey: key) {
+            cache.knowledgeBytes -= removed.text.utf8.count + removed.foldedText.utf8.count
+            cache.knowledgeOrder.removeAll { $0 == key }
+        }
+        cache.lock.unlock()
+    }
+
+    private func invalidateRootCache() {
+        let rootKey = cacheKey(for: rootURL)
+        let cache = RepositoryCache.shared
+        cache.lock.lock()
+        cache.verifiedRoots.remove(rootKey)
+        cache.lock.unlock()
+    }
+
+    private func ensureDefaultsInstalledIfNeeded() {
+        let rootKey = cacheKey(for: rootURL)
+        let cache = RepositoryCache.shared
+        cache.lock.lock()
+        let alreadyVerified = cache.verifiedRoots.contains(rootKey)
+        cache.lock.unlock()
+
+        if alreadyVerified {
+            let fm = FileManager.default
+            if fm.fileExists(atPath: seededMarkerURL.path),
+               fm.fileExists(atPath: skillsDirectoryURL.path),
+               fm.fileExists(atPath: promptsDirectoryURL.path),
+               fm.fileExists(atPath: knowledgeDirectoryURL.path) {
+                return
+            }
+        }
+        try? ensureDefaultsInstalled()
+    }
+
     public func ensureDefaultsInstalled() throws {
         let fm = FileManager.default
         try fm.createDirectory(at: skillsDirectoryURL, withIntermediateDirectories: true)
         try fm.createDirectory(at: knowledgeDirectoryURL, withIntermediateDirectories: true)
         try fm.createDirectory(at: promptsDirectoryURL, withIntermediateDirectories: true)
 
-        var seeded = loadSeededIDs()
+        let originalSeeded = loadSeededIDs()
+        var seeded = originalSeeded
         for skill in DefaultAssistantSkills.all {
             let fileURL = skillURL(id: skill.id)
             if fm.fileExists(atPath: fileURL.path) {
                 seeded.insert(skill.id)
             } else if !seeded.contains(skill.id) {
                 try writeAtomic(AssistantSkillMarkdownCodec.encode(skill), to: fileURL)
+                invalidateFileCache(at: fileURL)
                 seeded.insert(skill.id)
             }
         }
@@ -162,41 +271,64 @@ public struct AssistantSkillRepository: Sendable {
                 seeded.insert(marker)
             } else if !seeded.contains(marker) {
                 try writeAtomic(DefaultAssistantPrompts.content(for: kind), to: fileURL)
+                invalidateFileCache(at: fileURL)
                 seeded.insert(marker)
             }
         }
-        try saveSeededIDs(seeded)
+        if seeded != originalSeeded || !fm.fileExists(atPath: seededMarkerURL.path) {
+            try saveSeededIDs(seeded)
+        }
 
         if !fm.fileExists(atPath: peopleFileURL.path) {
             try writeAtomic(AssistantPeopleMarkdownCodec.starterMarkdown(), to: peopleFileURL)
+            invalidateFileCache(at: peopleFileURL)
         }
         if !fm.fileExists(atPath: teamContextFileURL.path) {
             try writeAtomic(AssistantTeamContextDocument.starter().encode(), to: teamContextFileURL)
+            invalidateFileCache(at: teamContextFileURL)
         }
+
+        let rootKey = cacheKey(for: rootURL)
+        let cache = RepositoryCache.shared
+        cache.lock.lock()
+        cache.verifiedRoots.insert(rootKey)
+        cache.lock.unlock()
     }
 
     public func restoreDefaultSkill(id: String) throws -> AssistantSkill? {
         guard let template = DefaultAssistantSkills.skill(id: id) else { return nil }
         try FileManager.default.createDirectory(at: skillsDirectoryURL, withIntermediateDirectories: true)
-        try writeAtomic(AssistantSkillMarkdownCodec.encode(template), to: skillURL(id: template.id))
+        let target = skillURL(id: template.id)
+        try writeAtomic(AssistantSkillMarkdownCodec.encode(template), to: target)
+        invalidateFileCache(at: target)
+        invalidateRootCache()
         var seeded = loadSeededIDs()
-        seeded.insert(template.id)
-        try saveSeededIDs(seeded)
+        if seeded.insert(template.id).inserted {
+            try saveSeededIDs(seeded)
+        }
         return template
     }
 
     public func restoreAllDefaultSkills() throws {
         try FileManager.default.createDirectory(at: skillsDirectoryURL, withIntermediateDirectories: true)
         var seeded = loadSeededIDs()
+        var dirty = false
         for skill in DefaultAssistantSkills.all {
-            try writeAtomic(AssistantSkillMarkdownCodec.encode(skill), to: skillURL(id: skill.id))
-            seeded.insert(skill.id)
+            let target = skillURL(id: skill.id)
+            try writeAtomic(AssistantSkillMarkdownCodec.encode(skill), to: target)
+            invalidateFileCache(at: target)
+            if seeded.insert(skill.id).inserted {
+                dirty = true
+            }
         }
-        try saveSeededIDs(seeded)
+        invalidateRootCache()
+        if dirty {
+            try saveSeededIDs(seeded)
+        }
     }
 
     public func listSkills() -> [AssistantSkill] {
-        try? ensureDefaultsInstalled()
+        ensureDefaultsInstalledIfNeeded()
         let fm = FileManager.default
         guard let files = try? fm.contentsOfDirectory(
             at: skillsDirectoryURL,
@@ -206,11 +338,23 @@ public struct AssistantSkillRepository: Sendable {
             return DefaultAssistantSkills.all
         }
 
+        let cache = RepositoryCache.shared
         var loaded: [AssistantSkill] = []
         for file in files where file.pathExtension.caseInsensitiveCompare("md") == .orderedSame {
             guard let values = try? file.resourceValues(forKeys: [.isRegularFileKey, .contentModificationDateKey]),
-                  values.isRegularFile == true,
-                  let text = try? String(contentsOf: file, encoding: .utf8) else { continue }
+                  values.isRegularFile == true else { continue }
+            let key = cacheKey(for: file)
+            let stamp = Self.fileStamp(for: file)
+            if let stamp {
+                cache.lock.lock()
+                let hit = cache.skillsByPath[key]
+                cache.lock.unlock()
+                if let hit, hit.stamp == stamp {
+                    loaded.append(hit.skill)
+                    continue
+                }
+            }
+            guard let text = try? String(contentsOf: file, encoding: .utf8) else { continue }
             let slug = file.deletingPathExtension().lastPathComponent
             let skill = AssistantSkillMarkdownCodec.decode(
                 text,
@@ -218,6 +362,11 @@ public struct AssistantSkillRepository: Sendable {
                 relativePath: "Skills/\(file.lastPathComponent)",
                 updatedAt: values.contentModificationDate
             )
+            if let stamp {
+                cache.lock.lock()
+                cache.skillsByPath[key] = (stamp, skill)
+                cache.lock.unlock()
+            }
             loaded.append(skill)
         }
         return loaded.sorted {
@@ -229,7 +378,29 @@ public struct AssistantSkillRepository: Sendable {
         let slug = AssistantSkill.sanitizedSlug(from: id)
         guard !slug.isEmpty else { return nil }
         let file = skillURL(id: slug)
-        if let text = try? String(contentsOf: file, encoding: .utf8) {
+        let key = cacheKey(for: file)
+        let cache = RepositoryCache.shared
+        if let stamp = Self.fileStamp(for: file) {
+            cache.lock.lock()
+            let hit = cache.skillsByPath[key]
+            cache.lock.unlock()
+            if let hit, hit.stamp == stamp {
+                return hit.skill
+            }
+            if let text = try? String(contentsOf: file, encoding: .utf8) {
+                let modified = (try? file.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+                let skill = AssistantSkillMarkdownCodec.decode(
+                    text,
+                    fallbackSlug: slug,
+                    relativePath: "Skills/\(file.lastPathComponent)",
+                    updatedAt: modified
+                )
+                cache.lock.lock()
+                cache.skillsByPath[key] = (stamp, skill)
+                cache.lock.unlock()
+                return skill
+            }
+        } else if let text = try? String(contentsOf: file, encoding: .utf8) {
             let modified = (try? file.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
             return AssistantSkillMarkdownCodec.decode(
                 text,
@@ -247,7 +418,9 @@ public struct AssistantSkillRepository: Sendable {
         var clean = skill
         clean.sourceRelativePath = "Skills/\(clean.id).md"
         clean.updatedAt = Date()
-        try writeAtomic(AssistantSkillMarkdownCodec.encode(clean), to: skillURL(id: clean.id))
+        let destination = skillURL(id: clean.id)
+        try writeAtomic(AssistantSkillMarkdownCodec.encode(clean), to: destination)
+        invalidateFileCache(at: destination)
         return clean
     }
 
@@ -258,9 +431,12 @@ public struct AssistantSkillRepository: Sendable {
         if FileManager.default.fileExists(atPath: file.path) {
             try FileManager.default.removeItem(at: file)
         }
+        invalidateFileCache(at: file)
+        invalidateRootCache()
         var seeded = loadSeededIDs()
-        seeded.insert(slug)
-        try? saveSeededIDs(seeded)
+        if seeded.insert(slug).inserted {
+            try? saveSeededIDs(seeded)
+        }
     }
 
     public func searchSkills(query: String, enabledOnly: Bool = false) -> [AssistantSkill] {
@@ -278,16 +454,34 @@ public struct AssistantSkillRepository: Sendable {
     }
 
     public func loadPeople() -> AssistantPeopleDirectory {
-        try? ensureDefaultsInstalled()
+        ensureDefaultsInstalledIfNeeded()
+        let key = cacheKey(for: peopleFileURL)
+        let cache = RepositoryCache.shared
+        let stamp = Self.fileStamp(for: peopleFileURL)
+        if let stamp {
+            cache.lock.lock()
+            let hit = cache.peopleByPath[key]
+            cache.lock.unlock()
+            if let hit, hit.stamp == stamp {
+                return hit.directory
+            }
+        }
         guard let text = try? String(contentsOf: peopleFileURL, encoding: .utf8) else {
             return AssistantPeopleDirectory()
         }
-        return AssistantPeopleMarkdownCodec.decode(text)
+        let decoded = AssistantPeopleMarkdownCodec.decode(text)
+        if let stamp {
+            cache.lock.lock()
+            cache.peopleByPath[key] = (stamp, decoded)
+            cache.lock.unlock()
+        }
+        return decoded
     }
 
     public func savePeople(_ directory: AssistantPeopleDirectory) throws {
         try FileManager.default.createDirectory(at: knowledgeDirectoryURL, withIntermediateDirectories: true)
         try writeAtomic(AssistantPeopleMarkdownCodec.encode(directory), to: peopleFileURL)
+        invalidateFileCache(at: peopleFileURL)
     }
 
     @discardableResult
@@ -307,16 +501,34 @@ public struct AssistantSkillRepository: Sendable {
     }
 
     public func loadTeamContext() -> AssistantTeamContextDocument {
-        try? ensureDefaultsInstalled()
+        ensureDefaultsInstalledIfNeeded()
+        let key = cacheKey(for: teamContextFileURL)
+        let cache = RepositoryCache.shared
+        let stamp = Self.fileStamp(for: teamContextFileURL)
+        if let stamp {
+            cache.lock.lock()
+            let hit = cache.teamContextByPath[key]
+            cache.lock.unlock()
+            if let hit, hit.stamp == stamp {
+                return hit.doc
+            }
+        }
         guard let text = try? String(contentsOf: teamContextFileURL, encoding: .utf8) else {
             return .starter()
         }
-        return AssistantTeamContextDocument.decode(text)
+        let decoded = AssistantTeamContextDocument.decode(text)
+        if let stamp {
+            cache.lock.lock()
+            cache.teamContextByPath[key] = (stamp, decoded)
+            cache.lock.unlock()
+        }
+        return decoded
     }
 
     public func saveTeamContext(_ doc: AssistantTeamContextDocument) throws {
         try FileManager.default.createDirectory(at: knowledgeDirectoryURL, withIntermediateDirectories: true)
         try writeAtomic(doc.encode(), to: teamContextFileURL)
+        invalidateFileCache(at: teamContextFileURL)
     }
 
     // MARK: - Core Obsidian Prompts (`Prompts/*.md`)
@@ -326,12 +538,29 @@ public struct AssistantSkillRepository: Sendable {
     }
 
     public func loadPrompt(_ kind: AssistantPromptKind) -> AssistantPromptDocument {
-        try? ensureDefaultsInstalled()
+        ensureDefaultsInstalledIfNeeded()
         let url = promptURL(for: kind)
+        let key = cacheKey(for: url)
+        let cache = RepositoryCache.shared
+        let stamp = Self.fileStamp(for: url)
+        if let stamp {
+            cache.lock.lock()
+            let hit = cache.promptsByPath[key]
+            cache.lock.unlock()
+            if let hit, hit.stamp == stamp {
+                return hit.doc
+            }
+        }
         if let text = try? String(contentsOf: url, encoding: .utf8),
            !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             let modified = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
-            return AssistantPromptDocument(kind: kind, content: text, relativePath: kind.relativePath, updatedAt: modified)
+            let doc = AssistantPromptDocument(kind: kind, content: text, relativePath: kind.relativePath, updatedAt: modified)
+            if let stamp {
+                cache.lock.lock()
+                cache.promptsByPath[key] = (stamp, doc)
+                cache.lock.unlock()
+            }
+            return doc
         }
         return AssistantPromptDocument(
             kind: kind,
@@ -344,10 +573,14 @@ public struct AssistantSkillRepository: Sendable {
     public func savePrompt(_ kind: AssistantPromptKind, content: String) throws -> AssistantPromptDocument {
         try FileManager.default.createDirectory(at: promptsDirectoryURL, withIntermediateDirectories: true)
         let normalized = content.trimmingCharacters(in: .newlines) + "\n"
-        try writeAtomic(normalized, to: promptURL(for: kind))
+        let url = promptURL(for: kind)
+        try writeAtomic(normalized, to: url)
+        invalidateFileCache(at: url)
+        invalidateRootCache()
         var seeded = loadSeededIDs()
-        seeded.insert("prompt:\(kind.rawValue)")
-        try? saveSeededIDs(seeded)
+        if seeded.insert("prompt:\(kind.rawValue)").inserted {
+            try? saveSeededIDs(seeded)
+        }
         return AssistantPromptDocument(kind: kind, content: normalized, relativePath: kind.relativePath, updatedAt: Date())
     }
 
@@ -357,18 +590,19 @@ public struct AssistantSkillRepository: Sendable {
         return try savePrompt(kind, content: starter)
     }
 
-    /// Resolves active skills (explicitly pinned skills + trigger-matched skills for this meeting/command)
-    /// and compiles compact Obsidian-backed guidance + BasePersona for an LLM or Realtime turn.
-    public func renderPromptContext(
+    /// Compiles compact Obsidian-backed guidance + BasePersona from already-loaded in-memory values.
+    public static func renderPromptContext(
+        skills: [AssistantSkill],
+        people: AssistantPeopleDirectory,
+        teamContext: AssistantTeamContextDocument,
+        basePersona: String,
         explicitSkillIDs: [String] = [],
         meetingTitle: String = "",
         commandText: String = "",
         includePeopleLimit: Int = 24
     ) -> (instructions: String, selectedSkills: [AssistantSkill], people: AssistantPeopleDirectory, teamContext: AssistantTeamContextDocument, basePersona: String) {
-        let allSkills = listSkills().filter(\.enabled)
-        let people = loadPeople()
-        let team = loadTeamContext()
-        let basePersona = loadPrompt(.basePersona).content.trimmingCharacters(in: .whitespacesAndNewlines)
+        let allSkills = skills.filter(\.enabled)
+        let cleanPersona = basePersona.trimmingCharacters(in: .whitespacesAndNewlines)
 
         var selected: [AssistantSkill] = []
         var seenSkillIDs: Set<String> = []
@@ -388,12 +622,12 @@ public struct AssistantSkillRepository: Sendable {
         }
 
         var parts: [String] = []
-        if !team.defaultJiraBoardURL.isEmpty || !team.defaultJiraProjectKey.isEmpty || !team.defaultCalendarIdentifier.isEmpty || !team.notes.isEmpty {
+        if !teamContext.defaultJiraBoardURL.isEmpty || !teamContext.defaultJiraProjectKey.isEmpty || !teamContext.defaultCalendarIdentifier.isEmpty || !teamContext.notes.isEmpty {
             var block = "## Team Context (Obsidian Knowledge/TeamContext.md)\n"
-            if !team.defaultJiraBoardURL.isEmpty { block += "- Default Jira Board URL: \(team.defaultJiraBoardURL)\n" }
-            if !team.defaultJiraProjectKey.isEmpty { block += "- Default Jira Project Key: \(team.defaultJiraProjectKey)\n" }
-            if !team.defaultCalendarIdentifier.isEmpty { block += "- Preferred Calendar ID: \(team.defaultCalendarIdentifier)\n" }
-            if !team.notes.isEmpty { block += "\n\(team.notes.prefix(1_200))" }
+            if !teamContext.defaultJiraBoardURL.isEmpty { block += "- Default Jira Board URL: \(teamContext.defaultJiraBoardURL)\n" }
+            if !teamContext.defaultJiraProjectKey.isEmpty { block += "- Default Jira Project Key: \(teamContext.defaultJiraProjectKey)\n" }
+            if !teamContext.defaultCalendarIdentifier.isEmpty { block += "- Preferred Calendar ID: \(teamContext.defaultCalendarIdentifier)\n" }
+            if !teamContext.notes.isEmpty { block += "\n\(teamContext.notes.prefix(1_200))" }
             parts.append(block)
         }
 
@@ -419,7 +653,27 @@ public struct AssistantSkillRepository: Sendable {
             parts.append("### Active Skill: \(skill.name) (`\(skill.id)`)\n" + String(skill.instructions.prefix(4_000)))
         }
 
-        return (parts.joined(separator: "\n\n"), selected, people, team, basePersona)
+        return (parts.joined(separator: "\n\n"), selected, people, teamContext, cleanPersona)
+    }
+
+    /// Resolves active skills (explicitly pinned skills + trigger-matched skills for this meeting/command)
+    /// and compiles compact Obsidian-backed guidance + BasePersona for an LLM or Realtime turn.
+    public func renderPromptContext(
+        explicitSkillIDs: [String] = [],
+        meetingTitle: String = "",
+        commandText: String = "",
+        includePeopleLimit: Int = 24
+    ) -> (instructions: String, selectedSkills: [AssistantSkill], people: AssistantPeopleDirectory, teamContext: AssistantTeamContextDocument, basePersona: String) {
+        Self.renderPromptContext(
+            skills: listSkills(),
+            people: loadPeople(),
+            teamContext: loadTeamContext(),
+            basePersona: loadPrompt(.basePersona).content,
+            explicitSkillIDs: explicitSkillIDs,
+            meetingTitle: meetingTitle,
+            commandText: commandText,
+            includePeopleLimit: includePeopleLimit
+        )
     }
 
     /// Searches Skills, Prompts, People.md, TeamContext.md, and optional extra Obsidian vault Markdown files on demand.
@@ -434,8 +688,20 @@ public struct AssistantSkillRepository: Sendable {
 
         var searchRoots: [(url: URL, base: URL, kind: String)] = []
         let fm = FileManager.default
-        if let enumerator = fm.enumerator(at: rootURL, includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey], options: [.skipsHiddenFiles]) {
-            for case let file as URL in enumerator where file.pathExtension.caseInsensitiveCompare("md") == .orderedSame {
+        if let enumerator = fm.enumerator(
+            at: rootURL,
+            includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey, .isSymbolicLinkKey],
+            options: [.skipsHiddenFiles, .skipsPackageDescendants]
+        ) {
+            var visitedRoot = 0
+            for case let file as URL in enumerator {
+                visitedRoot += 1
+                if visitedRoot > 1_500 { break }
+                guard let vals = try? file.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey, .isSymbolicLinkKey]),
+                      vals.isSymbolicLink != true,
+                      vals.isRegularFile == true,
+                      (vals.fileSize ?? 0) <= 262_144,
+                      file.pathExtension.caseInsensitiveCompare("md") == .orderedSame else { continue }
                 let kind: String
                 if file.path.contains("/Skills/") {
                     kind = "skill"
@@ -465,13 +731,49 @@ public struct AssistantSkillRepository: Sendable {
 
         var hits: [AssistantKnowledgeSearchHit] = []
         let rootPrefixCount = rootURL.path.hasSuffix("/") ? rootURL.path.count : rootURL.path.count + 1
+        let cache = RepositoryCache.shared
         for item in searchRoots {
-            guard let text = try? String(contentsOf: item.url, encoding: .utf8), !text.isEmpty else { continue }
-            let foldedText = AssistantPersonEntry.fold(text)
             let basePrefix = item.base.path.hasSuffix("/") ? item.base.path.count : item.base.path.count + 1
             let relPath = item.url.path.count > basePrefix ? String(item.url.path.dropFirst(basePrefix)) : item.url.lastPathComponent
-            let title = item.url.deletingPathExtension().lastPathComponent
-            let foldedTitle = AssistantPersonEntry.fold(title + " " + relPath)
+            let key = cacheKey(for: item.url)
+            let stamp = Self.fileStamp(for: item.url)
+
+            let title: String
+            let text: String
+            let foldedTitle: String
+            let foldedText: String
+
+            cache.lock.lock()
+            let cached = stamp.flatMap { currentStamp -> CachedKnowledgeEntry? in
+                guard let hit = cache.knowledgeByPath[key], hit.stamp == currentStamp else { return nil }
+                return hit
+            }
+            cache.lock.unlock()
+
+            if let cached {
+                title = cached.title
+                text = cached.text
+                foldedTitle = cached.foldedTitle
+                foldedText = cached.foldedText
+            } else {
+                guard let loaded = try? String(contentsOf: item.url, encoding: .utf8), !loaded.isEmpty else { continue }
+                text = loaded
+                title = item.url.deletingPathExtension().lastPathComponent
+                foldedText = AssistantPersonEntry.fold(loaded)
+                foldedTitle = AssistantPersonEntry.fold(title + " " + relPath)
+                if let stamp {
+                    let entry = CachedKnowledgeEntry(
+                        stamp: stamp,
+                        title: title,
+                        text: loaded,
+                        foldedTitle: foldedTitle,
+                        foldedText: foldedText
+                    )
+                    cache.lock.lock()
+                    cache.storeKnowledge(entry, forKey: key)
+                    cache.lock.unlock()
+                }
+            }
 
             var score = 0.0
             for token in tokens {
@@ -501,9 +803,9 @@ public struct AssistantSkillRepository: Sendable {
     }
 
     private func bestExcerpt(in text: String, tokens: [String], maxLength: Int) -> String {
-        let lines = text.components(separatedBy: "\n")
+        let lines = text.split(omittingEmptySubsequences: false, whereSeparator: { $0 == "\n" })
         for (idx, line) in lines.enumerated() {
-            let foldedLine = AssistantPersonEntry.fold(line)
+            let foldedLine = AssistantPersonEntry.fold(String(line))
             if tokens.contains(where: { foldedLine.contains($0) }) {
                 let start = max(0, idx - 1)
                 let end = min(lines.count - 1, idx + 3)

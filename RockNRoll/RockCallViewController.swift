@@ -95,6 +95,38 @@ final class RockCallViewController: UIViewController, UIScrollViewDelegate, UICo
     private var gallerySize = CGSize.zero
     private var restoreGalleryPage = true
     private var rosterOrder: [String] = []
+    private var lastRenderedLayoutKey: RenderedCallLayoutKey?
+    private struct RenderedVideoTrackKey: Equatable {
+        let id: String
+        let kind: CallVideoKind
+        let isMuted: Bool
+        let sourceIdentity: ObjectIdentifier
+    }
+    private struct RenderedParticipantKey: Equatable {
+        let id: String
+        let name: String?
+        let isLocal: Bool
+        let cameraOn: Bool
+        let screenShareOn: Bool
+        let tracks: [RenderedVideoTrackKey]
+    }
+    private struct RenderedCallLayoutKey: Equatable {
+        let participants: [RenderedParticipantKey]
+        let localShareIdentity: ObjectIdentifier?
+        let roomIdentifier: String?
+        let layoutMode: MeetingLayoutMode
+        let explicitLayout: Bool
+        let displayMode: ConferenceDisplayMode
+        let pinnedStream: PinnedStream?
+        let selectedShare: PinnedStream?
+        let browsedStream: PinnedStream?
+        let cameraFocusShare: PinnedStream?
+        let preservingPinDuringReconnect: Bool
+        let isHeld: Bool
+        let canFlipCamera: Bool
+        let captureDeviceID: String?
+        let activeSpeakerID: String?
+    }
     private var identityTiles: [String: UIView] = [:]
     private var identityViews: [String: ParticipantIdentityView] = [:]
     private var tileSelections: [ObjectIdentifier: PinnedStream] = [:]
@@ -1514,7 +1546,51 @@ final class RockCallViewController: UIViewController, UIScrollViewDelegate, UICo
         sourceSelector.configuration?.title = primaryName ?? L("Screen share")
         sourceSelector.accessibilityLabel = L("Screen share") + ": " + (primaryName ?? L("Musician"))
     }
+    private func makeRenderedLayoutKey(snapshot: CallMediaSnapshot) -> RenderedCallLayoutKey {
+        RenderedCallLayoutKey(
+            participants: snapshot.participants.map { participant in
+                RenderedParticipantKey(
+                    id: participant.id,
+                    name: participant.name,
+                    isLocal: participant.isLocal,
+                    cameraOn: participant.cameraOn,
+                    screenShareOn: participant.screenShareOn,
+                    tracks: participant.videoTracks.map {
+                        RenderedVideoTrackKey(
+                            id: $0.id,
+                            kind: $0.source,
+                            isMuted: $0.isMuted,
+                            sourceIdentity: $0.track.identity
+                        )
+                    }
+                )
+            },
+            localShareIdentity: snapshot.localShare?.identity,
+            roomIdentifier: workspace.roomIdentifier,
+            layoutMode: layoutMode,
+            explicitLayout: explicitLayout,
+            displayMode: displayMode,
+            pinnedStream: pinnedStream,
+            selectedShare: selectedShare,
+            browsedStream: browsedStream,
+            cameraFocusShare: cameraFocusShare,
+            preservingPinDuringReconnect: preservingPinDuringReconnect,
+            isHeld: isHeld,
+            canFlipCamera: studio?.canFlipCamera == true,
+            captureDeviceID: studio?.liveCaptureDevice?()?.uniqueID,
+            activeSpeakerID: (effectiveLayoutMode == .speaker && pinnedStream == nil && browsedStream == nil)
+                ? activeSpeaker.current?.id
+                : nil
+        )
+    }
+
     func render(snapshot: CallMediaSnapshot) {
+        let layoutKey = makeRenderedLayoutKey(snapshot: snapshot)
+        if layoutKey == lastRenderedLayoutKey {
+            refreshSpeaking(snapshot: snapshot)
+            return
+        }
+        lastRenderedLayoutKey = layoutKey
         for entry in videoTiles.values where entry.zoom.window != nil { rememberZoom(entry.zoom) }
         displayedSnapshot = snapshot
         let ids = snapshot.participants.map(\.id), existing = Set(rosterOrder)

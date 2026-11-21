@@ -1,16 +1,23 @@
+import Darwin
 import Dispatch
 import Foundation
 
 /// Watches the active Rock Assistant root directory (`Skills/`, `Prompts/`, `Knowledge/`)
 /// for external edits made in Obsidian, Git, or Finder/Files and fires a debounced callback.
 public final class AssistantSkillFolderWatcher: @unchecked Sendable {
+    private struct WatchedSource {
+        let isDirectory: Bool
+        let inode: UInt64
+        let source: DispatchSourceFileSystemObject
+    }
+
     public let rootURL: URL
     private let debounceInterval: TimeInterval
     private let onChange: @Sendable () -> Void
 
     private let lock = NSLock()
     private let queue = DispatchQueue(label: "dev.vsmirn0v.conferencecore.skill-folder-watcher", qos: .utility)
-    private var sources: [DispatchSourceFileSystemObject] = []
+    private var sourcesByPath: [String: WatchedSource] = [:]
     private var debounceWorkItem: DispatchWorkItem?
     private var needsSourceRefresh = false
 
@@ -41,8 +48,6 @@ public final class AssistantSkillFolderWatcher: @unchecked Sendable {
     }
 
     private func rebuildSourcesLocked() {
-        stopLocked(cancelDebounce: false)
-
         let fm = FileManager.default
         let directories = [
             rootURL,
@@ -51,9 +56,19 @@ public final class AssistantSkillFolderWatcher: @unchecked Sendable {
             rootURL.appendingPathComponent("Knowledge", isDirectory: true),
         ]
 
-        var watchedPaths: [URL] = []
+        var desiredTargets: [(path: String, isDirectory: Bool, inode: UInt64)] = []
+        var seenPaths: Set<String> = []
+        func currentInode(_ path: String) -> UInt64? {
+            var st = Darwin.stat()
+            guard Darwin.lstat(path, &st) == 0 else { return nil }
+            return UInt64(st.st_ino)
+        }
+
         for dir in directories where fm.fileExists(atPath: dir.path) {
-            watchedPaths.append(dir)
+            let path = dir.standardizedFileURL.path
+            if let inode = currentInode(path), seenPaths.insert(path).inserted {
+                desiredTargets.append((path, true, inode))
+            }
         }
 
         // Also watch individual .md file descriptors so non-atomic in-place edits
@@ -67,14 +82,28 @@ public final class AssistantSkillFolderWatcher: @unchecked Sendable {
                       options: [.skipsHiddenFiles]
                   ) else { continue }
             for fileURL in entries where fileURL.pathExtension.lowercased() == "md" {
-                watchedPaths.append(fileURL)
-                fileCount += 1
-                if fileCount >= 128 { break }
+                let path = fileURL.standardizedFileURL.path
+                if let inode = currentInode(path), seenPaths.insert(path).inserted {
+                    desiredTargets.append((path, false, inode))
+                    fileCount += 1
+                    if fileCount >= 128 { break }
+                }
             }
         }
 
-        for target in watchedPaths {
-            let isDirectory = directories.contains(where: { $0.path == target.path })
+        // Cancel stale or replaced (atomic rename -> new inode) file descriptors while keeping
+        // unchanged file/directory watches open without churn.
+        let desiredByPath = Dictionary(uniqueKeysWithValues: desiredTargets.map { ($0.path, ($0.isDirectory, $0.inode)) })
+        for (path, existing) in sourcesByPath {
+            if let target = desiredByPath[path], target.0 == existing.isDirectory, target.1 == existing.inode {
+                continue
+            }
+            sourcesByPath.removeValue(forKey: path)
+            existing.source.cancel()
+        }
+
+        for target in desiredTargets {
+            if sourcesByPath[target.path] != nil { continue }
             let fd = open(target.path, O_EVTONLY)
             guard fd >= 0 else { continue }
             let mask: DispatchSource.FileSystemEvent = [.write, .rename, .delete, .extend, .attrib, .link]
@@ -83,6 +112,7 @@ public final class AssistantSkillFolderWatcher: @unchecked Sendable {
                 eventMask: mask,
                 queue: queue
             )
+            let isDirectory = target.isDirectory
             source.setEventHandler { [weak self, weak source] in
                 let flags = source?.data ?? []
                 let refresh = isDirectory || flags.contains(.delete) || flags.contains(.rename)
@@ -91,7 +121,7 @@ public final class AssistantSkillFolderWatcher: @unchecked Sendable {
             source.setCancelHandler {
                 close(fd)
             }
-            sources.append(source)
+            sourcesByPath[target.path] = WatchedSource(isDirectory: isDirectory, inode: target.inode, source: source)
             source.resume()
         }
     }
@@ -102,10 +132,10 @@ public final class AssistantSkillFolderWatcher: @unchecked Sendable {
             debounceWorkItem = nil
             needsSourceRefresh = false
         }
-        let existing = sources
-        sources.removeAll()
-        for source in existing {
-            source.cancel()
+        let existing = Array(sourcesByPath.values)
+        sourcesByPath.removeAll()
+        for entry in existing {
+            entry.source.cancel()
         }
     }
 

@@ -235,6 +235,22 @@ public actor TranscriptArchiveStore {
         indexCache = parsed
     }
 
+    private static let monthFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM"
+        return formatter
+    }()
+
+    private static let dayFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter
+    }()
+
+    private static let isoDateFormatter = ISO8601DateFormatter()
+
     private static func writeSession(
         sessionID: UUID,
         title: String,
@@ -245,13 +261,6 @@ public actor TranscriptArchiveStore {
         index: inout [UUID: String]
     ) throws {
         let fm = FileManager.default
-        let monthFormatter = DateFormatter()
-        monthFormatter.locale = Locale(identifier: "en_US_POSIX")
-        monthFormatter.dateFormat = "yyyy-MM"
-        let dayFormatter = DateFormatter()
-        dayFormatter.locale = Locale(identifier: "en_US_POSIX")
-        dayFormatter.dateFormat = "yyyy-MM-dd"
-
         let referenceDate = startedAt == .distantPast ? (endedAt ?? Date()) : startedAt
         let monthFolder = monthFormatter.string(from: referenceDate)
         let dayPrefix = dayFormatter.string(from: referenceDate)
@@ -362,7 +371,7 @@ public actor TranscriptArchiveStore {
         startedAt: Date,
         events: [SyncedTranscriptEvent]
     ) -> String {
-        let clock = ISO8601DateFormatter()
+        let clock = isoDateFormatter
         var lines = ["# " + title, ""]
         if startedAt != .distantPast {
             lines.append("Started: \(clock.string(from: startedAt))")

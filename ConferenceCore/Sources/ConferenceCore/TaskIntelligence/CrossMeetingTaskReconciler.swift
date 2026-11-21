@@ -83,6 +83,10 @@ public struct TaskTranscriptFollowUp: Equatable, Sendable {
 }
 
 public enum CrossMeetingTaskReconciler {
+    private static let nonAlphanumerics = CharacterSet.alphanumerics.inverted
+    private static let issueKeyRegex = try? NSRegularExpression(pattern: #"\b([A-Z][A-Z0-9_]{1,15}-\d+)\b"#, options: [])
+    private static let embeddedTaskIDRegex = try? NSRegularExpression(pattern: #"\[RnR-Task:\s*([0-9A-Fa-f-]{36})\]"#, options: [])
+
     private static let stopwords: Set<String> = [
         "the", "and", "for", "with", "that", "this", "from", "into", "about", "need", "needs",
         "will", "shall", "must", "should", "have", "has", "had", "been", "were", "are", "was",
@@ -94,22 +98,34 @@ public enum CrossMeetingTaskReconciler {
     ]
 
     public static func extractIssueKeys(from text: String) -> Set<String> {
-        let pattern = #"\b([A-Z][A-Z0-9_]{1,15}-\d+)\b"#
-        guard let regex = try? NSRegularExpression(pattern: pattern, options: []) else { return [] }
+        guard text.contains("-"), let regex = issueKeyRegex else { return [] }
         let nsRange = NSRange(text.startIndex..<text.endIndex, in: text)
         let matches = regex.matches(in: text, options: [], range: nsRange)
-        return Set(matches.compactMap { match in
-            Range(match.range(at: 1), in: text).map { String(text[$0]) }
-        })
+        guard !matches.isEmpty else { return [] }
+        var keys: Set<String> = []
+        keys.reserveCapacity(matches.count)
+        for match in matches {
+            if let range = Range(match.range(at: 1), in: text) {
+                keys.insert(String(text[range]))
+            }
+        }
+        return keys
     }
 
     public static func extractEmbeddedTaskIDs(from text: String) -> Set<UUID> {
-        let pattern = #"\[RnR-Task:\s*([0-9A-Fa-f-]{36})\]"#
-        guard let regex = try? NSRegularExpression(pattern: pattern, options: []) else { return [] }
+        guard text.contains("[RnR-Task:"), let regex = embeddedTaskIDRegex else { return [] }
         let nsRange = NSRange(text.startIndex..<text.endIndex, in: text)
-        return Set(regex.matches(in: text, options: [], range: nsRange).compactMap { match in
-            Range(match.range(at: 1), in: text).flatMap { UUID(uuidString: String(text[$0])) }
-        })
+        let matches = regex.matches(in: text, options: [], range: nsRange)
+        guard !matches.isEmpty else { return [] }
+        var ids: Set<UUID> = []
+        ids.reserveCapacity(matches.count)
+        for match in matches {
+            if let range = Range(match.range(at: 1), in: text),
+               let uuid = UUID(uuidString: String(text[range])) {
+                ids.insert(uuid)
+            }
+        }
+        return ids
     }
 
     public static func matchesScheduledDiscussion(
@@ -139,7 +155,7 @@ public enum CrossMeetingTaskReconciler {
     public static func meaningfulTokens(_ text: String) -> [String] {
         let folded = text.workspaceFolded
         let words = folded
-            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .components(separatedBy: nonAlphanumerics)
             .filter { $0.count >= 2 && !stopwords.contains($0) }
         var seen: Set<String> = []
         var result: [String] = []
@@ -172,6 +188,10 @@ public enum CrossMeetingTaskReconciler {
     public static func containmentOverlap(_ shortOrCandidate: String, in longerSentence: String) -> Double {
         let tokensA = Set(meaningfulTokens(shortOrCandidate))
         let tokensB = Set(meaningfulTokens(longerSentence))
+        return containmentOverlap(tokensA: tokensA, tokensB: tokensB)
+    }
+
+    private static func containmentOverlap(tokensA: Set<String>, tokensB: Set<String>) -> Double {
         guard tokensA.count >= 2, tokensB.count >= 2 else { return 0 }
         let shared = Double(tokensA.intersection(tokensB).count)
         guard shared >= 2 else { return 0 }
@@ -180,11 +200,12 @@ public enum CrossMeetingTaskReconciler {
 
     private static func trigrams(_ text: String) -> Set<String> {
         let clean = JiraContactMatcher.transliterateCyrillicToLatin(text)
-            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .components(separatedBy: nonAlphanumerics)
             .joined(separator: " ")
         let chars = Array(clean)
         guard chars.count >= 3 else { return Set(chars.map { String($0) }) }
         var set: Set<String> = []
+        set.reserveCapacity(chars.count - 2)
         for i in 0...(chars.count - 3) {
             set.insert(String(chars[i..<(i + 3)]))
         }
@@ -199,12 +220,36 @@ public enum CrossMeetingTaskReconciler {
         }
         let tokensL = Set(meaningfulTokens(lhs))
         let tokensR = Set(meaningfulTokens(rhs))
+        return similarityScore(
+            lhsText: lhs,
+            rhsText: rhs,
+            tokensL: tokensL,
+            tokensR: tokensR,
+            trigramsL: nil,
+            trigramsR: nil
+        )
+    }
+
+    private static func similarityScore(
+        lhsText: String,
+        rhsText: String,
+        tokensL: Set<String>,
+        tokensR: Set<String>,
+        trigramsL: Set<String>?,
+        trigramsR: Set<String>?
+    ) -> Double {
         guard !tokensL.isEmpty && !tokensR.isEmpty else { return 0 }
         let intersection = Double(tokensL.intersection(tokensR).count)
+        if intersection == 0 {
+            let triL = trigramsL ?? trigrams(lhsText)
+            let triR = trigramsR ?? trigrams(rhsText)
+            let triOverlap = triL.isEmpty || triR.isEmpty ? 0.0 : Double(triL.intersection(triR).count * 2) / Double(triL.count + triR.count)
+            return triOverlap * 0.25
+        }
         let dice = (2.0 * intersection) / Double(tokensL.count + tokensR.count)
         let jaccard = intersection / Double(tokensL.union(tokensR).count)
-        let triL = trigrams(lhs)
-        let triR = trigrams(rhs)
+        let triL = trigramsL ?? trigrams(lhsText)
+        let triR = trigramsR ?? trigrams(rhsText)
         let triOverlap = triL.isEmpty || triR.isEmpty ? 0.0 : Double(triL.intersection(triR).count * 2) / Double(triL.count + triR.count)
         let containment = intersection / Double(min(tokensL.count, tokensR.count))
         let fullContainmentFloor = (intersection >= 3.0 && containment >= 0.99) ? 0.78 : 0.0
@@ -222,11 +267,53 @@ public enum CrossMeetingTaskReconciler {
             .union(extractIssueKeys(from: existing.text + " " + existing.extended.contextNotes))
         let candidateKeys = Set(candidate.extended.externalBindings.compactMap(\.externalKey))
             .union(extractIssueKeys(from: candidate.text + " " + candidate.extended.contextNotes))
+        return matchScore(
+            candidate: candidate,
+            candidateKeys: candidateKeys,
+            candidateTokens: Set(meaningfulTokens(candidate.text)),
+            candidateTrigrams: nil,
+            existing: existing,
+            existingKeys: existingKeys,
+            existingTokens: Set(meaningfulTokens(existing.text)),
+            existingTrigrams: nil,
+            currentSeriesID: currentSeriesID,
+            currentRoomIdentity: currentRoomIdentity,
+            myAliases: myAliases
+        )
+    }
+
+    private static func matchScore(
+        candidate: SyncedTaskSnapshot,
+        candidateKeys: Set<String>,
+        candidateTokens: Set<String>,
+        candidateTrigrams: Set<String>?,
+        existing: TaskReconciliationCandidateInput,
+        existingKeys: Set<String>,
+        existingTokens: Set<String>,
+        existingTrigrams: Set<String>?,
+        currentSeriesID: String? = nil,
+        currentRoomIdentity: String? = nil,
+        myAliases: [String] = []
+    ) -> Double {
         if !existingKeys.isEmpty && !existingKeys.isDisjoint(with: candidateKeys) {
             return 1.0
         }
-
-        let base = textSimilarity(candidate.text, existing.text)
+        guard !candidateTokens.isEmpty && !existingTokens.isEmpty else { return 0 }
+        if candidateTokens.isDisjoint(with: existingTokens) {
+            // Disjoint token sets cap similarityScore at 0.25, which always fails `guard base > 0.25`.
+            let triL = candidateTrigrams ?? trigrams(candidate.text)
+            let triR = existingTrigrams ?? trigrams(existing.text)
+            let triOverlap = triL.isEmpty || triR.isEmpty ? 0.0 : Double(triL.intersection(triR).count * 2) / Double(triL.count + triR.count)
+            return triOverlap * 0.25
+        }
+        let base = similarityScore(
+            lhsText: candidate.text,
+            rhsText: existing.text,
+            tokensL: candidateTokens,
+            tokensR: existingTokens,
+            trigramsL: candidateTrigrams,
+            trigramsR: existingTrigrams
+        )
         guard base > 0.25 else { return base }
 
         var score = base
@@ -331,20 +418,92 @@ public enum CrossMeetingTaskReconciler {
             if !onlyUpdateOwnedExistingTasks { return true }
             return task.isOwnedByCurrentUser || JiraContactMatcher.isCurrentUserOwner(task.owner, myAliases: myAliases)
         }
+        guard !permittedTasks.isEmpty else { return [] }
+
+        struct PreparedFollowUpTask {
+            let task: TaskReconciliationCandidateInput
+            let keys: Set<String>
+            let tokens: Set<String>
+        }
+
+        let preparedTasks: [PreparedFollowUpTask] = permittedTasks.map { task in
+            let keys = Set(task.extended.externalBindings.compactMap(\.externalKey))
+                .union(extractIssueKeys(from: task.text + " " + task.extended.contextNotes))
+            let tokens = Set(meaningfulTokens(task.text))
+            return PreparedFollowUpTask(task: task, keys: keys, tokens: tokens)
+        }
+        var trigramsCacheByTaskIndex: [Int: Set<String>] = [:]
+        var tasksByKey: [String: [Int]] = [:]
+        var tasksByToken: [String: [Int]] = [:]
+        for (idx, item) in preparedTasks.enumerated() {
+            for key in item.keys {
+                tasksByKey[key, default: []].append(idx)
+            }
+            for token in item.tokens {
+                tasksByToken[token, default: []].append(idx)
+            }
+        }
 
         var followUpsByTask: [UUID: TaskTranscriptFollowUp] = [:]
         for line in usableLines {
             let trimmed = line.text.trimmingCharacters(in: .whitespacesAndNewlines)
             guard trimmed.count >= 6 else { continue }
             let lineKeys = extractIssueKeys(from: trimmed)
-            let signal = detectStatusSignal(in: trimmed)
+            let lineTokens = Set(meaningfulTokens(trimmed))
+            guard !lineKeys.isEmpty || !lineTokens.isEmpty else { continue }
 
-            for task in permittedTasks {
-                let taskKeys = Set(task.extended.externalBindings.compactMap(\.externalKey))
-                    .union(extractIssueKeys(from: task.text + " " + task.extended.contextNotes))
-                let keyMatched = !taskKeys.isEmpty && !taskKeys.isDisjoint(with: lineKeys)
-                let similarity = keyMatched ? 1.0 : textSimilarity(trimmed, task.text)
-                let containment = keyMatched ? 1.0 : containmentOverlap(task.text, in: trimmed)
+            var candidateIndices: [Int] = []
+            var seenIndices: Set<Int> = []
+            for key in lineKeys {
+                for idx in tasksByKey[key] ?? [] where seenIndices.insert(idx).inserted {
+                    candidateIndices.append(idx)
+                }
+            }
+            for token in lineTokens {
+                for idx in tasksByToken[token] ?? [] where seenIndices.insert(idx).inserted {
+                    candidateIndices.append(idx)
+                }
+            }
+            guard !candidateIndices.isEmpty else { continue }
+            candidateIndices.sort()
+
+            let signal = detectStatusSignal(in: trimmed)
+            var lazyLineTrigrams: Set<String>?
+
+            for idx in candidateIndices {
+                let prepared = preparedTasks[idx]
+                let task = prepared.task
+                let keyMatched = !prepared.keys.isEmpty && !prepared.keys.isDisjoint(with: lineKeys)
+                let similarity: Double
+                let containment: Double
+                if keyMatched {
+                    similarity = 1.0
+                    containment = 1.0
+                } else {
+                    if lazyLineTrigrams == nil {
+                        lazyLineTrigrams = trigrams(trimmed)
+                    }
+                    let taskTris = trigramsCacheByTaskIndex[idx] ?? {
+                        let t = trigrams(task.text)
+                        trigramsCacheByTaskIndex[idx] = t
+                        return t
+                    }()
+                    similarity = similarityScore(
+                        lhsText: trimmed,
+                        rhsText: task.text,
+                        tokensL: lineTokens,
+                        tokensR: prepared.tokens,
+                        trigramsL: lazyLineTrigrams,
+                        trigramsR: taskTris
+                    )
+                    if similarity >= 0.50 && signal != nil {
+                        containment = 0
+                    } else if similarity >= 0.68 {
+                        containment = 0
+                    } else {
+                        containment = containmentOverlap(tokensA: prepared.tokens, tokensB: lineTokens)
+                    }
+                }
                 guard keyMatched
                     || (similarity >= 0.50 && signal != nil)
                     || (containment >= 0.65 && similarity >= 0.30 && signal != nil)
@@ -545,9 +704,32 @@ public enum CrossMeetingTaskReconciler {
         }
 
         // 1. Reconcile newly extracted tasks against prior meetings' tasks.
+        let otherByID = Dictionary(uniqueKeysWithValues: otherMeetingTasks.map { ($0.id, $0) })
+        struct PreparedExistingTask {
+            let existing: TaskReconciliationCandidateInput
+            let keys: Set<String>
+            let tokens: Set<String>
+            let matchesDiscussion: Bool
+        }
+        let preparedExisting: [PreparedExistingTask] = extractedTasks.isEmpty ? [] : otherMeetingTasks.map { existing in
+            let keys = Set(existing.extended.externalBindings.compactMap(\.externalKey))
+                .union(extractIssueKeys(from: existing.text + " " + existing.extended.contextNotes))
+            let tokens = Set(meaningfulTokens(existing.text))
+            let matched = matchesScheduledDiscussion(
+                existing,
+                sessionID: sessionID,
+                meetingTitle: meetingTitle,
+                endedAt: endedAt,
+                seriesID: seriesID,
+                roomIdentity: roomIdentity
+            )
+            return PreparedExistingTask(existing: existing, keys: keys, tokens: tokens, matchesDiscussion: matched)
+        }
+        var existingTrigramsByID: [UUID: Set<String>] = [:]
+
         for candidate in extractedTasks {
             if let llmFollowUp = llmMatches[candidate.id],
-               let existing = otherMeetingTasks.first(where: { $0.id == llmFollowUp.existingTaskID }),
+               let existing = otherByID[llmFollowUp.existingTaskID],
                canAutoMutate(existing) {
                 let status = llmFollowUp.newStatus ?? detectStatusSignal(in: candidate.text + " " + candidate.extended.contextNotes)
                 mergeUpdate(
@@ -568,33 +750,59 @@ public enum CrossMeetingTaskReconciler {
                 continue
             }
 
-            let ranked = otherMeetingTasks.map { existing -> (TaskReconciliationCandidateInput, Double) in
-                var score = matchScore(
-                    candidate: candidate,
-                    existing: existing,
-                    currentSeriesID: seriesID,
-                    currentRoomIdentity: roomIdentity,
-                    myAliases: myAliases
-                )
-                if matchesScheduledDiscussion(
-                    existing,
-                    sessionID: sessionID,
-                    meetingTitle: meetingTitle,
-                    endedAt: endedAt,
-                    seriesID: seriesID,
-                    roomIdentity: roomIdentity
-                ) {
-                    score = max(score, 0.90)
-                }
-                return (existing, score)
-            }.sorted { $0.1 > $1.1 }
+            let candidateKeys = Set(candidate.extended.externalBindings.compactMap(\.externalKey))
+                .union(extractIssueKeys(from: candidate.text + " " + candidate.extended.contextNotes))
+            let candidateTokens = Set(meaningfulTokens(candidate.text))
+            var candidateTrigrams: Set<String>?
 
-            if let best = ranked.first, best.1 >= 0.72 {
-                if canAutoMutate(best.0) {
+            var bestMatch: (task: TaskReconciliationCandidateInput, score: Double)?
+            for item in preparedExisting {
+                let keyMatched = !item.keys.isEmpty && !item.keys.isDisjoint(with: candidateKeys)
+                var score: Double
+                if item.matchesDiscussion {
+                    score = 0.90
+                } else if keyMatched {
+                    score = 1.0
+                } else if candidateTokens.isDisjoint(with: item.tokens) {
+                    continue
+                } else {
+                    if candidateTrigrams == nil {
+                        candidateTrigrams = trigrams(candidate.text)
+                    }
+                    let existingTris = existingTrigramsByID[item.existing.id] ?? {
+                        let t = trigrams(item.existing.text)
+                        existingTrigramsByID[item.existing.id] = t
+                        return t
+                    }()
+                    score = matchScore(
+                        candidate: candidate,
+                        candidateKeys: candidateKeys,
+                        candidateTokens: candidateTokens,
+                        candidateTrigrams: candidateTrigrams,
+                        existing: item.existing,
+                        existingKeys: item.keys,
+                        existingTokens: item.tokens,
+                        existingTrigrams: existingTris,
+                        currentSeriesID: seriesID,
+                        currentRoomIdentity: roomIdentity,
+                        myAliases: myAliases
+                    )
+                }
+                if let currentBest = bestMatch {
+                    if score > currentBest.score {
+                        bestMatch = (item.existing, score)
+                    }
+                } else {
+                    bestMatch = (item.existing, score)
+                }
+            }
+
+            if let best = bestMatch, best.score >= 0.72 {
+                if canAutoMutate(best.task) {
                     let detectedStatus = detectStatusSignal(in: candidate.text + " " + candidate.extended.contextNotes)
                     let addition = candidate.extended.contextNotes.isEmpty ? candidate.text : candidate.extended.contextNotes
                     mergeUpdate(
-                        existing: best.0,
+                        existing: best.task,
                         historicalTaskID: candidate.id,
                         newStatus: detectedStatus ?? (candidate.done ? .done : nil),
                         contextAddition: addition,
@@ -605,7 +813,7 @@ public enum CrossMeetingTaskReconciler {
                     links.append(SyncedTaskLink(
                         sessionID: sessionID,
                         historicalTaskID: candidate.id,
-                        canonicalTaskID: best.0.id,
+                        canonicalTaskID: best.task.id,
                         updatedAt: endedAt
                     ))
                 } else {
@@ -616,16 +824,16 @@ public enum CrossMeetingTaskReconciler {
                         observedAt: endedAt,
                         previousStatus: nil,
                         updatedStatus: candidate.extended.workflowStatus,
-                        note: L("Matches teammate's task (%@): %@", best.0.owner.isEmpty ? L("Unassigned") : best.0.owner, best.0.text),
+                        note: L("Matches teammate's task (%@): %@", best.task.owner.isEmpty ? L("Unassigned") : best.task.owner, best.task.text),
                         source: .meetingExtraction
                     ))
                     reviewCandidates.append(ReconciledExtractedTask(
                         snapshot: flagged,
-                        suggestedMatchTaskID: best.0.id,
-                        suggestedMatchScore: best.1
+                        suggestedMatchTaskID: best.task.id,
+                        suggestedMatchScore: best.score
                     ))
                 }
-            } else if let best = ranked.first, best.1 >= 0.48 {
+            } else if let best = bestMatch, best.score >= 0.48 {
                 var flagged = candidate
                 flagged.extended.appendHistory(TaskMeetingContextEntry(
                     sessionID: sessionID,
@@ -633,13 +841,13 @@ public enum CrossMeetingTaskReconciler {
                     observedAt: endedAt,
                     previousStatus: nil,
                     updatedStatus: candidate.extended.workflowStatus,
-                    note: L("Possible match to existing task (%ld%%): %@", Int((best.1 * 100).rounded()), best.0.text),
+                    note: L("Possible match to existing task (%ld%%): %@", Int((best.score * 100).rounded()), best.task.text),
                     source: .meetingExtraction
                 ))
                 reviewCandidates.append(ReconciledExtractedTask(
                     snapshot: flagged,
-                    suggestedMatchTaskID: best.0.id,
-                    suggestedMatchScore: best.1
+                    suggestedMatchTaskID: best.task.id,
+                    suggestedMatchScore: best.score
                 ))
             } else {
                 newTasks.append(ReconciledExtractedTask(snapshot: candidate))
@@ -648,7 +856,7 @@ public enum CrossMeetingTaskReconciler {
 
         // 2. Apply transcript/discussion follow-ups for existing tasks not matched via extracted task rows.
         for followUp in transcriptFollowUps {
-            guard let existing = otherMeetingTasks.first(where: { $0.id == followUp.existingTaskID }),
+            guard let existing = otherByID[followUp.existingTaskID],
                   canAutoMutate(existing) else { continue }
             mergeUpdate(
                 existing: existing,

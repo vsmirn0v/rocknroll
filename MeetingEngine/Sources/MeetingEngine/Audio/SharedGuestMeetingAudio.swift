@@ -54,6 +54,7 @@ import LiveKitWebRTC
 
     var factory: LKRTCPeerConnectionFactory { owner.factory }
     var profile: GuestAudioProfile { owner.profile }
+    var isMicrophoneMuted: Bool { !attachment.isTalk || attachment.moduleMuted || owner.isMicrophoneMuted }
     var snapshot: [String: Any] {
         let base = owner.snapshot, talk = attachment.isTalk
         return base.merging([

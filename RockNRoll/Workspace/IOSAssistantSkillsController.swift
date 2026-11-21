@@ -51,6 +51,7 @@ final class IOSAssistantSkillsController: ObservableObject {
     private let customRootURL: URL?
     private var folderWatcher: AssistantSkillFolderWatcher?
     private var watchedVaultURL: URL?
+    private var hasLoadedOnce = false
 
     init(
         workspace: IOSWorkspaceCoordinator?,
@@ -89,11 +90,11 @@ final class IOSAssistantSkillsController: ObservableObject {
         return base.appendingPathComponent("Rock Assistant", isDirectory: true)
     }
 
-    func withRepository<T>(_ operation: (AssistantSkillRepository, URL?) throws -> T) rethrows -> T {
+    private func resolveRepositoryContext() -> (repo: AssistantSkillRepository, vaultURL: URL?, stopAccess: Bool) {
         if let customRootURL {
             let repo = AssistantSkillRepository(rootURL: customRootURL)
             try? repo.ensureDefaultsInstalled()
-            return try operation(repo, nil)
+            return (repo, nil, false)
         }
         if let bookmark = preferences.data(forKey: Keys.vaultBookmark) {
             var stale = false
@@ -104,7 +105,6 @@ final class IOSAssistantSkillsController: ObservableObject {
                 bookmarkDataIsStale: &stale
             ) {
                 let accessed = vaultURL.startAccessingSecurityScopedResource()
-                defer { if accessed { vaultURL.stopAccessingSecurityScopedResource() } }
                 if stale, let refreshed = try? vaultURL.bookmarkData(
                     options: .minimalBookmark,
                     includingResourceValuesForKeys: nil,
@@ -115,12 +115,22 @@ final class IOSAssistantSkillsController: ObservableObject {
                 let root = vaultURL.appendingPathComponent("Rock Assistant", isDirectory: true)
                 let repo = AssistantSkillRepository(rootURL: root)
                 try? repo.ensureDefaultsInstalled()
-                return try operation(repo, vaultURL)
+                return (repo, vaultURL, accessed)
             }
         }
         let repo = AssistantSkillRepository(rootURL: Self.defaultLocalRootURL())
         try? repo.ensureDefaultsInstalled()
-        return try operation(repo, nil)
+        return (repo, nil, false)
+    }
+
+    func withRepository<T>(_ operation: (AssistantSkillRepository, URL?) throws -> T) rethrows -> T {
+        let context = resolveRepositoryContext()
+        defer {
+            if context.stopAccess {
+                context.vaultURL?.stopAccessingSecurityScopedResource()
+            }
+        }
+        return try operation(context.repo, context.vaultURL)
     }
 
     func setObsidianFolder(url: URL) throws {
@@ -152,6 +162,7 @@ final class IOSAssistantSkillsController: ObservableObject {
             self.teamContext = repo.loadTeamContext()
             self.isObsidianBacked = vaultURL != nil
             self.folderPath = repo.rootURL.path
+            self.hasLoadedOnce = true
         }
     }
 
@@ -305,12 +316,38 @@ final class IOSAssistantSkillsController: ObservableObject {
         }
     }
 
+    func searchKnowledgeAsync(query: String, limit: Int = 8) async -> [AssistantKnowledgeSearchHit] {
+        let context = resolveRepositoryContext()
+        defer {
+            if context.stopAccess {
+                context.vaultURL?.stopAccessingSecurityScopedResource()
+            }
+        }
+        let repo = context.repo
+        let vaultURL = context.vaultURL
+        return await Task.detached(priority: .userInitiated) {
+            repo.searchKnowledge(query: query, extraVaultRoot: vaultURL, limit: limit)
+        }.value
+    }
+
     func renderPromptContext(
         explicitSkillIDs: [String] = [],
         meetingTitle: String = "",
         commandText: String = ""
     ) -> (instructions: String, selectedSkills: [AssistantSkill], people: AssistantPeopleDirectory, teamContext: AssistantTeamContextDocument, basePersona: String) {
         let preferred = explicitSkillIDs.isEmpty ? selectedSkillIDs : explicitSkillIDs
+        if hasLoadedOnce {
+            let basePersona = prompts.first(where: { $0.kind == .basePersona })?.content ?? ""
+            return AssistantSkillRepository.renderPromptContext(
+                skills: skills,
+                people: people,
+                teamContext: teamContext,
+                basePersona: basePersona,
+                explicitSkillIDs: preferred,
+                meetingTitle: meetingTitle,
+                commandText: commandText
+            )
+        }
         return withRepository { repo, _ in
             repo.renderPromptContext(
                 explicitSkillIDs: preferred,

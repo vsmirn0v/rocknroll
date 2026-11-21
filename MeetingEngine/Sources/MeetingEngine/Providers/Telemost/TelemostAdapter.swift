@@ -129,6 +129,8 @@ extension TelemostTransport: TelemostSignalingTransport {}
     private var lastSlotConfiguration: Data?
     private var slotUpdateTask: Task<Void, Never>?
     private var slotUpdateDirty = false
+    private var lastPublishedSnapshot: NativeDesktopExternalSnapshot?
+    private var lastPublishedSessionSnapshot: MeetingSessionSnapshot?
 
     var beforeAudioShutdownForTesting: (() -> Void)?
     #if DEBUG
@@ -160,7 +162,7 @@ extension TelemostTransport: TelemostSignalingTransport {}
             phase: snapshot.phase,
             connectionIdentity: connectionIdentity,
             intent: MeetingMediaIntent(microphoneOn: microphoneIntent, cameraOn: cameraIntent, playoutOn: outputIntent, sharing: screenTrack != nil, playoutVolume: meetingVolume),
-            effective: MeetingEffectiveMedia(microphoneOn: snapshot.microphoneOn, cameraOn: snapshot.cameraOn, playoutOn: snapshot.playoutOn, sharing: snapshot.sharing, microphoneLevel: snapshot.microphoneLevel, physicallyMuted: audio?.snapshot["microphoneMuted"] as? Bool != false),
+            effective: MeetingEffectiveMedia(microphoneOn: snapshot.microphoneOn, cameraOn: snapshot.cameraOn, playoutOn: snapshot.playoutOn, sharing: snapshot.sharing, microphoneLevel: snapshot.microphoneLevel, physicallyMuted: audio?.isMicrophoneMuted != false),
             permissions: MeetingMediaPermission(canShareMicrophone: inputPermitted, canShareCamera: true, canShareScreen: true, microphoneRestriction: nil),
             capabilities: capabilities,
             participants: snapshot.participants,
@@ -214,6 +216,8 @@ extension TelemostTransport: TelemostSignalingTransport {}
         lastCameraFailure = nil
         accessoryCapturePrepared = false
         audioProfile = .saved
+        lastPublishedSnapshot = nil
+        lastPublishedSessionSnapshot = nil
         snapshot = .init(phase: .connecting, playoutOn: !quiet)
         publish()
         probeLog("external-connect", ["provider": kind.rawValue, "quiet": quiet, "inputPermitted": inputPermitted])
@@ -885,9 +889,16 @@ extension TelemostTransport: TelemostSignalingTransport {}
         guard meter == nil else { return }
         meter = Task { [weak self] in
             while let self, !Task.isCancelled {
-                let level = await publisher?.microphoneLevel()
-                if !Task.isCancelled { snapshot.microphoneLevel = level; publish() }
-                do { try await Task.sleep(for: .milliseconds(200)) } catch { break }
+                if self.microphoneIntent || self.snapshot.microphoneLevel != nil {
+                    let level = await self.publisher?.microphoneLevel()
+                    if !Task.isCancelled, self.snapshot.microphoneLevel != level {
+                        self.snapshot.microphoneLevel = level
+                        self.publish()
+                    }
+                    do { try await Task.sleep(for: .milliseconds(200)) } catch { break }
+                } else {
+                    do { try await Task.sleep(for: .milliseconds(500)) } catch { break }
+                }
             }
         }
     }
@@ -912,20 +923,30 @@ extension TelemostTransport: TelemostSignalingTransport {}
 
     private func refresh() {
         var people: [NativeDesktopParticipant] = [], video: [NativeDesktopExternalVideo] = []
+        var slotsByParticipant: [String: [(source: NativeDesktopVideoSource, track: LKRTCVideoTrack)]] = [:]
+        for slot in slots {
+            for (key, source) in [("participantVideoByMid", NativeDesktopVideoSource.camera), ("participantScreenSharingByMid", .screen)] {
+                guard let owner = slot[key] as? [String: Any],
+                      let pid = owner["participantId"] as? String,
+                      let mid = owner["mid"] as? String,
+                      let track = tracks[mid] else { continue }
+                slotsByParticipant[pid, default: []].append((source, track))
+            }
+        }
+        var seenVideoIDs: Set<String> = []
         for value in descriptions.values where value["hideFromParticipantsList"] as? Bool != true {
             guard let id = value["id"] as? String, id != localID else { continue }
             let meta = value["meta"] as? [String: Any] ?? [:]
             let mic = meta["sendAudio"] as? Bool ?? value["sendAudio"] as? Bool
             let camera = meta["sendVideo"] as? Bool ?? value["sendVideo"] as? Bool
             var sharing = meta["sendSharing"] as? Bool ?? value["sendSharing"] as? Bool
-            for slot in slots {
-                for (key, source) in [("participantVideoByMid", NativeDesktopVideoSource.camera), ("participantScreenSharingByMid", .screen)] {
-                    guard let owner = slot[key] as? [String: Any], owner["participantId"] as? String == id,
-                          let mid = owner["mid"] as? String, let track = tracks[mid], source != .camera || camera != false else { continue }
-                    let key = id + "." + source.rawValue
-                    if !video.contains(where: { $0.id == key }) { video.append(.init(id: key, participantID: id, source: source, track: track)) }
-                    if source == .screen { sharing = true }
+            for entry in slotsByParticipant[id] ?? [] {
+                guard entry.source != .camera || camera != false else { continue }
+                let videoKey = id + "." + entry.source.rawValue
+                if seenVideoIDs.insert(videoKey).inserted {
+                    video.append(.init(id: videoKey, participantID: id, source: entry.source, track: entry.track))
                 }
+                if entry.source == .screen { sharing = true }
             }
             people.append(.init(id: id, name: String((meta["name"] as? String ?? L("Participant")).prefix(256)),
                 microphoneOn: mic, cameraOn: camera, sharing: sharing, speaking: speaking.contains(id) ? true : nil))
@@ -934,17 +955,33 @@ extension TelemostTransport: TelemostSignalingTransport {}
         people.insert(.init(id: localID.isEmpty ? "local" : localID, name: name, isLocal: true,
             microphoneOn: snapshot.microphoneOn, cameraOn: snapshot.cameraOn, sharing: snapshot.sharing,
             speaking: snapshot.microphoneOn && speaking.contains(localID) ? true : nil), at: 0)
+        var trackOwnersByID: [ObjectIdentifier: [String]] = [:]
+        for item in video {
+            trackOwnersByID[ObjectIdentifier(item.track), default: []].append(item.participantID)
+        }
         for track in tracks.values {
-            let owners = video.filter { $0.track.isEqual(track) }.map(\.participantID)
+            let owners = trackOwnersByID[ObjectIdentifier(track)] ?? []
             track.isEnabled = visibleParticipantIDs.map { allowed in owners.contains(where: allowed.contains) } ?? true
         }
-        snapshot.participants = people; incomingVideo = video.sorted { $0.id < $1.id }
-        onVideo?(incomingVideo); publish()
+        snapshot.participants = people
+        let sortedVideo = video.sorted { $0.id < $1.id }
+        if !NativeDesktopExternalVideo.listEquals(incomingVideo, sortedVideo) {
+            incomingVideo = sortedVideo
+            onVideo?(sortedVideo)
+        }
+        publish()
     }
 
     private func publish() {
-        onState?(snapshot)
-        onSessionSnapshot?(sessionSnapshot)
+        if lastPublishedSnapshot != snapshot {
+            lastPublishedSnapshot = snapshot
+            onState?(snapshot)
+        }
+        let nextSession = sessionSnapshot
+        if lastPublishedSessionSnapshot != nextSession {
+            lastPublishedSessionSnapshot = nextSession
+            onSessionSnapshot?(nextSession)
+        }
     }
 
     func recover(_ error: Error) {

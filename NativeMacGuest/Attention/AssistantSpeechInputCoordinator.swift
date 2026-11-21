@@ -17,7 +17,11 @@ import Speech
         case dictating
     }
 
-    @Published private(set) var mode: Mode = .idle
+    @Published private(set) var mode: Mode = .idle {
+        didSet {
+            processor.setCapturesRawChunks(mode == .dictating || mode == .pushToTalk)
+        }
+    }
     @Published private(set) var wakeArmed = false
     @Published private(set) var livePartialText = ""
     @Published private(set) var lastHeardCommand: String?
@@ -542,6 +546,11 @@ private final class AudioProcessor: @unchecked Sendable {
 
     var onCompletedSegment: (([Float]) -> Void)?
     var onSamplesChunk: (([Float]) -> Void)?
+    private var capturesRawChunks = false
+
+    func setCapturesRawChunks(_ enabled: Bool) {
+        lock.withLock { capturesRawChunks = enabled }
+    }
 
     var hasRecentSharedAudio: Bool {
         lock.withLock {
@@ -581,7 +590,9 @@ private final class AudioProcessor: @unchecked Sendable {
             let samples = convert(copy)
             guard !samples.isEmpty else { return }
             recordPreRoll(samples)
-            onSamplesChunk?(samples)
+            if lock.withLock({ capturesRawChunks }) {
+                onSamplesChunk?(samples)
+            }
             let segments = appendToVAD(samples)
             for segment in segments {
                 onCompletedSegment?(segment)

@@ -110,13 +110,44 @@ public final class AnyCloudZoneTransport<Record: SyncZoneRecord> {
     }
 }
 
+private final class CloudCodecPool: @unchecked Sendable {
+    static let shared = CloudCodecPool()
+    private let lock = NSLock()
+    private var encoders: [JSONEncoder] = []
+    private var decoders: [JSONDecoder] = []
+
+    func withEncoder<T>(_ body: (JSONEncoder) throws -> T) rethrows -> T {
+        lock.lock()
+        let encoder = encoders.popLast() ?? JSONEncoder()
+        lock.unlock()
+        defer {
+            lock.lock()
+            if encoders.count < 8 { encoders.append(encoder) }
+            lock.unlock()
+        }
+        return try body(encoder)
+    }
+
+    func withDecoder<T>(_ body: (JSONDecoder) throws -> T) rethrows -> T {
+        lock.lock()
+        let decoder = decoders.popLast() ?? JSONDecoder()
+        lock.unlock()
+        defer {
+            lock.lock()
+            if decoders.count < 8 { decoders.append(decoder) }
+            lock.unlock()
+        }
+        return try body(decoder)
+    }
+}
+
 public enum CloudPayloadCodec {
     private static let lzfseMagic = Data("RNRLZF1".utf8)
     public static let maxRecordBytes = 512 * 1024
     private static let maxUncompressedBytes = 16 * 1024 * 1024
 
     public static func encode<T: Encodable>(_ value: T) throws -> Data {
-        let raw = try JSONEncoder.syncCodec.encode(value)
+        let raw = try CloudCodecPool.shared.withEncoder { try $0.encode(value) }
         let compressed = compressLZFSE(raw)
         let candidate = (compressed != nil && compressed!.count < raw.count) ? compressed! : raw
         guard candidate.count <= maxRecordBytes else {
@@ -135,7 +166,7 @@ public enum CloudPayloadCodec {
         } else {
             jsonData = data
         }
-        return try JSONDecoder.syncCodec.decode(T.self, from: jsonData)
+        return try CloudCodecPool.shared.withDecoder { try $0.decode(T.self, from: jsonData) }
     }
 
     private static func compressLZFSE(_ raw: Data) -> Data? {
@@ -431,15 +462,15 @@ public final class CloudEnvelopeTransport<Record: SyncZoneRecord>: CloudZoneTran
 
         var saved: [Record] = []
         for batch in encodedBatches {
-            let batchSaved = try await saveBatch(batch.map(\.record), session: session, attempt: 0)
+            let batchSaved = try await saveBatch(batch, session: session, attempt: 0)
             saved.append(contentsOf: batchSaved)
         }
         return saved
     }
 
-    private func saveBatch(_ items: [Record], session: CloudZoneSession, attempt: Int) async throws -> [Record] {
+    private func saveBatch(_ items: [(record: Record, payload: Data)], session: CloudZoneSession, attempt: Int) async throws -> [Record] {
         guard !items.isEmpty else { return [] }
-        let ids = items.map { recordID(for: $0.syncRecordID) }
+        let ids = items.map { recordID(for: $0.record.syncRecordID) }
         let existing: [CKRecord.ID: Result<CKRecord, Error>]
         do {
             existing = try await database.records(for: ids)
@@ -453,11 +484,11 @@ public final class CloudEnvelopeTransport<Record: SyncZoneRecord>: CloudZoneTran
         }
 
         var ckRecords: [CKRecord] = []
-        var itemsByCKID: [CKRecord.ID: Record] = [:]
+        var itemsByCKID: [CKRecord.ID: (record: Record, payload: Data)] = [:]
         var mergedByCKID: [CKRecord.ID: Record] = [:]
 
         for item in items {
-            let id = recordID(for: item.syncRecordID)
+            let id = recordID(for: item.record.syncRecordID)
             let ckRecord: CKRecord
             switch existing[id] {
             case .success(let serverRecord):
@@ -471,8 +502,13 @@ public final class CloudEnvelopeTransport<Record: SyncZoneRecord>: CloudZoneTran
             case .none:
                 throw CloudZoneError.incompatibleData
             }
-            let merged = try decode(ckRecord, generation: session.generation).map { item.merging($0) } ?? item
-            let data = try CloudPayloadCodec.encode(Envelope(generation: session.generation, record: merged))
+            let merged = try decode(ckRecord, generation: session.generation).map { item.record.merging($0) } ?? item.record
+            let data: Data
+            if merged == item.record {
+                data = item.payload
+            } else {
+                data = try CloudPayloadCodec.encode(Envelope(generation: session.generation, record: merged))
+            }
             ckRecord.encryptedValues["payload"] = data as CKRecordValue
             ckRecords.append(ckRecord)
             itemsByCKID[id] = item
@@ -487,7 +523,7 @@ public final class CloudEnvelopeTransport<Record: SyncZoneRecord>: CloudZoneTran
                 atomically: false
             )
             var saved: [Record] = []
-            var conflicted: [Record] = []
+            var conflicted: [(record: Record, payload: Data)] = []
             for (ckID, result) in response.saveResults {
                 switch result {
                 case .success:

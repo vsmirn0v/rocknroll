@@ -1,6 +1,38 @@
+import AVFoundation
 import ConferenceCore
 import Foundation
 import SwiftUI
+
+/// Routes events and tool execution from a long-lived warm `RealtimeVoiceRouter` into the active voice turn.
+final class RealtimeTurnSinkBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var eventHandler: (@Sendable (RealtimeVoiceEvent) async -> Void)?
+    private var toolHandler: (@Sendable (String, String) async -> String)?
+
+    func setHandlers(
+        onEvent: (@Sendable (RealtimeVoiceEvent) async -> Void)?,
+        executeTool: (@Sendable (String, String) async -> String)?
+    ) {
+        lock.lock()
+        eventHandler = onEvent
+        toolHandler = executeTool
+        lock.unlock()
+    }
+
+    func forwardEvent(_ event: RealtimeVoiceEvent) async {
+        lock.lock()
+        let handler = eventHandler
+        lock.unlock()
+        await handler?(event)
+    }
+
+    func executeTool(name: String, argsJSON: String) async -> String {
+        lock.lock()
+        let handler = toolHandler
+        lock.unlock()
+        return await handler?(name, argsJSON) ?? "{}"
+    }
+}
 
 /// Agent-runtime integration for the talk controller. Active only when
 /// `AttentionStore.agentAssistantEnabled` is on; otherwise the existing
@@ -24,6 +56,26 @@ extension AssistantTalkController {
         catch { agentAppend(error.localizedDescription) }
     }
 
+    private func stopWarmRealtimeRouter() async {
+        warmRealtimeIdleTask?.cancel()
+        warmRealtimeIdleTask = nil
+        warmRealtimeConfigKey = nil
+        warmRealtimeInstructions = nil
+        if let router = warmRealtimeRouter {
+            warmRealtimeRouter = nil
+            await router.stop()
+        }
+    }
+
+    private func scheduleWarmRealtimeIdleDisconnect() {
+        warmRealtimeIdleTask?.cancel()
+        warmRealtimeIdleTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(90))
+            guard !Task.isCancelled, let self else { return }
+            await self.stopWarmRealtimeRouter()
+        }
+    }
+
     /// Runs a low-latency single-turn Realtime WebSocket query for spoken voice interactions
     /// when a Realtime provider key is configured, falling back to `agentRuntime.submit` on failure.
     private func runVoiceRealtimeTurnIfConfigured(_ input: String, environment: AssistantAgentEnvironment) async -> Bool {
@@ -35,20 +87,12 @@ extension AssistantTalkController {
             return false
         }
 
-        @MainActor
-        final class Collector {
-            var chunks: [Data] = []
-            var transcript = ""
-            var finished = false
-            var failed = false
-        }
-
-        let collector = Collector()
         let basePersona = environment.context["obsidian_base_persona"] ?? ""
         let skills = environment.context["obsidian_skills"] ?? ""
         let instructions = [basePersona, skills, "Answer concisely by voice in the user's language."]
             .filter { !$0.isEmpty }
             .joined(separator: "\n\n")
+        let exportedTools = AssistantSkillToolRegistrar.exportRealtimeTools(from: environment.registry)
         let config = RealtimeSessionConfig(
             provider: kind,
             apiKey: apiKey,
@@ -56,70 +100,182 @@ extension AssistantTalkController {
             voice: attention.store.realtimeVoice,
             endpointOverride: attention.store.realtimeEndpoint,
             systemInstructions: instructions,
-            tools: AssistantSkillToolRegistrar.exportRealtimeTools(from: environment.registry)
+            tools: exportedTools
         )
-        let router = RealtimeVoiceRouter()
-        await router.start(
-            config: config,
+        let configKey = [
+            kind.rawValue,
+            apiKey,
+            config.model,
+            config.voice,
+            config.endpointOverride,
+            exportedTools.map(\.name).joined(separator: ",")
+        ].joined(separator: "|")
+
+        @MainActor
+        final class Collector {
+            let auditionID = UUID()
+            var pendingPCM = Data()
+            var streamingToken: UUID?
+            var didPlayAnyAudio = false
+            var transcript = ""
+            var finished = false
+            var failed = false
+            var continuation: CheckedContinuation<Void, Never>?
+
+            func complete(failed: Bool) {
+                if failed { self.failed = true } else { self.finished = true }
+                let cont = continuation
+                continuation = nil
+                cont?.resume()
+            }
+        }
+
+        let collector = Collector()
+        let streamPreBufferBytes = 7_200 // 150ms @ 24 kHz mono Int16
+
+        let sinkBox = realtimeTurnSink
+        sinkBox.setHandlers(
+            onEvent: { [weak self, weak collector] event in
+                await MainActor.run { [weak self, weak collector] in
+                    guard let collector else { return }
+                    switch event {
+                    case .audioPCM16(let pcm, let sampleRate):
+                        collector.pendingPCM.append(pcm)
+                        if collector.streamingToken == nil, collector.pendingPCM.count >= streamPreBufferBytes {
+                            if let self, let token = try? self.beginStreamingAudition(id: collector.auditionID, sampleRate: Double(sampleRate)) {
+                                collector.streamingToken = token
+                                collector.didPlayAnyAudio = true
+                            }
+                        }
+                        if let token = collector.streamingToken, !collector.pendingPCM.isEmpty {
+                            let alignedBytes = (collector.pendingPCM.count / 2) * 2
+                            if alignedBytes > 0 {
+                                let slice = collector.pendingPCM.prefix(alignedBytes)
+                                collector.pendingPCM.removeFirst(alignedBytes)
+                                if let buffer = RealtimeVoiceAudio.pcm16ToAudioBuffer(data: Data(slice), sampleRate: Double(sampleRate)) {
+                                    VoicePreviewPlayer.shared.enqueueStreamBuffer(buffer, sessionToken: token)
+                                }
+                            }
+                        }
+                    case .assistantTranscriptDelta(let delta):
+                        collector.transcript += delta
+                    case .assistantTranscriptDone(let full):
+                        collector.transcript = full
+                    case .audioDone:
+                        if let token = collector.streamingToken {
+                            if collector.pendingPCM.count >= 2,
+                               let tailBuffer = RealtimeVoiceAudio.pcm16ToAudioBuffer(data: collector.pendingPCM, sampleRate: 24_000) {
+                                collector.pendingPCM.removeAll()
+                                VoicePreviewPlayer.shared.enqueueStreamBuffer(tailBuffer, sessionToken: token)
+                            }
+                            VoicePreviewPlayer.shared.finishStreaming(sessionToken: token)
+                        }
+                        collector.complete(failed: false)
+                    case .error, .disconnected:
+                        collector.complete(failed: true)
+                    default:
+                        break
+                    }
+                }
+            },
             executeTool: { name, argsJSON in
                 await AssistantSkillToolRegistrar.executeToolCallJSON(
                     registry: environment.registry,
                     name: name,
                     argumentsJSON: argsJSON
                 )
-            },
-            onEvent: { event in
-                await MainActor.run {
-                    switch event {
-                    case .audioPCM16(let pcm, _):
-                        collector.chunks.append(pcm)
-                    case .assistantTranscriptDelta(let delta):
-                        collector.transcript += delta
-                    case .assistantTranscriptDone(let full):
-                        collector.transcript = full
-                    case .audioDone:
-                        collector.finished = true
-                    case .error, .disconnected:
-                        collector.failed = true
-                    default:
-                        break
-                    }
-                }
             }
         )
-        guard await router.isRealtimeConnected else {
-            await router.stop()
-            return false
+
+        warmRealtimeIdleTask?.cancel()
+        warmRealtimeIdleTask = nil
+
+        let router: RealtimeVoiceRouter
+        if let existing = warmRealtimeRouter,
+           warmRealtimeConfigKey == configKey,
+           await existing.isRealtimeConnected {
+            router = existing
+            if warmRealtimeInstructions != instructions {
+                warmRealtimeInstructions = instructions
+                await router.updateInstructions(instructions)
+            }
+        } else {
+            await stopWarmRealtimeRouter()
+            let fresh = RealtimeVoiceRouter()
+            await fresh.start(
+                config: config,
+                executeTool: { name, argsJSON in
+                    await sinkBox.executeTool(name: name, argsJSON: argsJSON)
+                },
+                onEvent: { event in
+                    await sinkBox.forwardEvent(event)
+                }
+            )
+            guard await fresh.isRealtimeConnected else {
+                sinkBox.setHandlers(onEvent: nil, executeTool: nil)
+                await fresh.stop()
+                return false
+            }
+            warmRealtimeRouter = fresh
+            warmRealtimeConfigKey = configKey
+            warmRealtimeInstructions = instructions
+            router = fresh
         }
+
         guard await router.sendText(input) else {
-            await router.stop()
+            sinkBox.setHandlers(onEvent: nil, executeTool: nil)
+            await stopWarmRealtimeRouter()
             return false
         }
 
-        // Wait bounded up to 20s for completion.
-        for _ in 0..<200 {
-            if collector.finished || collector.failed || Task.isCancelled { break }
-            try? await Task.sleep(for: .milliseconds(100))
+        let timeoutTask = Task { @MainActor [weak collector] in
+            try? await Task.sleep(for: .seconds(20))
+            collector?.complete(failed: false)
         }
-        await router.stop()
+        if !collector.finished && !collector.failed && !Task.isCancelled {
+            await withTaskCancellationHandler {
+                await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                    if collector.finished || collector.failed || Task.isCancelled {
+                        continuation.resume()
+                    } else {
+                        collector.continuation = continuation
+                    }
+                }
+            } onCancel: {
+                Task { @MainActor [weak collector] in
+                    collector?.complete(failed: true)
+                }
+            }
+        }
+        timeoutTask.cancel()
+        await router.waitForPendingToolCalls(timeoutSeconds: 3.0)
+        sinkBox.setHandlers(onEvent: nil, executeTool: nil)
+        if collector.failed || Task.isCancelled {
+            await stopWarmRealtimeRouter()
+        } else {
+            scheduleWarmRealtimeIdleDisconnect()
+        }
 
         let text = collector.transcript.trimmed
-        let audioData = collector.chunks.reduce(into: Data()) { $0.append($1) }
-        guard !collector.failed, (!text.isEmpty || !audioData.isEmpty) else {
+        guard !collector.failed, (!text.isEmpty || !collector.pendingPCM.isEmpty || collector.didPlayAnyAudio) else {
+            if collector.streamingToken != nil { stopAudition() }
             return false
         }
 
         let displayAnswer = text.isEmpty ? L("Spoken response played.") : text
         let messageID = agentRuntime.appendDeterministicTurnForUI(userText: input, assistantText: displayAnswer)
         lastVoiceAnswer = displayAnswer
-        if let buffer = AutonomousMeetingFacilitator.pcm16ToAudioBuffer(data: audioData, sampleRate: 24_000) {
-            do {
-                try playAuditionBuffer(buffer, id: messageID)
-            } catch {
+        if !collector.didPlayAnyAudio {
+            if !collector.pendingPCM.isEmpty,
+               let buffer = AutonomousMeetingFacilitator.pcm16ToAudioBuffer(data: collector.pendingPCM, sampleRate: 24_000) {
+                do {
+                    try playAuditionBuffer(buffer, id: messageID)
+                } catch {
+                    autoAuditionIfNeeded(id: messageID, text: displayAnswer, source: activeInputSource)
+                }
+            } else {
                 autoAuditionIfNeeded(id: messageID, text: displayAnswer, source: activeInputSource)
             }
-        } else {
-            autoAuditionIfNeeded(id: messageID, text: displayAnswer, source: activeInputSource)
         }
         return true
     }

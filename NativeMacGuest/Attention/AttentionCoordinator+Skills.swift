@@ -2,10 +2,7 @@ import ConferenceCore
 import Foundation
 
 extension AttentionCoordinator {
-    /// Resolves `<ObsidianVault>/Rock Assistant` when an Obsidian destination bookmark is configured,
-    /// falling back to `store.localAssistantSkillsRootURL()` otherwise. Security-scoped access is held
-    /// only for the duration of `operation`.
-    func withSkillRepository<T>(_ operation: (AssistantSkillRepository, URL?) throws -> T) async rethrows -> T {
+    private func resolveSkillRepositoryContext() async -> (repo: AssistantSkillRepository, securityScopedVaultURL: URL?) {
         if let destination = try? await store.meetingLibrary.store.destination(),
            let bookmark = destination.vaultBookmark {
             let resolved = ObsidianVaultAccess.resolveWithRefresh(bookmark)
@@ -15,14 +12,28 @@ extension AttentionCoordinator {
                 try? await store.meetingLibrary.store.saveDestination(updated)
             }
             if case .granted(let vaultURL) = resolved.resolution {
-                defer { vaultURL.stopAccessingSecurityScopedResource() }
                 let repo = AssistantSkillRepository(rootURL: vaultURL.appendingPathComponent("Rock Assistant", isDirectory: true))
                 try? repo.ensureDefaultsInstalled()
-                return try operation(repo, vaultURL)
+                return (repo, vaultURL)
             }
         }
-        let repo = store.localSkillRepository()
-        return try operation(repo, nil)
+        return (store.localSkillRepository(), nil)
+    }
+
+    /// Resolves `<ObsidianVault>/Rock Assistant` when an Obsidian destination bookmark is configured,
+    /// falling back to `store.localAssistantSkillsRootURL()` otherwise. Security-scoped access is held
+    /// only for the duration of `operation`.
+    func withSkillRepository<T>(_ operation: (AssistantSkillRepository, URL?) throws -> T) async rethrows -> T {
+        let context = await resolveSkillRepositoryContext()
+        defer { context.securityScopedVaultURL?.stopAccessingSecurityScopedResource() }
+        return try operation(context.repo, context.securityScopedVaultURL)
+    }
+
+    /// Async counterpart to `withSkillRepository` holding security-scoped access across `operation`.
+    func withSkillRepositoryAsync<T>(_ operation: (AssistantSkillRepository, URL?) async throws -> T) async rethrows -> T {
+        let context = await resolveSkillRepositoryContext()
+        defer { context.securityScopedVaultURL?.stopAccessingSecurityScopedResource() }
+        return try await operation(context.repo, context.securityScopedVaultURL)
     }
 
     func skillStorageSummary() async -> (isObsidianBacked: Bool, folderPath: String) {
@@ -143,7 +154,12 @@ extension AttentionCoordinator {
     }
 
     func refreshCachedPrompts() async {
-        _ = await listAssistantPrompts()
+        let docs = await withSkillRepository { repo, _ in
+            repo.listPrompts()
+        }
+        for doc in docs {
+            cachedPromptTexts[doc.kind] = doc.content
+        }
     }
 
     func startSkillFolderWatcher() async {
@@ -193,8 +209,10 @@ extension AttentionCoordinator {
     }
 
     func searchAssistantKnowledge(query: String, limit: Int = 8) async -> [AssistantKnowledgeSearchHit] {
-        await withSkillRepository { repo, vaultURL in
-            repo.searchKnowledge(query: query, extraVaultRoot: vaultURL, limit: limit)
+        await withSkillRepositoryAsync { repo, vaultURL in
+            await Task.detached(priority: .userInitiated) {
+                repo.searchKnowledge(query: query, extraVaultRoot: vaultURL, limit: limit)
+            }.value
         }
     }
 

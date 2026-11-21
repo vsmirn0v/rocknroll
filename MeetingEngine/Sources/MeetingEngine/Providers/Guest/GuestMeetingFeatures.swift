@@ -196,6 +196,7 @@ struct GuestMeetingFeatures {
         guard !stopped, let event = envelope["event"] as? String else { return nil }
         let payload = envelope["payload"] as? [String: Any] ?? [:]
         var captured: (message: GuestMeetingMessage, transcript: Bool)?
+        var rosterDirty = true
         if event == "joined" {
             guard let participant = payload["participant"] as? [String: Any],
                   let id = Self.identifier(participant["participantId"]),
@@ -241,11 +242,13 @@ struct GuestMeetingFeatures {
             case "settings-updated":
                 if let title = payload["title"] as? String { snapshot.title = String(title.prefix(512)) }
             case "chat-message":
+                rosterDirty = false
                 if snapshot.permissions.canViewChat, let message = decodeMessage(payload["message"], fallbackID: envelope["requestId"], receivedAt: Date()) {
                     captured = (archiveMessage(message, raw: payload["message"]), false)
                     upsert(message, transcript: false)
                 }
             case "reaction":
+                rosterDirty = false
                 if let id = Self.identifier(payload["participantId"]), let value = payload["reaction"] as? String,
                    let reaction = GuestMeetingReaction.received(value) {
                     snapshot.reactions.append(.init(id: UUID(), participantID: id, participantName: members[id]?.name ?? "Participant",
@@ -253,6 +256,7 @@ struct GuestMeetingFeatures {
                     snapshot.reactions = Array(snapshot.reactions.suffix(100))
                 }
             case "transcription-message":
+                rosterDirty = false
                 if snapshot.permissions.canViewTranscript, let message = decodeMessage(payload["message"], receivedAt: Date()) {
                     if !loggedTranscriptShape, let fields = payload["message"] as? [String: Any] {
                         // Field names only, never content: which timestamp the provider sends.
@@ -262,13 +266,22 @@ struct GuestMeetingFeatures {
                     captured = (archiveMessage(message, raw: payload["message"]), true)
                     upsert(message, transcript: true)
                 }
-            case "transcription-started": snapshot.transcriptionStatus = .active
-            case "transcription-stopped": snapshot.transcriptionStatus = .stopped
-            case "transcription-error": snapshot.transcriptionStatus = .failed
-            default: break
+            case "transcription-started":
+                rosterDirty = false
+                snapshot.transcriptionStatus = .active
+            case "transcription-stopped":
+                rosterDirty = false
+                snapshot.transcriptionStatus = .stopped
+            case "transcription-error":
+                rosterDirty = false
+                snapshot.transcriptionStatus = .failed
+            default:
+                rosterDirty = false
             }
         }
-        rebuildRoster()
+        if rosterDirty {
+            rebuildRoster()
+        }
         return captured
     }
 
@@ -423,19 +436,47 @@ struct GuestMeetingFeatures {
         if let index = values.firstIndex(where: { $0.id == message.id }) {
             var updated = message; updated.receivedAt = values[index].receivedAt ?? message.receivedAt
             values[index] = updated
+            if values[index].sentAt != message.sentAt {
+                values.sort {
+                    if $0.sentAt != $1.sentAt { return ($0.sentAt ?? .distantPast) < ($1.sentAt ?? .distantPast) }
+                    return $0.id < $1.id
+                }
+            }
+        } else {
+            let needsSort: Bool
+            if let last = values.last {
+                let lastDate = last.sentAt ?? .distantPast
+                let newDate = message.sentAt ?? .distantPast
+                needsSort = (newDate < lastDate) || (newDate == lastDate && message.id < last.id)
+            } else {
+                needsSort = false
+            }
+            values.append(message)
+            if needsSort {
+                values.sort {
+                    if $0.sentAt != $1.sentAt { return ($0.sentAt ?? .distantPast) < ($1.sentAt ?? .distantPast) }
+                    return $0.id < $1.id
+                }
+            }
         }
-        else { values.append(message) }
-        values.sort {
-            if $0.sentAt != $1.sentAt { return ($0.sentAt ?? .distantPast) < ($1.sentAt ?? .distantPast) }
-            return $0.id < $1.id
+        let maxCount = transcript ? 1_000 : 200
+        if values.count > maxCount {
+            values = Array(values.suffix(maxCount))
         }
-        values = Array(values.suffix(transcript ? 1_000 : 200))
         if transcript { snapshot.transcript = values } else { snapshot.messages = values }
     }
     private static func identifier(_ value: Any?) -> String? {
         guard let value = value as? String, !value.isEmpty, value.utf8.count <= 1_024 else { return nil }
         return value
     }
+    private static let isoLock = NSLock()
+    private static let isoFractionalParser: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+    private static let isoStandardParser = ISO8601DateFormatter()
+
     private static func date(_ value: Any?) -> Date? {
         if let number = value as? NSNumber {
             // Milliseconds or seconds since 1970; anything before 2020 is not a wall-clock time.
@@ -445,8 +486,9 @@ struct GuestMeetingFeatures {
             return date > Date(timeIntervalSince1970: 1_577_836_800) ? date : nil
         }
         if let value = value as? String {
-            let parser = ISO8601DateFormatter(); parser.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-            return parser.date(from: value) ?? ISO8601DateFormatter().date(from: value)
+            isoLock.lock()
+            defer { isoLock.unlock() }
+            return isoFractionalParser.date(from: value) ?? isoStandardParser.date(from: value)
         }
         return nil
     }

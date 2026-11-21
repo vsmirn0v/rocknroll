@@ -129,9 +129,20 @@ final class RoomHistoryStore: ObservableObject {
     }
 }
 
+private final class KeychainRoomHistoryMemoryCache: @unchecked Sendable {
+    static let shared = KeychainRoomHistoryMemoryCache()
+    let lock = NSLock()
+    var values: [String: Data] = [:]
+}
+
 struct KeychainRoomHistoryStorage: RoomHistoryStorage {
     var service = "dev.vsmirn0v.conferenceguest.room-history"
+    private var cacheKey: String { service + "\0saved-rooms" }
+
     func write(_ data: Data) throws {
+        if KeychainRoomHistoryMemoryCache.shared.lock.withLock({ KeychainRoomHistoryMemoryCache.shared.values[cacheKey] == data }) {
+            return
+        }
         let query = self.query
         let update: [String: Any] = [kSecValueData as String: data]
         var status = SecItemUpdate(query as CFDictionary, update as CFDictionary)
@@ -142,15 +153,25 @@ struct KeychainRoomHistoryStorage: RoomHistoryStorage {
             status = SecItemAdd(addition as CFDictionary, nil)
         }
         guard status == errSecSuccess else { throw NSError(domain: NSOSStatusErrorDomain, code: Int(status)) }
+        KeychainRoomHistoryMemoryCache.shared.lock.withLock {
+            KeychainRoomHistoryMemoryCache.shared.values[cacheKey] = data
+        }
     }
 
     func read() -> Data? {
+        if let cached = KeychainRoomHistoryMemoryCache.shared.lock.withLock({ KeychainRoomHistoryMemoryCache.shared.values[cacheKey] }) {
+            return cached
+        }
         var query = self.query
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
         var result: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess else { return nil }
-        return result as? Data
+        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
+              let data = result as? Data else { return nil }
+        KeychainRoomHistoryMemoryCache.shared.lock.withLock {
+            KeychainRoomHistoryMemoryCache.shared.values[cacheKey] = data
+        }
+        return data
     }
 
     private var query: [String: Any] {

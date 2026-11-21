@@ -40,6 +40,11 @@ import SwiftUI
     var activeInputSource: AssistantInputSource = .typed
     private var auditionTask: Task<Void, Never>?
     private var preparedExecuteTask: Task<Void, Never>?
+    var warmRealtimeRouter: RealtimeVoiceRouter?
+    var warmRealtimeConfigKey: String?
+    var warmRealtimeInstructions: String?
+    var warmRealtimeIdleTask: Task<Void, Never>?
+    let realtimeTurnSink = RealtimeTurnSinkBox()
     // MARK: Agent runtime (typed tools, bounded loop; off unless the store flag is on)
     let agentRuntime = AssistantRuntime()
     @Published var agentPending: AssistantAgentApproval?
@@ -474,6 +479,38 @@ import SwiftUI
         attention?.speech.setSpeakingResponse(true)
         do {
             try VoicePreviewPlayer.shared.play(buffer) { [weak self] in
+                Task { @MainActor [weak self] in
+                    guard let self, self.auditioningItemID == id else { return }
+                    self.auditioningItemID = nil
+                    self.attention?.speech.setSpeakingResponse(false)
+                }
+            }
+        } catch {
+            if auditioningItemID == id {
+                auditioningItemID = nil
+                attention?.speech.setSpeakingResponse(false)
+            }
+            throw error
+        }
+    }
+
+    func beginStreamingAudition(id: UUID, sampleRate: Double = 24_000) throws -> UUID {
+        stopAudition()
+        auditioningItemID = id
+        audioError = nil
+        attention?.speech.setSpeakingResponse(true)
+        guard let format = AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: sampleRate,
+            channels: 1,
+            interleaved: false
+        ) else {
+            auditioningItemID = nil
+            attention?.speech.setSpeakingResponse(false)
+            throw VoiceSynthesisError.audio
+        }
+        do {
+            return try VoicePreviewPlayer.shared.beginStreaming(format: format) { [weak self] in
                 Task { @MainActor [weak self] in
                     guard let self, self.auditioningItemID == id else { return }
                     self.auditioningItemID = nil

@@ -103,6 +103,8 @@ extension TrueConfTransport: TrueConfSignalingTransport {}
     var localID = ""
     private var roomID = ""
     private var visibleParticipantIDs: Set<String>?
+    private var lastPublishedSnapshot: NativeDesktopExternalSnapshot?
+    private var lastPublishedSessionSnapshot: MeetingSessionSnapshot?
 
     var beforeAudioShutdownForTesting: (() -> Void)?
     #if DEBUG
@@ -130,7 +132,7 @@ extension TrueConfTransport: TrueConfSignalingTransport {}
             phase: snapshot.phase,
             connectionIdentity: connectionIdentity,
             intent: MeetingMediaIntent(microphoneOn: microphoneIntent, cameraOn: cameraIntent, playoutOn: outputIntent, sharing: screenTrack != nil, playoutVolume: meetingVolume),
-            effective: MeetingEffectiveMedia(microphoneOn: snapshot.microphoneOn, cameraOn: snapshot.cameraOn, playoutOn: snapshot.playoutOn, sharing: snapshot.sharing, microphoneLevel: snapshot.microphoneLevel, physicallyMuted: audio?.snapshot["microphoneMuted"] as? Bool != false),
+            effective: MeetingEffectiveMedia(microphoneOn: snapshot.microphoneOn, cameraOn: snapshot.cameraOn, playoutOn: snapshot.playoutOn, sharing: snapshot.sharing, microphoneLevel: snapshot.microphoneLevel, physicallyMuted: audio?.isMicrophoneMuted != false),
             permissions: MeetingMediaPermission(canShareMicrophone: inputPermitted, canShareCamera: true, canShareScreen: true, microphoneRestriction: nil),
             capabilities: capabilities,
             participants: snapshot.participants,
@@ -184,6 +186,8 @@ extension TrueConfTransport: TrueConfSignalingTransport {}
         lastCameraFailure = nil
         accessoryCapturePrepared = false
         audioProfile = .saved
+        lastPublishedSnapshot = nil
+        lastPublishedSessionSnapshot = nil
         snapshot = .init(phase: .connecting, playoutOn: !quiet)
         publish()
         probeLog("external-connect", ["provider": kind.rawValue, "quiet": quiet, "inputPermitted": inputPermitted])
@@ -877,9 +881,16 @@ extension TrueConfTransport: TrueConfSignalingTransport {}
         guard meter == nil else { return }
         meter = Task { [weak self] in
             while let self, !Task.isCancelled {
-                let level = await self.publisher?.microphoneLevel()
-                if !Task.isCancelled { self.snapshot.microphoneLevel = level; self.publish() }
-                do { try await Task.sleep(for: .milliseconds(200)) } catch { break }
+                if self.microphoneIntent || self.snapshot.microphoneLevel != nil {
+                    let level = await self.publisher?.microphoneLevel()
+                    if !Task.isCancelled, self.snapshot.microphoneLevel != level {
+                        self.snapshot.microphoneLevel = level
+                        self.publish()
+                    }
+                    do { try await Task.sleep(for: .milliseconds(200)) } catch { break }
+                } else {
+                    do { try await Task.sleep(for: .milliseconds(500)) } catch { break }
+                }
             }
         }
     }
@@ -981,13 +992,25 @@ extension TrueConfTransport: TrueConfSignalingTransport {}
         // TrueConf sends one composite. Local demand can stop its renderer,
         // but cannot pretend to unsubscribe one person's pixels on the wire.
         for track in tracks.values { track.isEnabled = visibleParticipantIDs?.isEmpty != true }
-        snapshot.participants = people; incomingVideo = video.sorted { $0.id < $1.id }
-        onVideo?(incomingVideo); publish()
+        snapshot.participants = people
+        let sortedVideo = video.sorted { $0.id < $1.id }
+        if !NativeDesktopExternalVideo.listEquals(incomingVideo, sortedVideo) {
+            incomingVideo = sortedVideo
+            onVideo?(sortedVideo)
+        }
+        publish()
     }
 
     private func publish() {
-        onState?(snapshot)
-        onSessionSnapshot?(sessionSnapshot)
+        if lastPublishedSnapshot != snapshot {
+            lastPublishedSnapshot = snapshot
+            onState?(snapshot)
+        }
+        let nextSession = sessionSnapshot
+        if lastPublishedSessionSnapshot != nextSession {
+            lastPublishedSessionSnapshot = nextSession
+            onSessionSnapshot?(nextSession)
+        }
     }
 
     func recover(_ error: Error) {

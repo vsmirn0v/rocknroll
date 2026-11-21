@@ -538,10 +538,12 @@ import UniformTypeIdentifiers
         action()
     }
     /// Service and local text form one timeline for Live text and Catch up.
+    var onTranscriptChanged: (() -> Void)?
     private func observeTranscript() {
         catchUp.observe(messages: transcript.map { TranscriptSegment(id: $0.id, speaker: $0.participantName, text: $0.text, spokenAt: Self.spokenAt($0)) },
             canView: guestFeatures.permissions.canViewTranscript || !localTranscript.isEmpty || transcribingLocally,
             enabled: guestFeatures.transcriptionStatus == .active || transcribingLocally)
+        onTranscriptChanged?()
     }
     private func observeParticipation() {
         if !participationVoiceEligible || participationRemoteSpeaking { participation.interruptVoice() }
@@ -2005,6 +2007,7 @@ import UniformTypeIdentifiers
     private func updateFeatures(_ features: GuestMeetingSnapshot) {
         guard !closed else { return }
         let previousTranscription = guestFeatures.transcriptionStatus
+        let oldMessages = guestFeatures.messages
         guestFeatures = features
         if features.transcriptionStatus != .active || features.permissions.canViewTranscript { localFallbackDeclined = false }
         if features.transcriptionStatus == .active && !features.permissions.canViewTranscript {
@@ -2018,11 +2021,13 @@ import UniformTypeIdentifiers
         chat.reactionHistoryAvailable = features.permissions.canSendReaction
         chat.canSend = features.permissions.canSendChat && features.connected
         chat.unavailableReason = features.permissions.canViewChat ? nil : L("Chat is unavailable in this meeting.")
-        chat.replace(features.messages.map { message in
-            ChatEntry(id: message.id, sender: message.participantName, text: message.text,
-                sentAt: message.sentAt ?? message.receivedAt ?? Date.distantPast, isOwn: message.isOwn,
-                delivery: message.delivery == .pending ? .pending : message.delivery == .failed ? .failed : .sent)
-        })
+        if features.messages != oldMessages {
+            chat.replace(features.messages.map { message in
+                ChatEntry(id: message.id, sender: message.participantName, text: message.text,
+                    sentAt: message.sentAt ?? message.receivedAt ?? Date.distantPast, isOwn: message.isOwn,
+                    delivery: message.delivery == .pending ? .pending : message.delivery == .failed ? .failed : .sent)
+            })
+        }
         for event in features.reactions where receivedReactions.insert(event.id).inserted {
             guard event.participantID != features.localParticipantID else { continue }
             if let kind = MeetingReaction.allCases.first(where: { $0.emoji == event.reaction.symbol }),

@@ -1,3 +1,4 @@
+import Accelerate
 import AVFoundation
 import Foundation
 import LiveKitWebRTC
@@ -36,19 +37,49 @@ final class GuestPCMMeter: NSObject, LKRTCAudioRenderer, @unchecked Sendable {
         for buffer in UnsafeMutableAudioBufferListPointer(pcmBuffer.mutableAudioBufferList) {
             guard let data = buffer.mData else { continue }
             let expected = Int(pcmBuffer.frameLength) * Int(buffer.mNumberChannels)
-            func accumulate<T>(_ type: T.Type, normalize: (T) -> Double) {
-                let count = min(expected, Int(buffer.mDataByteSize) / MemoryLayout<T>.size)
-                let values = data.assumingMemoryBound(to: T.self)
+            switch format.commonFormat {
+            case .pcmFormatFloat32:
+                let count = min(expected, Int(buffer.mDataByteSize) / MemoryLayout<Float>.size)
+                guard count > 0 else { continue }
+                let ptr = data.assumingMemoryBound(to: Float.self)
+                var sumSq: Float = 0
+                vDSP_svesq(ptr, 1, &sumSq, vDSP_Length(count))
+                if sumSq.isFinite {
+                    energy += Double(sumSq)
+                    samples += count
+                } else {
+                    for index in 0..<count {
+                        let value = Double(ptr[index])
+                        if value.isFinite { energy += value * value; samples += 1 }
+                    }
+                }
+            case .pcmFormatFloat64:
+                let count = min(expected, Int(buffer.mDataByteSize) / MemoryLayout<Double>.size)
+                let ptr = data.assumingMemoryBound(to: Double.self)
                 for index in 0..<count {
-                    let value = normalize(values[index])
+                    let value = ptr[index]
                     if value.isFinite { energy += value * value; samples += 1 }
                 }
-            }
-            switch format.commonFormat {
-            case .pcmFormatFloat32: accumulate(Float.self) { Double($0) }
-            case .pcmFormatFloat64: accumulate(Double.self) { $0 }
-            case .pcmFormatInt16: accumulate(Int16.self) { Double($0) / 32768 }
-            case .pcmFormatInt32: accumulate(Int32.self) { Double($0) / 2147483648 }
+            case .pcmFormatInt16:
+                let count = min(expected, Int(buffer.mDataByteSize) / MemoryLayout<Int16>.size)
+                let ptr = data.assumingMemoryBound(to: Int16.self)
+                var intEnergy: Double = 0
+                for index in 0..<count {
+                    let v = Double(ptr[index])
+                    intEnergy += v * v
+                }
+                energy += intEnergy / (32768.0 * 32768.0)
+                samples += count
+            case .pcmFormatInt32:
+                let count = min(expected, Int(buffer.mDataByteSize) / MemoryLayout<Int32>.size)
+                let ptr = data.assumingMemoryBound(to: Int32.self)
+                var intEnergy: Double = 0
+                for index in 0..<count {
+                    let v = Double(ptr[index])
+                    intEnergy += v * v
+                }
+                energy += intEnergy / (2147483648.0 * 2147483648.0)
+                samples += count
             default: break
             }
         }
@@ -56,7 +87,7 @@ final class GuestPCMMeter: NSObject, LKRTCAudioRenderer, @unchecked Sendable {
             callback.recordDelivery(frames: Int(pcmBuffer.frameLength), format: deliveredFormat, at: receivedUptime)
             measured.record(samples: samples, energy: energy, at: receivedUptime); bufferCount += 1
             lastLevel = samples > 0 ? Float(sqrt(energy / Double(samples))) : nil
-            lastSampleTime = ProcessInfo.processInfo.systemUptime
+            lastSampleTime = receivedUptime
         }
 #if DEBUG
         let observer = locked { diagnosticPCMObserver }
@@ -548,6 +579,9 @@ public final class GuestSystemAudio: NSObject, LKRTCAudioDeviceModuleDelegate, @
         }
     }
     /// Cached only: reading diagnostics never calls the native worker or accesses a device.
+    public var isMicrophoneMuted: Bool {
+        locked { cached["microphoneMuted"] as? Bool != false }
+    }
     public var snapshot: [String: Any] {
         let inputCount = inputCallbackSnapshot().count
         return locked { cached }
@@ -575,8 +609,18 @@ public final class GuestSystemAudio: NSObject, LKRTCAudioDeviceModuleDelegate, @
             (value["microphoneOptIn"] as? Bool == true || value["deferredActivation"] as? Bool == true) &&
             GuestSystemAudio.microphoneAuthorized
     }
-    public var privateInputLevel: Float? { locked { inputMeterEnabled } ? inputMeter.level : nil }
-    public var privateInputMeterEvidence: [String: Any] { meterEvidence(inputMeter).merging(["enabled": locked { inputMeterEnabled }]) { _, new in new } }
+    public var privateInputLevel: Float? {
+        inputCallbackLock.lock()
+        let enabled = inputMeterEnabled
+        inputCallbackLock.unlock()
+        return enabled ? inputMeter.level : nil
+    }
+    public var privateInputMeterEvidence: [String: Any] {
+        inputCallbackLock.lock()
+        let enabled = inputMeterEnabled
+        inputCallbackLock.unlock()
+        return meterEvidence(inputMeter).merging(["enabled": enabled]) { _, new in new }
+    }
     public var playoutMeterEvidence: [String: Any] { meterEvidence(playoutMeter) }
 #if DEBUG
     public var sharedPlayoutGateForTesting: GuestSharedPlayoutGate { sharedPlayoutGate }
@@ -605,12 +649,17 @@ public final class GuestSystemAudio: NSObject, LKRTCAudioDeviceModuleDelegate, @
                 "recentLevel": meter.level.map { $0 as Any } ?? NSNull()]
     }
     public func setPrivateInputMeterEnabled(_ enabled: Bool) {
-        locked { inputMeterEnabled = enabled }; inputMeter.reset()
+        inputCallbackLock.lock()
+        inputMeterEnabled = enabled
+        inputCallbackLock.unlock()
+        inputMeter.reset()
     }
     /// Receives your microphone's buffers on the audio thread; the sink must copy
     /// and return at once. Whether the meeting is unmuted is the caller's gate.
     public func setInputTranscriptionSink(_ sink: ((AVAudioPCMBuffer) -> Void)?) {
-        locked { inputTranscriptionSink = sink }
+        inputCallbackLock.lock()
+        inputTranscriptionSink = sink
+        inputCallbackLock.unlock()
     }
     /// Closing is acknowledged only when this owner has the active input graph.
     public func setMicrophoneGate(open: Bool) -> Bool {
@@ -741,8 +790,14 @@ public final class GuestSystemAudio: NSObject, LKRTCAudioDeviceModuleDelegate, @
         // participant's outgoing WebRTC level includes the assistant itself.
         let meter = participationInputMeter
         meter.reset()
-        locked { participationInputMeterEnabled = true }
-        defer { locked { participationInputMeterEnabled = false } }
+        inputCallbackLock.lock()
+        participationInputMeterEnabled = true
+        inputCallbackLock.unlock()
+        defer {
+            inputCallbackLock.lock()
+            participationInputMeterEnabled = false
+            inputCallbackLock.unlock()
+        }
         do { try await Task.sleep(for: .milliseconds(80)) } catch { return .notStarted }
         let monitor = Task { @MainActor in
             while !Task.isCancelled {
@@ -1600,10 +1655,10 @@ public final class GuestSystemAudio: NSObject, LKRTCAudioDeviceModuleDelegate, @
                 self.inputCallbackLock.lock()
                 self.inputCallback = .init(count: self.inputCallback.count + 1, frames: Int(buffer.frameLength),
                     format: signature, uptime: receivedUptime)
+                let metering = self.inputMeterEnabled
+                let participationMetering = self.participationInputMeterEnabled
+                let sink = self.inputTranscriptionSink
                 self.inputCallbackLock.unlock()
-                let (metering, participationMetering, sink) = self.locked {
-                    (self.inputMeterEnabled, self.participationInputMeterEnabled, self.inputTranscriptionSink)
-                }
                 sink?(buffer)
                 if metering { self.inputMeter.render(pcmBuffer: buffer) }
                 if participationMetering { self.participationInputMeter.render(pcmBuffer: buffer) }

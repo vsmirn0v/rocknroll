@@ -33,6 +33,19 @@ public struct NativeDesktopExternalVideo: Identifiable {
         self.id = id; self.participantID = participantID; self.source = source
         self.track = track; self.crop = crop
     }
+
+    public static func listEquals(_ lhs: [NativeDesktopExternalVideo], _ rhs: [NativeDesktopExternalVideo]) -> Bool {
+        guard lhs.count == rhs.count else { return false }
+        for idx in lhs.indices {
+            let a = lhs[idx]
+            let b = rhs[idx]
+            if a.id != b.id || a.participantID != b.participantID || a.source != b.source ||
+                a.crop != b.crop || a.track !== b.track {
+                return false
+            }
+        }
+        return true
+    }
 }
 public struct NativeDesktopExternalSnapshot: Equatable {
     public var phase: NativeDesktopMeetingPhase = .idle
