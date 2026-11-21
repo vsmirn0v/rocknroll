@@ -44,6 +44,7 @@ struct IOSWorkspaceHubView: View {
     @State private var showingMultiJoinSheet = false
     @State private var renamingSession: IOSMeetingSessionItem?
     @State private var renameDraft = ""
+    @State private var pendingDeleteSession: IOSMeetingSessionItem?
     @State private var searchQuery = ""
     @State private var searchHits: [IOSWorkspaceSearchHit] = []
 
@@ -87,18 +88,36 @@ struct IOSWorkspaceHubView: View {
             .navigationTitle(L("Assistant"))
             .toolbar { hubToolbar }
         } detail: {
-            if sizeClass == .regular && selectedTab != .history {
-                tabDetailContent
-                    .navigationTitle(selectedTab.title)
-            } else if let selectedID = selectedSessionID ?? workspace.historySessions.first?.id {
-                IOSMeetingDetailView(workspace: workspace, sync: sync, sessionID: selectedID)
-            } else {
-                ContentUnavailableView(
-                    L("No Meetings Yet"),
-                    systemImage: "note.text",
-                    description: Text(L("Recorded meetings, summaries, notes, and tasks synced from your Mac and iPhone appear here."))
-                )
+            Group {
+                if sizeClass == .regular && selectedTab != .history {
+                    tabDetailContent
+                        .navigationTitle(selectedTab.title)
+                } else if let selectedID = selectedSessionID ?? workspace.historySessions.first?.id {
+                    IOSMeetingDetailView(workspace: workspace, sync: sync, sessionID: selectedID)
+                } else {
+                    ContentUnavailableView(
+                        L("No Meetings Yet"),
+                        systemImage: "note.text",
+                        description: Text(L("Recorded meetings, summaries, notes, and tasks synced from your Mac and iPhone appear here."))
+                    )
+                }
             }
+            .toolbar {
+                if sizeClass == .regular {
+                    trailingHubToolbarItems
+                }
+            }
+        }
+        .onChange(of: sizeClass) { _, newClass in
+            if newClass == .compact && selectedTab != .history {
+                compactColumn = .sidebar
+            }
+        }
+        .onChange(of: showingBoardSheet) { _, isShowing in
+            board?.isInlineSheetActive = isShowing
+        }
+        .onDisappear {
+            board?.isInlineSheetActive = false
         }
         .sheet(isPresented: $showingSettings) {
             NavigationStack {
@@ -128,12 +147,38 @@ struct IOSWorkspaceHubView: View {
                 }
             }
         }
-        .sheet(isPresented: $showingBoardSheet) {
+        .sheet(isPresented: Binding(
+            get: { showingBoardSheet || (board?.isPresented == true && board?.isInlineSheetActive == false && !showingSkillsSheet && !showingSettings) },
+            set: { newValue in
+                showingBoardSheet = newValue
+                if !newValue { board?.isPresented = false }
+            }
+        )) {
             if let board {
                 IOSAssistantBoardSheet(
                     controller: board,
                     defaultBoardURL: skills?.teamContext.defaultJiraBoardURL ?? ""
                 )
+            }
+        }
+        .confirmationDialog(
+            L("Delete Meeting?"),
+            isPresented: Binding(
+                get: { pendingDeleteSession != nil },
+                set: { if !$0 { pendingDeleteSession = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            if let session = pendingDeleteSession {
+                Button(L("Delete"), role: .destructive) {
+                    Task { await workspace.deleteSession(session.id) }
+                    pendingDeleteSession = nil
+                }
+            }
+            Button(L("Cancel"), role: .cancel) { pendingDeleteSession = nil }
+        } message: {
+            if let session = pendingDeleteSession {
+                Text(session.title)
             }
         }
         .sheet(isPresented: $showingMultiJoinSheet) {
@@ -227,6 +272,13 @@ struct IOSWorkspaceHubView: View {
         ToolbarItem(placement: .cancellationAction) {
             Button(L("Done")) { dismiss() }
         }
+        if sizeClass != .regular {
+            trailingHubToolbarItems
+        }
+    }
+
+    @ToolbarContentBuilder
+    private var trailingHubToolbarItems: some ToolbarContent {
         ToolbarItemGroup(placement: .topBarTrailing) {
             if skills != nil {
                 Menu {
@@ -295,9 +347,9 @@ struct IOSWorkspaceHubView: View {
                     }
                     .buttonStyle(.plain)
                     .tag(session.id)
-                    .swipeActions(edge: .trailing) {
+                    .swipeActions(edge: .trailing, allowsFullSwipe: false) {
                         Button(role: .destructive) {
-                            Task { await workspace.deleteSession(session.id) }
+                            pendingDeleteSession = session
                         } label: {
                             Label(L("Delete"), systemImage: "trash")
                         }
@@ -407,7 +459,10 @@ struct IOSWorkspaceHubView: View {
                     } label: {
                         Image(systemName: "xmark.circle.fill")
                             .foregroundStyle(.secondary)
+                            .frame(minWidth: 44, minHeight: 44)
+                            .contentShape(Rectangle())
                     }
+                    .accessibilityLabel(L("Clear"))
                 }
             }
             .padding(10)

@@ -43,13 +43,16 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
     var workspaceSessionID: UUID?
     var workspaceDeviceID = ""
     var onOpenNotes: (() -> Void)?
+    var onOpenBoard: (() -> Void)?
+    var onOpenAsk: (() -> Void)?
     var onWorkspaceEventsChanged: ((UUID, [SyncedTranscriptEvent], [DateInterval], Set<String>) -> Void)?
 
     @Published private(set) var callView: RockCallViewController?
     @Published private(set) var title: String
     @Published private(set) var phase: NativeDesktopMeetingPhase = .idle
     @Published private(set) var isForegroundVisible = false
-    private var lastAssistantBadge: (mode: IOSMeetingAssistantMode, isPaused: Bool, alertCount: Int) = (.off, false, 0)
+    private var lastAssistantBadge: (mode: IOSMeetingAssistantMode, isPaused: Bool, alertCount: Int, facilitatorSkillName: String?) = (.off, false, 0, nil)
+    private weak var presentedBoardController: UIViewController?
     @Published private(set) var isTalkRoom = false
     @Published private(set) var isHeld = false
     @Published private(set) var isMeetingSoundEnabled = true
@@ -233,7 +236,11 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
         view.onOpenAssistant = { [weak self] in self?.onOpenAssistant?() }
         if let hud = assistantHUDContext {
             view.attachAssistantVoiceHUD(talk: hud.talk, speech: hud.speech) { [weak self] in
-                self?.onOpenAssistant?()
+                if let onOpenAsk = self?.onOpenAsk {
+                    onOpenAsk()
+                } else {
+                    self?.onOpenAssistant?()
+                }
             }
         }
         view.onLeave = { [weak self] in self?.leave() }
@@ -283,12 +290,14 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
         view.updateAssistantBadge(
             mode: lastAssistantBadge.mode,
             isPaused: lastAssistantBadge.isPaused,
-            alertCount: lastAssistantBadge.alertCount
+            alertCount: lastAssistantBadge.alertCount,
+            facilitatorSkillName: lastAssistantBadge.facilitatorSkillName
         )
         if let output = workspaceAudio?.audio.output { view.setAudioOutput(output) }
         view.workspace.openVoiceReply = { [weak self] in self?.presentVoiceReplySheet() }
         view.workspace.openTranscriptionSettings = { [weak self] in self?.presentTranscriptionSettingsSheet() }
         view.workspace.openNotes = { [weak self] in self?.onOpenNotes?() }
+        view.workspace.openBoard = { [weak self] in self?.onOpenBoard?() }
         view.setHeld(quiet || isHeld)
         view.setMicrophone(false)
         view.setCamera(false)
@@ -1289,9 +1298,19 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
         }
     }
 
-    func updateAssistantBadge(mode: IOSMeetingAssistantMode, isPaused: Bool, alertCount: Int) {
-        lastAssistantBadge = (mode, isPaused, alertCount)
-        callView?.updateAssistantBadge(mode: mode, isPaused: isPaused, alertCount: alertCount)
+    func updateAssistantBadge(
+        mode: IOSMeetingAssistantMode,
+        isPaused: Bool,
+        alertCount: Int,
+        facilitatorSkillName: String? = nil
+    ) {
+        lastAssistantBadge = (mode, isPaused, alertCount, facilitatorSkillName)
+        callView?.updateAssistantBadge(
+            mode: mode,
+            isPaused: isPaused,
+            alertCount: alertCount,
+            facilitatorSkillName: facilitatorSkillName
+        )
     }
 
     func showAssistantBanner(title: String, reason: String, onTap: @escaping () -> Void) {
@@ -1387,8 +1406,34 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
     func configureAssistantHUD(talk: IOSAssistantTalkController, speech: IOSAssistantSpeechCoordinator) {
         assistantHUDContext = (talk, speech)
         callView?.attachAssistantVoiceHUD(talk: talk, speech: speech) { [weak self] in
-            self?.onOpenAssistant?()
+            if let onOpenAsk = self?.onOpenAsk {
+                onOpenAsk()
+            } else {
+                self?.onOpenAssistant?()
+            }
         }
+    }
+
+    func presentAskRockSheet(talk: IOSAssistantTalkController, speech: IOSAssistantSpeechCoordinator) {
+        guard let host = topPresentedCallController() else { return }
+        let view = DismissableNavigationSheet(title: L("Ask Rock")) {
+            IOSAssistantTalkView(talk: talk, speech: speech)
+        }
+        let sheet = UIHostingController(rootView: view)
+        sheet.overrideUserInterfaceStyle = .dark
+        sheet.modalPresentationStyle = .formSheet
+        host.present(sheet, animated: true)
+    }
+
+    func presentBoardSheet(controller: IOSAssistantBoardController, defaultBoardURL: String) {
+        guard presentedBoardController?.presentingViewController == nil,
+              let host = topPresentedCallController() else { return }
+        let view = IOSAssistantBoardSheet(controller: controller, defaultBoardURL: defaultBoardURL)
+        let sheet = UIHostingController(rootView: view)
+        sheet.overrideUserInterfaceStyle = .dark
+        sheet.modalPresentationStyle = .formSheet
+        presentedBoardController = sheet
+        host.present(sheet, animated: true)
     }
 
     func presentNotesSheet(workspace: IOSWorkspaceCoordinator) {
@@ -1799,5 +1844,24 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
             isOwn: message.isOwn,
             delivery: delivery
         )
+    }
+}
+
+private struct DismissableNavigationSheet<Content: View>: View {
+    let title: String
+    @ViewBuilder let content: () -> Content
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            content()
+                .navigationTitle(title)
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button(L("Done")) { dismiss() }
+                    }
+                }
+        }
     }
 }

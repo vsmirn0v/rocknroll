@@ -499,6 +499,8 @@ struct PersonalTasksView: View {
                         .foregroundStyle(selectedTaskIDs.contains(row.id) ? Color.accentColor : Color.secondary)
                 }
                 .buttonStyle(.plain)
+                .accessibilityLabel(L("Select task: %@", taskText))
+                .accessibilityAddTraits(selectedTaskIDs.contains(row.id) ? .isSelected : [])
             }
             if archived {
                 Image(systemName: row.task.done ? "checkmark.square" : "square")
@@ -615,6 +617,7 @@ struct PersonalTasksView: View {
                 }
                 .buttonStyle(.borderless)
                 .help(L("Details & Context"))
+                .accessibilityLabel(L("Details & Context"))
             }
             if archived || owned {
                 Button(archived ? L("Restore") : L("Archive")) { archive(row, value: !archived) }

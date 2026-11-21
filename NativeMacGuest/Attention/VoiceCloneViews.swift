@@ -9,6 +9,8 @@ struct VoiceCloneSettingsView: View {
     var onPreparationAction: () -> Void = {}
     @State private var enrolling = false
     @State private var confirmingVoiceDeletion = false
+    @State private var confirmingModelDeletion = false
+    @State private var confirmingGPUModelDeletion = false
     @State private var voiceDeletionError: String?
 
     var body: some View {
@@ -32,6 +34,14 @@ struct VoiceCloneSettingsView: View {
             Button(L("Cancel"), role: .cancel) {}
         } message: {
             Text(L("Your saved voice will be deleted from this Mac. The downloaded model will remain. You can record your voice again later."))
+        }
+        .confirmationDialog(L("Delete Model"), isPresented: $confirmingModelDeletion, titleVisibility: .visible) {
+            Button(L("Delete Model"), role: .destructive) { clone.deleteModel() }
+            Button(L("Cancel"), role: .cancel) {}
+        }
+        .confirmationDialog(L("Remove GPU model"), isPresented: $confirmingGPUModelDeletion, titleVisibility: .visible) {
+            Button(L("Remove GPU model"), role: .destructive) { clone.deleteGPUModel() }
+            Button(L("Cancel"), role: .cancel) {}
         }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             // A user can free space in System Settings while this view stays open.
@@ -93,7 +103,7 @@ struct VoiceCloneSettingsView: View {
                         }
                         Spacer()
                         NativeSettingsButton(title: L("Remove GPU model"), role: .destructive,
-                                             id: "settings.voice-gpu-remove") { clone.deleteGPUModel() }
+                                             id: "settings.voice-gpu-remove") { confirmingGPUModelDeletion = true }
                     }
                 }
             }
@@ -189,7 +199,7 @@ struct VoiceCloneSettingsView: View {
             HStack(alignment: .firstTextBaseline) {
                 preparationStatus
                 Spacer()
-                Button(L("Delete Model"), role: .destructive) { clone.deleteModel() }.buttonStyle(.borderless)
+                Button(L("Delete Model"), role: .destructive) { confirmingModelDeletion = true }.buttonStyle(.borderless)
             }
         }
     }

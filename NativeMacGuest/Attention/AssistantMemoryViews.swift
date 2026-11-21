@@ -72,7 +72,7 @@ struct AssistantMemorySettings: View {
                                 Spacer()
                                 Button(L("Edit")) { editing = item }.controlSize(.small)
                                 Button { data.deleteMemory(item.id) } label: { Image(systemName: "trash") }
-                                    .buttonStyle(.borderless).help(L("Delete memory"))
+                                    .buttonStyle(.borderless).help(L("Delete memory")).accessibilityLabel(L("Delete memory"))
                             }
                         }
                     }.frame(maxWidth: .infinity, alignment: .leading)

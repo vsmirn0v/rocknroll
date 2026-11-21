@@ -192,6 +192,7 @@ struct TranscriptionAndVoiceSettingsView: View {
     @State private var showingEnrollmentSheet = false
     @State private var confirmingDeleteVoxModel = false
     @State private var confirmingDeleteVoxVoice = false
+    @State private var confirmingDeleteGigaAM = false
     @State private var recordPermission = AVAudioApplication.shared.recordPermission
     @State private var speechPermission = SFSpeechRecognizer.authorizationStatus()
 
@@ -261,8 +262,18 @@ struct TranscriptionAndVoiceSettingsView: View {
                             .foregroundStyle(.green)
                         Spacer()
                         Button(L("Delete"), role: .destructive) {
+                            confirmingDeleteGigaAM = true
+                        }
+                    }
+                    .confirmationDialog(
+                        L("Delete transcription model?"),
+                        isPresented: $confirmingDeleteGigaAM,
+                        titleVisibility: .visible
+                    ) {
+                        Button(L("Delete"), role: .destructive) {
                             modelStore.deleteGigaAM()
                         }
+                        Button(L("Cancel"), role: .cancel) {}
                     }
                 case .failed(let message):
                     VStack(alignment: .leading, spacing: 6) {

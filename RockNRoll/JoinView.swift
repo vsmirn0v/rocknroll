@@ -195,6 +195,22 @@ struct JoinView: View {
             .sheet(item: $activeSheet) { sheet in
                 sheetContent(for: sheet)
             }
+            .sheet(
+                isPresented: Binding(
+                    get: {
+                        model.assistantBoard.isPresented
+                            && !model.assistantBoard.isInlineSheetActive
+                            && activeSheet == nil
+                            && (model.sessions.isEmpty || model.isCallMinimized)
+                    },
+                    set: { model.assistantBoard.isPresented = $0 }
+                )
+            ) {
+                IOSAssistantBoardSheet(
+                    controller: model.assistantBoard,
+                    defaultBoardURL: model.assistantSkills.teamContext.defaultJiraBoardURL
+                )
+            }
             .sheet(isPresented: Binding(get: { setup.isPresented }, set: { if !$0 { setup.finishLater() } }), onDismiss: {
                 setup.presentationDidDismiss()
             }) {
@@ -407,10 +423,14 @@ struct JoinView: View {
         if !model.sessions.isEmpty {
             Section(L("Active meetings (%ld/4)", model.sessions.count)) {
                 ForEach(model.sessions) { session in
-                    HStack(spacing: 8) {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text(session.title).font(.headline).lineLimit(1)
-                            HStack(spacing: 6) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack(alignment: .firstTextBaseline, spacing: 8) {
+                            Text(session.title)
+                                .font(.headline)
+                                .lineLimit(2)
+                                .fixedSize(horizontal: false, vertical: true)
+                            Spacer(minLength: 4)
+                            HStack(spacing: 4) {
                                 Text(session.isTalkRoom ? L("Talk active") : L("Listening"))
                                     .font(.caption.weight(.semibold))
                                     .foregroundStyle(session.isTalkRoom ? accent : .secondary)
@@ -420,12 +440,17 @@ struct JoinView: View {
                                     Text(L("· Reconnecting")).font(.caption).foregroundStyle(.orange)
                                 }
                             }
-                            IOSActiveMeetingAssistantPill(controllerID: session.id, assistant: model.assistant) {
+                        }
+                        HStack(spacing: 8) {
+                            IOSActiveMeetingAssistantPill(
+                                controllerID: session.id,
+                                assistant: model.assistant,
+                                facilitator: model.assistantFacilitator,
+                                skills: model.assistantSkills
+                            ) {
                                 activeSheet = .assistantMode(session.id)
                             }
-                        }
-                        Spacer()
-                        HStack(spacing: 12) {
+                            Spacer(minLength: 4)
                             if !session.isTalkRoom {
                                 Button(L("Talk")) { model.switchTalk(to: session.id) }
                                     .buttonStyle(.bordered)
@@ -790,6 +815,7 @@ struct JoinView: View {
                     )
                 },
                 onJoinMultiple: { selected, skillID, enableVoice in
+                    activeSheet = nil
                     for candidate in selected {
                         if enableVoice {
                             model.assistantFacilitator.queuePendingSkill(
@@ -798,7 +824,9 @@ struct JoinView: View {
                                 invitation: candidate.invitation
                             )
                         }
-                        _ = model.assistantTalk.onJoinCandidate?(candidate)
+                    }
+                    Task {
+                        await model.joinCandidatesAlongside(selected)
                     }
                 },
                 initialTab: tab

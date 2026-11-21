@@ -11,6 +11,7 @@ final class MeetingCaptureCoordinator {
     private var subscriptions = Set<AnyCancellable>()
     private var shareReportTask: Task<Void, Never>?
     private var capture: NativeDesktopShareCapture?
+    private var isExternalShare = false
     private var sharingTask: Task<Void, Never>?
     private(set) var shareGeneration = UUID()
     private var stoppingShare: Task<Bool, Never>?
@@ -43,7 +44,9 @@ final class MeetingCaptureCoordinator {
     }
 
     var shareSourceTitle: String {
-        guard let presenter = presenterStorage, presenter.isSharing else { return L("Screen") }
+        guard let presenter = presenterStorage, presenter.isSharing else {
+            return isExternalShare ? L("Assistant Board") : L("Screen")
+        }
         if presenter.source == .screen { return L("Screen or window") }
         return presenter.scene.image != nil ? L("Image or slides") : L("Presenter studio")
     }
@@ -248,6 +251,7 @@ final class MeetingCaptureCoordinator {
         capture == nil && stoppingShare == nil && shareCleanupSucceeded
     }
 
+    @discardableResult
     func startSharing(canvas: Bool,
                       externalFrames: Bool = false,
                       isValidGeneration: @escaping @MainActor () -> Bool,
@@ -256,8 +260,9 @@ final class MeetingCaptureCoordinator {
                       engine: @escaping @MainActor () -> (any NativeDesktopMeetingEngine)?,
                       setSharingPending: @escaping @MainActor (Bool) -> Void,
                       setLocalShare: @escaping @MainActor (LKRTCVideoTrack?) -> Void,
-                      onError: @escaping @MainActor (String) -> Void) {
-        guard canStartSharing() else { return }
+                      onError: @escaping @MainActor (String) -> Void) -> Bool {
+        guard canStartSharing() else { return false }
+        isExternalShare = externalFrames
         setSharingPending(true)
         let shareToken = UUID()
         shareGeneration = shareToken
@@ -320,6 +325,7 @@ final class MeetingCaptureCoordinator {
                 }
             }
         }
+        return true
     }
 
     private func configure(_ capture: NativeDesktopShareCapture,
@@ -384,6 +390,7 @@ final class MeetingCaptureCoordinator {
         if waitForStartup { startup?.cancel() }
         let capture = capture
         self.capture = nil
+        isExternalShare = false
         capture?.cancel()
         setLocalShare(nil)
         shareSource = nil

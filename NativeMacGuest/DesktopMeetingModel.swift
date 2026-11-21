@@ -1890,9 +1890,15 @@ import UniformTypeIdentifiers
     var presenterSharing: Bool { captureCoordinator.isPresenterSharing }
     @Published private(set) var shareStartedAt: Date?
     @Published private(set) var quickSharePending = false
+    var onExternalShareStopped: (() -> Void)?
     private func noteShareState() {
         let live = !closed && isSharingLive
-        if live, shareStartedAt == nil { shareStartedAt = Date() } else if !live, shareStartedAt != nil { shareStartedAt = nil }
+        if live, shareStartedAt == nil {
+            shareStartedAt = Date()
+        } else if !live, shareStartedAt != nil {
+            shareStartedAt = nil
+            onExternalShareStopped?()
+        }
     }
     var shareSourceTitle: String { captureCoordinator.shareSourceTitle }
     var shareIncludesCamera: Bool {
@@ -1957,10 +1963,11 @@ import UniformTypeIdentifiers
             setLocalShare: { [weak self] track in self?.localShare = track },
             onError: { [weak self] message in self?.error = message })
     }
-    func startBoardSharing() {
-        guard !closed, !transferHeld, connected, !sharingPending else { return }
+    @discardableResult
+    func startBoardSharing() -> Bool {
+        guard !closed, !transferHeld, connected, !sharingPending else { return false }
         let token = generation
-        captureCoordinator.startSharing(
+        return captureCoordinator.startSharing(
             canvas: false,
             externalFrames: true,
             isValidGeneration: { [weak self] in self?.generation == token },
@@ -1975,12 +1982,16 @@ import UniformTypeIdentifiers
         captureCoordinator.pushExternalShareFrame(pixels)
     }
     @discardableResult func stopSharing() async -> Bool {
-        await captureCoordinator.stopSharing(
+        let stopped = await captureCoordinator.stopSharing(
             engine: engine,
             isSnapshotSharing: snapshot.sharing,
             setSharingPending: { [weak self] pending in self?.sharingPending = pending },
             setLocalShare: { [weak self] track in self?.localShare = track },
             onError: { [weak self] message in self?.error = message })
+        if stopped || !isSharingLive {
+            onExternalShareStopped?()
+        }
+        return stopped
     }
     private func retireShare(waitForStartup: Bool) async -> Bool {
         await captureCoordinator.retireShare(

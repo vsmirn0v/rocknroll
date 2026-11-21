@@ -15,10 +15,15 @@ final class AssistantBoardWindowController: NSObject, ObservableObject, WKNaviga
     @Published private(set) var sharingMeetingID: UUID?
     @Published private(set) var sharingMeetingTitle: String?
     @Published private(set) var lastActionSummary: String?
+    @Published private(set) var loadError: String?
 
     private var window: NSWindow?
     private var webView: WKWebView?
     private var urlField: NSTextField?
+    private var backButton: NSButton?
+    private var forwardButton: NSButton?
+    private var reloadButton: NSButton?
+    private var loadingIndicator: NSProgressIndicator?
     private var shareBannerLabel: NSTextField?
     private var stopShareButton: NSButton?
     private var frameTask: Task<Void, Never>?
@@ -59,13 +64,20 @@ final class AssistantBoardWindowController: NSObject, ObservableObject, WKNaviga
             throw NativeDesktopError.unavailable(L("Assistant Board web view is unavailable."))
         }
         finishPendingNavigation()
+        loadError = nil
         currentURL = url
         urlField?.stringValue = url.absoluteString
         isLoading = true
+        refreshNavigationUI()
+        refreshBanner()
         webView.load(URLRequest(url: url))
         try? await waitForLoadFinish(timeoutSeconds: 8)
         let title = webView.title?.trimmed.isEmpty == false ? (webView.title ?? url.host ?? url.absoluteString) : url.absoluteString
         pageTitle = title
+        if let err = loadError {
+            lastActionSummary = err
+            return err
+        }
         lastActionSummary = L("Opened %@", title)
         return L("Opened %@ (%@).", title, url.absoluteString)
     }
@@ -76,23 +88,36 @@ final class AssistantBoardWindowController: NSObject, ObservableObject, WKNaviga
         }
         showWindow()
         if let activeModel = sharedMeetingModel, activeModel.sessionID != model.sessionID {
+            activeModel.onExternalShareStopped = nil
             await activeModel.stopSharing()
+        }
+        guard model.startBoardSharing() else {
+            throw NativeDesktopError.unavailable(L("Stop the active screen share before sharing the Assistant Board."))
         }
         frameTask?.cancel()
         sharedMeetingModel = model
         sharingMeetingID = model.sessionID
         sharingMeetingTitle = model.title
-        model.startBoardSharing()
+        model.onExternalShareStopped = { [weak self] in
+            self?.stopSharing(notifyModel: false)
+        }
         refreshBanner()
 
         let targetSessionID = model.sessionID
+        let shareStartedAt = Date()
         frameTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
                 guard let self,
                       let meeting = self.sharedMeetingModel,
                       meeting.sessionID == targetSessionID,
                       !meeting.isClosed else {
-                    self?.stopSharing()
+                    self?.stopSharing(notifyModel: false)
+                    return
+                }
+                if Date().timeIntervalSince(shareStartedAt) > 2.0,
+                   !meeting.isSharingLive,
+                   !meeting.sharingPending {
+                    self.stopSharing(notifyModel: false)
                     return
                 }
                 if let buffer = await self.captureFrameBuffer() {
@@ -106,10 +131,17 @@ final class AssistantBoardWindowController: NSObject, ObservableObject, WKNaviga
     }
 
     func stopSharing() {
+        stopSharing(notifyModel: true)
+    }
+
+    func stopSharing(notifyModel: Bool) {
         frameTask?.cancel()
         frameTask = nil
         if let model = sharedMeetingModel {
-            Task { @MainActor in await model.stopSharing() }
+            model.onExternalShareStopped = nil
+            if notifyModel {
+                Task { @MainActor in await model.stopSharing() }
+            }
         }
         sharedMeetingModel = nil
         sharingMeetingID = nil
@@ -343,62 +375,129 @@ final class AssistantBoardWindowController: NSObject, ObservableObject, WKNaviga
             defer: false
         )
         win.title = L("Rock Assistant Board")
+        win.minSize = NSSize(width: 540, height: 380)
         win.isReleasedWhenClosed = false
         win.delegate = self
         win.center()
+        win.setFrameAutosaveName("RockAssistantBoardWindow")
 
         let root = NSView(frame: frame)
-        root.autoresizingMask = [.width, .height]
 
-        let barHeight: CGFloat = 44
-        let toolbar = NSView(frame: NSRect(x: 0, y: frame.height - barHeight, width: frame.width, height: barHeight))
-        toolbar.autoresizingMask = [.width, .minYMargin]
+        let back = NSButton(
+            image: NSImage(systemSymbolName: "chevron.backward", accessibilityDescription: L("Back")) ?? NSImage(),
+            target: self,
+            action: #selector(handleBack(_:))
+        )
+        back.bezelStyle = .texturedRounded
+        back.isEnabled = false
+        back.setAccessibilityLabel(L("Back"))
 
-        let field = NSTextField(frame: NSRect(x: 12, y: 10, width: frame.width - 360, height: 24))
-        field.autoresizingMask = [.width]
+        let forward = NSButton(
+            image: NSImage(systemSymbolName: "chevron.forward", accessibilityDescription: L("Forward")) ?? NSImage(),
+            target: self,
+            action: #selector(handleForward(_:))
+        )
+        forward.bezelStyle = .texturedRounded
+        forward.isEnabled = false
+        forward.setAccessibilityLabel(L("Forward"))
+
+        let reload = NSButton(
+            image: NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: L("Reload")) ?? NSImage(),
+            target: self,
+            action: #selector(handleReload(_:))
+        )
+        reload.bezelStyle = .texturedRounded
+        reload.setAccessibilityLabel(L("Reload"))
+
+        let field = NSTextField()
         field.placeholderString = "https://jira.example.com/boards/..."
         field.target = self
         field.action = #selector(submitURLField(_:))
+        field.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        field.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        let spinner = NSProgressIndicator()
+        spinner.style = .spinning
+        spinner.controlSize = .small
+        spinner.isDisplayedWhenStopped = false
 
         let banner = NSTextField(labelWithString: "")
-        banner.frame = NSRect(x: frame.width - 336, y: 13, width: 220, height: 18)
-        banner.autoresizingMask = [.minXMargin]
         banner.font = .systemFont(ofSize: 11, weight: .medium)
         banner.textColor = .secondaryLabelColor
         banner.lineBreakMode = .byTruncatingTail
+        banner.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
         let stopBtn = NSButton(title: L("Stop Share"), target: self, action: #selector(handleStopShare(_:)))
-        stopBtn.frame = NSRect(x: frame.width - 108, y: 8, width: 96, height: 28)
-        stopBtn.autoresizingMask = [.minXMargin]
         stopBtn.bezelStyle = .rounded
         stopBtn.isHidden = true
 
-        toolbar.addSubview(field)
-        toolbar.addSubview(banner)
-        toolbar.addSubview(stopBtn)
+        let toolbarStack = NSStackView(views: [back, forward, reload, field, spinner, banner, stopBtn])
+        toolbarStack.orientation = .horizontal
+        toolbarStack.alignment = .centerY
+        toolbarStack.spacing = 8
+        toolbarStack.edgeInsets = NSEdgeInsets(top: 6, left: 12, bottom: 6, right: 12)
+        toolbarStack.translatesAutoresizingMaskIntoConstraints = false
 
         let config = WKWebViewConfiguration()
         config.websiteDataStore = .default()
-        let web = WKWebView(frame: NSRect(x: 0, y: 0, width: frame.width, height: frame.height - barHeight), configuration: config)
-        web.autoresizingMask = [.width, .height]
+        let web = WKWebView(frame: .zero, configuration: config)
+        web.translatesAutoresizingMaskIntoConstraints = false
         web.navigationDelegate = self
 
+        root.addSubview(toolbarStack)
         root.addSubview(web)
-        root.addSubview(toolbar)
+        NSLayoutConstraint.activate([
+            toolbarStack.topAnchor.constraint(equalTo: root.topAnchor),
+            toolbarStack.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            toolbarStack.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            toolbarStack.heightAnchor.constraint(equalToConstant: 44),
+            field.widthAnchor.constraint(greaterThanOrEqualToConstant: 180),
+            banner.widthAnchor.constraint(lessThanOrEqualToConstant: 240),
+
+            web.topAnchor.constraint(equalTo: toolbarStack.bottomAnchor),
+            web.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            web.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            web.bottomAnchor.constraint(equalTo: root.bottomAnchor),
+        ])
         win.contentView = root
 
         self.window = win
         self.webView = web
+        self.backButton = back
+        self.forwardButton = forward
+        self.reloadButton = reload
+        self.loadingIndicator = spinner
         self.urlField = field
         self.shareBannerLabel = banner
         self.stopShareButton = stopBtn
+        refreshNavigationUI()
         refreshBanner()
+    }
+
+    @objc private func handleBack(_ sender: Any?) { webView?.goBack() }
+    @objc private func handleForward(_ sender: Any?) { webView?.goForward() }
+    @objc private func handleReload(_ sender: Any?) {
+        if isLoading {
+            webView?.stopLoading()
+            isLoading = false
+            refreshNavigationUI()
+        } else {
+            loadError = nil
+            refreshBanner()
+            webView?.reload()
+        }
     }
 
     @objc private func submitURLField(_ sender: NSTextField) {
         let value = sender.stringValue
         Task { @MainActor [weak self] in
-            _ = try? await self?.open(urlString: value)
+            guard let self else { return }
+            do {
+                _ = try await self.open(urlString: value)
+            } catch {
+                self.loadError = error.localizedDescription
+                self.refreshBanner()
+            }
         }
     }
 
@@ -406,8 +505,26 @@ final class AssistantBoardWindowController: NSObject, ObservableObject, WKNaviga
         stopSharing()
     }
 
+    private func refreshNavigationUI() {
+        backButton?.isEnabled = webView?.canGoBack ?? false
+        forwardButton?.isEnabled = webView?.canGoForward ?? false
+        if isLoading {
+            loadingIndicator?.startAnimation(nil)
+            reloadButton?.image = NSImage(systemSymbolName: "xmark", accessibilityDescription: L("Close"))
+            reloadButton?.setAccessibilityLabel(L("Close"))
+        } else {
+            loadingIndicator?.stopAnimation(nil)
+            reloadButton?.image = NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: L("Reload"))
+            reloadButton?.setAccessibilityLabel(L("Reload"))
+        }
+    }
+
     private func refreshBanner() {
-        if let title = sharingMeetingTitle {
+        if let err = loadError, !err.isEmpty {
+            shareBannerLabel?.stringValue = err
+            shareBannerLabel?.textColor = .systemRed
+            stopShareButton?.isHidden = sharingMeetingTitle == nil
+        } else if let title = sharingMeetingTitle {
             shareBannerLabel?.stringValue = L("Sharing to %@", title)
             shareBannerLabel?.textColor = .systemOrange
             stopShareButton?.isHidden = false
@@ -483,25 +600,43 @@ final class AssistantBoardWindowController: NSObject, ObservableObject, WKNaviga
 
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
         isLoading = true
+        loadError = nil
         currentURL = webView.url
         if let u = webView.url { urlField?.stringValue = u.absoluteString }
+        refreshNavigationUI()
+        refreshBanner()
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         isLoading = false
+        loadError = nil
         currentURL = webView.url
         if let u = webView.url { urlField?.stringValue = u.absoluteString }
         if let title = webView.title, !title.trimmed.isEmpty { pageTitle = title }
+        refreshNavigationUI()
+        refreshBanner()
         finishPendingNavigation()
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
         isLoading = false
+        let nsError = error as NSError
+        if !(nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorCancelled) {
+            loadError = error.localizedDescription
+        }
+        refreshNavigationUI()
+        refreshBanner()
         finishPendingNavigation()
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
         isLoading = false
+        let nsError = error as NSError
+        if !(nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorCancelled) {
+            loadError = error.localizedDescription
+        }
+        refreshNavigationUI()
+        refreshBanner()
         finishPendingNavigation()
     }
 

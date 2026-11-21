@@ -4,6 +4,7 @@ struct ObsidianSettingsView: View {
     @ObservedObject var coordinator: ObsidianExportCoordinator
     @State private var confirmHeld = false
     @State private var configureLayout = false
+    @State private var confirmDisconnectVault = false
 
     var body: some View {
         Form {
@@ -39,6 +40,17 @@ struct ObsidianSettingsView: View {
                     id: "settings.obsidian-vault"
                 ) {
                     coordinator.chooseVault()
+                }
+                if coordinator.vaultName != nil {
+                    Button(L("Disconnect Vault"), role: .destructive) {
+                        confirmDisconnectVault = true
+                    }
+                    .confirmationDialog(L("Disconnect Vault"), isPresented: $confirmDisconnectVault, titleVisibility: .visible) {
+                        Button(L("Disconnect Vault"), role: .destructive) {
+                            coordinator.disconnectVault()
+                        }
+                        Button(L("Cancel"), role: .cancel) {}
+                    }
                 }
                 if coordinator.waitingForVault && (coordinator.isEnabled || coordinator.pendingCount > 0) {
                     Text(L("Waiting for vault access")).foregroundStyle(.secondary)

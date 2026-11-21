@@ -103,6 +103,7 @@ final class ConferenceModel: ObservableObject {
     let setup: MeetingSetupCoordinator
     private var reminderSubscriptions: Set<AnyCancellable> = []
     private var workspaceSubscriptions: Set<AnyCancellable> = []
+    private var assistantSubscriptions: Set<AnyCancellable> = []
     private let reminderPresenter = MeetingReminderPresenter()
     private var reminderSceneVisible = true
     private let homeReminderHost = MeetingReminderHost()
@@ -478,6 +479,32 @@ final class ConferenceModel: ObservableObject {
         workspace.start()
         _ = assistantTalk
         assistantSpeech.startObservingEnvironment()
+
+        assistantFacilitator.$activeSessionSkills
+            .sink { [weak self] activeSkills in
+                guard let self else { return }
+                for controller in self.sessions {
+                    self.syncAssistantBadge(for: controller.id, activeFacilitatorSkills: activeSkills)
+                }
+            }
+            .store(in: &assistantSubscriptions)
+
+        assistantBoard.$isPresented
+            .sink { [weak self] shouldPresent in
+                guard shouldPresent else { return }
+                Task { @MainActor [weak self] in
+                    guard let self,
+                          self.assistantBoard.isPresented,
+                          !self.assistantBoard.isInlineSheetActive,
+                          !self.isCallMinimized,
+                          let foreground = self.foregroundSession else { return }
+                    foreground.presentBoardSheet(
+                        controller: self.assistantBoard,
+                        defaultBoardURL: self.assistantSkills.teamContext.defaultJiraBoardURL
+                    )
+                }
+            }
+            .store(in: &assistantSubscriptions)
     }
 
     deinit {
@@ -928,12 +955,24 @@ final class ConferenceModel: ObservableObject {
         )
     }
 
-    func syncAssistantBadge(for controllerID: UUID) {
+    func syncAssistantBadge(for controllerID: UUID, activeFacilitatorSkills: [UUID: String]? = nil) {
         guard let controller = sessions.first(where: { $0.id == controllerID }) else { return }
         let mode = assistant.resolvedMode(for: controllerID)
         let isPaused = assistant.isPausedForMicrophone(controllerID: controllerID)
         let alertCount = assistant.alertCards.filter { $0.controllerID == controllerID && !$0.dismissed }.count
-        controller.updateAssistantBadge(mode: mode, isPaused: isPaused, alertCount: alertCount)
+        let skillsMap = activeFacilitatorSkills ?? assistantFacilitator.activeSessionSkills
+        let facilitatorSkillName: String?
+        if let slug = skillsMap[controllerID] {
+            facilitatorSkillName = assistantSkills.skills.first(where: { $0.id == slug })?.name ?? slug
+        } else {
+            facilitatorSkillName = nil
+        }
+        controller.updateAssistantBadge(
+            mode: mode,
+            isPaused: isPaused,
+            alertCount: alertCount,
+            facilitatorSkillName: facilitatorSkillName
+        )
     }
 
     // MARK: - Links & Join Entry Points
@@ -1441,6 +1480,20 @@ final class ConferenceModel: ObservableObject {
                         board: self.assistantBoard
                     )
                 }
+                controller.onOpenAsk = { [weak self, weak controller] in
+                    guard let self, let controller else { return }
+                    controller.presentAskRockSheet(
+                        talk: self.assistantTalk,
+                        speech: self.assistantSpeech
+                    )
+                }
+                controller.onOpenBoard = { [weak self, weak controller] in
+                    guard let self, let controller else { return }
+                    controller.presentBoardSheet(
+                        controller: self.assistantBoard,
+                        defaultBoardURL: self.assistantSkills.teamContext.defaultJiraBoardURL
+                    )
+                }
                 controller.configureAssistantHUD(talk: self.assistantTalk, speech: self.assistantSpeech)
                 controller.onMicrophoneStateChanged = { [weak self] id, unmuted in
                     self?.assistant.handleMicrophoneChange(controllerID: id, unmuted: unmuted)
@@ -1850,6 +1903,37 @@ final class ConferenceModel: ObservableObject {
         pendingTitle = nil
         showSwitchConfirmation = false
         startJoin(target, title: title, allowAlongside: true)
+    }
+
+    func joinCandidatesAlongside(_ candidates: [JoinableMeetingCandidate]) async {
+        for (index, candidate) in candidates.enumerated() {
+            if let activeID = candidate.activeSessionID,
+               sessions.contains(where: { $0.id == activeID }) {
+                if index == 0 {
+                    presentSession(id: activeID)
+                }
+                continue
+            }
+            guard nonLeavingSessions.count < Self.maxConcurrentMeetings else { break }
+            do {
+                let target = try destination(for: candidate.invitation.absoluteString, verifiedEngine: nil)
+                let backgroundJoin = !sessions.isEmpty || index > 0
+                startJoin(
+                    target,
+                    quiet: false,
+                    title: candidate.title,
+                    backgroundJoin: backgroundJoin,
+                    allowAlongside: true
+                )
+                await joinTask?.value
+                if joinAwaitingName != nil || siteSelection != nil || engineSelection != nil {
+                    break
+                }
+            } catch {
+                status = error.localizedDescription
+                statusIsError = true
+            }
+        }
     }
 
     func replaceWithPending() {

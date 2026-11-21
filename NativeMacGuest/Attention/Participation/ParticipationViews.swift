@@ -30,19 +30,25 @@ struct ParticipationSetupView: View {
                 .buttonStyle(.borderless)
             Text(participation.status == .inactive ? L("Participate in this meeting") : participation.status.title)
                 .font(.headline)
-            if let reviewed {
-                settings(reviewed)
-            } else {
-                Text(unavailableReason)
-                    .foregroundStyle(.secondary)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 10) {
+                    if let reviewed {
+                        settings(reviewed)
+                    } else {
+                        Text(unavailableReason)
+                            .foregroundStyle(.secondary)
+                    }
+                    if let startFailure {
+                        Text(startFailure.message).foregroundStyle(.orange)
+                    } else if scopeChanged {
+                        Text(L("Review the updated participation settings before continuing."))
+                            .foregroundStyle(.orange)
+                    }
+                    activity
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
-            if let startFailure {
-                Text(startFailure.message).foregroundStyle(.orange)
-            } else if scopeChanged {
-                Text(L("Review the updated participation settings before continuing."))
-                    .foregroundStyle(.orange)
-            }
-            activity
+            .frame(maxHeight: 430)
             HStack {
                 Button(L("Close"), action: close)
                 Spacer()
@@ -277,6 +283,7 @@ struct ParticipationSetupView: View {
                         }
                         .buttonStyle(.borderless)
                         .help(dictating ? L("Stop dictation") : L("Dictate meeting context"))
+                        .accessibilityLabel(dictating ? L("Stop dictation") : L("Dictate meeting context"))
                         .accessibilityIdentifier("participation.objective.dictate")
                     }
                 }

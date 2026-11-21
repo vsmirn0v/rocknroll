@@ -567,6 +567,7 @@ struct WorkspaceComposer: View {
                     .textFieldStyle(.roundedBorder).lineLimit(1...3).accessibilityLabel(title)
                     .accessibilityIdentifier(symbol == "lock" ? "meetingWorkspace.privateGuidance" : "meetingWorkspace.manualMessage")
                 Button(actionTitle, action: perform).buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.return, modifiers: .command)
                     .accessibilityIdentifier(symbol == "lock" ? "meetingWorkspace.applyGuidance" : "meetingWorkspace.sendManualMessage")
                     .disabled(!canSubmit || text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                               || maximum.map { text.count > $0 } == true)

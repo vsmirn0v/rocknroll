@@ -428,7 +428,12 @@ struct NativeDesktopMeetingView: View {
             }
             Spacer(minLength: 8)
             HStack(spacing: 6) {
-                if let workspace { NativeDesktopMeetingsButton(workspace: workspace, current: model) }
+                if let workspace {
+                    NativeDesktopMeetingsButton(workspace: workspace, current: model)
+                    if !embedded {
+                        NativeMeetingAssistantMenu(meeting: model, attention: workspace.attention)
+                    }
+                }
                 iconButton("person.2", L("Participants")) { togglePanel(.participants) }
                 iconButton("bubble.left", L("Conversation")) { togglePanel(.conversation) }
                 if let notes = model.notes {
@@ -828,7 +833,7 @@ struct NativeDesktopMeetingView: View {
     }
     @ViewBuilder private func inspector(_ panel: NativeDesktopMeetingModel.Panel) -> some View {
         VStack(spacing: 0) {
-            HStack { Text(panel == .presenter ? L("Presenter studio") : L(panel.rawValue)).font(.headline); Spacer(); Button { model.panel = nil } label: { Image(systemName: "xmark") }.buttonStyle(.plain).help(L("Close")) }.padding(18)
+            HStack { Text(panel == .presenter ? L("Presenter studio") : L(panel.rawValue)).font(.headline); Spacer(); Button { model.panel = nil } label: { Image(systemName: "xmark") }.buttonStyle(.plain).help(L("Close")).accessibilityLabel(L("Close")) }.padding(18)
             Divider()
             switch panel {
             case .participants:
@@ -1181,7 +1186,11 @@ struct NativeDesktopConversationView: View {
                 Divider()
                 HStack {
                     TextField(L("Message"), text: $chat.draft).onSubmit { _ = chat.send(chat.draft) }.disabled(!chat.canSend)
-                    Button { _ = chat.send(chat.draft) } label: { Image(systemName: "arrow.up.circle.fill") }.buttonStyle(.plain).disabled(!chat.canSend || chat.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    Button { _ = chat.send(chat.draft) } label: { Image(systemName: "arrow.up.circle.fill") }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel(L("Send"))
+                        .help(L("Send"))
+                        .disabled(!chat.canSend || chat.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }.padding(14)
             }
         }.onAppear { chat.isConversationOpen = true }.onDisappear { chat.isConversationOpen = false }
@@ -1257,11 +1266,15 @@ struct NativeDesktopMiniMeeting: View {
     }
     private var controls: some View {
         HStack {
-            Button { model.toggleMicrophone() } label: { Image(systemName: model.snapshot.microphoneOn ? "mic.fill" : "mic.slash") }.help(L("Mute or unmute"))
+            Button { model.toggleMicrophone() } label: { Image(systemName: model.snapshot.microphoneOn ? "mic.fill" : "mic.slash") }
+                .help(L("Mute or unmute"))
+                .accessibilityLabel(L("Mute or unmute"))
             NativeDesktopLevelMeter(level: model.snapshot.microphoneLevel ?? 0)
             NativeDesktopMeetingVolume(model: model, compact: true).frame(minWidth: 70, maxWidth: 150)
             Spacer(minLength: 4); Button(L("Show meeting"), action: onRestore)
-            Button { Task { await model.onLeave?() } } label: { Image(systemName: "phone.down.fill").foregroundStyle(.red) }.help(L("Leave"))
+            Button { Task { await model.onLeave?() } } label: { Image(systemName: "phone.down.fill").foregroundStyle(.red) }
+                .help(L("Leave"))
+                .accessibilityLabel(L("Leave"))
         }
     }
     private func reveal() {
@@ -1484,6 +1497,7 @@ struct NativeDesktopMeetingsPopover: View {
     @ObservedObject var workspace: NativeDesktopWorkspace
     let current: NativeDesktopMeetingModel
     let close: () -> Void
+    @State private var confirmLeaveAll = false
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             Text(L("Meetings")).font(.headline).padding(.bottom, 6)
@@ -1491,7 +1505,19 @@ struct NativeDesktopMeetingsPopover: View {
                 NativeDesktopMeetingRow(workspace: workspace, model: model, index: index, current: model === current, close: close)
             }
             Divider().padding(.vertical, 6)
-            Button(L("Leave all meetings")) { close(); workspace.leaveAllNow() }.buttonStyle(.plain).foregroundStyle(.red)
+            Button(L("Leave all meetings")) {
+                if workspace.meetings.count > 1 {
+                    confirmLeaveAll = true
+                } else {
+                    close(); workspace.leaveAllNow()
+                }
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.red)
+            .confirmationDialog(L("Leave all meetings"), isPresented: $confirmLeaveAll, titleVisibility: .visible) {
+                Button(L("Leave all meetings"), role: .destructive) { close(); workspace.leaveAllNow() }
+                Button(L("Cancel"), role: .cancel) {}
+            }
             Text(L("Your microphone and camera work in one meeting at a time. Use headphones to avoid echo between meetings."))
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true).padding(.top, 4)
         }.padding(16).frame(width: 380)
@@ -1527,10 +1553,13 @@ private struct NativeDesktopMeetingRow: View {
                 Image(systemName: model.ownsMicrophone && model.snapshot.microphoneOn ? "mic.fill" : "mic.slash")
                     .foregroundStyle(model.ownsMicrophone && model.snapshot.microphoneOn ? Color.red : Color.primary)
             }.buttonStyle(.plain).help(model.ownsMicrophone ? L("Mute or unmute") : L("Unmute here"))
+                .accessibilityLabel(model.ownsMicrophone ? L("Mute or unmute") : L("Unmute here"))
             Button { model.togglePlayout() } label: { Image(systemName: model.soundSymbol) }
                 .buttonStyle(.plain).help(L("Silence or restore this meeting (⇧⌘S)"))
+                .accessibilityLabel(L("Silence or restore this meeting"))
             Button { Task { _ = await workspace.leave(model) } } label: { Image(systemName: "phone.down.fill").foregroundStyle(.red) }
                 .buttonStyle(.plain).help(L("Leave"))
+                .accessibilityLabel(L("Leave"))
         }.padding(.vertical, 6).padding(.horizontal, 8)
             .background(current ? Color.accentColor.opacity(0.12) : hovering ? Color.primary.opacity(0.06) : Color.clear,
                         in: RoundedRectangle(cornerRadius: 8))

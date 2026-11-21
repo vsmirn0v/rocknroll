@@ -1525,6 +1525,7 @@ import UserNotifications
     }
     @objc private func openHome() { show() }
     @objc private func showHomeItem() { show(section: .home) }
+    @objc private func showAssistantBoardWindow() { attention.boardController.showWindow() }
     @objc private func toggleWindowItem(_ sender: NSMenuItem) { if let model = menuMeeting(sender) { toggleWindow(model) } }
     @objc private func miniItem(_ sender: NSMenuItem) { if let model = menuMeeting(sender) { showMini(model) } }
     /// Window menu: standard window commands, Home and every meeting (⌘0–⌘4).
@@ -1547,6 +1548,13 @@ import UserNotifications
                 let row = NSMenuItem(title: title, action: selector, keyEquivalent: "")
                 row.target = self; row.representedObject = current.sessionID; menu.addItem(row)
             }
+        }
+        if attention.boardController.isWindowVisible {
+            menu.addItem(.separator())
+            let boardItem = NSMenuItem(title: L("Rock Assistant Board"), action: #selector(showAssistantBoardWindow), keyEquivalent: "")
+            boardItem.target = self
+            boardItem.image = NSImage(systemSymbolName: "macwindow", accessibilityDescription: L("Rock Assistant Board"))
+            menu.addItem(boardItem)
         }
         menu.addItem(.separator())
         menu.addItem(withTitle: L("Bring All to Front"), action: #selector(NSApplication.arrangeInFront(_:)), keyEquivalent: "")

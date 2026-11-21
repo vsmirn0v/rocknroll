@@ -11,8 +11,12 @@ final class IOSAssistantBoardController: NSObject, ObservableObject, WKNavigatio
     @Published private(set) var currentURL: URL?
     @Published private(set) var pageTitle: String = L("Assistant Board")
     @Published private(set) var isLoading = false
+    @Published private(set) var canGoBack = false
+    @Published private(set) var canGoForward = false
+    @Published private(set) var loadError: String?
     @Published private(set) var lastActionSummary: String?
     @Published var isPresented = false
+    var isInlineSheetActive = false
 
     private(set) lazy var webView: WKWebView = {
         let config = WKWebViewConfiguration()
@@ -31,12 +35,17 @@ final class IOSAssistantBoardController: NSObject, ObservableObject, WKNavigatio
             throw MeetingSessionError.unavailable(L("Enter an https:// or localhost URL for the Assistant Board."))
         }
         finishPendingNavigation()
+        loadError = nil
         currentURL = url
         urlDraft = url.absoluteString
         isPresented = true
         isLoading = true
         webView.load(URLRequest(url: url))
         await waitForLoadFinish(timeoutSeconds: 8)
+        if let loadError {
+            lastActionSummary = loadError
+            throw MeetingSessionError.unavailable(loadError)
+        }
         let title = (webView.title?.trimmingCharacters(in: .whitespacesAndNewlines)).flatMap { $0.isEmpty ? nil : $0 }
             ?? url.host
             ?? url.absoluteString
@@ -46,7 +55,16 @@ final class IOSAssistantBoardController: NSObject, ObservableObject, WKNavigatio
     }
 
     func reload() {
+        loadError = nil
         webView.reload()
+    }
+
+    func goBack() {
+        webView.goBack()
+    }
+
+    func goForward() {
+        webView.goForward()
     }
 
     func scroll(deltaY: Int) async throws -> String {
@@ -241,13 +259,19 @@ final class IOSAssistantBoardController: NSObject, ObservableObject, WKNavigatio
 
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
         isLoading = true
+        loadError = nil
         currentURL = webView.url
+        canGoBack = webView.canGoBack
+        canGoForward = webView.canGoForward
         if let u = webView.url { urlDraft = u.absoluteString }
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         isLoading = false
+        loadError = nil
         currentURL = webView.url
+        canGoBack = webView.canGoBack
+        canGoForward = webView.canGoForward
         if let u = webView.url { urlDraft = u.absoluteString }
         if let t = webView.title?.trimmingCharacters(in: .whitespacesAndNewlines), !t.isEmpty { pageTitle = t }
         finishPendingNavigation()
@@ -255,11 +279,21 @@ final class IOSAssistantBoardController: NSObject, ObservableObject, WKNavigatio
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
         isLoading = false
+        canGoBack = webView.canGoBack
+        canGoForward = webView.canGoForward
+        if (error as NSError).code != NSURLErrorCancelled {
+            loadError = error.localizedDescription
+        }
         finishPendingNavigation()
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
         isLoading = false
+        canGoBack = webView.canGoBack
+        canGoForward = webView.canGoForward
+        if (error as NSError).code != NSURLErrorCancelled {
+            loadError = error.localizedDescription
+        }
         finishPendingNavigation()
     }
 
@@ -307,12 +341,30 @@ struct IOSAssistantBoardSheet: View {
 
     @Environment(\.dismiss) private var dismiss
     @State private var filterText = ""
-    @State private var urlError: String?
+    @State private var errorMessage: String?
 
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
-                HStack(spacing: 8) {
+                HStack(spacing: 6) {
+                    Button {
+                        controller.goBack()
+                    } label: {
+                        Image(systemName: "chevron.backward")
+                            .frame(minWidth: 36, minHeight: 44)
+                    }
+                    .disabled(!controller.canGoBack)
+                    .accessibilityLabel(L("Back"))
+
+                    Button {
+                        controller.goForward()
+                    } label: {
+                        Image(systemName: "chevron.forward")
+                            .frame(minWidth: 36, minHeight: 44)
+                    }
+                    .disabled(!controller.canGoForward)
+                    .accessibilityLabel(L("Forward"))
+
                     TextField("https://jira.example.com/boards/...", text: $controller.urlDraft)
                         .textFieldStyle(.roundedBorder)
                         .keyboardType(.URL)
@@ -323,47 +375,62 @@ struct IOSAssistantBoardSheet: View {
 
                     Button(L("Go")) { openDraft() }
                         .buttonStyle(.borderedProminent)
-                        .controlSize(.small)
 
                     Button {
+                        errorMessage = nil
                         controller.reload()
                     } label: {
-                        Image(systemName: "arrow.clockwise")
+                        Group {
+                            if controller.isLoading {
+                                ProgressView()
+                            } else {
+                                Image(systemName: "arrow.clockwise")
+                            }
+                        }
+                        .frame(minWidth: 44, minHeight: 44)
                     }
-                    .controlSize(.small)
+                    .accessibilityLabel(L("Reload"))
                 }
                 .padding(.horizontal)
-                .padding(.vertical, 8)
+                .padding(.vertical, 6)
 
                 HStack(spacing: 8) {
                     TextField(L("Filter or issue key…"), text: $filterText)
                         .textFieldStyle(.roundedBorder)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
-                    Button(L("Filter")) {
-                        Task { _ = try? await controller.filter(query: filterText) }
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
+                        .submitLabel(.search)
+                        .onSubmit { runFilter() }
+                    Button(L("Filter")) { runFilter() }
+                        .buttonStyle(.bordered)
                     Button(L("Highlight")) {
-                        Task { _ = try? await controller.highlight(text: filterText) }
+                        dismissKeyboard()
+                        errorMessage = nil
+                        Task {
+                            do {
+                                _ = try await controller.highlight(text: filterText)
+                            } catch {
+                                errorMessage = error.localizedDescription
+                            }
+                        }
                     }
                     .buttonStyle(.bordered)
-                    .controlSize(.small)
                 }
                 .padding(.horizontal)
                 .padding(.bottom, 6)
 
-                if let urlError {
-                    Text(urlError)
+                if let activeError = errorMessage ?? controller.loadError {
+                    Text(activeError)
                         .font(.caption)
                         .foregroundStyle(.red)
                         .padding(.horizontal)
+                        .padding(.bottom, 4)
                 } else if let summary = controller.lastActionSummary {
                     Text(summary)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .padding(.horizontal)
+                        .padding(.bottom, 4)
                 }
 
                 IOSBoardWebViewContainer(webView: controller.webView)
@@ -385,14 +452,21 @@ struct IOSAssistantBoardSheet: View {
                     }
                 }
             }
+            .onDisappear {
+                controller.isPresented = false
+            }
             .task {
                 if controller.currentURL == nil {
                     let seed = controller.urlDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                         ? defaultBoardURL
                         : controller.urlDraft
                     if !seed.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        urlError = nil
-                        _ = try? await controller.open(urlString: seed)
+                        errorMessage = nil
+                        do {
+                            _ = try await controller.open(urlString: seed)
+                        } catch {
+                            errorMessage = error.localizedDescription
+                        }
                     }
                 }
             }
@@ -400,14 +474,31 @@ struct IOSAssistantBoardSheet: View {
     }
 
     private func openDraft() {
-        urlError = nil
+        dismissKeyboard()
+        errorMessage = nil
         Task {
             do {
                 _ = try await controller.open(urlString: controller.urlDraft)
             } catch {
-                urlError = error.localizedDescription
+                errorMessage = error.localizedDescription
             }
         }
+    }
+
+    private func runFilter() {
+        dismissKeyboard()
+        errorMessage = nil
+        Task {
+            do {
+                _ = try await controller.filter(query: filterText)
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    private func dismissKeyboard() {
+        UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
     }
 }
 

@@ -49,6 +49,12 @@ struct AssistantSkillsView: View {
 
     @State private var teamContext = AssistantTeamContextDocument()
     @State private var statusMessage: String?
+    @State private var statusIsError = false
+    @State private var confirmRestoreAllSkills = false
+    @State private var confirmResetTemplate = false
+    @State private var confirmDeleteSkill = false
+    @State private var confirmRestorePrompt = false
+    @State private var confirmRemovePerson = false
 
     init(attention: AttentionCoordinator) {
         self.attention = attention
@@ -60,19 +66,42 @@ struct AssistantSkillsView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             storageHeader
-            Picker(L("Skills workspace section"), selection: $tab) {
-                ForEach(SectionTab.allCases) { item in
-                    Text(item.title).tag(item)
+            ViewThatFits(in: .horizontal) {
+                Picker(L("Skills workspace section"), selection: $tab) {
+                    ForEach(SectionTab.allCases) { item in
+                        Text(item.title).tag(item)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        ForEach(SectionTab.allCases) { item in
+                            Button {
+                                tab = item
+                            } label: {
+                                Text(item.title)
+                                    .font(.callout.weight(tab == item ? .semibold : .regular))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 5)
+                                    .background(
+                                        tab == item
+                                            ? Color.accentColor.opacity(0.2)
+                                            : Color(nsColor: .controlBackgroundColor),
+                                        in: Capsule()
+                                    )
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityAddTraits(tab == item ? .isSelected : [])
+                        }
+                    }
                 }
             }
-            .pickerStyle(.segmented)
-            .labelsHidden()
             .nativeSettingAnchor("settings.skills", nativeControlFocus: true)
-
-            if let statusMessage {
-                Text(statusMessage)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+            .onChange(of: tab) { _ in
+                statusMessage = nil
+                statusIsError = false
             }
 
             switch tab {
@@ -84,6 +113,12 @@ struct AssistantSkillsView: View {
                 peopleTab
             case .board:
                 boardAndFacilitationTab
+            }
+
+            if let statusMessage {
+                Label(statusMessage, systemImage: statusIsError ? "exclamationmark.triangle" : "checkmark.circle")
+                    .font(.caption)
+                    .foregroundStyle(statusIsError ? Color.red : Color.secondary)
             }
         }
         .task { await reloadAll() }
@@ -131,13 +166,25 @@ struct AssistantSkillsView: View {
                 Button(L("+ New Skill")) { createNewSkill() }
                     .controlSize(.small)
                 Button(L("Restore Defaults")) {
-                    Task {
-                        try? await attention.restoreDefaultAssistantSkills()
-                        await reloadAll()
-                        statusMessage = L("Default assistant skills restored.")
-                    }
+                    confirmRestoreAllSkills = true
                 }
                 .controlSize(.small)
+                .confirmationDialog(L("Restore Defaults"), isPresented: $confirmRestoreAllSkills, titleVisibility: .visible) {
+                    Button(L("Restore Defaults"), role: .destructive) {
+                        Task {
+                            do {
+                                try await attention.restoreDefaultAssistantSkills()
+                                await reloadAll()
+                                statusIsError = false
+                                statusMessage = L("Default assistant skills restored.")
+                            } catch {
+                                statusIsError = true
+                                statusMessage = error.localizedDescription
+                            }
+                        }
+                    }
+                    Button(L("Cancel"), role: .cancel) {}
+                }
             }
 
             if !skills.isEmpty {
@@ -163,6 +210,8 @@ struct AssistantSkillsView: View {
                                 )
                             }
                             .buttonStyle(.plain)
+                            .accessibilityValue(item.enabled ? L("Enabled") : L("Disabled"))
+                            .accessibilityAddTraits(selectedSkillID == item.id ? .isSelected : [])
                         }
                     }
                 }
@@ -178,7 +227,7 @@ struct AssistantSkillsView: View {
                     }
                     TextField(L("Role summary"), text: $draftSkill.role)
                     TextField(L("Voice / meeting triggers (comma-separated)"), text: $draftTriggersText)
-                    HStack(spacing: 16) {
+                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 165), alignment: .leading)], spacing: 6) {
                         Toggle(L("Voice activation"), isOn: $draftSkill.voiceActivation)
                         Toggle(L("Approved speakers only"), isOn: $draftSkill.approvedSpeakersOnly)
                         Toggle(L("Prefer Realtime model"), isOn: $draftSkill.realtimePreferred)
@@ -236,11 +285,16 @@ struct AssistantSkillsView: View {
                                     .split(separator: ",")
                                     .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
                                     .filter { !$0.isEmpty }
-                                if let saved = try? await attention.saveAssistantSkill(updated) {
+                                do {
+                                    let saved = try await attention.saveAssistantSkill(updated)
                                     selectedSkillID = saved.id
                                     draftSkill = saved
                                     await reloadAll()
+                                    statusIsError = false
                                     statusMessage = L("Saved skill “%@” to Markdown.", saved.name)
+                                } catch {
+                                    statusIsError = true
+                                    statusMessage = error.localizedDescription
                                 }
                             }
                         }
@@ -249,24 +303,48 @@ struct AssistantSkillsView: View {
 
                         if DefaultAssistantSkills.defaultIDs.contains(draftSkill.id) {
                             Button(L("Reset Template")) {
-                                Task {
-                                    try? await attention.restoreDefaultAssistantSkills(id: draftSkill.id)
-                                    await reloadAll()
-                                    statusMessage = L("Reset default template for “%@”.", draftSkill.name)
+                                confirmResetTemplate = true
+                            }
+                            .confirmationDialog(L("Reset Template"), isPresented: $confirmResetTemplate, titleVisibility: .visible) {
+                                Button(L("Reset Template"), role: .destructive) {
+                                    Task {
+                                        do {
+                                            try await attention.restoreDefaultAssistantSkills(id: draftSkill.id)
+                                            await reloadAll()
+                                            statusIsError = false
+                                            statusMessage = L("Reset default template for “%@”.", draftSkill.name)
+                                        } catch {
+                                            statusIsError = true
+                                            statusMessage = error.localizedDescription
+                                        }
+                                    }
                                 }
+                                Button(L("Cancel"), role: .cancel) {}
                             }
                         }
 
                         Spacer()
                         if !draftSkill.id.isEmpty {
                             Button(L("Delete"), role: .destructive) {
-                                let targetID = draftSkill.id
-                                Task {
-                                    try? await attention.deleteAssistantSkill(id: targetID)
-                                    selectedSkillID = nil
-                                    await reloadAll()
-                                    statusMessage = L("Removed skill “%@”.", targetID)
+                                confirmDeleteSkill = true
+                            }
+                            .confirmationDialog(L("Delete"), isPresented: $confirmDeleteSkill, titleVisibility: .visible) {
+                                Button(L("Delete"), role: .destructive) {
+                                    let targetID = draftSkill.id
+                                    Task {
+                                        do {
+                                            try await attention.deleteAssistantSkill(id: targetID)
+                                            selectedSkillID = nil
+                                            await reloadAll()
+                                            statusIsError = false
+                                            statusMessage = L("Removed skill “%@”.", targetID)
+                                        } catch {
+                                            statusIsError = true
+                                            statusMessage = error.localizedDescription
+                                        }
+                                    }
                                 }
+                                Button(L("Cancel"), role: .cancel) {}
                             }
                         }
                     }
@@ -323,10 +401,15 @@ struct AssistantSkillsView: View {
                             let kind = selectedPromptKind
                             let body = draftPromptContent
                             Task {
-                                if let saved = try? await attention.saveAssistantPrompt(kind, content: body) {
+                                do {
+                                    let saved = try await attention.saveAssistantPrompt(kind, content: body)
                                     draftPromptContent = saved.content
                                     await reloadAll()
+                                    statusIsError = false
                                     statusMessage = L("Saved %@ in Obsidian.", kind.relativePath)
+                                } catch {
+                                    statusIsError = true
+                                    statusMessage = error.localizedDescription
                                 }
                             }
                         }
@@ -334,14 +417,25 @@ struct AssistantSkillsView: View {
                         .disabled(draftPromptContent.trimmed.isEmpty)
 
                         Button(L("Restore Default")) {
-                            let kind = selectedPromptKind
-                            Task {
-                                if let restored = try? await attention.restoreDefaultAssistantPrompt(kind) {
-                                    draftPromptContent = restored.content
-                                    await reloadAll()
-                                    statusMessage = L("Restored default %@.", kind.relativePath)
+                            confirmRestorePrompt = true
+                        }
+                        .confirmationDialog(L("Restore Default"), isPresented: $confirmRestorePrompt, titleVisibility: .visible) {
+                            Button(L("Restore Default"), role: .destructive) {
+                                let kind = selectedPromptKind
+                                Task {
+                                    do {
+                                        let restored = try await attention.restoreDefaultAssistantPrompt(kind)
+                                        draftPromptContent = restored.content
+                                        await reloadAll()
+                                        statusIsError = false
+                                        statusMessage = L("Restored default %@.", kind.relativePath)
+                                    } catch {
+                                        statusIsError = true
+                                        statusMessage = error.localizedDescription
+                                    }
                                 }
                             }
+                            Button(L("Cancel"), role: .cancel) {}
                         }
                         Spacer()
                     }
@@ -399,6 +493,7 @@ struct AssistantSkillsView: View {
                                 )
                             }
                             .buttonStyle(.plain)
+                            .accessibilityAddTraits(selectedPersonID == entry.id ? .isSelected : [])
                         }
                     }
                 }
@@ -418,6 +513,9 @@ struct AssistantSkillsView: View {
                     }
                     TextField(L("Notes"), text: $personNotes)
                     Toggle(L("Approved to instruct Rock by voice during facilitated meetings"), isOn: $personApprovedVoice)
+                    Text(L("Configure Jira API credentials and Reminders sync in Tasks → Sync Settings."))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                     HStack {
                         Button(L("Save to People.md")) {
                             Task {
@@ -432,10 +530,15 @@ struct AssistantSkillsView: View {
                                     approvedVoiceCommander: personApprovedVoice,
                                     notes: personNotes
                                 )
-                                if let updated = try? await attention.upsertPersonMapping(entry) {
+                                do {
+                                    let updated = try await attention.upsertPersonMapping(entry)
                                     people = updated
                                     selectedPersonID = entry.id
+                                    statusIsError = false
                                     statusMessage = L("Saved %@ in Knowledge/People.md.", entry.displayName)
+                                } catch {
+                                    statusIsError = true
+                                    statusMessage = error.localizedDescription
                                 }
                             }
                         }
@@ -445,14 +548,26 @@ struct AssistantSkillsView: View {
                         Spacer()
                         if let selectedPersonID {
                             Button(L("Remove"), role: .destructive) {
-                                Task {
-                                    var updated = people
-                                    updated.remove(id: selectedPersonID)
-                                    try? await attention.savePeopleDirectory(updated)
-                                    people = updated
-                                    clearPersonDraft()
-                                    statusMessage = L("Removed member from People.md.")
+                                confirmRemovePerson = true
+                            }
+                            .confirmationDialog(L("Remove"), isPresented: $confirmRemovePerson, titleVisibility: .visible) {
+                                Button(L("Remove"), role: .destructive) {
+                                    Task {
+                                        var updated = people
+                                        updated.remove(id: selectedPersonID)
+                                        do {
+                                            try await attention.savePeopleDirectory(updated)
+                                            people = updated
+                                            clearPersonDraft()
+                                            statusIsError = false
+                                            statusMessage = L("Removed member from People.md.")
+                                        } catch {
+                                            statusIsError = true
+                                            statusMessage = error.localizedDescription
+                                        }
+                                    }
                                 }
+                                Button(L("Cancel"), role: .cancel) {}
                             }
                         }
                     }
@@ -477,16 +592,28 @@ struct AssistantSkillsView: View {
                     HStack {
                         Button(L("Save Team Context")) {
                             Task {
-                                try? await attention.saveTeamContext(teamContext)
-                                statusMessage = L("Saved TeamContext.md.")
+                                do {
+                                    try await attention.saveTeamContext(teamContext)
+                                    statusIsError = false
+                                    statusMessage = L("Saved TeamContext.md.")
+                                } catch {
+                                    statusIsError = true
+                                    statusMessage = error.localizedDescription
+                                }
                             }
                         }
                         Button(L("Open Assistant Board")) {
                             Task {
-                                if !teamContext.defaultJiraBoardURL.trimmed.isEmpty {
-                                    _ = try? await board.open(urlString: teamContext.defaultJiraBoardURL)
-                                } else {
-                                    board.showWindow()
+                                do {
+                                    if !teamContext.defaultJiraBoardURL.trimmed.isEmpty {
+                                        _ = try await board.open(urlString: teamContext.defaultJiraBoardURL)
+                                        statusIsError = false
+                                    } else {
+                                        board.showWindow()
+                                    }
+                                } catch {
+                                    statusIsError = true
+                                    statusMessage = error.localizedDescription
                                 }
                             }
                         }
@@ -508,48 +635,58 @@ struct AssistantSkillsView: View {
                         ForEach(live, id: \.sessionID) { model in
                             let isActive = facilitator.activeSessionSkills[model.sessionID] != nil
                             let boundSkill = facilitator.activeSessionSkills[model.sessionID] ?? (skills.first?.id ?? "scrum-master")
-                            HStack(spacing: 8) {
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(model.title).font(.callout.weight(.medium))
-                                    if let msg = facilitator.lastStatusBySession[model.sessionID] {
-                                        Text(msg).font(.caption2).foregroundStyle(.secondary)
-                                    }
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text(model.title)
+                                    .font(.callout.weight(.medium))
+                                    .lineLimit(1)
+                                if let msg = facilitator.lastStatusBySession[model.sessionID] {
+                                    Text(msg)
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                        .fixedSize(horizontal: false, vertical: true)
                                 }
-                                Spacer()
-                                Menu {
-                                    ForEach(skills.filter(\.enabled)) { skill in
-                                        Button(skill.name) {
-                                            facilitator.enable(for: model, skillID: skill.id)
-                                        }
-                                    }
-                                } label: {
-                                    Text(skills.first(where: { $0.id == boundSkill })?.name ?? boundSkill)
-                                }
-                                .frame(width: 170)
-
-                                Button(isActive ? L("Stop Voice Facilitator") : L("Start Voice Facilitator")) {
-                                    if isActive {
-                                        facilitator.disable(for: model.sessionID)
-                                    } else {
-                                        facilitator.enable(for: model, skillID: boundSkill)
-                                    }
-                                }
-                                .buttonStyle(.bordered)
-
-                                Button(board.sharingMeetingID == model.sessionID ? L("Stop Board Share") : L("Share Board")) {
-                                    Task {
-                                        if board.sharingMeetingID == model.sessionID {
-                                            board.stopSharing()
-                                        } else {
-                                            if board.currentURL == nil && !teamContext.defaultJiraBoardURL.trimmed.isEmpty {
-                                                _ = try? await board.open(urlString: teamContext.defaultJiraBoardURL)
+                                HStack(spacing: 8) {
+                                    Menu {
+                                        ForEach(skills.filter(\.enabled)) { skill in
+                                            Button(skill.name) {
+                                                facilitator.enable(for: model, skillID: skill.id)
                                             }
-                                            _ = try? await board.startSharing(to: model)
+                                        }
+                                    } label: {
+                                        Text(skills.first(where: { $0.id == boundSkill })?.name ?? boundSkill)
+                                    }
+
+                                    Button(isActive ? L("Stop Voice Facilitator") : L("Start Voice Facilitator")) {
+                                        if isActive {
+                                            facilitator.disable(for: model.sessionID)
+                                        } else {
+                                            facilitator.enable(for: model, skillID: boundSkill)
                                         }
                                     }
+                                    .buttonStyle(.bordered)
+
+                                    Button(board.sharingMeetingID == model.sessionID ? L("Stop Board Share") : L("Share Board")) {
+                                        Task {
+                                            if board.sharingMeetingID == model.sessionID {
+                                                board.stopSharing()
+                                            } else {
+                                                do {
+                                                    if board.currentURL == nil && !teamContext.defaultJiraBoardURL.trimmed.isEmpty {
+                                                        _ = try await board.open(urlString: teamContext.defaultJiraBoardURL)
+                                                    }
+                                                    _ = try await board.startSharing(to: model)
+                                                    statusIsError = false
+                                                } catch {
+                                                    statusIsError = true
+                                                    statusMessage = error.localizedDescription
+                                                }
+                                            }
+                                        }
+                                    }
+                                    .buttonStyle(.bordered)
                                 }
-                                .buttonStyle(.bordered)
                             }
+                            .padding(.vertical, 4)
                         }
                     }
                 }
@@ -591,9 +728,9 @@ struct AssistantSkillsView: View {
     private func createNewSkill() {
         selectedSkillID = nil
         draftSkill = AssistantSkill(
-            id: "custom-role",
-            name: "Custom Assistant Skill",
-            role: "Specialized workflow stored in Obsidian.",
+            id: "custom-role-\(Int.random(in: 100...999))",
+            name: L("Custom Facilitator Skill"),
+            role: L("Custom meeting role"),
             enabled: true,
             voiceActivation: true,
             triggers: ["custom"],
@@ -601,9 +738,9 @@ struct AssistantSkillsView: View {
             approvedSpeakersOnly: true,
             realtimePreferred: false,
             instructions: """
-            # Custom Assistant Skill
+            # \(L("Custom Facilitator Skill"))
 
-            Describe how Rock should handle this meeting or workflow.
+            \(L("Custom meeting role"))
             """
         )
         draftTriggersText = "custom"
@@ -664,7 +801,7 @@ struct NativeMeetingAssistantMenu: View {
                 if isFacilitatorActive {
                     facilitator.disable(for: meeting.sessionID)
                 } else {
-                    facilitator.enable(for: meeting, skillID: activeSkillID)
+                    facilitator.enable(for: meeting, skillID: nil)
                 }
             }
             if isFacilitatorActive {
@@ -688,11 +825,15 @@ struct NativeMeetingAssistantMenu: View {
             Divider()
             Button(L("Open Assistant Board")) {
                 Task {
-                    let team = await attention.loadTeamContext()
-                    if board.currentURL == nil && !team.defaultJiraBoardURL.trimmed.isEmpty {
-                        _ = try? await board.open(urlString: team.defaultJiraBoardURL)
-                    } else {
-                        board.showWindow()
+                    do {
+                        let team = await attention.loadTeamContext()
+                        if board.currentURL == nil && !team.defaultJiraBoardURL.trimmed.isEmpty {
+                            _ = try await board.open(urlString: team.defaultJiraBoardURL)
+                        } else {
+                            board.showWindow()
+                        }
+                    } catch {
+                        meeting.error = error.localizedDescription
                     }
                 }
             }
@@ -701,11 +842,15 @@ struct NativeMeetingAssistantMenu: View {
                     if board.sharingMeetingID == meeting.sessionID {
                         board.stopSharing()
                     } else {
-                        let team = await attention.loadTeamContext()
-                        if board.currentURL == nil && !team.defaultJiraBoardURL.trimmed.isEmpty {
-                            _ = try? await board.open(urlString: team.defaultJiraBoardURL)
+                        do {
+                            let team = await attention.loadTeamContext()
+                            if board.currentURL == nil && !team.defaultJiraBoardURL.trimmed.isEmpty {
+                                _ = try await board.open(urlString: team.defaultJiraBoardURL)
+                            }
+                            _ = try await board.startSharing(to: meeting)
+                        } catch {
+                            meeting.error = error.localizedDescription
                         }
-                        _ = try? await board.startSharing(to: meeting)
                     }
                 }
             }
@@ -731,6 +876,8 @@ struct MultiMeetingRockJoinSheet: View {
     @State private var selectedSkillID: String = "scrum-master"
     @State private var enableVoice = true
     @State private var statusText: String?
+
+    @State private var isJoining = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -782,9 +929,12 @@ struct MultiMeetingRockJoinSheet: View {
                 Button(L("Cancel")) { isPresented = false }
                     .keyboardShortcut(.cancelAction)
                 Spacer()
-                Button(L("Join Selected")) {
+                Button {
+                    guard !isJoining else { return }
+                    isJoining = true
                     let chosenTitles = candidates.filter { selectedIDs.contains($0.id) }.map(\.title)
                     Task {
+                        defer { isJoining = false }
                         let res = await AssistantSkillToolRegistrar.joinMeetingsByQueries(
                             chosenTitles,
                             skillID: selectedSkillID,
@@ -797,9 +947,16 @@ struct MultiMeetingRockJoinSheet: View {
                             isPresented = false
                         }
                     }
+                } label: {
+                    HStack(spacing: 6) {
+                        if isJoining {
+                            ProgressView().controlSize(.small)
+                        }
+                        Text(L("Join Selected"))
+                    }
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(selectedIDs.isEmpty)
+                .disabled(selectedIDs.isEmpty || isJoining)
                 .keyboardShortcut(.defaultAction)
             }
         }

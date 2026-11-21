@@ -6,14 +6,44 @@ struct IOSAssistantModePill: View {
     let mode: IOSMeetingAssistantMode
     let isPaused: Bool
     let alertCount: Int
+    var facilitatorSkillName: String? = nil
     var action: () -> Void
+
+    private var hasFacilitatorOnly: Bool {
+        mode == .off && facilitatorSkillName != nil
+    }
+
+    private var effectiveSymbol: String {
+        hasFacilitatorOnly ? "waveform" : mode.symbol
+    }
+
+    private var effectiveTitle: String {
+        if isPaused { return L("Paused") }
+        if hasFacilitatorOnly, let facilitatorSkillName { return facilitatorSkillName }
+        return mode.shortTitle
+    }
+
+    private var effectiveAccessibilityLabel: String {
+        var parts: [String] = []
+        if hasFacilitatorOnly, let facilitatorSkillName {
+            parts.append(L("Voice facilitator: %@", facilitatorSkillName))
+        } else {
+            parts.append(L("Assistant mode: %@", mode.title))
+            if let facilitatorSkillName {
+                parts.append(L("Voice facilitator: %@", facilitatorSkillName))
+            }
+        }
+        if isPaused { parts.append(L("Paused")) }
+        if alertCount > 0 { parts.append(L("Unread alerts: %ld", alertCount)) }
+        return parts.joined(separator: ", ")
+    }
 
     var body: some View {
         Button(action: action) {
             HStack(spacing: 5) {
-                Image(systemName: mode.symbol)
+                Image(systemName: effectiveSymbol)
                     .font(.caption.weight(.semibold))
-                Text(isPaused ? L("Paused") : mode.shortTitle)
+                Text(effectiveTitle)
                     .font(.caption.weight(.semibold))
                     .lineLimit(1)
                 if alertCount > 0 {
@@ -25,17 +55,20 @@ struct IOSAssistantModePill: View {
                         .foregroundStyle(.white)
                 }
             }
-            .padding(.horizontal, 9)
-            .padding(.vertical, 5)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
             .background(pillBackground, in: Capsule())
             .foregroundStyle(pillForeground)
+            .frame(minHeight: 44)
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .accessibilityLabel(L("Assistant mode: %@", mode.title))
+        .accessibilityLabel(effectiveAccessibilityLabel)
     }
 
     private var pillBackground: Color {
         if isPaused { return .orange.opacity(0.16) }
+        if hasFacilitatorOnly { return .teal.opacity(0.16) }
         switch mode {
         case .off: return Color.secondary.opacity(0.12)
         case .mentions: return Color.blue.opacity(0.14)
@@ -46,6 +79,7 @@ struct IOSAssistantModePill: View {
 
     private var pillForeground: Color {
         if isPaused { return .orange }
+        if hasFacilitatorOnly { return .teal }
         switch mode {
         case .off: return .secondary
         case .mentions: return .blue
@@ -159,14 +193,12 @@ struct IOSAssistantAlertCardView: View {
                         Label(L("Speak"), systemImage: "waveform")
                     }
                     .buttonStyle(.bordered)
-                    .controlSize(.small)
                     .disabled(isWorking)
                 }
 
                 if let onFocusMeeting {
                     Button(L("Open meeting"), action: onFocusMeeting)
                         .buttonStyle(.bordered)
-                        .controlSize(.small)
                 }
 
                 Spacer()
@@ -176,9 +208,11 @@ struct IOSAssistantAlertCardView: View {
                 } label: {
                     Image(systemName: "xmark")
                         .font(.caption.weight(.semibold))
+                        .frame(minWidth: 36, minHeight: 36)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.bordered)
-                .controlSize(.small)
+                .frame(minWidth: 44, minHeight: 44)
                 .accessibilityLabel(L("Dismiss alert"))
             }
         }
@@ -294,6 +328,7 @@ struct IOSAssistantModeSheet: View {
                             .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
+                        .accessibilityAddTraits(activeMode == mode ? [.isSelected] : [])
                     }
 
                     Toggle(L("Remember mode for this room"), isOn: $rememberForRoom)
@@ -442,7 +477,13 @@ struct IOSAssistantModeSheet: View {
                 }
             }
             .onAppear { maybeAutoStartGoalDictation() }
-            .onDisappear { stopGoalDictation(commit: false) }
+            .onDisappear {
+                stopGoalDictation(commit: false)
+                board?.isInlineSheetActive = false
+            }
+            .onChange(of: showingBoardSheet) { _, isShowing in
+                board?.isInlineSheetActive = isShowing
+            }
             .sheet(isPresented: $showingBoardSheet) {
                 if let board {
                     IOSAssistantBoardSheet(
@@ -563,13 +604,57 @@ private struct IOSAssistantDictationFeedbackRow: View {
 struct IOSActiveMeetingAssistantPill: View {
     let controllerID: UUID
     @ObservedObject var assistant: IOSAssistantCoordinator
+    var facilitator: IOSAutonomousMeetingFacilitator? = nil
+    var skills: IOSAssistantSkillsController? = nil
     var action: () -> Void
 
     var body: some View {
         let mode = assistant.resolvedMode(for: controllerID)
         let isPaused = assistant.isPausedForMicrophone(controllerID: controllerID)
         let alerts = assistant.alertCards.filter { $0.controllerID == controllerID && !$0.dismissed }.count
-        IOSAssistantModePill(mode: mode, isPaused: isPaused, alertCount: alerts, action: action)
+        if let facilitator {
+            IOSFacilitatorAwareModePill(
+                controllerID: controllerID,
+                mode: mode,
+                isPaused: isPaused,
+                alertCount: alerts,
+                facilitator: facilitator,
+                skills: skills,
+                action: action
+            )
+        } else {
+            IOSAssistantModePill(
+                mode: mode,
+                isPaused: isPaused,
+                alertCount: alerts,
+                action: action
+            )
+        }
+    }
+}
+
+private struct IOSFacilitatorAwareModePill: View {
+    let controllerID: UUID
+    let mode: IOSMeetingAssistantMode
+    let isPaused: Bool
+    let alertCount: Int
+    @ObservedObject var facilitator: IOSAutonomousMeetingFacilitator
+    var skills: IOSAssistantSkillsController?
+    let action: () -> Void
+
+    private var skillName: String? {
+        guard let slug = facilitator.activeSessionSkills[controllerID] else { return nil }
+        return skills?.skills.first(where: { $0.id == slug })?.name ?? slug
+    }
+
+    var body: some View {
+        IOSAssistantModePill(
+            mode: mode,
+            isPaused: isPaused,
+            alertCount: alertCount,
+            facilitatorSkillName: skillName,
+            action: action
+        )
     }
 }
 
@@ -616,7 +701,7 @@ private struct IOSFacilitatorModeSection: View {
                 get: { isActive },
                 set: { enabled in
                     if enabled {
-                        facilitator.enable(controllerID: controllerID, title: meetingTitle, skillID: skills.selectedSkillIDs.first)
+                        facilitator.enable(controllerID: controllerID, title: meetingTitle, skillID: nil)
                     } else {
                         facilitator.disable(controllerID: controllerID)
                     }

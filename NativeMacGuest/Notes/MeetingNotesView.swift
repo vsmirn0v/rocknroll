@@ -48,6 +48,7 @@ struct MeetingNotesView: View {
                 .menuStyle(.borderlessButton)
                 .fixedSize()
                 .disabled(!editing)
+                .accessibilityLabel(L("Format"))
                 if let openWindow {
                     Button(action: openWindow) { Image(systemName: "macwindow.badge.plus") }
                         .accessibilityLabel(L("Open notes in a separate window"))

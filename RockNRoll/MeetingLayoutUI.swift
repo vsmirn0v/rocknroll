@@ -290,13 +290,25 @@ final class MeetingParticipantStrip: UIScrollView, UIScrollViewDelegate {
     }
     override func layoutSubviews() {
         super.layoutSubviews()
+        let isRTL = effectiveUserInterfaceLayoutDirection == .rightToLeft
+        let totalHorizontalWidth = CGFloat(items.count) * 112
         for (index, item) in items.enumerated() {
-            buttons[item.id]?.frame = vertical
-                ? CGRect(x: 0, y: CGFloat(index) * 100, width: bounds.width, height: 92)
-                : CGRect(x: CGFloat(index) * 112, y: 0, width: 104, height: bounds.height)
+            let rect: CGRect
+            if vertical {
+                rect = CGRect(x: 0, y: CGFloat(index) * 100, width: bounds.width, height: 92)
+            } else {
+                let ltrRect = CGRect(x: CGFloat(index) * 112, y: 0, width: 104, height: bounds.height)
+                if isRTL {
+                    let mirrorSpan = max(bounds.width, totalHorizontalWidth)
+                    rect = CGRect(x: mirrorSpan - ltrRect.maxX, y: ltrRect.minY, width: ltrRect.width, height: ltrRect.height)
+                } else {
+                    rect = ltrRect
+                }
+            }
+            buttons[item.id]?.frame = rect
         }
         contentSize = vertical ? CGSize(width: bounds.width, height: CGFloat(items.count) * 100) :
-            CGSize(width: CGFloat(items.count) * 112, height: bounds.height)
+            CGSize(width: totalHorizontalWidth, height: bounds.height)
         refreshPreviews()
     }
     override func didMoveToWindow() { super.didMoveToWindow(); refreshPreviews() }

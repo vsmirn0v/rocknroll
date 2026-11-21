@@ -224,7 +224,7 @@ struct NativeGuestApplication {
         shareItem.keyEquivalentModifierMask = [.command, .shift]
         shareItem.target = self; meetingMenu.addItem(shareItem)
         let assistantItem = NSMenuItem(title: L("Ask Assistant"), action: #selector(focusAssistantView), keyEquivalent: "a")
-        assistantItem.keyEquivalentModifierMask = [.control, .option]
+        assistantItem.keyEquivalentModifierMask = [.command, .shift]
         assistantItem.target = self; meetingMenu.addItem(assistantItem)
         meetingMenu.addItem(.separator())
         let pause = NSMenuItem(title: L("Pause All Assistant Participation"), action: #selector(pauseAllParticipation), keyEquivalent: "")
@@ -423,7 +423,10 @@ struct NativeGuestApplication {
     }
     func applicationDockMenu(_ sender: NSApplication) -> NSMenu? { workspace?.dockMenu() }
     @objc private func pauseAllParticipation() {
-        for meeting in workspace?.meetings ?? [] { meeting.participation.pause() }
+        for meeting in workspace?.meetings ?? [] {
+            meeting.participation.pause()
+            workspace?.attention.facilitator?.disable(for: meeting.sessionID)
+        }
     }
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()

@@ -15,6 +15,8 @@ struct IOSAssistantSettingsView: View {
     @ObservedObject private var voxStore = IOSVoxCPM2Store.shared
 
     @State private var apiKeyDraft = ""
+    @State private var keyFeedback: String?
+    @State private var keyFeedbackIsError = false
     @State private var choosingModel = false
     @State private var pickingArchiveFolder = false
     @State private var pickingExportBundleFolder = false
@@ -47,6 +49,9 @@ struct IOSAssistantSettingsView: View {
                 Toggle(L("Ask before sending replies"), isOn: $assistant.participationConfig.askBeforeSending)
                 TextField(L("Default participation goal (optional)"), text: $assistant.participationConfig.goal, axis: .vertical)
                     .lineLimit(1...3)
+                if let skills {
+                    IOSFacilitatorSettingsToggleRow(skills: skills)
+                }
             } header: {
                 Text(L("Live Meeting Assistant"))
             } footer: {
@@ -54,18 +59,7 @@ struct IOSAssistantSettingsView: View {
             }
 
             if let skills, let board {
-                Section(L("Obsidian Skills & Realtime")) {
-                    NavigationLink {
-                        IOSAssistantSkillsView(skills: skills, board: board)
-                    } label: {
-                        LabeledContent(
-                            L("Skills, Prompts & People.md"),
-                            value: skills.realtimeProvider == .disabled
-                                ? L("%ld skills", skills.skills.filter(\.enabled).count)
-                                : skills.realtimeProvider.title
-                        )
-                    }
-                }
+                IOSObsidianSkillsSettingsLink(skills: skills, board: board)
             }
 
             Section {
@@ -154,15 +148,30 @@ struct IOSAssistantSettingsView: View {
                     ))
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
-                    SecureField(L("API Key (stored in Keychain)"), text: Binding(
-                        get: { apiKeyDraft },
-                        set: { key in
-                            apiKeyDraft = key
-                            workspace.saveAPIKey(key, for: workspace.outcomeConfig.providerKind)
-                        }
-                    ))
+                    SecureField(L("API Key (stored in Keychain)"), text: $apiKeyDraft)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
+                        .submitLabel(.done)
+                        .onSubmit { saveSummaryAPIKey() }
+
+                    HStack {
+                        Button(L("Save Key")) {
+                            saveSummaryAPIKey()
+                        }
+                        .buttonStyle(.borderedProminent)
+                        if !workspace.readAPIKey(for: workspace.outcomeConfig.providerKind).isEmpty || !apiKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                            Button(L("Remove"), role: .destructive) {
+                                apiKeyDraft = ""
+                                saveSummaryAPIKey(removing: true)
+                            }
+                            .buttonStyle(.bordered)
+                        }
+                    }
+                    if let keyFeedback {
+                        Text(keyFeedback)
+                            .font(.caption)
+                            .foregroundStyle(keyFeedbackIsError ? .red : .secondary)
+                    }
                 }
             } header: {
                 Text(L("Meeting Summaries & Tasks"))
@@ -273,6 +282,7 @@ struct IOSAssistantSettingsView: View {
         }
         .onAppear {
             apiKeyDraft = workspace.readAPIKey(for: workspace.outcomeConfig.providerKind)
+            keyFeedback = nil
             Task { await workspace.refreshArchiveStats() }
         }
         .fileImporter(isPresented: $pickingArchiveFolder, allowedContentTypes: [.folder]) { result in
@@ -396,5 +406,57 @@ private struct IOSSummaryModelPicker: View {
         }
         .contentShape(Rectangle())
         .accessibilityAddTraits(selected ? .isSelected : [])
+    }
+}
+
+private extension IOSAssistantSettingsView {
+    func saveSummaryAPIKey(removing: Bool = false) {
+        let kind = workspace.outcomeConfig.providerKind
+        workspace.saveAPIKey(removing ? "" : apiKeyDraft, for: kind)
+        let savedNow = workspace.readAPIKey(for: kind)
+        let trimmed = apiKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        if removing || trimmed.isEmpty {
+            if savedNow.isEmpty {
+                keyFeedback = L("Removed API key from Keychain.")
+                keyFeedbackIsError = false
+            } else {
+                keyFeedback = L("Could not remove the API key from the Keychain.")
+                keyFeedbackIsError = true
+            }
+        } else if savedNow == trimmed {
+            keyFeedback = L("Saved API key to Keychain.")
+            keyFeedbackIsError = false
+        } else {
+            keyFeedback = L("Could not save the API key to the Keychain.")
+            keyFeedbackIsError = true
+        }
+    }
+}
+
+private struct IOSFacilitatorSettingsToggleRow: View {
+    @ObservedObject var skills: IOSAssistantSkillsController
+
+    var body: some View {
+        Toggle(L("Enable autonomous in-meeting voice facilitator"), isOn: $skills.autonomousMeetingVoiceEnabled)
+    }
+}
+
+private struct IOSObsidianSkillsSettingsLink: View {
+    @ObservedObject var skills: IOSAssistantSkillsController
+    @ObservedObject var board: IOSAssistantBoardController
+
+    var body: some View {
+        Section(L("Obsidian Skills & Realtime")) {
+            NavigationLink {
+                IOSAssistantSkillsView(skills: skills, board: board)
+            } label: {
+                LabeledContent(
+                    L("Skills, Prompts & People.md"),
+                    value: skills.realtimeProvider == .disabled
+                        ? L("%ld skills", skills.skills.filter(\.enabled).count)
+                        : skills.realtimeProvider.title
+                )
+            }
+        }
     }
 }

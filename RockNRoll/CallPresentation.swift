@@ -290,12 +290,15 @@ final class CallToolbar: UIView {
     }
     override func layoutSubviews() {
         super.layoutSubviews()
+        let isRTL = effectiveUserInterfaceLayoutDirection == .rightToLeft
         let separated = separatesLast && !rail && !largeText && items.count > 1
         endSurface.isHidden = !separated
         leaveDivider.isHidden = separated || largeText || items.count < 2
         if separated {
-            let end = CGRect(x: bounds.maxX - 54, y: 0, width: 54, height: bounds.height)
-            surface.frame = CGRect(x: 0, y: 0, width: end.minX - 8 - inlineAccessWidth, height: bounds.height)
+            let ltrEnd = CGRect(x: bounds.maxX - 54, y: 0, width: 54, height: bounds.height)
+            let ltrSurface = CGRect(x: 0, y: 0, width: ltrEnd.minX - 8 - inlineAccessWidth, height: bounds.height)
+            let end = mirroredHorizontallyIfRTL(ltrEnd, within: bounds)
+            surface.frame = mirroredHorizontallyIfRTL(ltrSurface, within: bounds)
             endSurface.frame = end
             surface.layoutIfNeeded(); endSurface.layoutIfNeeded()
             let area = surface.frame.insetBy(dx: 4, dy: 5)
@@ -303,8 +306,15 @@ final class CallToolbar: UIView {
             for (index, item) in items.enumerated() {
                 setCaptions(in: item, visible: true)
                 let isLast = index == items.count - 1
-                let rect = isLast ? end.insetBy(dx: 4, dy: 5) :
-                    CGRect(x: area.minX + CGFloat(index) * width, y: area.minY, width: width, height: area.height)
+                let rect: CGRect
+                if isLast {
+                    rect = end.insetBy(dx: 4, dy: 5)
+                } else {
+                    let x = isRTL
+                        ? area.maxX - CGFloat(index + 1) * width
+                        : area.minX + CGFloat(index) * width
+                    rect = CGRect(x: x, y: area.minY, width: width, height: area.height)
+                }
                 place(item, in: isLast ? endSurface : surface, frame: rect)
             }
             return
@@ -321,17 +331,32 @@ final class CallToolbar: UIView {
         for (index, item) in items.enumerated() {
             setCaptions(in: item, visible: !rail || largeText)
             let last = index == items.count - 1
-            let rect = CGRect(x: area.minX + CGFloat(index % columns) * width + (last && !rail ? gap : 0),
-                                y: area.minY + CGFloat(index / columns) * height + (last && rail ? gap : 0),
-                                width: width, height: height).insetBy(dx: 1, dy: 0)
+            let ltrRect = CGRect(
+                x: area.minX + CGFloat(index % columns) * width + (last && !rail ? gap : 0),
+                y: area.minY + CGFloat(index / columns) * height + (last && rail ? gap : 0),
+                width: width,
+                height: height
+            ).insetBy(dx: 1, dy: 0)
+            let rect = rail ? ltrRect : mirroredHorizontallyIfRTL(ltrRect, within: area)
             place(item, in: surface, frame: rect)
         }
         if let last = items.last, !leaveDivider.isHidden {
             let lastFrame = convert(last.bounds, from: last)
+            let horizontalDividerX = isRTL ? (lastFrame.maxX + gap / 2) : (lastFrame.minX - gap / 2 - 1)
             leaveDivider.frame = rail ? CGRect(x: area.minX + 8, y: lastFrame.minY - gap / 2,
-                width: max(0, area.width - 16), height: 1) : CGRect(x: lastFrame.minX - gap / 2 - 1,
+                width: max(0, area.width - 16), height: 1) : CGRect(x: horizontalDividerX,
                 y: area.midY - 14, width: 1, height: 28)
         }
+    }
+
+    private func mirroredHorizontallyIfRTL(_ rect: CGRect, within container: CGRect) -> CGRect {
+        guard effectiveUserInterfaceLayoutDirection == .rightToLeft else { return rect }
+        return CGRect(
+            x: container.minX + (container.maxX - rect.maxX),
+            y: rect.minY,
+            width: rect.width,
+            height: rect.height
+        )
     }
     override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
         let hit = super.hitTest(point, with: event)

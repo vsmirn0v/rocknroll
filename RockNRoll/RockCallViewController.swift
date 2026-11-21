@@ -141,6 +141,7 @@ final class RockCallViewController: UIViewController, UIScrollViewDelegate, UICo
     private var currentAssistantMode: IOSMeetingAssistantMode { workspace.assistantMode }
     private var currentAssistantPaused: Bool { workspace.assistantPaused }
     private var currentAssistantAlertCount = 0
+    private var currentFacilitatorSkillName: String?
     private var assistantBannerView: UIView?
     private var assistantBannerDismissTask: Task<Void, Never>?
     private var assistantBannerTapHandler: (() -> Void)?
@@ -1949,21 +1950,38 @@ final class RockCallViewController: UIViewController, UIScrollViewDelegate, UICo
                 }
         ]
         var invite: [UIMenuElement] = []
-        let assistantTitle = currentAssistantMode == .off
-            ? L("Assistant mode")
-            : L("Assistant mode: %@", currentAssistantMode.title)
-        var meeting: [UIMenuElement] = [UIAction(title: assistantTitle, image: UIImage(systemName: "sparkles")) { [weak self] _ in
+        let assistantAppearance = assistantBadgeAppearance()
+        let assistantTitle: String
+        if currentAssistantMode != .off {
+            assistantTitle = L("Assistant mode: %@", currentAssistantMode.title)
+        } else if let currentFacilitatorSkillName {
+            assistantTitle = L("Voice facilitator: %@", currentFacilitatorSkillName)
+        } else {
+            assistantTitle = L("Assistant mode")
+        }
+        var meeting: [UIMenuElement] = [UIAction(title: assistantTitle, image: UIImage(systemName: assistantAppearance.symbol)) { [weak self] _ in
             self?.onOpenAssistant?()
         }, UIAction(title: L("Voice reply"), image: UIImage(systemName: "waveform.and.mic"),
                 attributes: isHeld ? [.disabled] : []) { [weak self] _ in
             self?.workspace.openVoiceReply?()
-        }, UIAction(title: L("Meeting details"), image: UIImage(systemName: "info.circle")) { [weak self] _ in
+        }]
+        if workspace.openBoard != nil {
+            meeting.append(UIAction(title: L("Assistant Board"), image: UIImage(systemName: "rectangle.3.group")) { [weak self] _ in
+                self?.workspace.openBoard?()
+            })
+        }
+        if workspace.openNotes != nil {
+            meeting.append(UIAction(title: L("Meeting Notes"), image: UIImage(systemName: "note.text")) { [weak self] _ in
+                self?.workspace.openNotes?()
+            })
+        }
+        meeting.append(UIAction(title: L("Meeting details"), image: UIImage(systemName: "info.circle")) { [weak self] _ in
             guard let self else { return }
             let details = [self.workspace.roomIdentifier, self.workspace.invitationURL?.absoluteString].compactMap { $0 }.joined(separator: "\n")
             let alert = UIAlertController(title: self.titleLabel.text, message: details, preferredStyle: .alert)
             alert.addAction(UIAlertAction(title: L("Done"), style: .default))
             self.reactionsButton.callActionPresenter?.present(alert, animated: true)
-        }]
+        })
         if activeMeetingsForSwitcher.count < ConferenceModel.maxConcurrentMeetings, onJoinAnotherMeeting != nil {
             meeting.append(UIAction(title: L("Join another meeting…"), image: UIImage(systemName: "plus.circle")) { [weak self] _ in
                 self?.onJoinAnotherMeeting?()
@@ -2053,8 +2071,7 @@ final class RockCallViewController: UIViewController, UIScrollViewDelegate, UICo
         #endif
         var quickActions: [UIMenuElement] = []
         if onOpenAssistant != nil {
-            let assistantSymbol = currentAssistantMode == .off ? "sparkles" : currentAssistantMode.symbol
-            quickActions.append(UIAction(title: assistantTitle, image: UIImage(systemName: assistantSymbol)) { [weak self] _ in
+            quickActions.append(UIAction(title: assistantTitle, image: UIImage(systemName: assistantAppearance.symbol)) { [weak self] _ in
                 self?.onOpenAssistant?()
             })
         }
@@ -2358,33 +2375,72 @@ final class RockCallViewController: UIViewController, UIScrollViewDelegate, UICo
         view.setNeedsLayout()
     }
 
-    private func syncCompactWorkspaceControls() {
-        let symbol = currentAssistantMode == .off ? "sparkles" : currentAssistantMode.symbol
-        let modeColor: UIColor
-        if currentAssistantPaused || currentAssistantAlertCount > 0 {
-            modeColor = .systemOrange
+    private func assistantBadgeAppearance() -> (symbol: String, color: UIColor, label: String, shortTitle: String) {
+        let symbol: String
+        if currentAssistantMode != .off {
+            symbol = currentAssistantMode.symbol
+        } else if currentFacilitatorSkillName != nil {
+            symbol = "waveform"
         } else {
+            symbol = "sparkles"
+        }
+
+        let color: UIColor
+        if currentAssistantPaused || currentAssistantAlertCount > 0 {
+            color = .systemOrange
+        } else if currentAssistantMode != .off {
             switch currentAssistantMode {
-            case .off: modeColor = .label
-            case .mentions: modeColor = .systemBlue
-            case .follow: modeColor = .systemIndigo
-            case .participating: modeColor = .systemGreen
+            case .off: color = .label
+            case .mentions: color = .systemBlue
+            case .follow: color = .systemIndigo
+            case .participating: color = .systemGreen
+            }
+        } else if currentFacilitatorSkillName != nil {
+            color = .systemTeal
+        } else {
+            color = .label
+        }
+
+        var labelParts: [String] = []
+        if currentAssistantMode == .off, let currentFacilitatorSkillName {
+            labelParts.append(L("Voice facilitator: %@", currentFacilitatorSkillName))
+        } else {
+            labelParts.append(L("Assistant mode: %@", currentAssistantMode.title))
+            if let currentFacilitatorSkillName {
+                labelParts.append(L("Voice facilitator: %@", currentFacilitatorSkillName))
             }
         }
-        let modeLabel = L("Assistant mode: %@", currentAssistantMode.title)
-        let label = currentAssistantPaused ? [modeLabel, L("Paused")].joined(separator: ", ") : modeLabel
+        if currentAssistantPaused {
+            labelParts.append(L("Paused"))
+        }
+        if currentAssistantAlertCount > 0 {
+            labelParts.append(L("Unread alerts: %ld", currentAssistantAlertCount))
+        }
+        let shortTitle: String
+        if currentAssistantPaused {
+            shortTitle = L("Paused")
+        } else if currentAssistantMode == .off, let currentFacilitatorSkillName {
+            shortTitle = currentFacilitatorSkillName
+        } else {
+            shortTitle = currentAssistantMode.shortTitle
+        }
+        return (symbol, color, labelParts.joined(separator: ", "), shortTitle)
+    }
+
+    private func syncCompactWorkspaceControls() {
+        let appearance = assistantBadgeAppearance()
         let activeCount = activeMeetingsForSwitcher.count
         let switcherAvailable = !activeMeetingsForSwitcher.isEmpty || onJoinAnotherMeeting != nil
         compactHeader.setCallWorkspaceControls(
             minimizeAvailable: onMinimize != nil,
             assistantAvailable: onOpenAssistant != nil,
-            assistantSymbol: symbol,
-            assistantColor: modeColor,
-            assistantLabel: label,
+            assistantSymbol: appearance.symbol,
+            assistantColor: appearance.color,
+            assistantLabel: appearance.label,
             assistantAlertCount: currentAssistantAlertCount,
             switcherAvailable: switcherAvailable,
             activeMeetingCount: activeCount,
-            assistantModeTitle: currentAssistantPaused ? L("Paused") : currentAssistantMode.shortTitle
+            assistantModeTitle: appearance.shortTitle
         )
     }
 
@@ -2427,30 +2483,24 @@ final class RockCallViewController: UIViewController, UIScrollViewDelegate, UICo
         present(sheet, animated: true)
     }
 
-    func updateAssistantBadge(mode: IOSMeetingAssistantMode, isPaused: Bool, alertCount: Int) {
+    func updateAssistantBadge(
+        mode: IOSMeetingAssistantMode,
+        isPaused: Bool,
+        alertCount: Int,
+        facilitatorSkillName: String? = nil
+    ) {
         if workspace.assistantMode != mode { workspace.assistantMode = mode }
         if workspace.assistantPaused != isPaused { workspace.assistantPaused = isPaused }
         currentAssistantAlertCount = alertCount
+        currentFacilitatorSkillName = facilitatorSkillName
         guard isViewLoaded else { return }
-        let symbol = mode == .off ? "sparkles" : mode.symbol
-        let color: UIColor
-        if isPaused || alertCount > 0 {
-            color = .systemOrange
-        } else {
-            switch mode {
-            case .off: color = .label
-            case .mentions: color = .systemBlue
-            case .follow: color = .systemIndigo
-            case .participating: color = .systemGreen
-            }
-        }
-        let label = L("Assistant mode: %@", mode.title)
-        assistantButton.configuration?.image = UIImage(systemName: symbol)
+        let appearance = assistantBadgeAppearance()
+        assistantButton.configuration?.image = UIImage(systemName: appearance.symbol)
         assistantButton.configuration?.title = alertCount > 0 ? "\(alertCount)" : nil
-        assistantButton.configuration?.baseForegroundColor = color
-        assistantButton.accessibilityLabel = label
-        assistantButton.largeContentTitle = label
-        assistantButton.largeContentImage = UIImage(systemName: symbol)
+        assistantButton.configuration?.baseForegroundColor = appearance.color
+        assistantButton.accessibilityLabel = appearance.label
+        assistantButton.largeContentTitle = appearance.label
+        assistantButton.largeContentImage = UIImage(systemName: appearance.symbol)
         syncCompactWorkspaceControls()
         configureMoreMenu()
     }
@@ -2466,6 +2516,17 @@ final class RockCallViewController: UIViewController, UIScrollViewDelegate, UICo
         container.layer.borderWidth = 0.5
         container.layer.borderColor = UIColor.separator.cgColor
         container.translatesAutoresizingMaskIntoConstraints = false
+        let spokenBanner = [title, reason].filter { !$0.isEmpty }.joined(separator: ". ")
+        container.isAccessibilityElement = true
+        container.accessibilityTraits = .button
+        container.accessibilityLabel = spokenBanner
+        container.accessibilityHint = L("Double-tap to open Assistant controls")
+        container.accessibilityCustomActions = [
+            UIAccessibilityCustomAction(name: L("Dismiss alert")) { [weak self] _ in
+                self?.dismissAssistantAlert()
+                return true
+            }
+        ]
 
         let icon = UIImageView(image: UIImage(systemName: "sparkles"))
         icon.tintColor = accent
@@ -2532,10 +2593,13 @@ final class RockCallViewController: UIViewController, UIScrollViewDelegate, UICo
         view.bringSubviewToFront(container)
 
         assistantBannerView = container
-        assistantBannerDismissTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(for: .seconds(8))
-            guard !Task.isCancelled else { return }
-            self?.dismissAssistantAlert()
+        UIAccessibility.post(notification: .announcement, argument: spokenBanner)
+        if !UIAccessibility.isVoiceOverRunning {
+            assistantBannerDismissTask = Task { @MainActor [weak self] in
+                try? await Task.sleep(for: .seconds(8))
+                guard !Task.isCancelled else { return }
+                self?.dismissAssistantAlert()
+            }
         }
     }
 

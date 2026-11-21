@@ -34,9 +34,15 @@ struct IOSAssistantTalkView: View {
                     }
                     .padding()
                 }
+                .scrollDismissesKeyboard(.interactively)
                 .onChange(of: talk.messages.count) { _, _ in
                     if let last = talk.messages.last {
                         withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
+                    }
+                }
+                .onChange(of: talk.pendingApproval?.id) { _, approvalID in
+                    if let approvalID {
+                        withAnimation { proxy.scrollTo(approvalID, anchor: .bottom) }
                     }
                 }
             }
@@ -124,6 +130,7 @@ struct IOSAssistantTalkView: View {
                         .contentShape(Rectangle())
                 }
                 .disabled(talk.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || talk.working || talk.pendingApproval != nil)
+                .accessibilityLabel(L("Send"))
                 .accessibilityIdentifier("ios.assistant.send")
             }
             .padding()

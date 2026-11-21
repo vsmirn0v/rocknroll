@@ -350,6 +350,7 @@ struct AssistantUnreadBadge: View {
             Text(store.momentHistory.unreadCount, format: .number)
                 .font(.caption2.weight(.bold)).padding(.horizontal, 6).padding(.vertical, 1)
                 .background(Color.orange, in: Capsule())
+                .accessibilityLabel(L("Unread alerts: %ld", store.momentHistory.unreadCount))
         }
     }
 }

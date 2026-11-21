@@ -242,6 +242,7 @@ struct AttentionInspector: View {
     @ObservedObject var attention: AttentionCoordinator
     let card: AttentionCoordinator.Card
     @Environment(\.dismiss) private var dismiss
+    @State private var copiedSupport = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -289,7 +290,14 @@ struct AttentionInspector: View {
                         attention.editingPreset = .init(invitation: card.invitation, seriesID: card.seriesID, title: card.meetingTitle)
                     }
                 }
-                Button(L("Copy for support")) { copyForSupport() }
+                Button(copiedSupport ? L("Copied") : L("Copy for support")) {
+                    copyForSupport()
+                    copiedSupport = true
+                    Task { @MainActor in
+                        try? await Task.sleep(for: .seconds(2))
+                        copiedSupport = false
+                    }
+                }
                 Spacer()
                 if attention.cards.contains(where: { $0.id == card.id }) {
                     Button(L("This was wrong"), role: .destructive) { attention.decline(card, reason: .other, note: L("Marked wrong in the inspector")); dismiss() }
@@ -641,6 +649,7 @@ struct NativeDesktopIntelligenceSettings: View {
     @State private var writerKey = ""
     @State private var escalationKey = ""
     @State private var realtimeKey = ""
+    @State private var keychainError: String?
     @State private var aliases = ""
     @State private var testing = false
     @State private var testResult: String?
@@ -697,9 +706,33 @@ struct NativeDesktopIntelligenceSettings: View {
             HStack {
                 SecureField(store.hasKey(for: provider) ? L("Saved in the keychain") : L("API key for %@", provider.title), text: text)
                     .nativeSettingAnchor(id, nativeControlFocus: true)
-                Button(L("Save")) { store.setAPIKey(text.wrappedValue, for: provider); text.wrappedValue = "" }
-                    .disabled(text.wrappedValue.trimmed.isEmpty)
-                if store.hasKey(for: provider) { Button(L("Remove")) { store.setAPIKey("", for: provider) } }
+                    .onSubmit {
+                        guard !text.wrappedValue.trimmed.isEmpty else { return }
+                        if store.setAPIKey(text.wrappedValue, for: provider) {
+                            text.wrappedValue = ""
+                            keychainError = nil
+                        } else {
+                            keychainError = L("Could not save the API key to the Keychain.")
+                        }
+                    }
+                Button(L("Save")) {
+                    if store.setAPIKey(text.wrappedValue, for: provider) {
+                        text.wrappedValue = ""
+                        keychainError = nil
+                    } else {
+                        keychainError = L("Could not save the API key to the Keychain.")
+                    }
+                }
+                .disabled(text.wrappedValue.trimmed.isEmpty)
+                if store.hasKey(for: provider) {
+                    Button(L("Remove")) {
+                        if store.setAPIKey("", for: provider) {
+                            keychainError = nil
+                        } else {
+                            keychainError = L("Could not remove the API key from the Keychain.")
+                        }
+                    }
+                }
             }
         }
     }
@@ -853,11 +886,29 @@ struct NativeDesktopIntelligenceSettings: View {
                 if store.provider.kind == .rapidMLX { RapidMLXStatusView(store: store) }
                 if store.provider.needsKey {
                     HStack {
-                        SecureField(store.hasKey ? L("Saved in the keychain") : L("API key"), text: $key).accessibilityIdentifier("attention.key").nativeSettingAnchor("settings.api-key", nativeControlFocus: true)
-                        Button(L("Save")) { store.setAPIKey(key); key = "" }.disabled(key.trimmed.isEmpty)
-                        if store.hasKey { Button(L("Remove")) { store.setAPIKey("") } }
+                        SecureField(store.hasKey ? L("Saved in the keychain") : L("API key"), text: $key)
+                            .accessibilityIdentifier("attention.key")
+                            .nativeSettingAnchor("settings.api-key", nativeControlFocus: true)
+                            .onSubmit {
+                                guard !key.trimmed.isEmpty else { return }
+                                if store.setAPIKey(key) { key = ""; keychainError = nil }
+                                else { keychainError = L("Could not save the API key to the Keychain.") }
+                            }
+                        Button(L("Save")) {
+                            if store.setAPIKey(key) { key = ""; keychainError = nil }
+                            else { keychainError = L("Could not save the API key to the Keychain.") }
+                        }.disabled(key.trimmed.isEmpty)
+                        if store.hasKey {
+                            Button(L("Remove")) {
+                                if store.setAPIKey("") { keychainError = nil }
+                                else { keychainError = L("Could not remove the API key from the Keychain.") }
+                            }
+                        }
                     }
                     Text(L("The key is stored in this Mac's keychain and sent only to the address above.")).font(.caption).foregroundStyle(.secondary)
+                    if let keychainError {
+                        Text(keychainError).font(.caption).foregroundStyle(.red)
+                    }
                 }
                 HStack {
                     NativeSettingsButton(title: L("Compare models…"), id: "settings.provider-compare") { comparing = true }
@@ -943,18 +994,39 @@ struct NativeDesktopIntelligenceSettings: View {
                         prompt: Text(store.realtimeProvider.defaultVoice)
                     )
                     HStack {
+                        let hasDedicatedKey = store.keyedRealtimeProviders.contains(store.realtimeProvider)
+                        let hasInheritedOpenAIKey = store.realtimeProvider == .openAIRealtime && !hasDedicatedKey && store.hasKey(for: AttentionProvider.defaults[.openAI]!)
                         let hasKey = store.realtimeAPIKey(for: store.realtimeProvider) != nil
                         SecureField(hasKey ? L("Saved in the keychain") : L("Realtime API key"), text: $realtimeKey)
+                            .onSubmit {
+                                guard !realtimeKey.trimmed.isEmpty else { return }
+                                if store.setRealtimeAPIKey(realtimeKey, for: store.realtimeProvider) {
+                                    realtimeKey = ""; keychainError = nil
+                                } else {
+                                    keychainError = L("Could not save the API key to the Keychain.")
+                                }
+                            }
                         Button(L("Save")) {
-                            store.setRealtimeAPIKey(realtimeKey, for: store.realtimeProvider)
-                            realtimeKey = ""
-                        }
-                        .disabled(realtimeKey.trimmed.isEmpty)
-                        if store.keyedRealtimeProviders.contains(store.realtimeProvider) {
-                            Button(L("Remove")) {
-                                store.setRealtimeAPIKey("", for: store.realtimeProvider)
+                            if store.setRealtimeAPIKey(realtimeKey, for: store.realtimeProvider) {
+                                realtimeKey = ""; keychainError = nil
+                            } else {
+                                keychainError = L("Could not save the API key to the Keychain.")
                             }
                         }
+                        .disabled(realtimeKey.trimmed.isEmpty)
+                        if hasDedicatedKey {
+                            Button(L("Remove")) {
+                                if store.setRealtimeAPIKey("", for: store.realtimeProvider) { keychainError = nil }
+                                else { keychainError = L("Could not remove the API key from the Keychain.") }
+                            }
+                        } else if hasInheritedOpenAIKey {
+                            Text(L("Using your OpenAI API key"))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    if let keychainError {
+                        Text(keychainError).font(.caption).foregroundStyle(.red)
                     }
                 }
                 Text(L("Improves live meeting latency when enabled and configured. Rock automatically falls back to your standard STT, model, and TTS voice pipeline whenever Realtime is off or unavailable."))
@@ -1232,6 +1304,10 @@ struct NativeDesktopIntelligenceSettings: View {
                     Label(L("Typed and locally recognized commands send your request and current meeting and Moment names to %@.", store.provider.host), systemImage: "arrow.up.forward")
                 }
                 Label(L("Meeting audio is sent to participants when your microphone is on. Spoken replies can also be sent to a meeting."), systemImage: "mic")
+                if store.realtimeProvider != .disabled {
+                    Label(L("When Realtime voice (%@) is enabled, live meeting and microphone audio streams over WebSocket for low-latency voice replies.", store.realtimeProvider.title), systemImage: "waveform.badge.mic")
+                        .foregroundStyle(.orange)
+                }
                 if store.voiceEngine == .rapidMLX, let host = store.voiceConfiguration.speechHost {
                     Label(L("Text for spoken replies is sent to the configured voice server at %@.", host), systemImage: "arrow.up.forward")
                 }

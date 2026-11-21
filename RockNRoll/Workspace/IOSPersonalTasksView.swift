@@ -30,8 +30,10 @@ struct IOSPersonalTasksView: View {
     @Environment(\.calendar) private var calendar
     @Environment(\.timeZone) private var timeZone
     @Environment(\.openURL) private var openURL
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @State private var searchText = ""
     @State private var selectedAssignee: IOSTaskAssigneeFilter = .all
+    @State private var showFilterControls = false
     @State private var editingTask: IOSMeetingTaskItem?
     @State private var busy: Set<UUID> = []
     @State private var undoTaskID: UUID?
@@ -91,15 +93,30 @@ struct IOSPersonalTasksView: View {
                 }
                 .pickerStyle(.segmented)
 
-                HStack {
+                HStack(spacing: 4) {
                     Toggle(L("Assigned to me"), isOn: $myTasksOnly)
                         .font(.subheadline)
-                    Spacer()
+                    Spacer(minLength: 4)
+                    if !(myTasksOnly && !workspace.taskProfile.isConfigured), horizontalSizeClass != .regular {
+                        Button {
+                            withAnimation { showFilterControls.toggle() }
+                        } label: {
+                            Image(systemName: (showFilterControls || !searchText.isEmpty || selectedAssignee != .all)
+                                  ? "line.3.horizontal.decrease.circle.fill"
+                                  : "line.3.horizontal.decrease.circle")
+                                .frame(minWidth: 44, minHeight: 44)
+                                .contentShape(Rectangle())
+                        }
+                        .accessibilityLabel(L("Search & Filter"))
+                    }
                     Button(L("Profile")) {
                         loadProfileDrafts()
                         showingProfileEditor = true
                     }
                     .font(.subheadline)
+                    .frame(minHeight: 44)
+                    .padding(.horizontal, 4)
+                    .contentShape(Rectangle())
                     Menu {
                         Button(L("Sync Tasks…")) { Task { await taskSync.runSync() } }
                         Button(L("Import from Jira / Reminders…")) {
@@ -133,11 +150,15 @@ struct IOSPersonalTasksView: View {
                         Divider()
                         Button(L("Task Sync & Contacts…")) { showingSyncSettings = true }
                     } label: {
-                        if taskSync.isBusy {
-                            ProgressView()
-                        } else {
-                            Image(systemName: "arrow.triangle.2.circlepath")
+                        Group {
+                            if taskSync.isBusy {
+                                ProgressView()
+                            } else {
+                                Image(systemName: "arrow.triangle.2.circlepath")
+                            }
                         }
+                        .frame(minWidth: 44, minHeight: 44)
+                        .contentShape(Rectangle())
                     }
                     .accessibilityLabel(L("External Task Sync"))
                     Menu {
@@ -147,6 +168,8 @@ struct IOSPersonalTasksView: View {
                         }
                     } label: {
                         Image(systemName: grouping == .list ? "list.bullet" : "rectangle.3.group")
+                            .frame(minWidth: 44, minHeight: 44)
+                            .contentShape(Rectangle())
                     }
                     .accessibilityLabel(L("Group by"))
                 }
@@ -195,15 +218,20 @@ struct IOSPersonalTasksView: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
 
-                if !(myTasksOnly && !workspace.taskProfile.isConfigured) {
+                if !(myTasksOnly && !workspace.taskProfile.isConfigured),
+                   horizontalSizeClass == .regular || showFilterControls || !searchText.isEmpty || selectedAssignee != .all {
                     HStack(spacing: 8) {
                         Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
                         TextField(L("Search tasks…"), text: $searchText)
                             .textInputAutocapitalization(.never)
                             .autocorrectionDisabled()
                         if !searchText.isEmpty {
-                            Button { searchText = "" } label: { Image(systemName: "xmark.circle.fill") }
-                                .accessibilityLabel(L("Clear filters"))
+                            Button { searchText = "" } label: {
+                                Image(systemName: "xmark.circle.fill")
+                                    .frame(minWidth: 44, minHeight: 44)
+                                    .contentShape(Rectangle())
+                            }
+                            .accessibilityLabel(L("Clear filters"))
                         }
                     }
                     .padding(8)
@@ -505,17 +533,20 @@ struct IOSPersonalTasksView: View {
 
         return HStack(alignment: .top, spacing: 12) {
             if isSelecting {
+                let isPicked = selectedTaskIDs.contains(task.id)
                 Button {
-                    if selectedTaskIDs.contains(task.id) { selectedTaskIDs.remove(task.id) }
+                    if isPicked { selectedTaskIDs.remove(task.id) }
                     else { selectedTaskIDs.insert(task.id) }
                 } label: {
-                    Image(systemName: selectedTaskIDs.contains(task.id) ? "checkmark.square.fill" : "square")
+                    Image(systemName: isPicked ? "checkmark.square.fill" : "square")
                         .font(.title3)
-                        .foregroundStyle(selectedTaskIDs.contains(task.id) ? Color.accentColor : .secondary)
+                        .foregroundStyle(isPicked ? Color.accentColor : .secondary)
                         .frame(minWidth: 44, minHeight: 44)
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
+                .accessibilityLabel(L("Select task: %@", task.text))
+                .accessibilityAddTraits(isPicked ? [.isSelected] : [])
             }
             Button {
                 mutate(task.id) { await workspace.toggleTaskDone(task.id) }
@@ -537,7 +568,7 @@ struct IOSPersonalTasksView: View {
                     .strikethrough(task.done)
                     .foregroundStyle(task.done ? .secondary : .primary)
 
-                HStack(spacing: 8) {
+                IOSTaskBadgeFlowLayout(spacing: 6, lineSpacing: 4) {
                     if task.extended.issueKind != .task {
                         Text(task.extended.issueKind.localizedTitle.uppercased())
                             .font(.caption2.weight(.bold))
@@ -635,6 +666,8 @@ struct IOSPersonalTasksView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .contentShape(Rectangle())
             .onTapGesture { editingTask = task }
+            .accessibilityAddTraits(.isButton)
+            .accessibilityHint(L("Edit"))
         }
         .padding(.vertical, 2)
         .contextMenu {
@@ -758,5 +791,55 @@ struct IOSPersonalTasksView: View {
     private func loadProfileDrafts() {
         profileNameDraft = workspace.taskProfile.aliases.first ?? ""
         profileAliasesDraft = workspace.taskProfile.aliases.dropFirst().joined(separator: ", ")
+    }
+}
+
+private struct IOSTaskBadgeFlowLayout: Layout {
+    var spacing: CGFloat = 6
+    var lineSpacing: CGFloat = 4
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let maxWidth = proposal.width ?? .infinity
+        var currentX: CGFloat = 0
+        var currentY: CGFloat = 0
+        var lineHeight: CGFloat = 0
+        var usedWidth: CGFloat = 0
+
+        for subview in subviews {
+            let size = subview.sizeThatFits(.unspecified)
+            if currentX > 0 && currentX + size.width > maxWidth {
+                currentY += lineHeight + lineSpacing
+                currentX = 0
+                lineHeight = 0
+            }
+            usedWidth = max(usedWidth, currentX + size.width)
+            currentX += size.width + spacing
+            lineHeight = max(lineHeight, size.height)
+        }
+        return CGSize(
+            width: maxWidth.isFinite ? max(usedWidth, maxWidth) : usedWidth,
+            height: currentY + lineHeight
+        )
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        var currentX = bounds.minX
+        var currentY = bounds.minY
+        var lineHeight: CGFloat = 0
+
+        for subview in subviews {
+            let size = subview.sizeThatFits(.unspecified)
+            if currentX > bounds.minX && currentX + size.width > bounds.maxX {
+                currentY += lineHeight + lineSpacing
+                currentX = bounds.minX
+                lineHeight = 0
+            }
+            subview.place(
+                at: CGPoint(x: currentX, y: currentY),
+                proposal: ProposedViewSize(width: size.width, height: size.height)
+            )
+            currentX += size.width + spacing
+            lineHeight = max(lineHeight, size.height)
+        }
     }
 }

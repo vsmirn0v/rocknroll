@@ -91,8 +91,8 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
         let chosen = resolveSkillID(explicitSkillID: skillID, meetingTitle: title)
         activeSessionSkills[controllerID] = chosen
         seenEventIDsBySession[controllerID] = Set((recentEventsBySession[controllerID] ?? []).map(\.id))
-        lastStatusBySession[controllerID] = L("Autonomous voice facilitator active (%@)", chosen)
         let skill = skills?.skills.first(where: { $0.id == chosen })
+        lastStatusBySession[controllerID] = L("Autonomous voice facilitator active (%@)", skill?.name ?? chosen)
         Task { @MainActor [weak self] in
             guard let self else { return }
             await self.resolveBridge(controllerID)?.ensureFacilitatorTranscription()

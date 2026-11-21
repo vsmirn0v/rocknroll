@@ -733,9 +733,10 @@ struct MeetingHistoryView: View {
                             }
                             .buttonStyle(.borderless)
                             .help(L("Task details, reminder rules & discussion meeting"))
+                            .accessibilityLabel(L("Task details, reminder rules & discussion meeting"))
                             Button { var copy = binding.wrappedValue; copy.tasks.removeAll { $0.id == task.id }; data.updateOutcome(copy) } label: {
                                 Image(systemName: "trash")
-                            }.buttonStyle(.borderless).help(L("Delete task"))
+                            }.buttonStyle(.borderless).help(L("Delete task")).accessibilityLabel(L("Delete task"))
                         }
                         .padding(6)
                         .background(navigation.taskID == task.id ? Color.orange.opacity(0.12) : .clear,

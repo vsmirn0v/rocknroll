@@ -89,6 +89,22 @@ import Foundation
         }
     }
 
+    func disconnectVault() {
+        let connection = library.participationVaultConnection
+        let change = connection.beginChange()
+        update { destination in
+            destination.id = UUID()
+            destination.enabled = false
+            destination.vaultBookmark = nil
+            destination.layout.legacyRuntimeYears = nil
+        }
+        let save = settingsWrite
+        Task {
+            await save?.value
+            connection.endChange(change)
+        }
+    }
+
     private func update(_ change: (inout ObsidianDestinationRecord) -> Void) {
         var record = destination ?? ObsidianDestinationRecord()
         change(&record)
@@ -183,7 +199,7 @@ import Foundation
                 self.destination = latest
             }
         } else {
-            waitingForVault = true
+            waitingForVault = false
         }
     }
 

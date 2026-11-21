@@ -6,6 +6,7 @@ struct NativeDesktopTranscriptionSettings: View {
     /// Readiness and memory of the on-device models. Nil when the settings
     /// view is built without an Attention coordinator (previews, tests).
     var models: LocalModelStatusStore? = nil
+    @State private var modelPendingDeletion: ListenModelCatalog.Model?
 
     var body: some View {
         Form {
@@ -166,7 +167,21 @@ struct NativeDesktopTranscriptionSettings: View {
             switch state {
             case .installed:
                 if pending { Button(L("Cancel Switch")) { store.cancelPendingSelection() } }
-                else { Button(L("Delete")) { store.delete(model) }.buttonStyle(.borderless).foregroundStyle(.red) }
+                else {
+                    Button(L("Delete")) { modelPendingDeletion = model }
+                        .buttonStyle(.borderless)
+                        .foregroundStyle(.red)
+                        .confirmationDialog(L("Delete"), isPresented: Binding(
+                            get: { modelPendingDeletion?.id == model.id },
+                            set: { if !$0 { modelPendingDeletion = nil } }
+                        ), titleVisibility: .visible) {
+                            Button(L("Delete"), role: .destructive) {
+                                store.delete(model)
+                                modelPendingDeletion = nil
+                            }
+                            Button(L("Cancel"), role: .cancel) { modelPendingDeletion = nil }
+                        }
+                }
             case .downloading:
                 Button(L("Cancel")) { store.cancel(model) }.buttonStyle(.borderless)
             case .absent, .failed:

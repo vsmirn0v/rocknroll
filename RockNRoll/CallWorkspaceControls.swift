@@ -31,6 +31,7 @@ final class CallWorkspaceControls: ObservableObject {
     var openVoiceReply: (() -> Void)?
     var openTranscriptionSettings: (() -> Void)?
     var openNotes: (() -> Void)?
+    var openBoard: (() -> Void)?
 
     func copyInvitation() {
         guard let invitationURL else { return }

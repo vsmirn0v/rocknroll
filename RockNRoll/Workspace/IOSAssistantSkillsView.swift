@@ -1,5 +1,6 @@
 import ConferenceCore
 import SwiftUI
+import UIKit
 import UniformTypeIdentifiers
 
 struct IOSAssistantSkillsView: View {
@@ -33,19 +34,66 @@ struct IOSAssistantSkillsView: View {
     @State private var editingPerson: AssistantPersonEntry?
     @State private var realtimeKeyDraft = ""
     @State private var statusBanner: String?
+    @State private var statusIsError = false
     @State private var pickingVaultFolder = false
     @State private var showingBoardSheet = false
+    @State private var confirmDisconnectObsidian = false
+    @State private var confirmRestoreAllSkills = false
+    @State private var confirmRestorePrompt = false
+    @State private var pendingDeleteSkill: AssistantSkill?
+    @State private var pendingDeletePerson: AssistantPersonEntry?
 
     var body: some View {
         VStack(spacing: 0) {
-            Picker("", selection: $selectedTab) {
-                ForEach(Tab.allCases) { tab in
-                    Text(tab.title).tag(tab)
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    ForEach(Tab.allCases) { tab in
+                        let isSelected = selectedTab == tab
+                        Button {
+                            selectedTab = tab
+                        } label: {
+                            Text(tab.title)
+                                .font(.subheadline.weight(isSelected ? .semibold : .regular))
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 8)
+                                .background(
+                                    isSelected ? Color.accentColor : Color.secondary.opacity(0.14),
+                                    in: Capsule()
+                                )
+                                .foregroundStyle(isSelected ? Color.white : Color.primary)
+                                .frame(minHeight: 44)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityAddTraits(isSelected ? [.isSelected] : [])
+                    }
                 }
+                .padding(.horizontal)
+                .padding(.vertical, 6)
             }
-            .pickerStyle(.segmented)
-            .padding(.horizontal)
-            .padding(.vertical, 8)
+
+            if let statusBanner {
+                HStack(spacing: 8) {
+                    Image(systemName: statusIsError ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
+                        .foregroundStyle(statusIsError ? .red : .green)
+                    Text(statusBanner)
+                        .font(.caption)
+                        .foregroundStyle(statusIsError ? .red : .primary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    Button {
+                        self.statusBanner = nil
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.caption.weight(.semibold))
+                            .frame(minWidth: 44, minHeight: 44)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(L("Dismiss alert"))
+                }
+                .padding(.horizontal)
+                .padding(.vertical, 4)
+                .background(Color(.secondarySystemGroupedBackground))
+            }
 
             switch selectedTab {
             case .skills:
@@ -58,16 +106,31 @@ struct IOSAssistantSkillsView: View {
                 realtimeBoardTab
             }
         }
+        .scrollDismissesKeyboard(.interactively)
         .navigationTitle(L("Skills, Prompts & Knowledge"))
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItemGroup(placement: .keyboard) {
+                Spacer()
+                Button(L("Done")) { dismissKeyboard() }
+            }
+        }
         .onAppear { loadDrafts() }
+        .onDisappear { board.isInlineSheetActive = false }
+        .onChange(of: selectedTab) { _, _ in
+            statusBanner = nil
+            statusIsError = false
+        }
+        .onChange(of: showingBoardSheet) { _, isShowing in
+            board.isInlineSheetActive = isShowing
+        }
         .sheet(item: $editingSkill) { draft in
             IOSSkillEditorSheet(skill: draft) { updated in
                 do {
                     _ = try skills.saveSkill(updated)
-                    statusBanner = L("Saved skill “%@”.", updated.name)
+                    showStatus(L("Saved skill “%@”.", updated.name))
                 } catch {
-                    statusBanner = error.localizedDescription
+                    showStatus(error.localizedDescription, isError: true)
                 }
             }
         }
@@ -75,9 +138,9 @@ struct IOSAssistantSkillsView: View {
             IOSPersonEditorSheet(person: person) { updated in
                 do {
                     _ = try skills.upsertPerson(updated)
-                    statusBanner = L("Saved %@ in People.md.", updated.displayName)
+                    showStatus(L("Saved %@ in People.md.", updated.displayName))
                 } catch {
-                    statusBanner = error.localizedDescription
+                    showStatus(error.localizedDescription, isError: true)
                 }
             }
         }
@@ -92,12 +155,107 @@ struct IOSAssistantSkillsView: View {
                 do {
                     try skills.setObsidianFolder(url: url)
                     loadDrafts()
-                    statusBanner = L("Connected Obsidian folder.")
+                    showStatus(L("Connected Obsidian folder."))
                 } catch {
-                    statusBanner = error.localizedDescription
+                    showStatus(error.localizedDescription, isError: true)
                 }
             }
         }
+        .confirmationDialog(
+            L("Use App Documents Folder"),
+            isPresented: $confirmDisconnectObsidian,
+            titleVisibility: .visible
+        ) {
+            Button(L("Use App Documents Folder"), role: .destructive) {
+                skills.clearObsidianFolder()
+                loadDrafts()
+                showStatus(L("Switched to App Documents storage."))
+            }
+            Button(L("Cancel"), role: .cancel) {}
+        }
+        .confirmationDialog(
+            L("Restore Default Skills"),
+            isPresented: $confirmRestoreAllSkills,
+            titleVisibility: .visible
+        ) {
+            Button(L("Restore Default Skills"), role: .destructive) {
+                do {
+                    try skills.restoreDefaultSkill(id: nil)
+                    loadDrafts()
+                    showStatus(L("Restored default skills."))
+                } catch {
+                    showStatus(error.localizedDescription, isError: true)
+                }
+            }
+            Button(L("Cancel"), role: .cancel) {}
+        }
+        .confirmationDialog(
+            L("Restore Default"),
+            isPresented: $confirmRestorePrompt,
+            titleVisibility: .visible
+        ) {
+            Button(L("Restore Default"), role: .destructive) {
+                do {
+                    let doc = try skills.restoreDefaultPrompt(selectedPromptKind)
+                    promptDraft = doc.content
+                    showStatus(L("Restored default prompt."))
+                } catch {
+                    showStatus(error.localizedDescription, isError: true)
+                }
+            }
+            Button(L("Cancel"), role: .cancel) {}
+        }
+        .confirmationDialog(
+            L("Delete skill?"),
+            isPresented: Binding(
+                get: { pendingDeleteSkill != nil },
+                set: { if !$0 { pendingDeleteSkill = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            if let skill = pendingDeleteSkill {
+                Button(L("Delete"), role: .destructive) {
+                    do {
+                        try skills.deleteSkill(id: skill.id)
+                        showStatus(L("Deleted skill “%@”.", skill.name))
+                    } catch {
+                        showStatus(error.localizedDescription, isError: true)
+                    }
+                    pendingDeleteSkill = nil
+                }
+            }
+            Button(L("Cancel"), role: .cancel) { pendingDeleteSkill = nil }
+        }
+        .confirmationDialog(
+            L("Remove team member?"),
+            isPresented: Binding(
+                get: { pendingDeletePerson != nil },
+                set: { if !$0 { pendingDeletePerson = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            if let person = pendingDeletePerson {
+                Button(L("Remove"), role: .destructive) {
+                    do {
+                        try skills.removePerson(id: person.id)
+                        showStatus(L("Removed %@.", person.displayName))
+                    } catch {
+                        showStatus(error.localizedDescription, isError: true)
+                    }
+                    pendingDeletePerson = nil
+                }
+            }
+            Button(L("Cancel"), role: .cancel) { pendingDeletePerson = nil }
+        }
+    }
+
+    private func showStatus(_ message: String, isError: Bool = false) {
+        statusBanner = message
+        statusIsError = isError
+    }
+
+    private func dismissKeyboard() {
+        UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
     }
 
     // MARK: - Skills Tab
@@ -121,13 +279,13 @@ struct IOSAssistantSkillsView: View {
                 }
                 if skills.isObsidianBacked {
                     Button(L("Use App Documents Folder"), role: .destructive) {
-                        skills.clearObsidianFolder()
-                        loadDrafts()
+                        confirmDisconnectObsidian = true
                     }
                 }
                 Button(L("Reload from Disk")) {
                     skills.refresh()
                     loadDrafts()
+                    showStatus(L("Reloaded skills from disk."))
                 }
             } header: {
                 Text(L("Markdown Storage"))
@@ -136,7 +294,7 @@ struct IOSAssistantSkillsView: View {
             Section {
                 Button {
                     editingSkill = AssistantSkill(
-                        id: "custom-\(Int.random(in: 100...999))",
+                        id: "custom-role-\(Int.random(in: 100...999))",
                         name: L("Custom Facilitator Skill"),
                         role: L("Custom meeting role"),
                         triggers: [],
@@ -147,13 +305,18 @@ struct IOSAssistantSkillsView: View {
                 }
 
                 ForEach(skills.skills) { skill in
+                    let isPinned = skills.selectedSkillIDs.contains(skill.id)
                     HStack {
                         Toggle(isOn: Binding(
                             get: { skill.enabled },
                             set: { newValue in
                                 var copy = skill
                                 copy.enabled = newValue
-                                _ = try? skills.saveSkill(copy)
+                                do {
+                                    _ = try skills.saveSkill(copy)
+                                } catch {
+                                    showStatus(error.localizedDescription, isError: true)
+                                }
                             }
                         )) {
                             VStack(alignment: .leading, spacing: 3) {
@@ -169,15 +332,30 @@ struct IOSAssistantSkillsView: View {
                             }
                         }
 
+                        Button {
+                            if isPinned {
+                                skills.selectedSkillIDs.removeAll { $0 == skill.id }
+                            } else {
+                                skills.selectedSkillIDs.append(skill.id)
+                            }
+                        } label: {
+                            Image(systemName: isPinned ? "star.fill" : "star")
+                                .foregroundStyle(isPinned ? .yellow : .secondary)
+                                .frame(minWidth: 44, minHeight: 44)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel(isPinned ? L("Pinned for chats") : L("Pin for chats"))
+
                         Button(L("Edit")) {
                             editingSkill = skill
                         }
                         .buttonStyle(.bordered)
-                        .controlSize(.small)
+                        .frame(minHeight: 44)
                     }
-                    .swipeActions {
+                    .swipeActions(allowsFullSwipe: false) {
                         Button(role: .destructive) {
-                            try? skills.deleteSkill(id: skill.id)
+                            pendingDeleteSkill = skill
                         } label: {
                             Label(L("Delete"), systemImage: "trash")
                         }
@@ -185,16 +363,10 @@ struct IOSAssistantSkillsView: View {
                 }
 
                 Button(L("Restore Default Skills")) {
-                    try? skills.restoreDefaultSkill(id: nil)
+                    confirmRestoreAllSkills = true
                 }
             } header: {
                 Text(L("Assistant Skills (Skills/*.md)"))
-            }
-
-            if let statusBanner {
-                Section {
-                    Text(statusBanner).font(.caption).foregroundStyle(.secondary)
-                }
             }
         }
     }
@@ -227,17 +399,15 @@ struct IOSAssistantSkillsView: View {
                     Button(L("Save Prompt")) {
                         do {
                             _ = try skills.savePrompt(selectedPromptKind, content: promptDraft)
-                            statusBanner = L("Saved %@.", selectedPromptKind.relativePath)
+                            showStatus(L("Saved %@.", selectedPromptKind.relativePath))
                         } catch {
-                            statusBanner = error.localizedDescription
+                            showStatus(error.localizedDescription, isError: true)
                         }
                     }
                     .buttonStyle(.borderedProminent)
 
                     Button(L("Restore Default")) {
-                        if let doc = try? skills.restoreDefaultPrompt(selectedPromptKind) {
-                            promptDraft = doc.content
-                        }
+                        confirmRestorePrompt = true
                     }
                     .buttonStyle(.bordered)
                 }
@@ -290,9 +460,9 @@ struct IOSAssistantSkillsView: View {
                             }
                         }
                         .buttonStyle(.plain)
-                        .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
                             Button(role: .destructive) {
-                                try? skills.removePerson(id: person.id)
+                                pendingDeletePerson = person
                             } label: {
                                 Label(L("Delete"), systemImage: "trash")
                             }
@@ -321,12 +491,16 @@ struct IOSAssistantSkillsView: View {
                     doc.notes = teamNotesDraft
                     do {
                         try skills.saveTeamContext(doc)
-                        statusBanner = L("Saved Knowledge/TeamContext.md.")
+                        showStatus(L("Saved Knowledge/TeamContext.md."))
                     } catch {
-                        statusBanner = error.localizedDescription
+                        showStatus(error.localizedDescription, isError: true)
                     }
                 }
                 .buttonStyle(.borderedProminent)
+
+                Text(L("Configure Jira API credentials and Reminders sync in Tasks → Sync Settings."))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             } header: {
                 Text(L("Team Context (Knowledge/TeamContext.md)"))
             }
@@ -361,9 +535,34 @@ struct IOSAssistantSkillsView: View {
                     SecureField(L("Realtime API Key (stored in Keychain)"), text: $realtimeKeyDraft)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
-                        .onChange(of: realtimeKeyDraft) { _, newValue in
-                            skills.setRealtimeAPIKey(newValue, for: skills.realtimeProvider)
+                        .submitLabel(.done)
+                        .onSubmit { saveRealtimeAPIKey() }
+
+                    if skills.realtimeProvider == .openAIRealtime,
+                       !skills.keyedRealtimeProviders.contains(.openAIRealtime),
+                       !(skills.realtimeAPIKey(for: .openAIRealtime) ?? "").isEmpty {
+                        Text(L("Using your OpenAI API key"))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    HStack {
+                        Button(L("Save Key")) {
+                            saveRealtimeAPIKey()
                         }
+                        .buttonStyle(.borderedProminent)
+                        if skills.keyedRealtimeProviders.contains(skills.realtimeProvider) {
+                            Button(L("Remove"), role: .destructive) {
+                                realtimeKeyDraft = ""
+                                if skills.setRealtimeAPIKey("", for: skills.realtimeProvider) {
+                                    showStatus(L("Removed API key from Keychain."))
+                                } else {
+                                    showStatus(L("Could not remove the API key from the Keychain."), isError: true)
+                                }
+                            }
+                            .buttonStyle(.bordered)
+                        }
+                    }
                 }
             } header: {
                 Text(L("Optional Realtime Voice (gpt-live / Gemini Live)"))
@@ -389,6 +588,14 @@ struct IOSAssistantSkillsView: View {
         projectKeyDraft = skills.teamContext.defaultJiraProjectKey
         teamNotesDraft = skills.teamContext.notes
         realtimeKeyDraft = skills.realtimeAPIKey(for: skills.realtimeProvider) ?? ""
+    }
+
+    private func saveRealtimeAPIKey() {
+        if skills.setRealtimeAPIKey(realtimeKeyDraft, for: skills.realtimeProvider) {
+            showStatus(L("Saved API key to Keychain."))
+        } else {
+            showStatus(L("Could not save the API key to the Keychain."), isError: true)
+        }
     }
 }
 
@@ -440,9 +647,16 @@ private struct IOSSkillEditorSheet: View {
                         .frame(minHeight: 220)
                 }
             }
+            .scrollDismissesKeyboard(.interactively)
             .navigationTitle(draft.name)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                ToolbarItemGroup(placement: .keyboard) {
+                    Spacer()
+                    Button(L("Done")) {
+                        UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+                    }
+                }
                 ToolbarItem(placement: .cancellationAction) {
                     Button(L("Cancel")) { dismiss() }
                 }
@@ -577,6 +791,7 @@ struct IOSMultiMeetingRockJoinSheet: View {
                                 }
                             }
                             .buttonStyle(.plain)
+                            .accessibilityAddTraits(selected ? [.isSelected] : [])
                         }
                     }
                 }

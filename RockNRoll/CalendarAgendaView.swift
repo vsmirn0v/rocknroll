@@ -216,6 +216,7 @@ private struct CalendarMeetingActions: View {
 
 struct CalendarSettingsView: View {
     @ObservedObject var calendar: CalendarMeetingStore
+    @State private var confirmingForgetBindings = false
     var body: some View {
         Form {
             Section {
@@ -245,7 +246,19 @@ struct CalendarSettingsView: View {
                     if !calendar.supportsScheduledJoining { CalendarAutomaticJoinSettings(calendar: calendar) }
                     Section {
                         Button(L("Refresh calendar")) { calendar.refresh() }.disabled(calendar.loading)
-                        Button(L("Forget room associations"), role: .destructive) { calendar.forgetBindings() }
+                        Button(L("Forget room associations"), role: .destructive) {
+                            confirmingForgetBindings = true
+                        }
+                        .confirmationDialog(
+                            L("Forget room associations?"),
+                            isPresented: $confirmingForgetBindings,
+                            titleVisibility: .visible
+                        ) {
+                            Button(L("Forget room associations"), role: .destructive) {
+                                calendar.forgetBindings()
+                            }
+                            Button(L("Cancel"), role: .cancel) {}
+                        }
                     } footer: {
                         Text(L("Calendar selection and room associations belong to this device. Saved favorites use your existing iCloud Sync preference."))
                     }

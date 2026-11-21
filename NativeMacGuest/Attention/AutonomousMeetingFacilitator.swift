@@ -81,16 +81,17 @@ final class AutonomousMeetingFacilitator: ObservableObject {
         activeSessionSkills[model.sessionID] = chosen
         // Skip pre-existing lines at activation time so Rock responds to new spoken instructions.
         processedLineIDsBySession[model.sessionID] = Set(model.transcript.map(\.id))
-        lastStatusBySession[model.sessionID] = L("Autonomous voice facilitator active (%@)", chosen)
+        let initialTitle = cachedSkills.first(where: { $0.id == chosen })?.name ?? chosen
+        lastStatusBySession[model.sessionID] = L("Autonomous voice facilitator active (%@)", initialTitle)
         Task { @MainActor [weak self, weak model] in
             guard let self, let model, !model.isClosed else { return }
             await self.refreshSkillsCache()
             if skillID == nil {
                 chosen = self.resolveSkillID(explicitSkillID: nil, meetingTitle: model.title)
                 self.activeSessionSkills[model.sessionID] = chosen
-                self.lastStatusBySession[model.sessionID] = L("Autonomous voice facilitator active (%@)", chosen)
             }
             let skill = self.cachedSkills.first(where: { $0.id == chosen })
+            self.lastStatusBySession[model.sessionID] = L("Autonomous voice facilitator active (%@)", skill?.name ?? chosen)
             await self.maybeConnectRealtime(for: model, skill: skill, skillID: chosen)
             if skill?.autoGreet == true {
                 await self.kickOffSkill(for: model, skillID: chosen)

@@ -1,5 +1,6 @@
 import ConferenceCore
 import SwiftUI
+import UIKit
 
 enum IOSMeetingDetailTab: String, CaseIterable, Identifiable {
     case summary
@@ -54,6 +55,7 @@ struct IOSMeetingDetailView: View {
     @State private var neverDraft = ""
     @State private var peopleDraft = ""
     @State private var newRuleDraft = ""
+    @State private var settingsSaved = false
 
     private var session: IOSMeetingSessionItem? {
         workspace.sessions.first { $0.id == sessionID }
@@ -134,11 +136,20 @@ struct IOSMeetingDetailView: View {
                 settingsView
             }
         }
+        .scrollDismissesKeyboard(.interactively)
         .navigationTitle(session?.title ?? L("Meeting"))
         .navigationDestination(item: $linkedRecordID) { id in
             IOSMeetingDetailView(workspace: workspace, sync: sync, sessionID: id)
         }
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItemGroup(placement: .keyboard) {
+                Spacer()
+                Button(L("Done")) {
+                    UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+                }
+            }
+        }
         .onAppear {
             loadInitialState()
         }
@@ -417,6 +428,8 @@ struct IOSMeetingDetailView: View {
                                     .contentShape(Rectangle())
                             }
                             .buttonStyle(.plain)
+                            .accessibilityLabel(L("Task completed"))
+                            .accessibilityValue(task.done ? L("Done") : L("Open"))
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(task.text)
                                     .strikethrough(task.done)
@@ -623,22 +636,12 @@ struct IOSMeetingDetailView: View {
                 TextField(L("Never mention or focus on"), text: $neverDraft, axis: .vertical)
                 TextField(L("People to listen for (comma separated)"), text: $peopleDraft)
                 Button(L("Save Meeting Settings")) {
-                    let people = peopleDraft.split(separator: ",")
-                        .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
-                        .filter { !$0.isEmpty }
-                    let kind: SyncedMeetingContextSettings.ScopeKind = useSeriesScope ? .calendarSeries : .room
-                    Task {
-                        await workspace.saveContextSettings(
-                            scopeKey: contextScopeKey,
-                            scopeKind: kind,
-                            title: session?.title ?? L("Meeting"),
-                            sameRoomTransition: transitionChoice?.rawValue,
-                            about: aboutDraft,
-                            matters: mattersDraft,
-                            never: neverDraft,
-                            people: people
-                        )
-                    }
+                    saveCurrentContextSettings()
+                }
+                if settingsSaved {
+                    Label(L("Saved"), systemImage: "checkmark.circle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.green)
                 }
             }
 
@@ -668,10 +671,36 @@ struct IOSMeetingDetailView: View {
                             Task { await workspace.removeGuidanceRule(id: rule.id, scopeKey: contextScopeKey) }
                         } label: {
                             Image(systemName: "trash")
+                                .frame(minWidth: 44, minHeight: 44)
+                                .contentShape(Rectangle())
                         }
+                        .accessibilityLabel(L("Delete"))
+                        .accessibilityValue(rule.text)
                     }
                 }
             }
+        }
+    }
+
+    private func saveCurrentContextSettings() {
+        let people = peopleDraft.split(separator: ",")
+            .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        let kind: SyncedMeetingContextSettings.ScopeKind = useSeriesScope ? .calendarSeries : .room
+        Task {
+            await workspace.saveContextSettings(
+                scopeKey: contextScopeKey,
+                scopeKind: kind,
+                title: session?.title ?? L("Meeting"),
+                sameRoomTransition: transitionChoice?.rawValue,
+                about: aboutDraft,
+                matters: mattersDraft,
+                never: neverDraft,
+                people: people
+            )
+            settingsSaved = true
+            try? await Task.sleep(for: .seconds(2))
+            settingsSaved = false
         }
     }
 

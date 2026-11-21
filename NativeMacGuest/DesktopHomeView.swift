@@ -497,7 +497,11 @@ struct NativeDesktopHomeView: View {
                     AssistantLastOutcome(assistant: workspace.attention.store.assistant, invitation: room.invitationURL, before: Date())
                 }.frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
             }.buttonStyle(.plain)
-            Button { library.toggleFavorite(room) } label: { Image(systemName: room.isStarred ? "star.fill" : "star") }.buttonStyle(.borderless).foregroundStyle(.orange)
+            Button { library.toggleFavorite(room) } label: { Image(systemName: room.isStarred ? "star.fill" : "star") }
+                .buttonStyle(.borderless)
+                .foregroundStyle(.orange)
+                .help(room.isStarred ? L("Remove from Favorites") : L("Add to Favorites"))
+                .accessibilityLabel(room.isStarred ? L("Remove from Favorites") : L("Add to Favorites"))
         }.padding(14).frame(minHeight: 82).background(.quaternary.opacity(0.3), in: RoundedRectangle(cornerRadius: 14)).contextMenu { roomMenu(room) }
     }
     private func roomRow(_ room: RecentRoom) -> some View { roomCard(room) }
@@ -555,14 +559,19 @@ struct NativeDesktopHomeView: View {
                 AssistantLastOutcome(assistant: workspace.attention.store.assistant, invitation: item.invitation,
                     series: item.seriesID, before: item.start)
             }.frame(maxWidth: .infinity, alignment: .leading)
+            let isCalendarStarred = item.invitation.flatMap { library.history.matching($0, engine: item.engine) }?.isStarred == true
             Button {
                 if let url = item.invitation {
                     if library.history.matching(url, engine: item.engine) != nil { library.history.toggleStar(url) }
                     else { library.history.saveFavorite(url: url, title: item.title, engine: item.engine) }
                 }
             } label: {
-                Image(systemName: item.invitation.flatMap { library.history.matching($0, engine: item.engine) }?.isStarred == true ? "star.fill" : "star")
-            }.buttonStyle(.borderless).foregroundStyle(.orange)
+                Image(systemName: isCalendarStarred ? "star.fill" : "star")
+            }
+            .buttonStyle(.borderless)
+            .foregroundStyle(.orange)
+            .help(isCalendarStarred ? L("Remove from Favorites") : L("Add to Favorites"))
+            .accessibilityLabel(isCalendarStarred ? L("Remove from Favorites") : L("Add to Favorites"))
             if let room = item.roomIdentity,
                let id = workspace.workspaceSync.historySession(matching: MeetingCalendarAssociation(item, room: room)) {
                 Button(L("Open saved meeting")) { workspace.openMeetingHistory(id, source: .calendar) }
