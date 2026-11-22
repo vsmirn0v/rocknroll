@@ -1,5 +1,9 @@
 import AVFoundation
 import ConferenceCore
+import CoreMedia
+import CoreVideo
+import Network
+import UIKit
 import XCTest
 @testable import RockNRoll
 
@@ -824,6 +828,315 @@ final class IOSAssistantTalkTests: XCTestCase {
         XCTAssertEqual(toolResults.first?.name, "rocknroll_create_task")
         XCTAssertTrue(workspace.tasks.contains(where: { $0.text == "Publish iOS changelog" }))
         XCTAssertEqual(talk.lastVoiceAnswer, "Created task Publish iOS changelog.")
+        await store.close()
+        try? FileManager.default.removeItem(at: tempRoot)
+    }
+
+    // MARK: - Desktop Jira Board Rendering & Direct Sharing
+
+    @MainActor
+    private final class MockBoardShareSession: IOSBoardShareSession {
+        let id: UUID
+        let title: String
+        var canShareBoard = true
+        private(set) var isSharingScreen = false
+        var onExternalBoardShareStopped: (() -> Void)?
+        private(set) var startedSamples: [CMSampleBuffer] = []
+        private(set) var pushedSamples: [CMSampleBuffer] = []
+        private(set) var stopCount = 0
+
+        init(id: UUID = UUID(), title: String = "Sprint Planning") {
+            self.id = id
+            self.title = title
+        }
+
+        func startBoardSharing(initialSample: CMSampleBuffer) async throws {
+            isSharingScreen = true
+            startedSamples.append(initialSample)
+        }
+
+        func pushBoardShareFrame(_ sample: CMSampleBuffer) {
+            pushedSamples.append(sample)
+        }
+
+        func stopBoardSharing() async {
+            isSharingScreen = false
+            stopCount += 1
+        }
+    }
+
+    private final class LoopbackHTTPBoardServer: @unchecked Sendable {
+        private let queue = DispatchQueue(label: "ios.board.loopback")
+        private var listener: NWListener?
+        private let html: String
+
+        init(html: String) {
+            self.html = html
+        }
+
+        func start() async throws -> UInt16 {
+            let listener = try NWListener(using: .tcp, on: .any)
+            self.listener = listener
+            return try await withCheckedThrowingContinuation { continuation in
+                var resumed = false
+                listener.stateUpdateHandler = { state in
+                    switch state {
+                    case .ready:
+                        if !resumed, let port = listener.port?.rawValue {
+                            resumed = true
+                            continuation.resume(returning: port)
+                        }
+                    case .failed(let error):
+                        if !resumed {
+                            resumed = true
+                            continuation.resume(throwing: error)
+                        }
+                    default:
+                        break
+                    }
+                }
+                listener.newConnectionHandler = { [weak self] conn in
+                    self?.serve(conn)
+                }
+                listener.start(queue: queue)
+            }
+        }
+
+        func stop() {
+            listener?.cancel()
+            listener = nil
+        }
+
+        private func serve(_ conn: NWConnection) {
+            conn.start(queue: queue)
+            conn.receive(minimumIncompleteLength: 1, maximumLength: 16_384) { [weak self] _, _, _, error in
+                guard let self, error == nil else {
+                    conn.cancel()
+                    return
+                }
+                let body = Data(self.html.utf8)
+                let response =
+                    "HTTP/1.1 200 OK\r\n" +
+                    "Content-Type: text/html; charset=utf-8\r\n" +
+                    "Content-Length: \(body.count)\r\n" +
+                    "Connection: close\r\n\r\n"
+                var payload = Data(response.utf8)
+                payload.append(body)
+                conn.send(content: payload, completion: .contentProcessed { _ in
+                    conn.cancel()
+                })
+            }
+        }
+    }
+
+    private func makeSolidBoardCGImage(width: Int = 1440, height: Int = 810) -> CGImage {
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        let bitmapInfo = CGBitmapInfo.byteOrder32Little.rawValue | CGImageAlphaInfo.premultipliedFirst.rawValue
+        let ctx = CGContext(
+            data: nil,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: width * 4,
+            space: colorSpace,
+            bitmapInfo: bitmapInfo
+        )!
+        ctx.setFillColor(red: 0.12, green: 0.35, blue: 0.72, alpha: 1.0)
+        ctx.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        return ctx.makeImage()!
+    }
+
+    func testIOSAssistantBoardUsesDesktopViewportAndUserAgent() async throws {
+        let board = IOSAssistantBoardController()
+        let html = """
+        <!doctype html>
+        <html>
+          <head><title>Jira Desktop Board</title></head>
+          <body style="margin:0"><div id="cols" style="width:1440px;height:810px">Sprint Columns</div></body>
+        </html>
+        """
+        await board.loadHTMLForTesting(html)
+
+        XCTAssertEqual(board.webView.configuration.defaultWebpagePreferences.preferredContentMode, .desktop)
+        XCTAssertTrue((board.webView.customUserAgent ?? "").contains("Macintosh"))
+        XCTAssertEqual(board.webView.bounds.size, CGSize(width: 1440, height: 810))
+
+        let dims = try await board.webView.evaluateJavaScript("[window.innerWidth, window.innerHeight]") as? [NSNumber]
+        XCTAssertEqual(dims?.first?.intValue, 1440)
+        XCTAssertEqual(dims?.last?.intValue, 810)
+    }
+
+    func testIOSAssistantBoardShares1080pDesktopFramesAndHandlesStop() async throws {
+        let suite = SuiteBox()
+        let tempRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ios-board-share-\(UUID().uuidString)", isDirectory: true)
+        let (workspace, store) = try await makeTestWorkspace(tempRoot: tempRoot, prefs: suite.defaults)
+        let skills = IOSAssistantSkillsController(
+            workspace: workspace,
+            preferences: suite.defaults,
+            keychain: WorkspaceAPIKeychain(service: "dev.vsmirn0v.ios.boardshare.\(UUID().uuidString)"),
+            customRootURL: tempRoot.appendingPathComponent("skills", isDirectory: true)
+        )
+        defer { skills.stopWatcher() }
+
+        let mockSession = MockBoardShareSession(title: "Sprint Planning")
+        let board = IOSAssistantBoardController()
+        board.resolveShareTarget = { requested in
+            (requested == nil || requested == mockSession.id) ? mockSession : nil
+        }
+        let testImage = makeSolidBoardCGImage()
+        board.snapshotOverrideForTesting = { testImage }
+        await board.loadHTMLForTesting("<!doctype html><html><body><div>ROCK-101</div></body></html>")
+
+        let shareJSON = await IOSAutonomousMeetingFacilitator.executeSharedTool(
+            name: "rocknroll_control_board",
+            argumentsJSON: "{\"command\":\"share_to_meeting\"}",
+            sessionID: nil,
+            controllerID: mockSession.id,
+            allowWrites: true,
+            allowedGroups: [.boardShare],
+            skills: skills,
+            workspace: workspace,
+            board: board
+        )
+        let shareObj = try JSONSerialization.jsonObject(with: Data(shareJSON.utf8)) as? [String: Any]
+        XCTAssertEqual(shareObj?["sharing"] as? Bool, true)
+        XCTAssertTrue(board.isSharing)
+        XCTAssertEqual(board.sharingSessionID, mockSession.id)
+        XCTAssertEqual(board.sharingMeetingTitle, "Sprint Planning")
+        XCTAssertEqual(mockSession.startedSamples.count, 1)
+
+        let firstPixels = try XCTUnwrap(CMSampleBufferGetImageBuffer(mockSession.startedSamples[0]))
+        XCTAssertEqual(CVPixelBufferGetWidth(firstPixels), 1920)
+        XCTAssertEqual(CVPixelBufferGetHeight(firstPixels), 1080)
+
+        board.markBoardDirty()
+        for _ in 0..<25 where mockSession.pushedSamples.isEmpty {
+            try await Task.sleep(for: .milliseconds(30))
+        }
+        XCTAssertFalse(mockSession.pushedSamples.isEmpty)
+        let pushedPixels = try XCTUnwrap(CMSampleBufferGetImageBuffer(mockSession.pushedSamples[0]))
+        XCTAssertEqual(CVPixelBufferGetWidth(pushedPixels), 1920)
+        XCTAssertEqual(CVPixelBufferGetHeight(pushedPixels), 1080)
+
+        // External stop from the active call clears board sharing state without loop
+        mockSession.onExternalBoardShareStopped?()
+        XCTAssertFalse(board.isSharing)
+        XCTAssertNil(board.sharingSessionID)
+
+        // Re-share and verify explicit stop_share tool stops the session cleanly
+        _ = await IOSAutonomousMeetingFacilitator.executeSharedTool(
+            name: "rocknroll_control_board",
+            argumentsJSON: "{\"command\":\"share_to_meeting\"}",
+            sessionID: nil,
+            controllerID: mockSession.id,
+            allowWrites: true,
+            allowedGroups: [.boardShare],
+            skills: skills,
+            workspace: workspace,
+            board: board
+        )
+        XCTAssertTrue(board.isSharing)
+
+        let stopJSON = await IOSAutonomousMeetingFacilitator.executeSharedTool(
+            name: "rocknroll_control_board",
+            argumentsJSON: "{\"command\":\"stop_share\"}",
+            sessionID: nil,
+            controllerID: mockSession.id,
+            allowWrites: true,
+            allowedGroups: [.boardShare],
+            skills: skills,
+            workspace: workspace,
+            board: board
+        )
+        let stopObj = try JSONSerialization.jsonObject(with: Data(stopJSON.utf8)) as? [String: Any]
+        XCTAssertEqual(stopObj?["sharing"] as? Bool, false)
+        XCTAssertFalse(board.isSharing)
+        for _ in 0..<20 where mockSession.stopCount == 0 {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        XCTAssertEqual(mockSession.stopCount, 1)
+
+        await store.close()
+        try? FileManager.default.removeItem(at: tempRoot)
+    }
+
+    func testIOSFacilitatorDeterministicVoiceSharesJiraBoard() async throws {
+        let suite = SuiteBox()
+        let tempRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ios-voice-board-share-\(UUID().uuidString)", isDirectory: true)
+        let (workspace, store) = try await makeTestWorkspace(tempRoot: tempRoot, prefs: suite.defaults)
+        let skills = IOSAssistantSkillsController(
+            workspace: workspace,
+            preferences: suite.defaults,
+            keychain: WorkspaceAPIKeychain(service: "dev.vsmirn0v.ios.voiceboard.\(UUID().uuidString)"),
+            customRootURL: tempRoot.appendingPathComponent("skills", isDirectory: true)
+        )
+        defer { skills.stopWatcher() }
+
+        let server = LoopbackHTTPBoardServer(
+            html: "<!doctype html><html><head><title>Standup Board</title></head><body><div>ROCK-42</div></body></html>"
+        )
+        let port = try await server.start()
+        defer { server.stop() }
+        let boardURL = "http://127.0.0.1:\(port)/boards/42"
+        var teamDoc = skills.teamContext
+        teamDoc.defaultJiraBoardURL = boardURL
+        try skills.saveTeamContext(teamDoc)
+
+        let mockSession = MockBoardShareSession(title: "Daily Standup")
+        let board = IOSAssistantBoardController()
+        board.defaultBoardURLProvider = { skills.teamContext.defaultJiraBoardURL }
+        board.resolveShareTarget = { requested in
+            (requested == nil || requested == mockSession.id) ? mockSession : nil
+        }
+        let testImage = makeSolidBoardCGImage()
+        board.snapshotOverrideForTesting = { testImage }
+
+        let facilitator = IOSAutonomousMeetingFacilitator(
+            skills: skills,
+            workspace: workspace,
+            board: board,
+            resolveBridge: { _ in nil }
+        )
+
+        let replyRU = await facilitator.executeStandardTurn(
+            controllerID: mockSession.id,
+            title: "Daily Standup",
+            skillID: "scrum-master",
+            speakerName: "Vitalii",
+            allowWrites: true,
+            commandText: "Расшарь доску Jira"
+        )
+        XCTAssertTrue(replyRU.contains("Daily Standup"))
+        XCTAssertTrue(board.isSharing)
+        XCTAssertEqual(board.currentURL?.absoluteString, boardURL)
+        XCTAssertEqual(mockSession.startedSamples.count, 1)
+
+        // Stop and test English deterministic phrase
+        let stopReply = await facilitator.executeStandardTurn(
+            controllerID: mockSession.id,
+            title: "Daily Standup",
+            skillID: "scrum-master",
+            speakerName: "Vitalii",
+            allowWrites: true,
+            commandText: "Stop sharing the Jira board"
+        )
+        XCTAssertTrue(stopReply.contains("Stopped"))
+        XCTAssertFalse(board.isSharing)
+
+        let replyEN = await facilitator.executeStandardTurn(
+            controllerID: mockSession.id,
+            title: "Daily Standup",
+            skillID: "scrum-master",
+            speakerName: "Vitalii",
+            allowWrites: true,
+            commandText: "Share the Jira board"
+        )
+        XCTAssertTrue(replyEN.contains("Daily Standup"))
+        XCTAssertTrue(board.isSharing)
+
+        board.stopSharing()
         await store.close()
         try? FileManager.default.removeItem(at: tempRoot)
     }

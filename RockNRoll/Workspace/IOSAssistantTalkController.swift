@@ -597,14 +597,14 @@ import FoundationModels
             }
         }
 
-        // 9. Open Jira / Assistant Board
-        if (lower.contains("открой") || lower.contains("покажи") || lower.contains("open") || lower.contains("show"))
-            && (lower.contains("доск") || lower.contains("board") || lower.contains("jira")),
-           let board, let skills {
-            let url = skills.teamContext.defaultJiraBoardURL
-            if !url.isEmpty, let msg = try? await board.open(urlString: url) {
-                return msg
-            }
+        // 9. Open / Share / Stop Jira / Assistant Board
+        if let boardReply = await IOSAutonomousMeetingFacilitator.handleDeterministicBoardCommand(
+            input,
+            board: board,
+            defaultBoardURL: skills?.teamContext.defaultJiraBoardURL ?? "",
+            targetID: resolvedTargetMeetingID()
+        ) {
+            return boardReply
         }
 
         return nil
@@ -877,7 +877,8 @@ import FoundationModels
 
     private func executeDirectRealtimeTool(name: String, argumentsJSON: String) async -> String {
         guard let skills else { return "{\"error\":\"Skills unavailable\"}" }
-        let targetSessionID = resolvedTargetMeetingID().flatMap { id in
+        let resolvedControllerID = resolvedTargetMeetingID()
+        let targetSessionID = resolvedControllerID.flatMap { id in
             activeMeetingsProvider().first(where: { $0.id == id })?.sessionID
                 ?? workspace?.workspaceSessionID(forControllerID: id)
         } ?? activeMeetingsProvider().first?.sessionID
@@ -886,6 +887,7 @@ import FoundationModels
             name: name,
             argumentsJSON: argumentsJSON,
             sessionID: targetSessionID,
+            controllerID: resolvedControllerID,
             allowWrites: true,
             allowedGroups: nil,
             skills: skills,

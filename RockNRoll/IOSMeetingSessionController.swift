@@ -1,6 +1,7 @@
 import AVFoundation
 import Combine
 import ConferenceCore
+import CoreMedia
 import LiveKit
 import LiveKitWebRTC
 import MeetingEngine
@@ -11,7 +12,7 @@ import UIKit
 /// `.telemost`, `.trueconf`), sharing workspace-wide CallKit/AVAudioSession ownership
 /// through `IOSWorkspaceAudioCoordinator` and gating remote video decode to foreground visibility.
 @MainActor
-final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifiable {
+final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifiable, IOSBoardShareSession {
     let id: UUID
     let destination: JoinDestination
     let session: MeetingSession
@@ -45,6 +46,8 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
     var onOpenNotes: (() -> Void)?
     var onOpenBoard: (() -> Void)?
     var onOpenAsk: (() -> Void)?
+    var onExternalBoardShareStopped: (() -> Void)?
+    var canShareBoard: Bool { !leaving && phase == .connected && !isHeld && !quiet }
     var onWorkspaceEventsChanged: ((UUID, [SyncedTranscriptEvent], [DateInterval], Set<String>) -> Void)?
 
     @Published private(set) var callView: RockCallViewController?
@@ -330,6 +333,7 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
             }
             rewired.onExternalEnd = { [weak self] in
                 self?.studio.presenter.sharingEnded()
+                self?.notifyExternalBoardShareStopped()
             }
             rewired.onError = { [weak self] error in
                 self?.reportMediaStatus(error.localizedDescription)
@@ -650,6 +654,7 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
             callView?.setSharing(false)
             return
         }
+        notifyExternalBoardShareStopped()
         Task { @MainActor [weak self] in
             guard let self, let screenShare = self.screenShare else { return }
             do {
@@ -675,7 +680,38 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
         }
     }
 
+    func startBoardSharing(initialSample: CMSampleBuffer) async throws {
+        guard canShareBoard else {
+            throw MeetingSessionError.unavailable(L("Connect to the meeting before sharing the board."))
+        }
+        notifyExternalBoardShareStopped()
+        await stopScreenSharing(retirePresenter: true)
+        guard canShareBoard, let screenShare else {
+            throw MeetingSessionError.unavailable(L("Screen sharing is unavailable in this call state."))
+        }
+        let codec = session.capabilities.supportsScreenShareVP9 ? "vp9" : "h264"
+        let profile = GuestVideoProfile(width: 1920, height: 1080, fps: 15, maximumBitrate: 2_000_000)
+        try await screenShare.startComposed(initialSample: initialSample, profile: profile, codec: codec)
+    }
+
+    func pushBoardShareFrame(_ sample: CMSampleBuffer) {
+        guard canShareBoard else { return }
+        screenShare?.sendComposed(sample)
+    }
+
+    func stopBoardSharing() async {
+        onExternalBoardShareStopped = nil
+        await stopScreenSharing(retirePresenter: false)
+    }
+
+    private func notifyExternalBoardShareStopped() {
+        let callback = onExternalBoardShareStopped
+        onExternalBoardShareStopped = nil
+        callback?()
+    }
+
     private func stopScreenSharing(retirePresenter: Bool) async {
+        notifyExternalBoardShareStopped()
         let wasBroadcast = screenShare?.isBroadcastSharing == true
         if retirePresenter { studio.presenter.sharingEnded() }
         await screenShare?.stop()
@@ -1819,6 +1855,7 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
         appLifecycleObservers.forEach(NotificationCenter.default.removeObserver)
         appLifecycleObservers = []
 
+        notifyExternalBoardShareStopped()
         let wasBroadcast = screenShare?.isBroadcastSharing == true
         await localTranscriber.reset()
         await screenShare?.stop()

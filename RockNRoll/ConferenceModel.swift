@@ -148,7 +148,24 @@ final class ConferenceModel: ObservableObject {
         preferences: preferences,
         keychain: workspace.keychain
     )
-    lazy var assistantBoard: IOSAssistantBoardController = IOSAssistantBoardController()
+    lazy var assistantBoard: IOSAssistantBoardController = {
+        let controller = IOSAssistantBoardController()
+        controller.defaultBoardURLProvider = { [weak self] in
+            self?.assistantSkills.teamContext.defaultJiraBoardURL ?? ""
+        }
+        controller.resolveShareTarget = { [weak self] requestedID in
+            guard let self else { return nil }
+            if let requestedID,
+               let match = self.sessions.first(where: { $0.id == requestedID || $0.workspaceSessionID == requestedID }) {
+                return match
+            }
+            if let foreground = self.foregroundSession, foreground.canShareBoard {
+                return foreground
+            }
+            return self.sessions.first(where: \.canShareBoard)
+        }
+        return controller
+    }()
     lazy var assistantFacilitator: IOSAutonomousMeetingFacilitator = IOSAutonomousMeetingFacilitator(
         skills: assistantSkills,
         workspace: workspace,

@@ -729,12 +729,12 @@ private struct IOSFacilitatorModeSection: View {
                 }
             }
 
-            if board != nil {
-                Button {
-                    onOpenBoard()
-                } label: {
-                    Label(L("Open Assistant Board"), systemImage: "macwindow")
-                }
+            if let board {
+                IOSFacilitatorBoardControls(
+                    controllerID: controllerID,
+                    board: board,
+                    onOpenBoard: onOpenBoard
+                )
             }
 
             if let note = facilitator.lastStatusBySession[controllerID] {
@@ -742,6 +742,53 @@ private struct IOSFacilitatorModeSection: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+        }
+    }
+}
+
+private struct IOSFacilitatorBoardControls: View {
+    let controllerID: UUID
+    @ObservedObject var board: IOSAssistantBoardController
+    let onOpenBoard: () -> Void
+    @State private var shareError: String?
+
+    var body: some View {
+        Button {
+            onOpenBoard()
+        } label: {
+            Label(L("Open Assistant Board"), systemImage: "macwindow")
+        }
+
+        if board.isSharing {
+            Button(role: .destructive) {
+                shareError = nil
+                board.stopSharing()
+            } label: {
+                Label(L("Stop Sharing Board"), systemImage: "display.trianglebadge.exclamationmark")
+            }
+        } else if board.canShareToActiveMeeting {
+            Button {
+                shareError = nil
+                Task {
+                    do {
+                        _ = try await board.startSharing(targetID: controllerID)
+                    } catch {
+                        shareError = error.localizedDescription
+                    }
+                }
+            } label: {
+                Label(
+                    board.isStartingShare ? L("Starting Share…") : L("Share Desktop Board"),
+                    systemImage: "display"
+                )
+            }
+            .disabled(board.isStartingShare)
+        }
+
+        if let shareError {
+            Text(shareError)
+                .font(.caption)
+                .foregroundStyle(.red)
         }
     }
 }

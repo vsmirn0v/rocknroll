@@ -478,12 +478,13 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
 
         // Direct deterministic board controls when allowed
         if (allowedGroups.isEmpty || allowedGroups.contains(.boardShare)),
-           lower.contains("доск") || lower.contains("board") || lower.contains("jira"),
-           (lower.contains("открой") || lower.contains("покажи") || lower.contains("open") || lower.contains("show")) {
-            let boardURL = skills.teamContext.defaultJiraBoardURL
-            if !boardURL.isEmpty, let msg = try? await board?.open(urlString: boardURL) {
-                return msg
-            }
+           let boardReply = await Self.handleDeterministicBoardCommand(
+               commandText,
+               board: board,
+               defaultBoardURL: skills.teamContext.defaultJiraBoardURL,
+               targetID: controllerID
+           ) {
+            return boardReply
         }
 
         // Direct deterministic task creation by approved speaker when allowed
@@ -543,6 +544,7 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
                     name: name,
                     argumentsJSON: argsJSON,
                     sessionID: resolvedSessionID,
+                    controllerID: controllerID,
                     allowWrites: allowWrites,
                     allowedGroups: skillToolSet,
                     skills: skills,
@@ -660,6 +662,7 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
             name: name,
             argumentsJSON: argumentsJSON,
             sessionID: sid,
+            controllerID: controllerID,
             allowWrites: state.gate.currentAllowWrites(),
             allowedGroups: allowedGroups,
             skills: skills,
@@ -672,6 +675,7 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
         name: String,
         argumentsJSON: String,
         sessionID: UUID?,
+        controllerID: UUID? = nil,
         allowWrites: Bool,
         allowedGroups: Set<AssistantSkillToolGroup>?,
         skills: IOSAssistantSkillsController,
@@ -872,6 +876,23 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
                         ?? skills.teamContext.defaultJiraBoardURL
                     let msg = try await board.open(urlString: url)
                     return jsonString(["message": msg])
+                case "share_to_meeting":
+                    let rawURL = (args["url"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let explicitURL: String?
+                    if let rawURL, !rawURL.isEmpty {
+                        explicitURL = rawURL
+                    } else if board.currentURL == nil {
+                        let fallback = skills.teamContext.defaultJiraBoardURL.trimmingCharacters(in: .whitespacesAndNewlines)
+                        explicitURL = fallback.isEmpty ? nil : fallback
+                    } else {
+                        explicitURL = nil
+                    }
+                    let targetUUID = (args["meeting_id"] as? String).flatMap(UUID.init(uuidString:)) ?? controllerID ?? sessionID
+                    let msg = try await board.startSharing(targetID: targetUUID, urlOverride: explicitURL)
+                    return jsonString(["sharing": true, "message": msg])
+                case "stop_share":
+                    board.stopSharing()
+                    return jsonString(["sharing": false, "message": L("Stopped sharing the Assistant Board.")])
                 case "filter":
                     return jsonString(["message": try await board.filter(query: (args["query"] as? String) ?? (args["text"] as? String) ?? "")])
                 case "scroll":
@@ -1052,6 +1073,47 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
     }
 
     // MARK: - Helpers
+
+    static func handleDeterministicBoardCommand(
+        _ input: String,
+        board: IOSAssistantBoardController?,
+        defaultBoardURL: String,
+        targetID: UUID?
+    ) async -> String? {
+        guard let board else { return nil }
+        let lower = input.lowercased().replacingOccurrences(of: "ё", with: "е")
+        guard lower.contains("доск") || lower.contains("board") || lower.contains("jira") else {
+            return nil
+        }
+
+        let asksStop = lower.contains("останов") || lower.contains("прекрат") || lower.contains("выключ")
+            || lower.contains("stop shar") || lower.contains("unshare")
+        if asksStop {
+            board.stopSharing()
+            return L("Stopped sharing the Assistant Board.")
+        }
+
+        let asksShare = lower.contains("расшар") || lower.contains("пошар") || lower.contains("демонстр")
+            || lower.contains("поделис") || lower.contains("share") || lower.contains("present")
+        if asksShare {
+            let trimmedDefault = defaultBoardURL.trimmingCharacters(in: .whitespacesAndNewlines)
+            let urlOverride = board.currentURL == nil && !trimmedDefault.isEmpty ? trimmedDefault : nil
+            do {
+                return try await board.startSharing(targetID: targetID, urlOverride: urlOverride)
+            } catch {
+                return error.localizedDescription
+            }
+        }
+
+        let asksOpen = lower.contains("открой") || lower.contains("покажи") || lower.contains("open") || lower.contains("show")
+        if asksOpen {
+            let trimmedDefault = defaultBoardURL.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmedDefault.isEmpty, let msg = try? await board.open(urlString: trimmedDefault) {
+                return msg
+            }
+        }
+        return nil
+    }
 
     nonisolated static func extractDirectTaskInstruction(
         from input: String,
@@ -1369,15 +1431,17 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
         if allows(.boardShare) {
             tools.append(.init(
                 name: "rocknroll_control_board",
-                description: "Control the in-app Assistant Board browser (open_url, filter, scroll, click, click_at, highlight, inspect, snapshot).",
+                description: "Control the in-app desktop-sized (1440x810) Assistant Board browser and stream it directly to an active meeting like a desktop screen share (open_url, share_to_meeting, stop_share, filter, scroll, click, click_at, highlight, inspect, snapshot).",
                 parametersJSONSchema: [
                     "type": "object",
                     "properties": [
-                        "command": ["type": "string", "enum": ["open_url", "filter", "scroll", "click", "click_at", "highlight", "inspect", "snapshot"]],
+                        "command": ["type": "string", "enum": ["open_url", "share_to_meeting", "stop_share", "filter", "scroll", "click", "click_at", "highlight", "inspect", "snapshot"]],
                         "url": ["type": "string"],
+                        "meeting_id": ["type": "string"],
                         "query": ["type": "string"],
                         "text": ["type": "string"],
                         "selector": ["type": "string"],
+                        "delta_y": ["type": "integer"],
                         "x": ["type": "number"],
                         "y": ["type": "number"],
                         "normalized": ["type": "boolean"]
