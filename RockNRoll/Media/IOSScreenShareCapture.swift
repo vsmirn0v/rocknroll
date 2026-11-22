@@ -585,6 +585,14 @@ final class IOSScreenShareCapture {
                         return
                     }
                     do {
+                        let replayTask = Task { @MainActor [weak activeSender] in
+                            while !Task.isCancelled {
+                                await Task.yield()
+                                activeSender?.replayLatestFrame()
+                                try? await Task.sleep(for: .milliseconds(65))
+                            }
+                        }
+                        defer { replayTask.cancel() }
                         if session.supportsScreenSharePublication {
                             let track = activeSender.track
                             let initial = activeSender.latestFrame
@@ -592,15 +600,8 @@ final class IOSScreenShareCapture {
                                 NativeDesktopRelayCapture(track: track, source: source, initialFrame: initial)
                             }
                             try await session.startScreenShare(request)
+                            activeSender.replayLatestFrame()
                         } else {
-                            let replayTask = Task { @MainActor [weak activeSender] in
-                                while !Task.isCancelled {
-                                    await Task.yield()
-                                    activeSender?.replayLatestFrame()
-                                    try? await Task.sleep(for: .milliseconds(50))
-                                }
-                            }
-                            defer { replayTask.cancel() }
                             try await session.setScreenTrack(activeSender.track)
                             activeSender.replayLatestFrame()
                         }

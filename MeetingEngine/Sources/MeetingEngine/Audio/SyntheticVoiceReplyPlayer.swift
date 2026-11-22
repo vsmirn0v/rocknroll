@@ -35,6 +35,48 @@ enum SyntheticVoiceReplyPlayer {
         }
     }
 
+    #if !os(macOS)
+    private final class IOSMonitorBox: @unchecked Sendable {
+        let player: AVAudioPlayer
+
+        init?(samples: [Int16], gain: Float) {
+            guard gain > 0, !samples.isEmpty else { return nil }
+            var wav = Data()
+            let pcmByteCount = samples.count * MemoryLayout<Int16>.size
+            wav.reserveCapacity(44 + pcmByteCount)
+            func appendLE<T: FixedWidthInteger>(_ value: T) {
+                var little = value.littleEndian
+                withUnsafeBytes(of: &little) { wav.append(contentsOf: $0) }
+            }
+            wav.append(contentsOf: "RIFF".utf8)
+            appendLE(UInt32(clamping: 36 + pcmByteCount))
+            wav.append(contentsOf: "WAVEfmt ".utf8)
+            appendLE(UInt32(16))
+            appendLE(UInt16(1))
+            appendLE(UInt16(targetChannels))
+            appendLE(UInt32(targetSampleRate))
+            appendLE(UInt32(targetSampleRate) * UInt32(targetChannels) * 2)
+            appendLE(UInt16(targetChannels) * 2)
+            appendLE(UInt16(16))
+            wav.append(contentsOf: "data".utf8)
+            appendLE(UInt32(clamping: pcmByteCount))
+            samples.withUnsafeBytes { wav.append(contentsOf: $0) }
+
+            guard let audioPlayer = try? AVAudioPlayer(data: wav) else { return nil }
+            audioPlayer.volume = min(1, max(0, gain))
+            audioPlayer.prepareToPlay()
+            guard audioPlayer.play() else { return nil }
+            self.player = audioPlayer
+        }
+
+        var isPlaying: Bool { player.isPlaying }
+
+        func stop() {
+            player.stop()
+        }
+    }
+    #endif
+
     static func play(_ buffer: AVAudioPCMBuffer,
                      localGain: Float?,
                      deliverFrame: @escaping @Sendable (UnsafePointer<Int16>, Int) -> Void,
@@ -51,7 +93,8 @@ enum SyntheticVoiceReplyPlayer {
         let monitor = localGain.flatMap { MonitorBox(buffer: buffer, gain: $0) }
         defer { monitor?.stop() }
         #else
-        _ = localGain
+        let monitor = localGain.flatMap { IOSMonitorBox(samples: speechSamples, gain: $0) }
+        defer { monitor?.stop() }
         #endif
 
         // Pad remainder of final 10ms chunk plus two silent 10ms frames so Opus flushes the tail cleanly.
@@ -89,6 +132,15 @@ enum SyntheticVoiceReplyPlayer {
                 }
             }
         }
+        #if !os(macOS)
+        if !Task.isCancelled, let monitor {
+            var drainTicks = 0
+            while monitor.isPlaying && drainTicks < 12 && !Task.isCancelled {
+                drainTicks += 1
+                try? await clock.sleep(for: .milliseconds(20))
+            }
+        }
+        #endif
         return offset >= totalSpeech && !Task.isCancelled
     }
 

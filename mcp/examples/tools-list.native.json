@@ -1134,12 +1134,16 @@
         "destructiveHint" : false,
         "readOnlyHint" : false
       },
-      "description" : "Search Jira issues with JQL or post a comment directly on a Jira issue.",
+      "description" : "Search Jira issues with JQL, search Jira users to bind to People.md, or post a comment directly on a Jira issue.",
       "inputSchema" : {
         "additionalProperties" : false,
         "properties" : {
           "action_id" : {
             "description" : "Client-generated UUID used as an idempotency key. Retrying with the same action_id and identical arguments replays the recorded result; reusing it with different arguments fails with ACTION_ID_REUSED.",
+            "type" : "string"
+          },
+          "assignee" : {
+            "description" : "Meeting/display name or Jira handle to resolve via People.md or Jira user search.",
             "type" : "string"
           },
           "comment" : {
@@ -1158,7 +1162,7 @@
           },
           "max_results" : {
             "default" : 15,
-            "description" : "Maximum issues to return for search (1...50).",
+            "description" : "Maximum issues or users to return (1...50).",
             "maximum" : 50,
             "minimum" : 1,
             "type" : "integer"
@@ -1167,12 +1171,13 @@
             "description" : "Jira operation.",
             "enum" : [
               "search",
+              "search_users",
               "comment"
             ],
             "type" : "string"
           },
           "query" : {
-            "description" : "Plain text search query when jql is omitted.",
+            "description" : "Plain text search query when jql is omitted, or name/login/email query for search_users.",
             "type" : "string"
           }
         },

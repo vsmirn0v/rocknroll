@@ -88,6 +88,11 @@ final class AssistantBoardWindowController: NSObject, ObservableObject, WKNaviga
         guard let webView else {
             throw NativeDesktopError.unavailable(L("Assistant Board web view is unavailable."))
         }
+        if currentURL == url && loadError == nil && !isLoading {
+            let title = webView.title?.trimmed.isEmpty == false ? (webView.title ?? url.host ?? url.absoluteString) : url.absoluteString
+            pageTitle = title
+            return L("Opened %@ (%@).", title, url.absoluteString)
+        }
         finishPendingNavigation()
         loadError = nil
         currentURL = url
@@ -147,6 +152,10 @@ final class AssistantBoardWindowController: NSObject, ObservableObject, WKNaviga
         let shareStartedAt = Date()
         markBoardDirty()
         lastCaptureUptime = 0
+        if let initialBuffer = await captureFrameBuffer() {
+            lastCaptureUptime = ProcessInfo.processInfo.systemUptime
+            model.pushBoardShareFrame(initialBuffer)
+        }
         frameTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
                 guard let self,
@@ -156,11 +165,15 @@ final class AssistantBoardWindowController: NSObject, ObservableObject, WKNaviga
                     self?.stopSharing(notifyModel: false)
                     return
                 }
-                if Date().timeIntervalSince(shareStartedAt) > 2.0,
+                if Date().timeIntervalSince(shareStartedAt) > 8.0,
                    !meeting.isSharingLive,
                    !meeting.sharingPending {
                     self.stopSharing(notifyModel: false)
                     return
+                }
+                guard meeting.connected else {
+                    try? await Task.sleep(for: .milliseconds(250))
+                    continue
                 }
                 let uptime = ProcessInfo.processInfo.systemUptime
                 let isDirty = (uptime - self.lastDirtyUptime) <= 1.0 || self.isLoading

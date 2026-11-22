@@ -76,6 +76,7 @@ public final class WorkspaceTaskSyncController: ObservableObject {
     @Published public var pendingPacket: TaskSyncPacket?
     @Published public var lastReport: TaskSyncExecutionReport?
     @Published public var assignableJiraUsers: [JiraUserContact] = []
+    public var jiraConnectorForTesting: (any JiraTaskConnecting)?
     @Published public var currentJiraUser: JiraUserContact?
     @Published public var reminderLists: [ReminderListInfo] = []
     @Published public var appContacts: [AppContactPerson] = []
@@ -723,13 +724,185 @@ public final class WorkspaceTaskSyncController: ObservableObject {
         statusMessage = L("Processed %ld Jira handover(s) from iPhone.", pending.count)
     }
 
-    // MARK: - Direct Assistant Jira Queries & Comments
+    // MARK: - Direct Assistant Jira Queries, User Search & Comments
+
+    public enum JiraAssigneeResolution: Equatable, Sendable {
+        case resolved(jqlIdentifier: String, person: AssistantPersonEntry?)
+        case unresolved(query: String, candidates: [JiraUserContact])
+    }
+
+    nonisolated public static func extractLiteralAssigneeFromJQL(_ jql: String) -> String? {
+        guard let regex = try? NSRegularExpression(
+            pattern: #"\bassignee\s*(?:=|!=)\s*["']([^"']+)["']"#,
+            options: [.caseInsensitive]
+        ) else {
+            return nil
+        }
+        let nsRange = NSRange(jql.startIndex..<jql.endIndex, in: jql)
+        guard let match = regex.firstMatch(in: jql, range: nsRange),
+              match.numberOfRanges >= 2,
+              let range = Range(match.range(at: 1), in: jql) else {
+            return nil
+        }
+        let literal = String(jql[range]).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !literal.isEmpty, literal.lowercased() != "currentuser()" else { return nil }
+        return literal
+    }
+
+    nonisolated public static func escapedJQLString(_ value: String) -> String {
+        value
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+    }
+
+    nonisolated public static func injectAssignee(_ assigneeIdentifier: String, intoJQL jql: String) -> String {
+        let escaped = escapedJQLString(assigneeIdentifier)
+        let clause = "assignee = \"\(escaped)\""
+        let trimmed = jql.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "\(clause) ORDER BY updated DESC" }
+        if let orderRange = trimmed.range(of: #"\bORDER\s+BY\b"#, options: [.regularExpression, .caseInsensitive]) {
+            let filterPart = String(trimmed[..<orderRange.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+            let orderPart = String(trimmed[orderRange.lowerBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+            if filterPart.isEmpty {
+                return "\(clause) \(orderPart)"
+            }
+            return "(\(filterPart)) AND \(clause) \(orderPart)"
+        }
+        return "(\(trimmed)) AND \(clause)"
+    }
+
+    nonisolated public static func replacingLiteralAssignee(in jql: String, with assigneeIdentifier: String) -> String {
+        guard let regex = try? NSRegularExpression(
+            pattern: #"(\bassignee\s*(?:=|!=)\s*)["'][^"']+["']"#,
+            options: [.caseInsensitive]
+        ) else {
+            return jql
+        }
+        let escaped = NSRegularExpression.escapedTemplate(for: escapedJQLString(assigneeIdentifier))
+        let range = NSRange(jql.startIndex..<jql.endIndex, in: jql)
+        return regex.stringByReplacingMatches(in: jql, range: range, withTemplate: "$1\"\(escaped)\"")
+    }
+
+    nonisolated public static func jiraUserPayload(_ user: JiraUserContact) -> [String: Any] {
+        [
+            "identifier": user.identifier,
+            "username": user.username ?? "",
+            "account_id": user.accountId ?? "",
+            "display_name": user.displayName,
+            "email": user.emailAddress ?? "",
+            "is_server_or_dc": user.isServerOrDC,
+        ]
+    }
+
+    nonisolated public static func unresolvedJiraAssigneePayload(
+        query: String,
+        candidates: [JiraUserContact]
+    ) -> [String: Any] {
+        [
+            "needs_user_confirmation": true,
+            "unmapped_meeting_user": query,
+            "jira_user_candidates": candidates.map(jiraUserPayload),
+            "instruction": "Ask the participant whether one of these Jira users matches their meeting name, or ask for their Jira username/email. Once confirmed, call rocknroll_manage_people(operation='upsert', display_name=..., aliases=[meeting_display_name], jira_username=..., jira_account_id=..., email=...) and retry the Jira query."
+        ]
+    }
+
+    public func searchJiraUsers(
+        query: String,
+        projectKey: String? = nil,
+        maxResults: Int = 15
+    ) async throws -> [JiraUserContact] {
+        guard preferences.jira.enabled else {
+            throw JiraConnectorError.badRequest(L("Jira integration is not enabled."))
+        }
+        let connector = jiraConnectorForTesting ?? hooks.makeJiraConnector(preferences.jira, keychain)
+        let project = projectKey?.cleanedNilIfEmpty ?? preferences.jira.cleanProjectKey.cleanedNilIfEmpty
+        return try await connector.searchUsers(query: query, projectKey: project, maxResults: maxResults)
+    }
+
+    public func resolveJiraAssignee(
+        _ rawAssignee: String,
+        people: AssistantPeopleDirectory,
+        defaultProjectKey: String = ""
+    ) async -> JiraAssigneeResolution {
+        let clean = rawAssignee.trimmingCharacters(in: .whitespacesAndNewlines)
+        let stripped = AssistantPeopleDirectory.strippedMeetingDisplayName(clean)
+        let query = stripped.isEmpty ? clean : stripped
+        guard !query.isEmpty else {
+            return .unresolved(query: rawAssignee, candidates: [])
+        }
+        if clean.lowercased() == "currentuser()" {
+            return .resolved(jqlIdentifier: clean, person: nil)
+        }
+
+        if let person = people.resolvePerson(matching: clean) ?? people.resolvePerson(matching: query) {
+            let handle = preferences.jira.isCloudHost
+                ? (person.jiraAccountID?.cleanedNilIfEmpty ?? person.jiraUsername?.cleanedNilIfEmpty)
+                : (person.jiraUsername?.cleanedNilIfEmpty ?? person.jiraAccountID?.cleanedNilIfEmpty)
+            if let handle {
+                return .resolved(jqlIdentifier: handle, person: person)
+            }
+        }
+
+        let needle = query.hasPrefix("@") ? String(query.dropFirst()) : query
+        for mapping in preferences.contactMappings where mapping.isConfirmedByUser {
+            let score = JiraContactMatcher.matchScore(
+                name: needle,
+                candidateNames: [
+                    mapping.appDisplayName,
+                    mapping.jiraDisplayName,
+                    mapping.jiraUsername ?? "",
+                    mapping.jiraIdentifier
+                ],
+                candidateEmail: mapping.jiraEmail,
+                candidateUsername: mapping.jiraUsername
+            )
+            if score >= 0.85 {
+                let handle = preferences.jira.isCloudHost
+                    ? (mapping.jiraAccountId?.cleanedNilIfEmpty ?? mapping.jiraIdentifier)
+                    : (mapping.jiraUsername?.cleanedNilIfEmpty ?? mapping.jiraIdentifier)
+                return .resolved(jqlIdentifier: handle, person: nil)
+            }
+        }
+
+        let project = defaultProjectKey.cleanedNilIfEmpty ?? preferences.jira.cleanProjectKey.cleanedNilIfEmpty
+        var liveCandidates: [JiraUserContact] = []
+        if preferences.jira.enabled {
+            liveCandidates = (try? await searchJiraUsers(query: query, projectKey: project, maxResults: 8)) ?? []
+        }
+
+        if liveCandidates.isEmpty {
+            let cached = assignableJiraUsers.isEmpty ? preferences.jira.cachedProjectUsers : assignableJiraUsers
+            liveCandidates = cached
+                .map { user -> (JiraUserContact, Double) in
+                    let score = JiraContactMatcher.matchScore(
+                        name: needle,
+                        candidateNames: [user.displayName, user.username ?? "", user.identifier],
+                        candidateEmail: user.emailAddress,
+                        candidateUsername: user.username
+                    )
+                    return (user, score)
+                }
+                .filter { $0.1 >= 0.50 }
+                .sorted { $0.1 > $1.1 }
+                .map(\.0)
+        }
+
+        if let exact = liveCandidates.first(where: {
+            $0.identifier.caseInsensitiveCompare(needle) == .orderedSame
+                || ($0.username?.caseInsensitiveCompare(needle) == .orderedSame)
+                || ($0.accountId?.caseInsensitiveCompare(needle) == .orderedSame)
+        }) {
+            return .resolved(jqlIdentifier: exact.identifier, person: nil)
+        }
+
+        return .unresolved(query: clean, candidates: Array(liveCandidates.prefix(8)))
+    }
 
     public func searchJiraIssues(jql: String, maxResults: Int = 20) async throws -> [JiraRemoteIssue] {
         guard preferences.jira.enabled else {
             throw JiraConnectorError.badRequest(L("Jira integration is not enabled."))
         }
-        let connector = hooks.makeJiraConnector(preferences.jira, keychain)
+        let connector = jiraConnectorForTesting ?? hooks.makeJiraConnector(preferences.jira, keychain)
         return try await connector.searchIssues(jql: jql, maxResults: maxResults)
     }
 
@@ -737,7 +910,7 @@ public final class WorkspaceTaskSyncController: ObservableObject {
         guard preferences.jira.enabled else {
             throw JiraConnectorError.badRequest(L("Jira integration is not enabled."))
         }
-        let connector = hooks.makeJiraConnector(preferences.jira, keychain)
+        let connector = jiraConnectorForTesting ?? hooks.makeJiraConnector(preferences.jira, keychain)
         try await connector.addIssueComment(key: key, comment: comment)
     }
 }

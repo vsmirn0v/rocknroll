@@ -28,6 +28,7 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
         private var approvedSpeakersOnly = true
         private var lastApprovedTranscriptAt: Date?
         private var lastRemoteAudioAt: Date?
+        private var lastForwardedAudioAt: Date?
         private var lastTurnAllowWrites = false
         var coalescer: RealtimeAudioCoalescer?
         var senderTask: Task<Void, Never>?
@@ -78,6 +79,7 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
                 if !recentRemote {
                     lastTurnAllowWrites = true
                 }
+                lastForwardedAudioAt = now
                 return true
             } else {
                 lastRemoteAudioAt = now
@@ -89,8 +91,17 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
                 } else {
                     lastTurnAllowWrites = true
                 }
+                lastForwardedAudioAt = now
                 return true
             }
+        }
+
+        func recentlyForwardedAudio(within seconds: TimeInterval, now: Date = Date()) -> Bool {
+            lock.lock()
+            let at = lastForwardedAudioAt
+            lock.unlock()
+            guard let at else { return false }
+            return now.timeIntervalSince(at) <= seconds
         }
     }
 
@@ -98,6 +109,7 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
         let router = RealtimeVoiceRouter()
         let gate = AudioTapGate()
         var connected = false
+        var responseInProgress = false
         var audioChunks: [Data] = []
         let provider: RealtimeProviderKind
         var outputSampleRate: Double = 24_000
@@ -442,8 +454,12 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
             rtState.gate.setTurnApproval(allowWrites: allowWrites, approvedTranscriptAt: allowWrites ? Date() : nil)
             rtState.activeSkillID = skillID
             rtState.gate.setApprovedSpeakersOnly(skill?.approvedSpeakersOnly ?? true)
-            rtState.audioChunks.removeAll()
-            rtState.transcriptBuffer = ""
+            if rtState.responseInProgress
+                || !rtState.audioChunks.isEmpty
+                || !rtState.transcriptBuffer.isEmpty
+                || rtState.gate.recentlyForwardedAudio(within: 3.0) {
+                return
+            }
             let prefixedPrompt = "[\(speakerName) (approved=\(allowWrites)) in “\(title)”]: \(commandText)"
             if await rtState.router.sendText(prefixedPrompt) {
                 AppDiagnostics.log("assistant-facilitator-turn", [
@@ -542,11 +558,18 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
             let speaker = ev.isOwn ? "Owner" : (ev.speaker ?? "Participant")
             return "\(speaker): \(ev.text)"
         }.joined(separator: "\n")
+        let bridge = resolveBridge(controllerID)
+        let meetingParticipants = bridge.map {
+            AssistantPersonEntry.deduped([$0.localDisplayName] + $0.participantNames)
+        } ?? []
+        let identityGuidance = DefaultAssistantPrompts.jiraIdentityResolutionGuidance(meetingParticipants: meetingParticipants)
 
         let sys = """
         \(rendered.basePersona)
 
         \(rendered.instructions)
+
+        \(identityGuidance)
 
         Keep spoken replies crisp (1–3 sentences) in the meeting language so they sound natural over voice.
         Speaker: \(speakerName) (authorized_for_writes=\(allowWrites)).
@@ -582,7 +605,8 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
                     allowedGroups: skillToolSet,
                     skills: skills,
                     workspace: self.workspace,
-                    board: self.board
+                    board: self.board,
+                    meetingParticipants: meetingParticipants
                 )
             }
            ),
@@ -626,7 +650,12 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
         await teardownRealtimeSession(controllerID: controllerID)
 
         let rendered = skills.renderPromptContext(explicitSkillIDs: [skillID], meetingTitle: title)
-        let instructions = [rendered.basePersona, rendered.instructions]
+        let bridge = resolveBridge(controllerID)
+        let meetingParticipants = bridge.map {
+            AssistantPersonEntry.deduped([$0.localDisplayName] + $0.participantNames)
+        } ?? []
+        let identityGuidance = DefaultAssistantPrompts.jiraIdentityResolutionGuidance(meetingParticipants: meetingParticipants)
+        let instructions = [rendered.basePersona, rendered.instructions, identityGuidance]
             .filter { !$0.isEmpty }
             .joined(separator: "\n\n")
         let tools = Self.buildToolDeclarations(allowedGroups: skill.map { Set($0.tools) })
@@ -713,6 +742,10 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
         let skill = skills.skills.first(where: { $0.id == state.activeSkillID })
         let allowedGroups = skill.map { Set($0.tools) }
         let sid = workspace?.workspaceSessionID(forControllerID: controllerID)
+        let bridge = resolveBridge(controllerID)
+        let participants = bridge.map {
+            AssistantPersonEntry.deduped([$0.localDisplayName] + $0.participantNames)
+        } ?? []
         return await Self.executeSharedTool(
             name: name,
             argumentsJSON: argumentsJSON,
@@ -722,7 +755,8 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
             allowedGroups: allowedGroups,
             skills: skills,
             workspace: workspace,
-            board: board
+            board: board,
+            meetingParticipants: participants
         )
     }
 
@@ -736,6 +770,7 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
         skills: IOSAssistantSkillsController,
         workspace: IOSWorkspaceCoordinator?,
         board: IOSAssistantBoardController?,
+        meetingParticipants: [String] = [],
         directTalkJoinHandler: ((String, String?) async -> String)? = nil,
         joinableTargetsProvider: (() -> [JoinableMeetingCandidate])? = nil
     ) async -> String {
@@ -751,6 +786,7 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
             skills: skills,
             workspace: workspace,
             board: board,
+            meetingParticipants: meetingParticipants,
             directTalkJoinHandler: directTalkJoinHandler,
             joinableTargetsProvider: joinableTargetsProvider
         )
@@ -772,6 +808,7 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
         skills: IOSAssistantSkillsController,
         workspace: IOSWorkspaceCoordinator?,
         board: IOSAssistantBoardController?,
+        meetingParticipants: [String],
         directTalkJoinHandler: ((String, String?) async -> String)?,
         joinableTargetsProvider: (() -> [JoinableMeetingCandidate])?
     ) async -> String {
@@ -802,22 +839,27 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
         case "rocknroll_manage_people":
             let op = (args["operation"] as? String) ?? "lookup"
             if op == "upsert" {
-                guard allowWrites else { return "{\"error\":\"Approved speaker required\"}" }
                 guard let display = (args["display_name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
                       !display.isEmpty else {
                     return "{\"error\":\"display_name required\"}"
                 }
+                let rawAliases = (args["aliases"] as? [String])
+                    ?? ((args["aliases"] as? String).map {
+                        $0.split(separator: ",").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                    } ?? [])
+                let explicitApproved = args["approved_voice_commander"] as? Bool
+                let allowPrivilegeChange = allowWrites && (explicitApproved != nil)
                 let entry = AssistantPersonEntry(
                     displayName: display,
-                    aliases: args["aliases"] as? [String] ?? [],
+                    aliases: rawAliases,
                     jiraUsername: args["jira_username"] as? String,
                     jiraAccountID: args["jira_account_id"] as? String,
                     email: args["email"] as? String,
                     role: args["role"] as? String,
-                    approvedVoiceCommander: (args["approved_voice_commander"] as? Bool) ?? false,
+                    approvedVoiceCommander: allowPrivilegeChange ? (explicitApproved ?? false) : false,
                     notes: args["notes"] as? String
                 )
-                let updated = try? skills.upsertPerson(entry)
+                let updated = try? skills.upsertPerson(entry, allowPrivilegeChange: allowPrivilegeChange)
                 return jsonString(["saved": updated != nil, "display_name": display])
             } else if op == "remove" {
                 guard allowWrites else { return "{\"error\":\"Approved speaker required\"}" }
@@ -834,15 +876,31 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
             let matches: [AssistantPersonEntry] = q.isEmpty
                 ? skills.people.entries
                 : (skills.people.resolvePerson(matching: q).map { [$0] } ?? [])
-            return jsonString(["items": matches.map {
-                [
-                    "id": $0.id,
-                    "display_name": $0.displayName,
-                    "jira_username": $0.jiraUsername ?? "",
-                    "jira_account_id": $0.jiraAccountID ?? "",
-                    "approved": $0.approvedVoiceCommander
-                ] as [String: Any]
-            }])
+            let participantRows: [[String: Any]] = AssistantPersonEntry.deduped(meetingParticipants).map { participantName in
+                let matched = skills.people.resolvePerson(matching: participantName)
+                return [
+                    "name": participantName,
+                    "matched_id": matched?.id ?? "",
+                    "jira_username": matched?.jiraUsername ?? "",
+                    "jira_account_id": matched?.jiraAccountID ?? ""
+                ]
+            }
+            return jsonString([
+                "items": matches.map {
+                    [
+                        "id": $0.id,
+                        "display_name": $0.displayName,
+                        "aliases": $0.aliases,
+                        "jira_username": $0.jiraUsername ?? "",
+                        "jira_account_id": $0.jiraAccountID ?? "",
+                        "email": $0.email ?? "",
+                        "role": $0.role ?? "",
+                        "approved_voice_commander": $0.approvedVoiceCommander,
+                        "notes": $0.notes ?? ""
+                    ] as [String: Any]
+                },
+                "meeting_participants": participantRows
+            ])
 
         case "rocknroll_create_task":
             guard allowWrites && (allows(.tasks) || allows(.jira)) else { return "{\"error\":\"Task creation not allowed\"}" }
@@ -944,13 +1002,62 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
                     return jsonString(["error": error.localizedDescription])
                 }
             }
+            if op == "search_users" {
+                let query = ((args["query"] as? String) ?? (args["assignee"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                let maxResults = max(1, min((args["max_results"] as? Int) ?? 15, 50))
+                do {
+                    let users = try await skills.searchJiraUsers(query: query, maxResults: maxResults)
+                    return jsonString(["users": users.map(WorkspaceTaskSyncController.jiraUserPayload)])
+                } catch {
+                    return jsonString(["error": error.localizedDescription])
+                }
+            }
             do {
-                let issues = try await skills.searchJiraIssues(
-                    jql: args["jql"] as? String,
+                var resolvedAssigneeID: String?
+                if let rawAssignee = (args["assignee"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                   !rawAssignee.isEmpty,
+                   let resolution = await skills.resolveJiraAssignee(rawAssignee) {
+                    switch resolution {
+                    case .resolved(let jqlID, _):
+                        resolvedAssigneeID = jqlID
+                    case .unresolved(let unresolvedQuery, let candidates):
+                        return jsonString(WorkspaceTaskSyncController.unresolvedJiraAssigneePayload(
+                            query: unresolvedQuery,
+                            candidates: candidates
+                        ))
+                    }
+                }
+                let jql = skills.resolvedJiraJQL(
+                    rawJQL: args["jql"] as? String,
                     query: args["query"] as? String,
-                    maxResults: (args["max_results"] as? Int) ?? 15
+                    assigneeIdentifier: resolvedAssigneeID
                 )
-                return jsonString(["issues": issues.map { ["key": $0.key, "summary": $0.summary, "status": $0.statusName, "assignee": $0.assigneeName ?? ""] }])
+                let maxResults = max(1, min((args["max_results"] as? Int) ?? 15, 50))
+                var finalJQL = jql
+                let issues: [JiraRemoteIssue]
+                do {
+                    issues = try await skills.searchJiraIssues(jql: jql, maxResults: maxResults)
+                } catch JiraConnectorError.badRequest(let detail) {
+                    if let literalAssignee = WorkspaceTaskSyncController.extractLiteralAssigneeFromJQL(jql),
+                       let resolution = await skills.resolveJiraAssignee(literalAssignee) {
+                        switch resolution {
+                        case .resolved(let handle, _):
+                            finalJQL = WorkspaceTaskSyncController.replacingLiteralAssignee(in: jql, with: handle)
+                            issues = try await skills.searchJiraIssues(jql: finalJQL, maxResults: maxResults)
+                        case .unresolved(let unresolvedQuery, let candidates):
+                            return jsonString(WorkspaceTaskSyncController.unresolvedJiraAssigneePayload(
+                                query: unresolvedQuery,
+                                candidates: candidates
+                            ))
+                        }
+                    } else {
+                        throw JiraConnectorError.badRequest(detail)
+                    }
+                }
+                return jsonString([
+                    "jql": finalJQL,
+                    "issues": issues.map { ["key": $0.key, "summary": $0.summary, "status": $0.statusName, "assignee": $0.assigneeName ?? ""] }
+                ])
             } catch {
                 return jsonString(["error": error.localizedDescription])
             }
@@ -1061,15 +1168,20 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
             ])
             syncRealtimeActiveFlag()
         case .audioPCM16(let pcm, let sampleRate):
+            state.responseInProgress = true
             if sampleRate > 0 {
                 state.outputSampleRate = Double(sampleRate)
             }
             state.audioChunks.append(pcm)
         case .assistantTranscriptDelta(let delta):
+            state.responseInProgress = true
             state.transcriptBuffer += delta
         case .assistantTranscriptDone(let text):
             state.transcriptBuffer = text
+        case .toolCall:
+            state.responseInProgress = true
         case .audioDone:
+            state.responseInProgress = false
             state.turnTimeoutTask?.cancel()
             state.turnTimeoutTask = nil
             busySessions.remove(controllerID)
@@ -1090,11 +1202,15 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
                 await speakIntoMeeting(text, controllerID: controllerID)
             }
         case .error(let msg):
+            state.responseInProgress = false
             state.turnTimeoutTask?.cancel()
             state.turnTimeoutTask = nil
             busySessions.remove(controllerID)
-            lastStatusBySession[controllerID] = L("Realtime fallback active (%@)", msg)
-            state.connected = false
+            let stillConnected = await state.router.isRealtimeConnected
+            if !stillConnected {
+                lastStatusBySession[controllerID] = L("Realtime fallback active (%@)", msg)
+                state.connected = false
+            }
             AppDiagnostics.log("assistant-facilitator-realtime", [
                 "provider": state.provider.rawValue,
                 "state": "error",
@@ -1103,6 +1219,7 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
             ])
             syncRealtimeActiveFlag()
         case .disconnected:
+            state.responseInProgress = false
             state.turnTimeoutTask?.cancel()
             state.turnTimeoutTask = nil
             busySessions.remove(controllerID)
@@ -1438,8 +1555,12 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
                         "id": ["type": "string"],
                         "query": ["type": "string"],
                         "display_name": ["type": "string"],
+                        "aliases": ["type": "array", "items": ["type": "string"]],
                         "jira_username": ["type": "string"],
                         "jira_account_id": ["type": "string"],
+                        "email": ["type": "string"],
+                        "role": ["type": "string"],
+                        "notes": ["type": "string"],
                         "approved_voice_commander": ["type": "boolean"]
                     ],
                     "required": ["operation"]
@@ -1481,13 +1602,15 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
         if allows(.jira) {
             tools.append(.init(
                 name: "rocknroll_jira_action",
-                description: "Search Jira issues or add a comment to a Jira issue.",
+                description: "Search Jira issues, search Jira users/assignees for People.md binding, or add a comment to a Jira issue.",
                 parametersJSONSchema: [
                     "type": "object",
                     "properties": [
-                        "operation": ["type": "string", "enum": ["search", "comment"]],
+                        "operation": ["type": "string", "enum": ["search", "search_users", "comment"]],
                         "jql": ["type": "string"],
                         "query": ["type": "string"],
+                        "assignee": ["type": "string"],
+                        "max_results": ["type": "integer"],
                         "issue_key": ["type": "string"],
                         "comment": ["type": "string"]
                     ],

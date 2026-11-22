@@ -20,6 +20,7 @@ final class AutonomousMeetingFacilitator: ObservableObject {
         private var approvedSpeakersOnly = true
         private var lastApprovedTranscriptAt: Date?
         private var lastRemoteAudioAt: Date?
+        private var lastForwardedAudioAt: Date?
         private var lastTurnAllowWrites = false
         private var voiceDeliveryInFlight = false
         var coalescer: RealtimeAudioCoalescer?
@@ -71,6 +72,7 @@ final class AutonomousMeetingFacilitator: ObservableObject {
                 if !recentRemote {
                     lastTurnAllowWrites = true
                 }
+                lastForwardedAudioAt = now
                 return true
             } else {
                 lastRemoteAudioAt = now
@@ -82,8 +84,17 @@ final class AutonomousMeetingFacilitator: ObservableObject {
                 } else {
                     lastTurnAllowWrites = true
                 }
+                lastForwardedAudioAt = now
                 return true
             }
+        }
+
+        func recentlyForwardedAudio(within seconds: TimeInterval, now: Date = Date()) -> Bool {
+            lock.lock()
+            let at = lastForwardedAudioAt
+            lock.unlock()
+            guard let at else { return false }
+            return now.timeIntervalSince(at) <= seconds
         }
     }
 
@@ -91,6 +102,7 @@ final class AutonomousMeetingFacilitator: ObservableObject {
         let router = RealtimeVoiceRouter()
         let gate = AudioTapGate()
         var connected = false
+        var responseInProgress = false
         var audioChunks: [Data] = []
         var outputSampleRate: Double = 24_000
         var transcriptBuffer = ""
@@ -385,8 +397,15 @@ final class AutonomousMeetingFacilitator: ObservableObject {
             rtState.gate.setTurnApproval(allowWrites: allowWrites, approvedTranscriptAt: allowWrites ? Date() : nil)
             rtState.activeSkillID = skillID
             rtState.gate.setApprovedSpeakersOnly(skill?.approvedSpeakersOnly ?? true)
-            rtState.audioChunks.removeAll()
-            rtState.transcriptBuffer = ""
+            if rtState.responseInProgress
+                || !rtState.audioChunks.isEmpty
+                || !rtState.transcriptBuffer.isEmpty
+                || rtState.gate.recentlyForwardedAudio(within: 3.0) {
+                if !rtState.responseInProgress {
+                    busySessions.remove(model.sessionID)
+                }
+                return
+            }
             let prefixedPrompt = "[\(speakerName) (approved=\(allowWrites)) in “\(model.title)”]: \(commandText)"
             if await rtState.router.sendText(prefixedPrompt) {
                 probeLog("assistant-facilitator-turn", [
@@ -433,6 +452,7 @@ final class AutonomousMeetingFacilitator: ObservableObject {
             talk: talk,
             snapshot: snapshot,
             allowPrivilegedActions: allowWrites,
+            allowPeopleIdentityBinding: true,
             allowedToolGroups: allowedGroups
         )
         let context = await AssistantSkillToolRegistrar.enrichedContext(
@@ -542,7 +562,9 @@ final class AutonomousMeetingFacilitator: ObservableObject {
         )
         let basePersona = promptCtx["obsidian_base_persona"] ?? ""
         let skillsText = promptCtx["obsidian_skills"] ?? "Facilitate the meeting concisely in the user's language."
-        let instructions = [basePersona, skillsText].filter { !$0.isEmpty }.joined(separator: "\n\n")
+        let participantNames = [model.displayName] + model.participants.filter { !$0.isLocal }.map(\.name)
+        let identityGuidance = DefaultAssistantPrompts.jiraIdentityResolutionGuidance(meetingParticipants: participantNames)
+        let instructions = [basePersona, skillsText, identityGuidance].filter { !$0.isEmpty }.joined(separator: "\n\n")
         let tools = AssistantSkillToolRegistrar.exportRealtimeTools(from: registry)
         let targetInputRate = kind.defaultInputSampleRate
         let config = RealtimeSessionConfig(
@@ -646,6 +668,7 @@ final class AutonomousMeetingFacilitator: ObservableObject {
             talk: talk,
             snapshot: snapshot,
             allowPrivilegedActions: allowWrites,
+            allowPeopleIdentityBinding: true,
             allowedToolGroups: allowedGroups
         )
         let result = await AssistantSkillToolRegistrar.executeToolCallJSON(
@@ -653,7 +676,8 @@ final class AutonomousMeetingFacilitator: ObservableObject {
             name: name,
             argumentsJSON: argumentsJSON
         )
-        let command = (try? JSONSerialization.jsonObject(with: Data(argumentsJSON.utf8)) as? [String: Any])?["command"] as? String ?? ""
+        let parsedArgs = try? JSONSerialization.jsonObject(with: Data(argumentsJSON.utf8)) as? [String: Any]
+        let command = (parsedArgs?["command"] as? String) ?? (parsedArgs?["operation"] as? String) ?? ""
         probeLog("assistant-facilitator-tool", [
             "tool": name,
             "command": command,
@@ -672,15 +696,20 @@ final class AutonomousMeetingFacilitator: ObservableObject {
             ])
             syncRealtimeActiveFlag()
         case .audioPCM16(let pcm, let sampleRate):
+            state.responseInProgress = true
             if sampleRate > 0 {
                 state.outputSampleRate = Double(sampleRate)
             }
             state.audioChunks.append(pcm)
         case .assistantTranscriptDelta(let delta):
+            state.responseInProgress = true
             state.transcriptBuffer += delta
         case .assistantTranscriptDone(let text):
             state.transcriptBuffer = text
+        case .toolCall:
+            state.responseInProgress = true
         case .audioDone:
+            state.responseInProgress = false
             state.turnTimeoutTask?.cancel()
             state.turnTimeoutTask = nil
             if let sessionID = model?.sessionID {
@@ -698,19 +727,26 @@ final class AutonomousMeetingFacilitator: ObservableObject {
                 }
             }
         case .error(let msg):
+            state.responseInProgress = false
             state.turnTimeoutTask?.cancel()
             state.turnTimeoutTask = nil
+            let stillConnected = await state.router.isRealtimeConnected
             if let sessionID = model?.sessionID {
                 busySessions.remove(sessionID)
-                lastStatusBySession[sessionID] = L("Realtime fallback active (%@)", msg)
+                if !stillConnected {
+                    lastStatusBySession[sessionID] = L("Realtime fallback active (%@)", msg)
+                }
             }
-            state.connected = false
+            if !stillConnected {
+                state.connected = false
+            }
             probeLog("assistant-facilitator-realtime", [
                 "state": "error",
                 "outputSampleRate": Int(state.outputSampleRate)
             ])
             syncRealtimeActiveFlag()
         case .disconnected:
+            state.responseInProgress = false
             state.turnTimeoutTask?.cancel()
             state.turnTimeoutTask = nil
             if let sessionID = model?.sessionID {

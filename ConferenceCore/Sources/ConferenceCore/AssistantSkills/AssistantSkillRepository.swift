@@ -489,9 +489,9 @@ public struct AssistantSkillRepository: Sendable {
     }
 
     @discardableResult
-    public func upsertPerson(_ entry: AssistantPersonEntry) throws -> AssistantPeopleDirectory {
+    public func upsertPerson(_ entry: AssistantPersonEntry, allowPrivilegeChange: Bool = true) throws -> AssistantPeopleDirectory {
         var directory = loadPeople()
-        directory.upsert(entry)
+        directory.upsert(entry, allowPrivilegeChange: allowPrivilegeChange)
         try savePeople(directory)
         return directory
     }

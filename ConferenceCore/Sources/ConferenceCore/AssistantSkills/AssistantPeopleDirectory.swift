@@ -50,12 +50,37 @@ public struct AssistantPersonEntry: Identifiable, Codable, Equatable, Sendable {
 
     public func matchesNameOrAlias(_ query: String) -> Bool {
         let needle = Self.fold(query)
+        let strippedNeedle = Self.fold(AssistantPeopleDirectory.strippedMeetingDisplayName(query))
         guard !needle.isEmpty else { return false }
         let candidates = [id, displayName, jiraUsername, jiraAccountID, email].compactMap { $0 } + aliases
-        return candidates.contains { Self.fold($0) == needle }
+        return candidates.contains {
+            let candidate = Self.fold($0)
+            return candidate == needle || (!strippedNeedle.isEmpty && candidate == strippedNeedle)
+        }
     }
 
     public func matchScore(for query: String) -> Double {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        let strippedRaw = AssistantPeopleDirectory.strippedMeetingDisplayName(trimmed)
+        let scoreRaw = rawMatchScore(for: trimmed)
+        let scoreStripped = strippedRaw == trimmed ? 0 : rawMatchScore(for: strippedRaw)
+        var best = max(scoreRaw, scoreStripped)
+        if best < 0.96 {
+            let candidates = [displayName, id, jiraUsername, jiraAccountID].compactMap { $0 } + aliases
+            let translitScore = JiraContactMatcher.matchScore(
+                name: strippedRaw.isEmpty ? trimmed : strippedRaw,
+                candidateNames: candidates,
+                candidateEmail: email,
+                candidateUsername: jiraUsername
+            )
+            if translitScore >= 0.85 {
+                best = max(best, translitScore * 0.95)
+            }
+        }
+        return best
+    }
+
+    private func rawMatchScore(for query: String) -> Double {
         let needle = Self.fold(query)
         guard !needle.isEmpty else { return 0 }
         let stripped = needle.hasPrefix("@") ? String(needle.dropFirst()) : needle
@@ -145,6 +170,16 @@ public struct AssistantPeopleDirectory: Equatable, Sendable {
         return false
     }
 
+    public static func strippedMeetingDisplayName(_ raw: String) -> String {
+        var current = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        while let range = current.range(of: #"\s*\([^()]*\)\s*$"#, options: .regularExpression) {
+            let trimmed = String(current[..<range.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { break }
+            current = trimmed
+        }
+        return current
+    }
+
     public func resolvePerson(matching query: String) -> AssistantPersonEntry? {
         var best: (entry: AssistantPersonEntry, score: Double)?
         for entry in entries {
@@ -157,9 +192,13 @@ public struct AssistantPeopleDirectory: Equatable, Sendable {
         return best?.entry
     }
 
-    public mutating func upsert(_ incoming: AssistantPersonEntry) {
-        if let index = entries.firstIndex(where: {
-            $0.id == incoming.id || $0.matchesNameOrAlias(incoming.displayName)
+    public mutating func upsert(_ incoming: AssistantPersonEntry, allowPrivilegeChange: Bool = true) {
+        if let index = entries.firstIndex(where: { existing in
+            existing.id == incoming.id
+                || existing.matchesNameOrAlias(incoming.displayName)
+                || incoming.aliases.contains(where: { existing.matchesNameOrAlias($0) })
+                || (incoming.jiraUsername.map { existing.matchesNameOrAlias($0) } ?? false)
+                || (incoming.jiraAccountID.map { existing.matchesNameOrAlias($0) } ?? false)
         }) {
             var existing = entries[index]
             if !incoming.displayName.isEmpty {
@@ -170,11 +209,17 @@ public struct AssistantPeopleDirectory: Equatable, Sendable {
             if let jiraAccountID = incoming.jiraAccountID { existing.jiraAccountID = jiraAccountID }
             if let email = incoming.email { existing.email = email }
             if let role = incoming.role { existing.role = role }
-            existing.approvedVoiceCommander = incoming.approvedVoiceCommander
+            if allowPrivilegeChange {
+                existing.approvedVoiceCommander = incoming.approvedVoiceCommander
+            }
             if let notes = incoming.notes { existing.notes = notes }
             entries[index] = existing
         } else {
-            entries.append(incoming)
+            var added = incoming
+            if !allowPrivilegeChange {
+                added.approvedVoiceCommander = false
+            }
+            entries.append(added)
         }
     }
 
@@ -327,7 +372,7 @@ public enum AssistantPeopleMarkdownCodec {
     }
 }
 
-private extension String {
+extension String {
     var cleanedNilIfEmpty: String? {
         let trimmed = trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed

@@ -203,7 +203,7 @@ import XCTest
             "rocknroll_manage_people": (["action_id", "operation", "query", "display_name", "aliases", "jira_username", "jira_account_id", "email", "role", "approved_voice_commander", "notes"], ["action_id", "operation"]),
             "rocknroll_control_board": (["action_id", "command", "url", "meeting_id", "query", "selector", "text", "delta_y", "x", "y", "normalized"], ["action_id", "command"]),
             "rocknroll_join_meetings": (["action_id", "queries", "skill_id", "enable_voice_facilitation"], ["action_id", "queries"]),
-            "rocknroll_jira_action": (["action_id", "operation", "jql", "query", "max_results", "issue_key", "comment"], ["action_id", "operation"]),
+            "rocknroll_jira_action": (["action_id", "operation", "jql", "query", "assignee", "max_results", "issue_key", "comment"], ["action_id", "operation"]),
         ]
         XCTAssertEqual(nativeMCPToolDefinitions().count, expected.count)
         for definition in nativeMCPToolDefinitions() {

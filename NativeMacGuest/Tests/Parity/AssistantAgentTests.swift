@@ -1241,4 +1241,128 @@ final class AssistantAgentTests: XCTestCase {
         }
         wait(for: [exp], timeout: 10.0)
     }
+
+    func testMacJiraUserSearchUnresolvedAssigneeConfirmationAndPeopleIdentityBinding() async throws {
+        final class MockMacJiraConnector: JiraTaskConnecting, @unchecked Sendable {
+            func verifyMyself() async throws -> JiraUserContact {
+                JiraUserContact(identifier: "scrum.bot", username: "scrum.bot", displayName: "Scrum Bot", isServerOrDC: true)
+            }
+            func fetchProjectMetadata(projectKey: String) async throws -> JiraProjectMetadata {
+                fatalError("unused")
+            }
+            func fetchAssignableUsers(projectKey: String, query: String) async throws -> [JiraUserContact] { [] }
+            func searchUsers(query: String, projectKey: String?, maxResults: Int) async throws -> [JiraUserContact] {
+                [JiraUserContact(
+                    identifier: "v.smirnov",
+                    username: "v.smirnov",
+                    displayName: "Vitaliy Smirnov",
+                    emailAddress: "v.smirnov@sberdevices.ru",
+                    isServerOrDC: true
+                )]
+            }
+            func searchIssues(jql: String, maxResults: Int) async throws -> [JiraRemoteIssue] {
+                if jql.contains("Виталий") {
+                    throw JiraConnectorError.badRequest("The value 'Виталий Смирнов (СДБ)' does not exist for the field 'assignee'.")
+                }
+                return [JiraRemoteIssue(
+                    id: "77",
+                    key: "SDBCTO-77",
+                    summary: "Unblock sprint board share",
+                    description: "",
+                    statusName: "In Progress",
+                    workflowStatus: .inProgress,
+                    assigneeName: "Vitaliy Smirnov",
+                    assigneeIdentifier: "v.smirnov"
+                )]
+            }
+            func createIssue(_ payload: JiraIssueWritePayload) async throws -> JiraRemoteIssue { fatalError("unused") }
+            func updateIssue(key: String, payload: JiraIssueWritePayload, targetStatus: TaskWorkflowStatus?, comment: String?) async throws -> JiraRemoteIssue { fatalError("unused") }
+        }
+
+        let defaults = UserDefaults(suiteName: "mac-jira-people-\(UUID().uuidString)")!
+        let keychain = AttentionKeychain(service: "dev.vsmirn0v.conferenceguest.jirapeople.\(UUID().uuidString)")
+        let tempRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mac-jira-people-\(UUID().uuidString)", isDirectory: true)
+        defer {
+            keychain.deleteAll()
+            try? FileManager.default.removeItem(at: tempRoot)
+        }
+
+        let store = AttentionStore(root: tempRoot, defaults: defaults, keychain: keychain)
+        let coordinator = AttentionCoordinator(store: store)
+        defer { coordinator.stop() }
+        coordinator.taskSync.jiraConnectorForTesting = MockMacJiraConnector()
+        coordinator.taskSync.assignableJiraUsers = []
+        var prefs = TaskSyncPreferences()
+        prefs.jira = JiraConnectionSettings(
+            enabled: true,
+            baseURL: "https://tasks.sberdevices.ru",
+            projectKey: "SDBCTO",
+            authMode: .personalAccessToken
+        )
+        coordinator.taskSync.preferences = prefs
+        defer {
+            coordinator.taskSync.jiraConnectorForTesting = nil
+            coordinator.taskSync.preferences = TaskSyncPreferences()
+        }
+
+        let snapshot = fixture()
+        let registry = self.registry(snapshot: snapshot)
+        AssistantSkillToolRegistrar.registerTools(
+            into: registry,
+            attention: coordinator,
+            talk: coordinator.talk,
+            snapshot: snapshot,
+            allowPrivilegedActions: false,
+            allowPeopleIdentityBinding: true
+        )
+        let names = Set(registry.descriptors.map(\.name))
+        XCTAssertTrue(names.contains("rocknroll_jira_action"))
+        XCTAssertTrue(names.contains("rocknroll_manage_people"))
+
+        func execute(_ toolName: String, _ args: AssistantJSON) async throws -> AssistantAgentToolResult {
+            let validated = try registry.validate(call(toolName, args))
+            return try await registry.tool(named: toolName)!.execute(validated, arguments: validated.arguments)
+        }
+
+        let searchUsersResult = try await execute("rocknroll_jira_action", .object([
+            "operation": .string("search_users"),
+            "query": .string("Виталий Смирнов (СДБ)"),
+        ]))
+        XCTAssertEqual(searchUsersResult.json["users"]?.arrayValue?.first?["username"]?.stringValue, "v.smirnov")
+
+        let unresolvedResult = try await execute("rocknroll_jira_action", .object([
+            "operation": .string("search"),
+            "assignee": .string("Виталий Смирнов (СДБ)"),
+        ]))
+        XCTAssertEqual(unresolvedResult.json["needs_user_confirmation"]?.boolValue, true)
+        XCTAssertEqual(unresolvedResult.json["jira_user_candidates"]?.arrayValue?.first?["identifier"]?.stringValue, "v.smirnov")
+
+        let lookupResult = try await execute("rocknroll_manage_people", .object([
+            "operation": .string("lookup"),
+        ]))
+        let participants = lookupResult.json["meeting_participants"]?.arrayValue?.compactMap { $0["name"]?.stringValue } ?? []
+        XCTAssertTrue(participants.contains("Anna"))
+
+        let upsertResult = try await execute("rocknroll_manage_people", .object([
+            "operation": .string("upsert"),
+            "display_name": .string("Vitaliy Smirnov"),
+            "aliases": .array([.string("Виталий Смирнов (СДБ)")]),
+            "jira_username": .string("v.smirnov"),
+            "approved_voice_commander": .bool(true),
+        ]))
+        XCTAssertEqual(upsertResult.json["saved"]?.boolValue, true)
+
+        let directory = await coordinator.loadPeopleDirectory()
+        let savedPerson = directory.resolvePerson(matching: "Виталий Смирнов (СДБ)")
+        XCTAssertEqual(savedPerson?.jiraUsername, "v.smirnov")
+        XCTAssertEqual(savedPerson?.approvedVoiceCommander, false)
+
+        let resolvedResult = try await execute("rocknroll_jira_action", .object([
+            "operation": .string("search"),
+            "assignee": .string("Виталий Смирнов (СДБ)"),
+        ]))
+        XCTAssertTrue(resolvedResult.json["jql"]?.stringValue?.contains(#"assignee = "v.smirnov""#) == true)
+        XCTAssertEqual(resolvedResult.json["issues"]?.arrayValue?.first?["key"]?.stringValue, "SDBCTO-77")
+    }
 }

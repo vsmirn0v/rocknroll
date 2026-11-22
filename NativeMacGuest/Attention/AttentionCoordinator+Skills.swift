@@ -82,9 +82,9 @@ extension AttentionCoordinator {
         }
     }
 
-    func upsertPersonMapping(_ entry: AssistantPersonEntry) async throws -> AssistantPeopleDirectory {
+    func upsertPersonMapping(_ entry: AssistantPersonEntry, allowPrivilegeChange: Bool = true) async throws -> AssistantPeopleDirectory {
         let updated = try await withSkillRepository { repo, _ in
-            try repo.upsertPerson(entry)
+            try repo.upsertPerson(entry, allowPrivilegeChange: allowPrivilegeChange)
         }
         // Mirror confirmed Jira handle into WorkspaceTaskSyncController so issue creation/reassignment sees it immediately.
         let handle = entry.jiraAccountID ?? entry.jiraUsername

@@ -11,11 +11,16 @@ protocol IOSBoardShareSession: AnyObject {
     var id: UUID { get }
     var title: String { get }
     var canShareBoard: Bool { get }
+    var isBoardShareSessionAlive: Bool { get }
     var isSharingScreen: Bool { get }
     var onExternalBoardShareStopped: (() -> Void)? { get set }
     func startBoardSharing(initialSample: CMSampleBuffer) async throws
     func pushBoardShareFrame(_ sample: CMSampleBuffer)
     func stopBoardSharing() async
+}
+
+extension IOSBoardShareSession {
+    var isBoardShareSessionAlive: Bool { canShareBoard }
 }
 
 private final class IOSBoardDirtyScriptHandlerProxy: NSObject, WKScriptMessageHandler {
@@ -295,7 +300,12 @@ final class IOSAssistantBoardController: NSObject, ObservableObject, WKNavigatio
 
         do {
             if !explicitURL.isEmpty {
-                _ = try await open(urlString: explicitURL, presentSheet: isPresented)
+                let targetURL = RealtimeVoiceAudio.validateBoardURL(explicitURL)
+                if !(targetURL != nil && currentURL == targetURL && loadError == nil && !isLoading) {
+                    _ = try await open(urlString: explicitURL, presentSheet: isPresented)
+                } else if isPresented {
+                    ensureWebViewHostedForRendering(force: true)
+                }
             } else if currentURL == nil {
                 let draftSeed = urlDraft.trimmingCharacters(in: .whitespacesAndNewlines)
                 let defaultSeed = defaultBoardURLProvider?().trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -363,9 +373,13 @@ final class IOSAssistantBoardController: NSObject, ObservableObject, WKNavigatio
                 while !Task.isCancelled {
                     guard let currentTarget = self.sharedTarget,
                           currentTarget.id == sessionID,
-                          currentTarget.canShareBoard else {
+                          currentTarget.isBoardShareSessionAlive else {
                         self.stopSharing(notifyTarget: false)
                         return
+                    }
+                    guard currentTarget.canShareBoard else {
+                        try? await Task.sleep(for: .milliseconds(250))
+                        continue
                     }
 
                     let uptime = ProcessInfo.processInfo.systemUptime
@@ -382,10 +396,11 @@ final class IOSAssistantBoardController: NSObject, ObservableObject, WKNavigatio
                         guard !Task.isCancelled,
                               self.sharedTarget === currentTarget,
                               self.sharingSessionID == sessionID,
-                              currentTarget.canShareBoard else {
+                              currentTarget.isBoardShareSessionAlive else {
                             return
                         }
-                        if let fresh,
+                        if currentTarget.canShareBoard,
+                           let fresh,
                            let sample = Self.makeSampleBuffer(from: fresh) {
                             cachedBuffer = fresh
                             self.lastCapturedGeneration = targetGen
@@ -393,7 +408,8 @@ final class IOSAssistantBoardController: NSObject, ObservableObject, WKNavigatio
                             lastPushUptime = lastFreshSnapshotUptime
                             currentTarget.pushBoardShareFrame(sample)
                         }
-                    } else if (uptime - lastPushUptime) >= 1.0,
+                    } else if currentTarget.canShareBoard,
+                              (uptime - lastPushUptime) >= 1.0,
                               let cachedBuffer,
                               let sample = Self.makeSampleBuffer(from: cachedBuffer) {
                         lastPushUptime = uptime

@@ -165,7 +165,8 @@ final class NativeScreenSender {
         func replayLatestFrame() {
             lock.lock()
             guard !retired, let previous = latestFrameValue else { lock.unlock(); return }
-            let nextTimestamp = max(lastTime + 1_000_000, previous.timeStampNs + 1_000_000)
+            let nowNs = Int64(ProcessInfo.processInfo.systemUptime * 1_000_000_000)
+            let nextTimestamp = max(nowNs, max(lastTime + 33_333_333, previous.timeStampNs + 33_333_333))
             lastTime = nextTimestamp
             let replayed = LKRTCVideoFrame(
                 buffer: previous.buffer,

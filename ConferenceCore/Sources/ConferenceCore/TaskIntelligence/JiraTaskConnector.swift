@@ -131,6 +131,7 @@ public protocol JiraTaskConnecting: Sendable {
     func verifyMyself() async throws -> JiraUserContact
     func fetchProjectMetadata(projectKey: String) async throws -> JiraProjectMetadata
     func fetchAssignableUsers(projectKey: String, query: String) async throws -> [JiraUserContact]
+    func searchUsers(query: String, projectKey: String?, maxResults: Int) async throws -> [JiraUserContact]
     func searchIssues(jql: String, maxResults: Int) async throws -> [JiraRemoteIssue]
     func createIssue(_ payload: JiraIssueWritePayload) async throws -> JiraRemoteIssue
     func updateIssue(
@@ -144,6 +145,7 @@ public protocol JiraTaskConnecting: Sendable {
 
 public extension JiraTaskConnecting {
     func addIssueComment(key: String, comment: String) async throws {}
+    func searchUsers(query: String, projectKey: String?, maxResults: Int) async throws -> [JiraUserContact] { [] }
 }
 
 public final class JiraTaskConnector: JiraTaskConnecting, @unchecked Sendable {
@@ -239,6 +241,151 @@ public final class JiraTaskConnector: JiraTaskConnecting, @unchecked Sendable {
             throw JiraConnectorError.invalidResponse
         }
         return array.compactMap { parseUser($0, isServerOrDC: !settings.isCloudHost) }
+    }
+
+    public func searchUsers(query: String, projectKey: String? = nil, maxResults: Int = 15) async throws -> [JiraUserContact] {
+        let cap = max(1, min(maxResults, 50))
+        let stripped = AssistantPeopleDirectory.strippedMeetingDisplayName(query)
+        var rawQuery = (stripped.isEmpty ? query : stripped).trimmingCharacters(in: .whitespacesAndNewlines)
+        if rawQuery.hasPrefix("@") {
+            rawQuery.removeFirst()
+            rawQuery = rawQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        var terms: [String] = []
+        var seenTerms: Set<String> = []
+        func addTerm(_ value: String) {
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return }
+            let key = trimmed.lowercased()
+            if seenTerms.insert(key).inserted {
+                terms.append(trimmed)
+            }
+        }
+
+        if rawQuery.isEmpty {
+            terms.append("")
+        } else {
+            addTerm(rawQuery)
+            let latinFull = JiraContactMatcher.transliterateCyrillicToLatin(rawQuery)
+            if latinFull.lowercased() != rawQuery.lowercased() {
+                addTerm(latinFull)
+            }
+            let latinTokens = JiraContactMatcher.tokens(rawQuery)
+            if latinTokens.count >= 2 {
+                if let surname = latinTokens.last, !surname.isEmpty {
+                    addTerm("\(latinTokens[0].prefix(1)).\(surname)")
+                    if surname.count >= 2 { addTerm(surname) }
+                }
+                if latinTokens[0].count >= 2 { addTerm(latinTokens[0]) }
+            } else {
+                for token in rawQuery.split(whereSeparator: \.isWhitespace) where token.count >= 2 {
+                    addTerm(String(token))
+                }
+            }
+        }
+
+        let cleanProject = (projectKey ?? settings.cleanProjectKey).trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        let isServerOrDC = !settings.isCloudHost
+        let path = settings.isCloudHost ? "/rest/api/3/user/search" : "/rest/api/2/user/search"
+        let paramName = settings.isCloudHost ? "query" : "username"
+
+        func runSearch(term: String) async throws -> [JiraUserContact] {
+            var items = [
+                URLQueryItem(name: paramName, value: term),
+                URLQueryItem(name: "maxResults", value: String(cap)),
+            ]
+            do {
+                let data = try await send(path: path, method: "GET", queryItems: items)
+                guard let array = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+                    throw JiraConnectorError.invalidResponse
+                }
+                return array.compactMap { parseUser($0, isServerOrDC: isServerOrDC) }
+            } catch JiraConnectorError.badRequest(let detail) where isServerOrDC && term.isEmpty {
+                items[0] = URLQueryItem(name: "username", value: ".")
+                if let data = try? await send(path: path, method: "GET", queryItems: items),
+                   let array = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
+                    return array.compactMap { parseUser($0, isServerOrDC: isServerOrDC) }
+                }
+                if !cleanProject.isEmpty {
+                    return try await fetchAssignableUsers(projectKey: cleanProject, query: term)
+                }
+                throw JiraConnectorError.badRequest(detail)
+            } catch let error as JiraConnectorError where !cleanProject.isEmpty {
+                switch error {
+                case .badRequest, .forbidden, .notFound:
+                    return try await fetchAssignableUsers(projectKey: cleanProject, query: term)
+                default:
+                    throw error
+                }
+            }
+        }
+
+        var collectedByID: [String: JiraUserContact] = [:]
+        var orderedKeys: [String] = []
+        var succeededAtLeastOnce = false
+        var firstError: Error?
+
+        for term in terms.prefix(4) {
+            do {
+                let hits = try await runSearch(term: term)
+                succeededAtLeastOnce = true
+                for user in hits {
+                    let key = user.identifier.lowercased()
+                    if collectedByID[key] == nil {
+                        orderedKeys.append(key)
+                    }
+                    collectedByID[key] = user
+                }
+            } catch {
+                if firstError == nil { firstError = error }
+            }
+        }
+
+        if let me = try? await verifyMyself() {
+            succeededAtLeastOnce = true
+            let includeMe = rawQuery.isEmpty || JiraContactMatcher.matchScore(
+                name: rawQuery,
+                candidateNames: [me.displayName, me.username ?? "", me.identifier],
+                candidateEmail: me.emailAddress,
+                candidateUsername: me.username
+            ) >= 0.55
+            if includeMe {
+                let key = me.identifier.lowercased()
+                if collectedByID[key] == nil {
+                    orderedKeys.append(key)
+                    collectedByID[key] = me
+                }
+            }
+        }
+
+        if !succeededAtLeastOnce, let firstError {
+            throw firstError
+        }
+
+        let unique = orderedKeys.compactMap { collectedByID[$0] }
+        guard !rawQuery.isEmpty else {
+            return Array(unique.prefix(cap))
+        }
+        let ranked = unique.enumerated().sorted { lhs, rhs in
+            let lScore = JiraContactMatcher.matchScore(
+                name: rawQuery,
+                candidateNames: [lhs.element.displayName, lhs.element.username ?? "", lhs.element.identifier],
+                candidateEmail: lhs.element.emailAddress,
+                candidateUsername: lhs.element.username
+            )
+            let rScore = JiraContactMatcher.matchScore(
+                name: rawQuery,
+                candidateNames: [rhs.element.displayName, rhs.element.username ?? "", rhs.element.identifier],
+                candidateEmail: rhs.element.emailAddress,
+                candidateUsername: rhs.element.username
+            )
+            if abs(lScore - rScore) > 0.001 {
+                return lScore > rScore
+            }
+            return lhs.offset < rhs.offset
+        }.map(\.element)
+        return Array(ranked.prefix(cap))
     }
 
     public func searchIssues(jql: String, maxResults: Int = 100) async throws -> [JiraRemoteIssue] {

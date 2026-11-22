@@ -48,6 +48,7 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
     var onOpenAsk: (() -> Void)?
     var onExternalBoardShareStopped: (() -> Void)?
     var canShareBoard: Bool { !leaving && phase == .connected && !isHeld && !quiet }
+    var isBoardShareSessionAlive: Bool { !leaving && phase != .idle && phase != .failed && !isHeld && !quiet }
     var onWorkspaceEventsChanged: ((UUID, [SyncedTranscriptEvent], [DateInterval], Set<String>) -> Void)?
 
     @Published private(set) var callView: RockCallViewController?
@@ -132,13 +133,41 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
             voiceReplyLock.unlock()
         }
     }
+    private final class VoiceReplyEchoGate: @unchecked Sendable {
+        private let lock = NSLock()
+        private var inFlight = false
+        private var endedUptime: TimeInterval = -.infinity
+
+        func begin() {
+            lock.lock()
+            inFlight = true
+            lock.unlock()
+        }
+
+        func end() {
+            lock.lock()
+            inFlight = false
+            endedUptime = ProcessInfo.processInfo.systemUptime
+            lock.unlock()
+        }
+
+        var isSuppressing: Bool {
+            let now = ProcessInfo.processInfo.systemUptime
+            lock.lock()
+            let active = inFlight || (now - endedUptime) < 0.45
+            lock.unlock()
+            return active
+        }
+    }
+
     private let voiceReplyLock = NSLock()
+    private let voiceReplyEchoGate = VoiceReplyEchoGate()
     nonisolated(unsafe) private var voiceReplyInFlightFlag = false
     var isVoiceReplyInFlight: Bool { voiceReplyTask != nil }
     nonisolated func isVoiceReplyInFlightThreadSafe() -> Bool {
         voiceReplyLock.lock()
         defer { voiceReplyLock.unlock() }
-        return voiceReplyInFlightFlag
+        return voiceReplyInFlightFlag || voiceReplyEchoGate.isSuppressing
     }
     private var assistantHUDContext: (talk: IOSAssistantTalkController, speech: IOSAssistantSpeechCoordinator)?
     private var micActiveStart: Date?
@@ -1278,6 +1307,8 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
                 guard !leaving, phase == .connected, !isHeld else { throw MeetingSessionError.notConnected }
                 stage = "send"
                 AppDiagnostics.log("voice-reply-prepared", ["frames": Int(buffer.frameLength), "sampleRate": buffer.format.sampleRate])
+                voiceReplyEchoGate.begin()
+                defer { voiceReplyEchoGate.end() }
                 let played = await session.playVoiceReply(buffer)
                 try Task.checkCancellation()
                 guard played else { throw MeetingSessionError.unavailable(L("Could not send the voice reply into this meeting.")) }
@@ -1314,6 +1345,8 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
             _ = await previous?.result
             try Task.checkCancellation()
             guard let self, !leaving, phase == .connected, !isHeld else { throw MeetingSessionError.notConnected }
+            voiceReplyEchoGate.begin()
+            defer { voiceReplyEchoGate.end() }
             let played = await session.playVoiceReply(buffer)
             try Task.checkCancellation()
             guard played else { throw MeetingSessionError.unavailable(L("Could not send the voice reply into this meeting.")) }
@@ -1330,6 +1363,7 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
 
     func cancelVoiceReply() {
         voiceReplyTask?.cancel()
+        voiceReplyEchoGate.end()
         isSpeakingVoiceReply = false
     }
 
@@ -1455,9 +1489,10 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
             return
         }
         let transcriber = localTranscriber
+        let echoGate = voiceReplyEchoGate
         session.setLocalAudioSink { buffer in
             privateSink?(buffer)
-            if transcribeLocal {
+            if transcribeLocal && !echoGate.isSuppressing {
                 transcriber.enqueueLocalAudio(buffer)
             }
         }

@@ -334,6 +334,7 @@ extension NativeDesktopMCPBackend {
             let (id, replay) = try beginAction(args, client: client)
             if let replay { return replay }
 
+            let explicitApproved = try MCPValue.optionalBool(args["approved_voice_commander"], key: "approved_voice_commander")
             let entry = AssistantPersonEntry(
                 displayName: cleanName,
                 aliases: args["aliases"] as? [String] ?? [],
@@ -341,10 +342,13 @@ extension NativeDesktopMCPBackend {
                 jiraAccountID: try MCPValue.optionalString(args["jira_account_id"], key: "jira_account_id"),
                 email: try MCPValue.optionalString(args["email"], key: "email"),
                 role: try MCPValue.optionalString(args["role"], key: "role"),
-                approvedVoiceCommander: try MCPValue.optionalBool(args["approved_voice_commander"], key: "approved_voice_commander") ?? false,
+                approvedVoiceCommander: explicitApproved ?? false,
                 notes: try MCPValue.optionalString(args["notes"], key: "notes")
             )
-            let updated = try await attention.upsertPersonMapping(entry)
+            let updated = try await attention.upsertPersonMapping(
+                entry,
+                allowPrivilegeChange: explicitApproved != nil
+            )
             let result: MCPJSON = [
                 "action_id": id,
                 "status": "applied",
@@ -441,6 +445,20 @@ extension NativeDesktopMCPBackend {
         case "share_to_meeting":
             let resolvedID = try MCPValue.string(args["meeting_id"], key: "meeting_id")
             let model = try activeMeeting(resolvedID)
+            let explicitURL = urlString?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let urlToOpen: String?
+            if !explicitURL.isEmpty {
+                urlToOpen = explicitURL
+            } else if board.currentURL == nil {
+                let team = await attention.loadTeamContext()
+                let fallback = team.defaultJiraBoardURL.trimmed
+                urlToOpen = fallback.isEmpty ? nil : fallback
+            } else {
+                urlToOpen = nil
+            }
+            if let urlToOpen {
+                _ = try await board.open(urlString: urlToOpen)
+            }
             let message = try await board.startSharing(to: model)
             return actions.finish(id, client: client, type: "board", target: resolvedID, status: "applied",
                                   result: ["action_id": id, "status": "applied", "observed_at": mcpNow(), "message": message, "warnings": []])
@@ -543,6 +561,7 @@ extension NativeDesktopMCPBackend {
         let operation = try MCPValue.string(args["operation"], key: "operation")
         let rawJQL = try MCPValue.optionalString(args["jql"], key: "jql")
         let query = try MCPValue.optionalString(args["query"], key: "query")
+        let assignee = try MCPValue.optionalString(args["assignee"], key: "assignee")?.trimmingCharacters(in: .whitespacesAndNewlines)
         let maxResults = try MCPValue.integer(args["max_results"], key: "max_results", default: 15, maximum: 50)
         let issueKey = try MCPValue.optionalString(args["issue_key"], key: "issue_key")?.trimmingCharacters(in: .whitespacesAndNewlines)
         let comment = try MCPValue.optionalString(args["comment"], key: "comment")?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -579,16 +598,94 @@ extension NativeDesktopMCPBackend {
             return actions.finish(id, client: client, type: "jira", target: issueKey ?? "", status: "applied", result: result)
         }
 
+        if operation == "search_users" {
+            let team = await attention.loadTeamContext()
+            let cleanQuery = (query ?? assignee ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            let projectKey = team.defaultJiraProjectKey.trimmed
+            let users = try await attention.taskSync.searchJiraUsers(
+                query: cleanQuery,
+                projectKey: projectKey.isEmpty ? nil : projectKey,
+                maxResults: maxResults
+            )
+            let userRows: [MCPJSON] = users.map(WorkspaceTaskSyncController.jiraUserPayload)
+            let result: MCPJSON = [
+                "action_id": id,
+                "status": "applied",
+                "observed_at": mcpNow(),
+                "operation": "search_users",
+                "count": userRows.count,
+                "users": userRows,
+                "warnings": [],
+            ]
+            return actions.finish(id, client: client, type: "jira", target: cleanQuery, status: "applied", result: result)
+        }
+
         // search
         let team = await attention.loadTeamContext()
-        let jql = AssistantSkillToolRegistrar.resolvedJiraJQL(
+        var resolvedAssigneeID: String?
+        if let assignee, !assignee.isEmpty {
+            let people = await attention.loadPeopleDirectory()
+            switch await attention.taskSync.resolveJiraAssignee(
+                assignee,
+                people: people,
+                defaultProjectKey: team.defaultJiraProjectKey
+            ) {
+            case .resolved(let handle, _):
+                resolvedAssigneeID = handle
+            case .unresolved(let unresolvedQuery, let candidates):
+                var result = WorkspaceTaskSyncController.unresolvedJiraAssigneePayload(
+                    query: unresolvedQuery,
+                    candidates: candidates
+                )
+                result["action_id"] = id
+                result["status"] = "applied"
+                result["observed_at"] = mcpNow()
+                result["operation"] = "search"
+                result["warnings"] = []
+                return actions.finish(id, client: client, type: "jira", target: unresolvedQuery, status: "applied", result: result)
+            }
+        }
+        let baseJQL = AssistantSkillToolRegistrar.resolvedJiraJQL(
             rawJQL: rawJQL,
             query: query,
             teamProjectKey: team.defaultJiraProjectKey,
             jiraProjectKey: attention.taskSync.preferences.jira.cleanProjectKey
         )
+        let jql = resolvedAssigneeID.map {
+            WorkspaceTaskSyncController.injectAssignee($0, intoJQL: baseJQL)
+        } ?? baseJQL
 
-        let issues = try await attention.taskSync.searchJiraIssues(jql: jql, maxResults: maxResults)
+        var finalJQL = jql
+        let issues: [JiraRemoteIssue]
+        do {
+            issues = try await attention.taskSync.searchJiraIssues(jql: jql, maxResults: maxResults)
+        } catch JiraConnectorError.badRequest(let detail) {
+            if let literalAssignee = WorkspaceTaskSyncController.extractLiteralAssigneeFromJQL(jql) {
+                let people = await attention.loadPeopleDirectory()
+                switch await attention.taskSync.resolveJiraAssignee(
+                    literalAssignee,
+                    people: people,
+                    defaultProjectKey: team.defaultJiraProjectKey
+                ) {
+                case .resolved(let handle, _):
+                    finalJQL = WorkspaceTaskSyncController.replacingLiteralAssignee(in: jql, with: handle)
+                    issues = try await attention.taskSync.searchJiraIssues(jql: finalJQL, maxResults: maxResults)
+                case .unresolved(let unresolvedQuery, let candidates):
+                    var result = WorkspaceTaskSyncController.unresolvedJiraAssigneePayload(
+                        query: unresolvedQuery,
+                        candidates: candidates
+                    )
+                    result["action_id"] = id
+                    result["status"] = "applied"
+                    result["observed_at"] = mcpNow()
+                    result["operation"] = "search"
+                    result["warnings"] = []
+                    return actions.finish(id, client: client, type: "jira", target: unresolvedQuery, status: "applied", result: result)
+                }
+            } else {
+                throw JiraConnectorError.badRequest(detail)
+            }
+        }
         let rows: [MCPJSON] = issues.map { issue in
             [
                 "key": issue.key,
@@ -605,11 +702,11 @@ extension NativeDesktopMCPBackend {
             "status": "applied",
             "observed_at": mcpNow(),
             "operation": "search",
-            "jql": jql,
+            "jql": finalJQL,
             "count": rows.count,
             "issues": rows,
             "warnings": [],
         ]
-        return actions.finish(id, client: client, type: "jira", target: jql, status: "applied", result: result)
+        return actions.finish(id, client: client, type: "jira", target: finalJQL, status: "applied", result: result)
     }
 }

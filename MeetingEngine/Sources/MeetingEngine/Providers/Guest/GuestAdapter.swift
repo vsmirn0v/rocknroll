@@ -644,7 +644,8 @@ public enum NativeDesktopGuestError: LocalizedError {
               inputPermitted || (snapshot.playoutOn && meetingVolume > 0),
               let native = currentNativeEngine else { return false }
 #endif
-        return await native.playNonTalkVoiceReply(buffer, localGain: Float(meetingVolume))
+        let localGain: Float? = (snapshot.playoutOn && meetingVolume > 0) ? Float(meetingVolume) : nil
+        return await native.playNonTalkVoiceReply(buffer, localGain: localGain)
     }
 
     func setParticipationVoiceGate(open: Bool) -> Bool {

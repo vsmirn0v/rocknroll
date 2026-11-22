@@ -306,9 +306,9 @@ final class IOSAssistantSkillsController: ObservableObject {
     }
 
     @discardableResult
-    func upsertPerson(_ entry: AssistantPersonEntry) throws -> AssistantPeopleDirectory {
+    func upsertPerson(_ entry: AssistantPersonEntry, allowPrivilegeChange: Bool = true) throws -> AssistantPeopleDirectory {
         let updated = try withRepository { repo, _ in
-            try repo.upsertPerson(entry)
+            try repo.upsertPerson(entry, allowPrivilegeChange: allowPrivilegeChange)
         }
         refresh()
         let handle = entry.jiraAccountID ?? entry.jiraUsername
@@ -616,9 +616,14 @@ final class IOSAssistantSkillsController: ObservableObject {
         return try await workspace.taskSync.createTaskDiscussionCalendarEvent(draft, forTaskID: UUID())
     }
 
-    func resolvedJiraJQL(rawJQL: String?, query: String?) -> String {
+    func resolvedJiraJQL(rawJQL: String?, query: String?, assigneeIdentifier: String? = nil) -> String {
         let explicit = (rawJQL ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        if !explicit.isEmpty { return explicit }
+        if !explicit.isEmpty {
+            if let assigneeIdentifier, !assigneeIdentifier.isEmpty {
+                return WorkspaceTaskSyncController.injectAssignee(assigneeIdentifier, intoJQL: explicit)
+            }
+            return explicit
+        }
         let teamProject = teamContext.defaultJiraProjectKey.trimmingCharacters(in: .whitespacesAndNewlines)
         let jiraProject = workspace?.taskSync.preferences.jira.cleanProjectKey ?? ""
         let project = teamProject.isEmpty ? jiraProject : teamProject
@@ -626,14 +631,40 @@ final class IOSAssistantSkillsController: ObservableObject {
             .replacingOccurrences(of: "\"", with: "")
         var clauses: [String] = []
         if !project.isEmpty { clauses.append("project = \(project)") }
+        if let assigneeIdentifier, !assigneeIdentifier.isEmpty {
+            clauses.append("assignee = \"\(WorkspaceTaskSyncController.escapedJQLString(assigneeIdentifier))\"")
+        }
         if !cleanQuery.isEmpty { clauses.append("text ~ \"\(cleanQuery)\"") }
         return clauses.isEmpty ? "ORDER BY updated DESC" : (clauses.joined(separator: " AND ") + " ORDER BY updated DESC")
     }
 
-    func searchJiraIssues(jql: String?, query: String?, maxResults: Int = 15) async throws -> [JiraRemoteIssue] {
+    func searchJiraUsers(query: String, maxResults: Int = 15) async throws -> [JiraUserContact] {
         guard let workspace else { return [] }
-        let resolved = resolvedJiraJQL(rawJQL: jql, query: query)
-        return try await workspace.taskSync.searchJiraIssues(jql: resolved, maxResults: max(1, min(maxResults, 50)))
+        let teamProject = teamContext.defaultJiraProjectKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        return try await workspace.taskSync.searchJiraUsers(
+            query: query,
+            projectKey: teamProject.isEmpty ? nil : teamProject,
+            maxResults: max(1, min(maxResults, 50))
+        )
+    }
+
+    func resolveJiraAssignee(_ assignee: String) async -> WorkspaceTaskSyncController.JiraAssigneeResolution? {
+        guard let workspace else { return nil }
+        return await workspace.taskSync.resolveJiraAssignee(
+            assignee,
+            people: people,
+            defaultProjectKey: teamContext.defaultJiraProjectKey
+        )
+    }
+
+    func searchJiraIssues(jql: String, maxResults: Int = 15) async throws -> [JiraRemoteIssue] {
+        guard let workspace else { return [] }
+        return try await workspace.taskSync.searchJiraIssues(jql: jql, maxResults: max(1, min(maxResults, 50)))
+    }
+
+    func searchJiraIssues(jql: String?, query: String?, assigneeIdentifier: String? = nil, maxResults: Int = 15) async throws -> [JiraRemoteIssue] {
+        let resolved = resolvedJiraJQL(rawJQL: jql, query: query, assigneeIdentifier: assigneeIdentifier)
+        return try await searchJiraIssues(jql: resolved, maxResults: maxResults)
     }
 
     func commentOnJiraIssue(key: String, comment: String) async throws {

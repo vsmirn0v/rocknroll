@@ -885,6 +885,131 @@ final class TaskIntelligenceTests: XCTestCase {
         XCTAssertTrue(macController.pendingMacHandovers.isEmpty)
     }
 
+    func testJiraUserSearchTransliterationAndPeopleDirectorySafeBinding() async throws {
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [MockJiraURLProtocol.self]
+        let urlSession = URLSession(configuration: config)
+
+        let lock = NSLock()
+        var queriedStrings: [String] = []
+        MockJiraURLProtocol.handler = { request in
+            let path = request.url?.path ?? ""
+            let components = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)
+            let q = components?.queryItems?.first(where: { $0.name == "username" || $0.name == "query" })?.value ?? ""
+            func jsonResponse(_ status: Int, _ obj: Any) -> (HTTPURLResponse, Data) {
+                let data = (try? JSONSerialization.data(withJSONObject: obj)) ?? Data()
+                let resp = HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: nil, headerFields: ["Content-Type": "application/json"])!
+                return (resp, data)
+            }
+            if path.hasSuffix("/myself") {
+                return jsonResponse(200, ["name": "scrum.bot", "displayName": "Scrum Bot"])
+            }
+            if path.hasSuffix("/user/search") || path.hasSuffix("/user/assignable/search") {
+                lock.lock()
+                queriedStrings.append(q)
+                lock.unlock()
+                let lower = q.lowercased()
+                if lower.contains("vital") || lower.contains("smirn") || lower.contains("v.") {
+                    return jsonResponse(200, [[
+                        "name": "v.smirnov",
+                        "displayName": "Vitaliy Smirnov",
+                        "emailAddress": "v.smirnov@sberdevices.ru"
+                    ]])
+                }
+                return jsonResponse(200, [])
+            }
+            return jsonResponse(404, [:])
+        }
+        defer { MockJiraURLProtocol.handler = nil }
+
+        let settings = JiraConnectionSettings(
+            enabled: true,
+            baseURL: "https://tasks.sberdevices.ru",
+            projectKey: "SDBCTO",
+            authMode: .personalAccessToken
+        )
+        let connector = JiraTaskConnector(
+            settings: settings,
+            secretProvider: { _, _ in "pat-secret" },
+            session: urlSession
+        )
+
+        let foundUsers = try await connector.searchUsers(query: "Виталий Смирнов (СДБ)", projectKey: "SDBCTO", maxResults: 10)
+        XCTAssertEqual(foundUsers.first?.username, "v.smirnov")
+        XCTAssertFalse(queriedStrings.isEmpty)
+
+        let sync = await MainActor.run {
+            let hooks = WorkspaceTaskSyncController.HostHooks(
+                loadTasks: { [] },
+                loadContacts: { [] },
+                loadMyAliases: { [] },
+                applyMutations: { _ in },
+                persistPreferences: { _ in },
+                makeJiraConnector: { _, _ in connector }
+            )
+            let controller = WorkspaceTaskSyncController(hooks: hooks)
+            var prefs = controller.preferences
+            prefs.jira = settings
+            controller.preferences = prefs
+            return controller
+        }
+
+        let firstResolution = await sync.resolveJiraAssignee(
+            "Виталий Смирнов (СДБ)",
+            people: AssistantPeopleDirectory(),
+            defaultProjectKey: "SDBCTO"
+        )
+        switch firstResolution {
+        case .unresolved(let query, let candidates):
+            XCTAssertEqual(query, "Виталий Смирнов (СДБ)")
+            XCTAssertEqual(candidates.first?.identifier, "v.smirnov")
+        case .resolved:
+            XCTFail("Expected unmapped meeting name to require user confirmation")
+        }
+
+        var people = AssistantPeopleDirectory()
+        people.upsert(AssistantPersonEntry(
+            displayName: "Vitaliy Smirnov",
+            aliases: ["Виталий Смирнов (СДБ)"],
+            jiraUsername: "v.smirnov",
+            approvedVoiceCommander: true
+        ), allowPrivilegeChange: false)
+        XCTAssertEqual(people.resolvePerson(matching: "Виталий Смирнов (СДБ)")?.approvedVoiceCommander, false)
+
+        people.upsert(AssistantPersonEntry(
+            displayName: "Vitaliy Smirnov",
+            aliases: ["Виталий Смирнов (СДБ)"],
+            jiraUsername: "v.smirnov",
+            approvedVoiceCommander: true
+        ), allowPrivilegeChange: true)
+        people.upsert(AssistantPersonEntry(
+            displayName: "Vitaliy Smirnov",
+            aliases: ["Виталий Смирнов (СДБ)", "V. Smirnov"],
+            jiraUsername: "v.smirnov",
+            approvedVoiceCommander: false
+        ), allowPrivilegeChange: false)
+        XCTAssertEqual(people.resolvePerson(matching: "Виталий Смирнов (СДБ)")?.approvedVoiceCommander, true)
+
+        let secondResolution = await sync.resolveJiraAssignee(
+            "Виталий Смирнов (СДБ)",
+            people: people,
+            defaultProjectKey: "SDBCTO"
+        )
+        if case .resolved(let jqlID, let matchedPerson) = secondResolution {
+            XCTAssertEqual(jqlID, "v.smirnov")
+            XCTAssertEqual(matchedPerson?.displayName, "Vitaliy Smirnov")
+        } else {
+            XCTFail("Expected People.md alias binding to resolve to v.smirnov")
+        }
+
+        let rawJQL = #"project = SDBCTO AND assignee = "Виталий Смирнов (СДБ)" ORDER BY updated DESC"#
+        XCTAssertEqual(WorkspaceTaskSyncController.extractLiteralAssigneeFromJQL(rawJQL), "Виталий Смирнов (СДБ)")
+        XCTAssertEqual(
+            WorkspaceTaskSyncController.replacingLiteralAssignee(in: rawJQL, with: "v.smirnov"),
+            #"project = SDBCTO AND assignee = "v.smirnov" ORDER BY updated DESC"#
+        )
+    }
+
     private static func readStream(_ stream: InputStream) -> Data? {
         stream.open()
         defer { stream.close() }

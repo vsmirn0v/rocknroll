@@ -13,6 +13,9 @@ public final class NativeDesktopRelayCapture: NSObject, GuestCameraCapture, LKRT
     private var active = false, started = false, stopped = false, queued = false
     private var initialFrame: LKRTCVideoFrame?
     private var latest: LKRTCVideoFrame?
+    private var lastDelivered: LKRTCVideoFrame?
+    private var lastDeliveredUptime: TimeInterval = 0
+    private var timer: DispatchSourceTimer?
     private var count = 0
     private var width = 0, height = 0
     private var completion: GuestCompletion<GuestCameraInfo>?
@@ -40,8 +43,16 @@ public final class NativeDesktopRelayCapture: NSObject, GuestCameraCapture, LKRT
                     return seed
                 }
                 track.add(self)
-                if seedFrame != nil {
-                    queue.async { [weak self] in self?.forward() }
+                queue.async { [weak self] in
+                    guard let self else { return }
+                    let heartbeat = DispatchSource.makeTimerSource(queue: self.queue)
+                    heartbeat.schedule(deadline: .now() + .milliseconds(100), repeating: .milliseconds(100), leeway: .milliseconds(15))
+                    heartbeat.setEventHandler { [weak self] in self?.heartbeatForward() }
+                    self.timer = heartbeat
+                    heartbeat.resume()
+                    if seedFrame != nil {
+                        self.forward()
+                    }
                 }
                 try Task.checkCancellation()
                 return try await withCheckedThrowingContinuation { done.install($0, timeout: 10) }
@@ -57,10 +68,27 @@ public final class NativeDesktopRelayCapture: NSObject, GuestCameraCapture, LKRT
         }
         if enqueue { queue.async { [weak self] in self?.forward() } }
     }
+    private func heartbeatForward() {
+        let now = ProcessInfo.processInfo.systemUptime
+        let shouldForward = locked { () -> Bool in
+            guard active, !queued, latest == nil, let previous = lastDelivered,
+                  (now - lastDeliveredUptime) >= 0.20 else { return false }
+            let nextTimestamp = max(Int64(now * 1_000_000_000), previous.timeStampNs + 33_333_333)
+            latest = LKRTCVideoFrame(buffer: previous.buffer, rotation: previous.rotation, timeStampNs: nextTimestamp)
+            queued = true
+            return true
+        }
+        if shouldForward {
+            forward()
+        }
+    }
     private func forward() {
+        let now = ProcessInfo.processInfo.systemUptime
         let work: (frame: LKRTCVideoFrame, completion: GuestCompletion<GuestCameraInfo>?, width: Int, height: Int)? = locked {
             queued = false
             guard active, let frame = latest else { return nil }; latest = nil
+            lastDelivered = frame
+            lastDeliveredUptime = now
             let rotated = frame.rotation == ._90 || frame.rotation == ._270
             width = Int(rotated ? frame.height : frame.width); height = Int(rotated ? frame.width : frame.height)
             count += 1
@@ -76,7 +104,11 @@ public final class NativeDesktopRelayCapture: NSObject, GuestCameraCapture, LKRT
         work.completion?.finish(.success(info))
     }
     public func cancel() {
-        let done = locked { active = false; stopped = true; initialFrame = nil; latest = nil; return completion }
+        let done = locked { active = false; stopped = true; initialFrame = nil; latest = nil; lastDelivered = nil; return completion }
+        queue.async { [weak self] in
+            self?.timer?.cancel()
+            self?.timer = nil
+        }
         done?.finish(.failure(CancellationError()))
     }
     public func stop() async throws {

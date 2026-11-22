@@ -422,6 +422,10 @@ final class IOSAssistantTalkTests: XCTestCase {
 
         func updateInstructions(_ instructions: String) async throws {}
 
+        func emitEventForTesting(_ event: RealtimeVoiceEvent) {
+            continuation.yield(event)
+        }
+
         func disconnect() async {
             await storage.recordDisconnect()
             continuation.finish()
@@ -843,6 +847,7 @@ final class IOSAssistantTalkTests: XCTestCase {
         let id: UUID
         let title: String
         var canShareBoard = true
+        var isBoardShareSessionAlive = true
         private(set) var isSharingScreen = false
         var onExternalBoardShareStopped: (() -> Void)?
         private(set) var startedSamples: [CMSampleBuffer] = []
@@ -1395,6 +1400,237 @@ final class IOSAssistantTalkTests: XCTestCase {
         facilitator.sessionTitleUpdated(controllerID: ctoDailyID, title: "CTO Daily")
         XCTAssertNil(facilitator.activeSessionSkills[ctoDailyID])
 
+        await store.close()
+    }
+
+    func testIOSScrumMasterJiraUserSearchPeopleBindingRealtimeDecollisionAndBoardResilience() async throws {
+        actor JiraSpy {
+            var queriedJQLs: [String] = []
+            func recordJQL(_ jql: String) { queriedJQLs.append(jql) }
+        }
+        final class MockIOSJiraConnector: JiraTaskConnecting, @unchecked Sendable {
+            let spy = JiraSpy()
+            func verifyMyself() async throws -> JiraUserContact {
+                JiraUserContact(identifier: "scrum.bot", username: "scrum.bot", displayName: "Scrum Bot", isServerOrDC: true)
+            }
+            func fetchProjectMetadata(projectKey: String) async throws -> JiraProjectMetadata {
+                fatalError("unused")
+            }
+            func fetchAssignableUsers(projectKey: String, query: String) async throws -> [JiraUserContact] { [] }
+            func searchUsers(query: String, projectKey: String?, maxResults: Int) async throws -> [JiraUserContact] {
+                [JiraUserContact(
+                    identifier: "v.smirnov",
+                    username: "v.smirnov",
+                    displayName: "Vitaliy Smirnov",
+                    emailAddress: "v.smirnov@sberdevices.ru",
+                    isServerOrDC: true
+                )]
+            }
+            func searchIssues(jql: String, maxResults: Int) async throws -> [JiraRemoteIssue] {
+                await spy.recordJQL(jql)
+                if jql.contains("Виталий") {
+                    throw JiraConnectorError.badRequest("The value 'Виталий Смирнов (СДБ)' does not exist for the field 'assignee'.")
+                }
+                return [JiraRemoteIssue(
+                    id: "42",
+                    key: "SDBCTO-42",
+                    summary: "Fix board sharing",
+                    description: "",
+                    statusName: "In Progress",
+                    workflowStatus: .inProgress,
+                    assigneeName: "Vitaliy Smirnov",
+                    assigneeIdentifier: "v.smirnov"
+                )]
+            }
+            func createIssue(_ payload: JiraIssueWritePayload) async throws -> JiraRemoteIssue { fatalError("unused") }
+            func updateIssue(key: String, payload: JiraIssueWritePayload, targetStatus: TaskWorkflowStatus?, comment: String?) async throws -> JiraRemoteIssue { fatalError("unused") }
+        }
+
+        let suite = SuiteBox()
+        let tempRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ios-scrum-jira-people-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempRoot) }
+        let (workspace, store) = try await makeTestWorkspace(
+            tempRoot: tempRoot.appendingPathComponent("ws", isDirectory: true),
+            prefs: suite.defaults
+        )
+
+        let jira = MockIOSJiraConnector()
+        workspace.taskSync.jiraConnectorForTesting = jira
+        workspace.taskSync.assignableJiraUsers = []
+        var syncPrefs = TaskSyncPreferences()
+        syncPrefs.jira = JiraConnectionSettings(
+            enabled: true,
+            baseURL: "https://tasks.sberdevices.ru",
+            projectKey: "SDBCTO",
+            authMode: .personalAccessToken
+        )
+        workspace.taskSync.preferences = syncPrefs
+        defer {
+            workspace.taskSync.jiraConnectorForTesting = nil
+            workspace.taskSync.preferences = TaskSyncPreferences()
+        }
+
+        let skills = IOSAssistantSkillsController(
+            workspace: workspace,
+            preferences: suite.defaults,
+            keychain: WorkspaceAPIKeychain(service: "dev.vsmirn0v.ios.scrumjira.\(UUID().uuidString)"),
+            customRootURL: tempRoot.appendingPathComponent("skills", isDirectory: true)
+        )
+        defer { skills.stopWatcher() }
+
+        // 1. Direct Jira user search
+        let userSearchJSON = await IOSAutonomousMeetingFacilitator.executeSharedTool(
+            name: "rocknroll_jira_action",
+            argumentsJSON: #"{"operation":"search_users","query":"Виталий Смирнов (СДБ)"}"#,
+            sessionID: nil,
+            allowWrites: false,
+            allowedGroups: [.jira],
+            skills: skills,
+            workspace: workspace,
+            board: nil
+        )
+        let userSearchObj = try JSONSerialization.jsonObject(with: Data(userSearchJSON.utf8)) as? [String: Any]
+        let foundUsers = userSearchObj?["users"] as? [[String: Any]]
+        XCTAssertEqual(foundUsers?.first?["username"] as? String, "v.smirnov")
+
+        // 2. Unmapped assignee returns needs_user_confirmation + jira_user_candidates
+        let unresolvedJSON = await IOSAutonomousMeetingFacilitator.executeSharedTool(
+            name: "rocknroll_jira_action",
+            argumentsJSON: #"{"operation":"search","assignee":"Виталий Смирнов (СДБ)"}"#,
+            sessionID: nil,
+            allowWrites: false,
+            allowedGroups: [.jira],
+            skills: skills,
+            workspace: workspace,
+            board: nil
+        )
+        let unresolvedObj = try JSONSerialization.jsonObject(with: Data(unresolvedJSON.utf8)) as? [String: Any]
+        XCTAssertEqual(unresolvedObj?["needs_user_confirmation"] as? Bool, true)
+        let candidates = unresolvedObj?["jira_user_candidates"] as? [[String: Any]]
+        XCTAssertEqual(candidates?.first?["identifier"] as? String, "v.smirnov")
+
+        // 3. Unapproved speaker can bind meeting alias to People.md without privilege escalation
+        let upsertJSON = await IOSAutonomousMeetingFacilitator.executeSharedTool(
+            name: "rocknroll_manage_people",
+            argumentsJSON: #"{"operation":"upsert","display_name":"Vitaliy Smirnov","aliases":["Виталий Смирнов (СДБ)"],"jira_username":"v.smirnov","approved_voice_commander":true}"#,
+            sessionID: nil,
+            allowWrites: false,
+            allowedGroups: [.tasks, .jira],
+            skills: skills,
+            workspace: workspace,
+            board: nil
+        )
+        let upsertObj = try JSONSerialization.jsonObject(with: Data(upsertJSON.utf8)) as? [String: Any]
+        XCTAssertEqual(upsertObj?["saved"] as? Bool, true)
+        XCTAssertEqual(skills.people.resolvePerson(matching: "Виталий Смирнов (СДБ)")?.approvedVoiceCommander, false)
+
+        // 4. Retry Jira issue search now resolves to v.smirnov
+        let resolvedSearchJSON = await IOSAutonomousMeetingFacilitator.executeSharedTool(
+            name: "rocknroll_jira_action",
+            argumentsJSON: #"{"operation":"search","assignee":"Виталий Смирнов (СДБ)"}"#,
+            sessionID: nil,
+            allowWrites: false,
+            allowedGroups: [.jira],
+            skills: skills,
+            workspace: workspace,
+            board: nil
+        )
+        let resolvedObj = try JSONSerialization.jsonObject(with: Data(resolvedSearchJSON.utf8)) as? [String: Any]
+        XCTAssertTrue((resolvedObj?["jql"] as? String)?.contains(#"assignee = "v.smirnov""#) == true)
+        let issues = resolvedObj?["issues"] as? [[String: Any]]
+        XCTAssertEqual(issues?.first?["key"] as? String, "SDBCTO-42")
+
+        // 5. Board share stays active across transient reconnect while session remains alive
+        let mockSession = MockBoardShareSession(title: "CTO Daily")
+        let board = IOSAssistantBoardController()
+        board.resolveShareTarget = { requested in
+            (requested == nil || requested == mockSession.id) ? mockSession : nil
+        }
+        let testImage = makeSolidBoardCGImage()
+        board.snapshotOverrideForTesting = { testImage }
+        await board.loadHTMLForTesting("<!doctype html><html><body><div>SDBCTO-42</div></body></html>")
+        _ = try await board.startSharing(targetID: mockSession.id)
+        XCTAssertTrue(board.isSharing)
+
+        mockSession.canShareBoard = false
+        mockSession.isBoardShareSessionAlive = true
+        board.markBoardDirty()
+        try await Task.sleep(for: .milliseconds(350))
+        XCTAssertTrue(board.isSharing, "Transient reconnect with canShareBoard == false must not stop board sharing")
+        XCTAssertEqual(mockSession.stopCount, 0)
+
+        mockSession.isBoardShareSessionAlive = false
+        board.markBoardDirty()
+        for _ in 0..<80 where board.isSharing {
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        XCTAssertFalse(board.isSharing)
+
+        // 6. Realtime handleVoiceTurn avoids duplicate sendText during recent audio tap & survives non-fatal .error
+        if var scrum = skills.skills.first(where: { $0.id == "scrum-master" }) {
+            scrum.autoGreet = false
+            try skills.saveSkill(scrum)
+        }
+        skills.realtimeProvider = .openAIRealtime
+        XCTAssertTrue(skills.setRealtimeAPIKey("test-rt-key", for: .openAIRealtime))
+
+        let rtCID = UUID()
+        var capturedTap: (@Sendable (String, Data) -> Void)?
+        let rtBridge = IOSAssistantSessionBridge(
+            controllerID: rtCID,
+            title: "CTO Daily",
+            roomKey: "https://meet.example.com/cto-daily",
+            localDisplayName: "Vitaliy",
+            participantNames: ["Anna"],
+            canSendChat: true,
+            isMicUnmuted: true,
+            isForeground: true,
+            ensureTranscription: {},
+            ensureFacilitatorTranscription: {},
+            releaseFacilitatorTranscription: {},
+            setRealtimeAudioTap: { capturedTap = $0 },
+            sendChat: { _ in },
+            speakVoice: { _ in }
+        )
+        let transport = MockRealtimeTransport()
+        let facilitator = IOSAutonomousMeetingFacilitator(
+            skills: skills,
+            workspace: workspace,
+            board: board,
+            resolveBridge: { $0 == rtCID ? rtBridge : nil }
+        )
+        facilitator.customRealtimeTransportFactory = { transport }
+        facilitator.enable(controllerID: rtCID, title: "CTO Daily", skillID: "scrum-master")
+
+        for _ in 0..<80 where !facilitator.realtimeActive || capturedTap == nil {
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        XCTAssertTrue(facilitator.realtimeActive)
+        XCTAssertNotNil(capturedTap)
+
+        let samplePCM = RealtimeVoiceAudio.floatSamplesToPCM16Data([0.2, -0.2, 0.15, -0.15])
+        capturedTap?("remote-anna", samplePCM)
+        try await Task.sleep(for: .milliseconds(120))
+        await facilitator.handleVoiceTurn(
+            controllerID: rtCID,
+            title: "CTO Daily",
+            skillID: "scrum-master",
+            speakerName: "Anna",
+            isLocalSpeaker: false,
+            commandText: "Какие задачи на Виталии?"
+        )
+        let sentTexts = await transport.storage.sentTexts
+        XCTAssertTrue(sentTexts.isEmpty, "handleVoiceTurn must skip sendText when Realtime server_vad already received audio")
+
+        transport.emitEventForTesting(.error("Conversation already has an active response"))
+        try await Task.sleep(for: .milliseconds(80))
+        XCTAssertTrue(facilitator.realtimeActive, "Non-fatal Realtime .error must preserve active session")
+
+        facilitator.sessionEnded(controllerID: rtCID)
+        for _ in 0..<40 where facilitator.realtimeActive {
+            try await Task.sleep(for: .milliseconds(20))
+        }
         await store.close()
     }
 }

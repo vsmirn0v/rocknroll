@@ -855,7 +855,7 @@ import LiveKitWebRTC
         }
         let playback = Task { @MainActor [weak self, weak room] in
             guard let self else { return false }
-            let localGain: Float? = (monitorLocally && self.meetingVolume > 0) ? Float(self.meetingVolume) : nil
+            let localGain: Float? = (monitorLocally && self.playoutIntent && self.meetingVolume > 0) ? Float(self.meetingVolume) : nil
             return await SyntheticVoiceReplyPlayer.play(
                 buffer,
                 localGain: localGain,

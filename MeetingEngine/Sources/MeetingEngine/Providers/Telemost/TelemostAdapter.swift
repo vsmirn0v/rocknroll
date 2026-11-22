@@ -561,10 +561,11 @@ extension TelemostTransport: TelemostSignalingTransport {}
             }
         }
 
+        let localGain: Float? = (outputIntent && meetingVolume > 0) ? Float(meetingVolume) : nil
         let played = await SyntheticVoiceReplyPlayer.play(
             buffer,
             into: synthSource,
-            localGain: Float(meetingVolume)
+            localGain: localGain
         ) { [weak self, weak publisher] in
 #if os(macOS)
             guard let self, let publisher, self.publisher === publisher,
