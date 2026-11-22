@@ -88,7 +88,7 @@ public struct SiteSignInSheet: View {
                 list.append(canonical)
             }
         }
-        return Array(list.prefix(8))
+        return list
     }
 
     public var body: some View {

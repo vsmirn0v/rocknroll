@@ -87,7 +87,7 @@ public enum SiteOrigin {
     }
 
     /// Combines unique canonical HTTPS origins from user-configured fallback website,
-    /// starred favorites, calendar invitations, and recent meeting history (excluding community jam hosts).
+    /// starred favorites, recent meeting history, and calendar invitations (excluding community jam hosts).
     public static func suggestedOrigins(
         rooms: [RecentRoom],
         calendarMeetings: [CalendarMeeting] = [],
@@ -117,6 +117,10 @@ public enum SiteOrigin {
             appendOrigin(room.joinURL, explicitEngine: room.engine)
             appendOrigin(room.invitationURL, explicitEngine: room.engine)
         }
+        for room in rooms where !room.isStarred {
+            appendOrigin(room.joinURL, explicitEngine: room.engine)
+            appendOrigin(room.invitationURL, explicitEngine: room.engine)
+        }
         for meeting in calendarMeetings where meeting.engine != .community {
             appendOrigin(meeting.invitation, explicitEngine: meeting.engine)
             for link in meeting.links {
@@ -127,10 +131,6 @@ public enum SiteOrigin {
                     appendOrigin(parsed.invitationURL, explicitEngine: nil)
                 }
             }
-        }
-        for room in rooms where !room.isStarred {
-            appendOrigin(room.joinURL, explicitEngine: room.engine)
-            appendOrigin(room.invitationURL, explicitEngine: room.engine)
         }
         return result
     }

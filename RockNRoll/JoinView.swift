@@ -984,7 +984,14 @@ struct JoinView: View {
                     NavigationLink { Form { phoneSettings }.navigationTitle(L("Phone calls")) } label: {
                         Label(L("Phone calls"), systemImage: "phone")
                     }.accessibilityIdentifier("settings.phone")
-                    NavigationLink { Form { websiteSettings }.navigationTitle(L("Meeting websites")) } label: {
+                    NavigationLink {
+                        MeetingWebsitesSettingsView(
+                            model: model,
+                            history: history,
+                            calendar: calendar,
+                            onCreateRoom: { origin in activeSheet = .createRoom(origin) }
+                        )
+                    } label: {
                         Label(L("Meeting websites"), systemImage: "globe")
                     }.accessibilityIdentifier("settings.websites")
                     NavigationLink { DiagnosticsSettingsView() } label: {
@@ -1002,21 +1009,6 @@ struct JoinView: View {
     private func offerSetup() {
         setup.offerIfAppropriate(homeVisible && foreground && !homeInteracting && model.invite.isEmpty &&
             !calendar.reminders.hasOpenIntent && !calendar.reminders.presenting && !CalendarReminderBroker.shared.hasPendingIntent)
-    }
-    @ViewBuilder
-    private var websiteSettings: some View {
-        Section(L("Compatible meeting website")) {
-            TextField(L("HTTPS website address"), text: $model.guestWebsiteOrigin)
-                .textInputAutocapitalization(.never).autocorrectionDisabled().keyboardType(.URL)
-            Text(L("Fallback for app links that omit their website. Links with an embedded host open directly."))
-                .font(.footnote).foregroundStyle(.secondary)
-        }
-        SiteAccountsSettingsSections(
-            suggestedOrigins: suggestedSiteOrigins,
-            onCreateRoom: { origin in
-                activeSheet = .createRoom(origin)
-            }
-        )
     }
     @ViewBuilder private var phoneSettings: some View {
         Section {
@@ -1348,5 +1340,36 @@ private struct SavedCatchUpView: View {
                 .background(.regularMaterial)
             }
         }
+    }
+}
+
+private struct MeetingWebsitesSettingsView: View {
+    @ObservedObject var model: ConferenceModel
+    @ObservedObject var history: RoomHistoryStore
+    @ObservedObject var calendar: CalendarMeetingStore
+    let onCreateRoom: @MainActor (URL) -> Void
+
+    private var suggestedOrigins: [URL] {
+        SiteOrigin.suggestedOrigins(
+            rooms: history.rooms,
+            calendarMeetings: calendar.meetings,
+            fallbackOrigin: model.guestWebsiteOrigin
+        )
+    }
+
+    var body: some View {
+        Form {
+            Section(L("Compatible meeting website")) {
+                TextField(L("HTTPS website address"), text: $model.guestWebsiteOrigin)
+                    .textInputAutocapitalization(.never).autocorrectionDisabled().keyboardType(.URL)
+                Text(L("Fallback for app links that omit their website. Links with an embedded host open directly."))
+                    .font(.footnote).foregroundStyle(.secondary)
+            }
+            SiteAccountsSettingsSections(
+                suggestedOrigins: suggestedOrigins,
+                onCreateRoom: onCreateRoom
+            )
+        }
+        .navigationTitle(L("Meeting websites"))
     }
 }

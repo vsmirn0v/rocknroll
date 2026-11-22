@@ -155,8 +155,43 @@ final class SiteAuthModelsTests: XCTestCase {
             [
                 "https://jazz.internal.example",
                 "https://meet.corp.example",
-                "https://tc.example.org",
-                "https://telemost.yandex.ru"
+                "https://telemost.yandex.ru",
+                "https://tc.example.org"
+            ]
+        )
+
+        var joinedTrueConf = RecentRoom(
+            invitationURL: URL(string: "https://tc.example.test/c/0100110011")!,
+            title: "TrueConf Room",
+            identifier: "0100110011",
+            isStarred: false,
+            lastJoined: now.addingTimeInterval(60)
+        )
+        joinedTrueConf.engine = .trueconf
+        let extraCalendarMeetings = (1...10).map { index in
+            CalendarMeeting(
+                id: "cal-\(index)",
+                seriesID: "series-\(index)",
+                calendarID: "cal",
+                calendarTitle: "Work",
+                title: "Sync \(index)",
+                start: now,
+                end: now.addingTimeInterval(1800),
+                links: [URL(string: "https://meet-\(index).example.org/calls/room\(index)")!]
+            )
+        }
+        let manyOrigins = SiteOrigin.suggestedOrigins(
+            rooms: [joinedTrueConf, favoriteRoom],
+            calendarMeetings: extraCalendarMeetings,
+            fallbackOrigin: "jazz.internal.example"
+        )
+        XCTAssertEqual(manyOrigins.count, 13)
+        XCTAssertEqual(
+            Array(manyOrigins.prefix(3).map(\.absoluteString)),
+            [
+                "https://jazz.internal.example",
+                "https://meet.corp.example",
+                "https://tc.example.test"
             ]
         )
     }
