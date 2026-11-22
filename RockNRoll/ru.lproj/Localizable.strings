@@ -4327,3 +4327,17 @@
 "Yandex LiveTTS returned no audio." = "Yandex LiveTTS не вернул аудио.";
 "Yandex LiveTTS timed out." = "Превышено время ожидания Yandex LiveTTS.";
 "Yandex LiveTTS · %@" = "Yandex LiveTTS · %@";
+"Screen sharing is unavailable in this call state." = "Демонстрация экрана недоступна в текущем состоянии звонка.";
+"1440×810 → 1080p desktop view" = "Десктопный вид 1440×810 → 1080p";
+"Connect to a meeting before sharing the Assistant Board." = "Подключитесь ко встрече перед тем, как показывать доску ассистента.";
+"Could not capture the Assistant Board frame." = "Не удалось захватить кадр доски ассистента.";
+"Enter a Jira board URL or set a Default Jira Board URL in Skills → Team Context first." = "Сначала введите URL доски Jira или задайте URL доски Jira по умолчанию в разделе «Навыки → Контекст команды».";
+"Renders in 1440×810 desktop layout (pinch or double-tap to zoom). Join a call to stream it as a desktop screen." = "Отображается в десктопном размере 1440×810 (сведите пальцы или дважды коснитесь для масштабирования). Подключитесь к звонку, чтобы транслировать её как экран компьютера.";
+"Share Desktop Board" = "Показать как десктоп";
+"Sharing Assistant Board as Desktop (16:9) to “%@”." = "Транслирую доску ассистента как десктоп (16:9) во встречу «%@».";
+"Sharing Desktop (16:9) to %@" = "Десктоп (16:9) во встрече «%@»";
+"Sharing desktop board to %@" = "Показ десктопной доски в «%@»";
+"Starting Assistant Board share…" = "Запускаю показ доски ассистента…";
+"Starting Share…" = "Запуск показа…";
+"You can tap Done to return to the call — the 1440×810 desktop board keeps streaming." = "Нажмите «Готово», чтобы вернуться к звонку — десктопная доска 1440×810 продолжит транслироваться.";
+"Stop Sharing Board" = "Остановить показ доски";

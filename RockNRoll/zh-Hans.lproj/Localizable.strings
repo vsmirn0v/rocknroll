@@ -4100,3 +4100,17 @@
 "Yandex LiveTTS returned no audio." = "Yandex LiveTTS 未返回音频。";
 "Yandex LiveTTS timed out." = "Yandex LiveTTS 请求超时。";
 "Yandex LiveTTS · %@" = "Yandex LiveTTS · %@";
+"Screen sharing is unavailable in this call state." = "当前通话状态下无法共享屏幕。";
+"1440×810 → 1080p desktop view" = "1440×810 → 1080p 桌面视图";
+"Connect to a meeting before sharing the Assistant Board." = "在共享助手看板前，请先连接到会议。";
+"Could not capture the Assistant Board frame." = "无法捕获助手看板画面。";
+"Enter a Jira board URL or set a Default Jira Board URL in Skills → Team Context first." = "请先输入 Jira 看板网址，或在“技能 → 团队上下文”中设置默认 Jira 看板网址。";
+"Renders in 1440×810 desktop layout (pinch or double-tap to zoom). Join a call to stream it as a desktop screen." = "以 1440×810 桌面布局渲染（双指捏合或双击可缩放）。加入通话即可作为桌面屏幕进行推流。";
+"Share Desktop Board" = "共享桌面看板";
+"Sharing Assistant Board as Desktop (16:9) to “%@”." = "正在向“%@”以桌面模式（16:9）共享助手看板。";
+"Sharing Desktop (16:9) to %@" = "正在向 %@ 共享桌面（16:9）";
+"Sharing desktop board to %@" = "正在向 %@ 共享桌面看板";
+"Starting Assistant Board share…" = "正在开始共享助手看板…";
+"Starting Share…" = "正在开始共享…";
+"You can tap Done to return to the call — the 1440×810 desktop board keeps streaming." = "您可以轻点“完成”返回通话——1440×810 桌面看板将继续推流。";
+"Stop Sharing Board" = "停止共享看板";

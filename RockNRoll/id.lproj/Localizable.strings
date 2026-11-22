@@ -4100,3 +4100,17 @@
 "Yandex LiveTTS returned no audio." = "Yandex LiveTTS tidak mengembalikan audio.";
 "Yandex LiveTTS timed out." = "Waktu tunggu Yandex LiveTTS habis.";
 "Yandex LiveTTS · %@" = "Yandex LiveTTS · %@";
+"Screen sharing is unavailable in this call state." = "Berbagi layar tidak tersedia dalam status panggilan ini.";
+"1440×810 → 1080p desktop view" = "Tampilan desktop 1440×810 → 1080p";
+"Connect to a meeting before sharing the Assistant Board." = "Hubungkan ke rapat sebelum membagikan Papan Asisten.";
+"Could not capture the Assistant Board frame." = "Tidak dapat mengambil bingkai Papan Asisten.";
+"Enter a Jira board URL or set a Default Jira Board URL in Skills → Team Context first." = "Masukkan URL papan Jira atau atur URL Papan Jira Default di Keahlian → Konteks Tim terlebih dahulu.";
+"Renders in 1440×810 desktop layout (pinch or double-tap to zoom). Join a call to stream it as a desktop screen." = "Ditampilkan dalam tata letak desktop 1440×810 (cubit atau ketuk dua kali untuk memperbesar). Bergabunglah ke panggilan untuk menayangkannya sebagai layar desktop.";
+"Share Desktop Board" = "Bagikan Papan Desktop";
+"Sharing Assistant Board as Desktop (16:9) to “%@”." = "Membagikan Papan Asisten sebagai Desktop (16:9) ke “%@”.";
+"Sharing Desktop (16:9) to %@" = "Membagikan Desktop (16:9) ke %@";
+"Sharing desktop board to %@" = "Membagikan papan desktop ke %@";
+"Starting Assistant Board share…" = "Memulai berbagi Papan Asisten…";
+"Starting Share…" = "Memulai Berbagi…";
+"You can tap Done to return to the call — the 1440×810 desktop board keeps streaming." = "Anda dapat mengetuk Selesai untuk kembali ke panggilan — papan desktop 1440×810 tetap ditayangkan.";
+"Stop Sharing Board" = "Hentikan Berbagi Papan";

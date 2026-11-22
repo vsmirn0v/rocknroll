@@ -4328,3 +4328,17 @@
 "Yandex LiveTTS returned no audio." = "Yandex LiveTTS returned no audio.";
 "Yandex LiveTTS timed out." = "Yandex LiveTTS timed out.";
 "Yandex LiveTTS · %@" = "Yandex LiveTTS · %@";
+"Screen sharing is unavailable in this call state." = "Screen sharing is unavailable in this call state.";
+"1440×810 → 1080p desktop view" = "1440×810 → 1080p desktop view";
+"Connect to a meeting before sharing the Assistant Board." = "Connect to a meeting before sharing the Assistant Board.";
+"Could not capture the Assistant Board frame." = "Could not capture the Assistant Board frame.";
+"Enter a Jira board URL or set a Default Jira Board URL in Skills → Team Context first." = "Enter a Jira board URL or set a Default Jira Board URL in Skills → Team Context first.";
+"Renders in 1440×810 desktop layout (pinch or double-tap to zoom). Join a call to stream it as a desktop screen." = "Renders in 1440×810 desktop layout (pinch or double-tap to zoom). Join a call to stream it as a desktop screen.";
+"Share Desktop Board" = "Share Desktop Board";
+"Sharing Assistant Board as Desktop (16:9) to “%@”." = "Sharing Assistant Board as Desktop (16:9) to “%@”.";
+"Sharing Desktop (16:9) to %@" = "Sharing Desktop (16:9) to %@";
+"Sharing desktop board to %@" = "Sharing desktop board to %@";
+"Starting Assistant Board share…" = "Starting Assistant Board share…";
+"Starting Share…" = "Starting Share…";
+"You can tap Done to return to the call — the 1440×810 desktop board keeps streaming." = "You can tap Done to return to the call — the 1440×810 desktop board keeps streaming.";
+"Stop Sharing Board" = "Stop Sharing Board";

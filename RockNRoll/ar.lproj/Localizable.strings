@@ -4100,3 +4100,17 @@
 "Yandex LiveTTS returned no audio." = "لم يُرجع Yandex LiveTTS أي صوت.";
 "Yandex LiveTTS timed out." = "انتهت مهلة Yandex LiveTTS.";
 "Yandex LiveTTS · %@" = "Yandex LiveTTS · %@";
+"Screen sharing is unavailable in this call state." = "مشاركة الشاشة غير متاحة في حالة المكالمة الحالية.";
+"1440×810 → 1080p desktop view" = "عرض سطح المكتب 1440×810 → 1080p";
+"Connect to a meeting before sharing the Assistant Board." = "اتصل باجتماع قبل مشاركة لوحة المساعد.";
+"Could not capture the Assistant Board frame." = "تعذر التقاط إطار لوحة المساعد.";
+"Enter a Jira board URL or set a Default Jira Board URL in Skills → Team Context first." = "أدخل رابط لوحة Jira أو عيّن رابط لوحة Jira الافتراضي في المهارات ← سياق الفريق أولاً.";
+"Renders in 1440×810 desktop layout (pinch or double-tap to zoom). Join a call to stream it as a desktop screen." = "يُعرض بتخطيط سطح مكتب 1440×810 (قرّب بإصبعيك أو انقر مرتين للتكبير). انضم إلى مكالمة لبثه كشاشة سطح مكتب.";
+"Share Desktop Board" = "مشاركة لوحة سطح المكتب";
+"Sharing Assistant Board as Desktop (16:9) to “%@”." = "تتم مشاركة لوحة المساعد كسطح مكتب (16:9) في «%@».";
+"Sharing Desktop (16:9) to %@" = "تتم مشاركة سطح المكتب (16:9) في %@";
+"Sharing desktop board to %@" = "تتم مشاركة لوحة سطح المكتب في %@";
+"Starting Assistant Board share…" = "جارٍ بدء مشاركة لوحة المساعد…";
+"Starting Share…" = "جارٍ البدء…";
+"You can tap Done to return to the call — the 1440×810 desktop board keeps streaming." = "يمكنك الضغط على «تم» للعودة إلى المكالمة — سيستمر بث لوحة سطح المكتب بدقة 1440×810.";
+"Stop Sharing Board" = "إيقاف مشاركة اللوحة";
