@@ -56,14 +56,38 @@ public struct KeychainSiteSecretStore: SiteSecretStoring {
         return result
     }
 
+    private final class EphemeralKeychainFallback: @unchecked Sendable {
+        private let lock = NSLock()
+        private var storage: [String: Data] = [:]
+
+        func read(service: String, account: String) -> Data? {
+            lock.lock(); defer { lock.unlock() }
+            return storage["\(service)\0\(account)"]
+        }
+
+        func write(_ data: Data, service: String, account: String) {
+            lock.lock(); defer { lock.unlock() }
+            storage["\(service)\0\(account)"] = data
+        }
+
+        func delete(service: String, account: String) {
+            lock.lock(); defer { lock.unlock() }
+            storage.removeValue(forKey: "\(service)\0\(account)")
+        }
+    }
+
+    private static let ephemeralFallback = EphemeralKeychainFallback()
+
     private func readData(account: String) -> Data? {
         var query = baseQuery(account: account)
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
         var result: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &result)
-        guard status == errSecSuccess else { return nil }
-        return result as? Data
+        if status == errSecSuccess {
+            return result as? Data
+        }
+        return Self.ephemeralFallback.read(service: service, account: account)
     }
 
     private func writeData(_ data: Data, account: String) -> Bool {
@@ -75,12 +99,21 @@ public struct KeychainSiteSecretStore: SiteSecretStoring {
             add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
             status = SecItemAdd(add as CFDictionary, nil)
         }
-        return status == errSecSuccess
+        if status == errSecSuccess {
+            Self.ephemeralFallback.delete(service: service, account: account)
+            return true
+        }
+        if status == errSecMissingEntitlement {
+            Self.ephemeralFallback.write(data, service: service, account: account)
+            return true
+        }
+        return false
     }
 
     private func deleteData(account: String) -> Bool {
+        Self.ephemeralFallback.delete(service: service, account: account)
         let status = SecItemDelete(baseQuery(account: account) as CFDictionary)
-        return status == errSecSuccess || status == errSecItemNotFound
+        return status == errSecSuccess || status == errSecItemNotFound || status == errSecMissingEntitlement
     }
 }
 

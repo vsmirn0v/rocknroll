@@ -4120,3 +4120,6 @@
 "Auto-engage role assistant" = "自动启用角色助手";
 "Keep this Off on shared team calls so multiple assistants do not talk over each other." = "在多人共享的团队会议中请保持关闭，以免多名成员的助手互相干扰。";
 "Meeting settings…" = "会议设置…";
+"Open site" = "打开";
+"Found %ld Jira users." = "找到 %ld 位 Jira 用户。";
+"Need user confirmation to match Jira user for “%@”." = "需要确认“%@”对应的 Jira 用户。";

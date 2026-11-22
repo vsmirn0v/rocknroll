@@ -48,7 +48,7 @@ enum AppDiagnostics {
             "ice-state", "peer-transport-state", "ice-selected-route", "ice-incoming-demand",
             "ice-timeout", "ice-failed-checklist", "ice-tcp-relay-fallback", "ice-relay-media-verified",
             "screen-codec-registration", "screen-share-start", "screen-share-stage", "screen-share-failed",
-            "session-control-failure", "session-recovery"
+            "session-control-failure", "session-recovery", "site-auth-web", "room-create"
         ]) { NativeDiagnosticsLog.shared.append($0) }
         NativeDiagnosticReports.shared.onSaved = { log("diagnostic-reports-saved", ["count": $0]) }
         NativeDiagnosticReports.shared.start()

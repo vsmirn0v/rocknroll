@@ -4120,3 +4120,6 @@
 "Auto-engage role assistant" = "تفعيل مساعد الدور تلقائيًا";
 "Keep this Off on shared team calls so multiple assistants do not talk over each other." = "أبقِ هذا الخيار متوقفًا في مكالمات الفريق المشتركة حتى لا تتداخل عدة مساعدات مع بعضها.";
 "Meeting settings…" = "إعدادات الاجتماع…";
+"Open site" = "فتح";
+"Found %ld Jira users." = "تم العثور على %ld من مستخدمي Jira.";
+"Need user confirmation to match Jira user for “%@”." = "يلزم تأكيد المستخدم لمطابقة مستخدم Jira لـ «%@».";

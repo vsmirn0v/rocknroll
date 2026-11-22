@@ -638,7 +638,19 @@ import UserNotifications
                     settingUp = false; endJoinSetup()
                     showMeeting(existing); return
                 }
-                let name = (nameOverride ?? library.displayName).trimmingCharacters(in: .whitespacesAndNewlines)
+                var name = (nameOverride ?? library.displayName).trimmingCharacters(in: .whitespacesAndNewlines)
+                if !destination.engineKind.inputPolicy.accepts(name: name),
+                   let account = SiteAccountStore.shared.account(for: url) {
+                    let accountName = [account.userDisplayName, account.username]
+                        .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+                        .first(where: { destination.engineKind.inputPolicy.accepts(name: $0) })
+                    if let accountName {
+                        name = accountName
+                        if library.displayName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                            library.displayName = accountName
+                        }
+                    }
+                }
                 guard destination.engineKind.inputPolicy.accepts(name: name) else { throw NativeGuestEntryError.invalidName }
                 if !name.isEmpty {
                     Task { @MainActor [weak self] in
@@ -760,6 +772,7 @@ import UserNotifications
                 synchronizeScheduledTransitions()
             } catch {
                 if token == joinGeneration, !(error is CancellationError) {
+                    probeLog("workspace-join-failed", ["errorType": String(describing: type(of: error))])
                     self.error = error.localizedDescription
                     if let challengeOrigin = SiteAuthError.challengeOrigin(from: error, attemptedURL: url) {
                         self.pendingAuthChallenge = (challengeOrigin, url, title)

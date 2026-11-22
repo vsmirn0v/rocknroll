@@ -144,6 +144,7 @@ public struct JWTClaims: Equatable, Sendable {
     public var expiresAt: Date?
     public var authorizedParty: String?
     public var issuer: String?
+    public var isLicenseToken: Bool
 
     public init(
         subject: String? = nil,
@@ -151,7 +152,8 @@ public struct JWTClaims: Equatable, Sendable {
         email: String? = nil,
         expiresAt: Date? = nil,
         authorizedParty: String? = nil,
-        issuer: String? = nil
+        issuer: String? = nil,
+        isLicenseToken: Bool = false
     ) {
         self.subject = subject
         self.displayName = displayName
@@ -159,6 +161,7 @@ public struct JWTClaims: Equatable, Sendable {
         self.expiresAt = expiresAt
         self.authorizedParty = authorizedParty
         self.issuer = issuer
+        self.isLicenseToken = isLicenseToken
     }
 
     public static func inspect(_ token: String) -> JWTClaims? {
@@ -206,13 +209,23 @@ public struct JWTClaims: Equatable, Sendable {
         let issuer = (json["iss"] as? String)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .nilIfEmpty
+        let preferredUsername = (json["preferred_username"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nilIfEmpty
+        let isLicenseToken = (json["graceExp"] != nil
+            || json["jazz_premium_user"] != nil
+            || json["license_type"] != nil)
+            && subject == nil
+            && email == nil
+            && preferredUsername == nil
         return JWTClaims(
             subject: subject,
             displayName: displayName,
             email: email,
             expiresAt: expDate,
             authorizedParty: authorizedParty,
-            issuer: issuer
+            issuer: issuer,
+            isLicenseToken: isLicenseToken
         )
     }
 }

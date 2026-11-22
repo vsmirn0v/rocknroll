@@ -1292,7 +1292,19 @@ final class ConferenceModel: ObservableObject {
         #else
         let requestedName = nameOverride ?? displayName
         #endif
-        let name = requestedName.trimmingCharacters(in: .whitespacesAndNewlines)
+        var name = requestedName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !target.inputPolicy.accepts(name: name),
+           let account = SiteAccountStore.shared.account(for: target.invitationURL) {
+            let accountName = [account.userDisplayName, account.username]
+                .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .first(where: { target.inputPolicy.accepts(name: $0) })
+            if let accountName {
+                name = accountName
+                if displayName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    displayName = accountName
+                }
+            }
+        }
         let sourceTitle = title ?? nameRequiredTitle.flatMap { $0.invitation == target.invitationURL ? $0.title : nil }
         let visitTitle = sourceTitle.flatMap { value -> String? in
             let clean = value.trimmingCharacters(in: .whitespacesAndNewlines)

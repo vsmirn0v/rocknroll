@@ -309,23 +309,43 @@ public final class SiteAuthCoordinator: ObservableObject {
         defer { session.finishTasksAndInvalidate() }
 
         let existing = store.account(forOriginKey: originKey)
-        let claims = JWTClaims.inspect(token)
-        if let exp = claims?.expiresAt, exp <= Date() {
+        let initialClaims = JWTClaims.inspect(token)
+        if engine == .guest, initialClaims?.isLicenseToken == true {
+            throw SiteAuthError.invalidCredentials(L("The session or token was rejected by %@.", host))
+        }
+        if let exp = initialClaims?.expiresAt, exp <= Date() {
             throw SiteAuthError.invalidCredentials(L("This token is already expired."))
         }
 
+        var claims = initialClaims
+        var effectiveToken = token
         var discoveredServerURL: String? = existing?.discoveredServerURL
-        var displayName = claims?.displayName
-        var username = claims?.email ?? claims?.subject
+        var displayName = initialClaims?.displayName
+        var username = initialClaims?.email ?? initialClaims?.subject
 
         switch engine {
         case .guest:
             let server = try await resolveGuestServerURL(origin: origin, existing: existing, session: session)
             discoveredServerURL = server.absoluteString
-            switch try await verifyGuestSession(serverURL: server, origin: origin, token: token, cookies: [], session: session) {
+            let outcome = try await verifyGuestSessionWithB2BFallback(
+                serverURL: server,
+                origin: origin,
+                initialToken: effectiveToken,
+                initialClaims: initialClaims,
+                cookies: [],
+                session: session
+            )
+            effectiveToken = outcome.effectiveToken ?? effectiveToken
+            claims = outcome.claims ?? claims
+            switch outcome.verification {
             case .authenticated(let profileUser, let profileName):
-                displayName = displayName ?? profileName
-                username = username ?? profileUser
+                displayName = Self.preferredDisplayName(
+                    outcomeClaims: outcome.claims,
+                    initialClaims: initialClaims,
+                    profileName: profileName,
+                    fallback: displayName
+                )
+                username = outcome.claims?.email ?? initialClaims?.email ?? profileUser ?? outcome.claims?.subject ?? initialClaims?.subject ?? username
             case .rejected, .anonymous:
                 throw SiteAuthError.invalidCredentials(L("The session or token was rejected by %@.", host))
             case .unavailable:
@@ -354,11 +374,11 @@ public final class SiteAuthCoordinator: ObservableObject {
             systemCertificateFingerprint: existing?.systemCertificateFingerprint,
             tokenEndpoint: existing?.tokenEndpoint,
             discoveredServerURL: discoveredServerURL,
-            tokenExpiresAt: claims?.expiresAt,
+            tokenExpiresAt: claims?.expiresAt ?? initialClaims?.expiresAt,
             lastAuthenticatedAt: Date(),
             needsReauthentication: false
         )
-        let secret = SiteSecretPayload(accessToken: token)
+        let secret = SiteSecretPayload(accessToken: effectiveToken)
         return store.upsertAccount(record, secret: secret, preservingCertificate: true)
     }
 
@@ -382,6 +402,9 @@ public final class SiteAuthCoordinator: ObservableObject {
         let existing = store.account(forOriginKey: originKey)
         let previousSecret = store.readSecret(for: originKey)
         var effectiveToken = capturedAccessToken.map(Self.cleanToken).flatMap { $0.isEmpty ? nil : $0 }
+        if engine == .guest, let tok = effectiveToken, JWTClaims.inspect(tok)?.isLicenseToken == true {
+            effectiveToken = nil
+        }
         let serializedCookies = rawCookies.compactMap(SerializedHTTPCookie.init)
             .filter { $0.expiresAt == nil || ($0.expiresAt ?? .distantFuture) > Date() }
 
@@ -392,7 +415,8 @@ public final class SiteAuthCoordinator: ObservableObject {
         let session = makeSession(origin)
         defer { session.finishTasksAndInvalidate() }
 
-        var claims = effectiveToken.flatMap(JWTClaims.inspect)
+        let initialClaims = effectiveToken.flatMap(JWTClaims.inspect)
+        var claims = initialClaims
         var displayName = claims?.displayName ?? fallbackDisplayName
         var username = claims?.email ?? claims?.subject
         var discoveredServerURL = existing?.discoveredServerURL
@@ -404,23 +428,47 @@ public final class SiteAuthCoordinator: ObservableObject {
             if effectiveToken == nil, !serializedCookies.isEmpty,
                let exchanged = await exchangeGuestCookieToToken(serverURL: server, cookies: serializedCookies, session: session) {
                 let cleaned = Self.cleanToken(exchanged)
-                if !cleaned.isEmpty {
+                if !cleaned.isEmpty, JWTClaims.inspect(cleaned)?.isLicenseToken != true {
                     effectiveToken = cleaned
                     claims = JWTClaims.inspect(cleaned)
                     displayName = claims?.displayName ?? displayName
                     username = claims?.email ?? claims?.subject ?? username
                 }
             }
-            switch try await verifyGuestSession(
+            let outcome = try await verifyGuestSessionWithB2BFallback(
                 serverURL: server,
                 origin: origin,
-                token: effectiveToken,
+                initialToken: effectiveToken,
+                initialClaims: claims,
                 cookies: serializedCookies,
                 session: session
-            ) {
+            )
+            effectiveToken = outcome.effectiveToken ?? effectiveToken
+            claims = outcome.claims ?? claims
+            let verificationName: String = switch outcome.verification {
+            case .authenticated: "authenticated"
+            case .rejected: "rejected"
+            case .anonymous: "anonymous"
+            case .unavailable: "unavailable"
+            }
+            probeLog("site-auth-web", [
+                "engine": engine.rawValue,
+                "hasToken": effectiveToken != nil,
+                "isJWT": claims != nil,
+                "initialIsJWT": initialClaims != nil,
+                "cookieCount": serializedCookies.count,
+                "b2bExchanged": outcome.exchangedViaB2B,
+                "verification": verificationName
+            ])
+            switch outcome.verification {
             case .authenticated(let profileUser, let profileName):
-                displayName = displayName ?? profileName
-                username = username ?? profileUser
+                displayName = Self.preferredDisplayName(
+                    outcomeClaims: outcome.claims,
+                    initialClaims: initialClaims,
+                    profileName: profileName,
+                    fallback: fallbackDisplayName ?? displayName
+                )
+                username = outcome.claims?.email ?? initialClaims?.email ?? profileUser ?? outcome.claims?.subject ?? initialClaims?.subject ?? username
             case .rejected:
                 throw SiteAuthError.invalidCredentials(L("The session or token was rejected by %@.", host))
             case .anonymous:
@@ -463,13 +511,18 @@ public final class SiteAuthCoordinator: ObservableObject {
         let explicitTokenEndpoint = tokenEndpoint?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .nilIfEmpty
+            .flatMap { Self.isRefreshableTokenEndpoint($0) ? $0 : nil }
         let derivedOIDCEndpoint: String? = (engine == .guest && explicitTokenEndpoint == nil && cleanedRefresh != nil)
-            ? Self.derivedOIDCTokenEndpoint(issuer: claims?.issuer, siteOrigin: origin)
+            ? (Self.derivedOIDCTokenEndpoint(issuer: claims?.issuer, siteOrigin: origin)
+                ?? Self.derivedOIDCTokenEndpoint(issuer: initialClaims?.issuer, siteOrigin: origin))
             : nil
-        let resolvedTokenEndpoint = explicitTokenEndpoint ?? derivedOIDCEndpoint ?? existing?.tokenEndpoint
+        let existingTokenEndpoint = existing?.tokenEndpoint.flatMap {
+            Self.isRefreshableTokenEndpoint($0) ? $0 : nil
+        }
+        let resolvedTokenEndpoint = explicitTokenEndpoint ?? derivedOIDCEndpoint ?? existingTokenEndpoint
         let resolvedClientID = capturedClientID?
             .trimmingCharacters(in: .whitespacesAndNewlines)
-            .nilIfEmpty ?? claims?.authorizedParty ?? previousSecret?.oauthClientID
+            .nilIfEmpty ?? claims?.authorizedParty ?? initialClaims?.authorizedParty ?? previousSecret?.oauthClientID
 
         let record = SiteAccountRecord(
             originKey: originKey,
@@ -481,7 +534,7 @@ public final class SiteAuthCoordinator: ObservableObject {
             systemCertificateFingerprint: existing?.systemCertificateFingerprint,
             tokenEndpoint: resolvedTokenEndpoint,
             discoveredServerURL: discoveredServerURL,
-            tokenExpiresAt: claims?.expiresAt,
+            tokenExpiresAt: claims?.expiresAt ?? initialClaims?.expiresAt,
             lastAuthenticatedAt: Date(),
             needsReauthentication: false
         )
@@ -560,9 +613,11 @@ public final class SiteAuthCoordinator: ObservableObject {
 
         let jwtExpiry = secret.accessToken.flatMap(JWTClaims.inspect)?.expiresAt
         let effectiveExpiry = account.tokenExpiresAt ?? jwtExpiry
+        let isExpired = effectiveExpiry.map { $0 <= now } ?? false
         let isExpiring = effectiveExpiry.map { $0 <= now.addingTimeInterval(60) } ?? false
+        let canFallbackToUnexpired = !forceRefresh && !account.needsReauthentication && !isExpired
 
-        if !forceRefresh && !account.needsReauthentication && !isExpiring {
+        func fallbackUnexpiredCredentials() -> ResolvedSiteCredentials? {
             if account.authMethod == .mtlsOnly {
                 return ResolvedSiteCredentials(account: account, accessToken: secret.accessToken, cookies: activeCookies)
             }
@@ -572,19 +627,32 @@ public final class SiteAuthCoordinator: ObservableObject {
             if !activeCookies.isEmpty {
                 return ResolvedSiteCredentials(account: account, accessToken: nil, cookies: activeCookies)
             }
+            return nil
+        }
+
+        if !forceRefresh && !account.needsReauthentication && !isExpiring,
+           let cached = fallbackUnexpiredCredentials() {
+            return cached
         }
 
         if let running = refreshTasks[originKey] {
-            return await running.value
+            return await running.value ?? (canFallbackToUnexpired ? fallbackUnexpiredCredentials() : nil)
         }
 
         let task = Task<ResolvedSiteCredentials?, Never> { @MainActor [weak self] in
             guard let self else { return nil }
             defer { self.refreshTasks.removeValue(forKey: originKey) }
-            return await self.performSilentRenewal(origin: origin, originKey: originKey, engine: engine, account: account, secret: secret)
+            return await self.performSilentRenewal(
+                origin: origin,
+                originKey: originKey,
+                engine: engine,
+                account: account,
+                secret: secret,
+                markExpiredOnFailure: !canFallbackToUnexpired
+            )
         }
         refreshTasks[originKey] = task
-        return await task.value
+        return await task.value ?? (canFallbackToUnexpired ? fallbackUnexpiredCredentials() : nil)
     }
 
     private func performSilentRenewal(
@@ -592,7 +660,8 @@ public final class SiteAuthCoordinator: ObservableObject {
         originKey: String,
         engine: MeetingEngineKind,
         account: SiteAccountRecord,
-        secret: SiteSecretPayload
+        secret: SiteSecretPayload,
+        markExpiredOnFailure: Bool
     ) async -> ResolvedSiteCredentials? {
         // 1. Try OAuth / REST refresh_token exchange
         if let refreshToken = secret.refreshToken, !refreshToken.isEmpty {
@@ -677,7 +746,9 @@ public final class SiteAuthCoordinator: ObservableObject {
             return ResolvedSiteCredentials(account: account, accessToken: nil, cookies: secret.cookies)
         }
 
-        store.markNeedsReauthentication(true, for: originKey)
+        if markExpiredOnFailure {
+            store.markNeedsReauthentication(true, for: originKey)
+        }
         return nil
     }
 
@@ -689,16 +760,19 @@ public final class SiteAuthCoordinator: ObservableObject {
         secret: SiteSecretPayload,
         refreshToken: String
     ) async -> ResolvedSiteCredentials? {
-        let tokenClaims = JWTClaims.inspect(secret.accessToken ?? refreshToken)
+        let tokenClaims = JWTClaims.inspect(secret.accessToken ?? "")
+        let refreshClaims = JWTClaims.inspect(refreshToken)
         let endpointURL: URL?
-        if let explicit = account.tokenEndpoint, let parsed = URL(string: explicit) {
+        if let explicit = account.tokenEndpoint,
+           Self.isRefreshableTokenEndpoint(explicit),
+           let parsed = URL(string: explicit) {
             endpointURL = parsed
         } else if engine == .trueconf {
             var comps = URLComponents(url: origin, resolvingAgainstBaseURL: false)
             comps?.path = "/oauth2/v1/token"
             endpointURL = comps?.url
         } else if engine == .guest,
-                  let oidcEndpoint = Self.derivedOIDCTokenEndpoint(issuer: tokenClaims?.issuer, siteOrigin: origin),
+                  let oidcEndpoint = Self.derivedOIDCTokenEndpoint(issuer: tokenClaims?.issuer ?? refreshClaims?.issuer, siteOrigin: origin),
                   let parsedOIDC = URL(string: oidcEndpoint) {
             endpointURL = parsedOIDC
         } else if engine == .guest, let serverString = account.discoveredServerURL, let server = URL(string: serverString) {
@@ -724,6 +798,7 @@ public final class SiteAuthCoordinator: ObservableObject {
             ]
             let clientID = secret.oauthClientID?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
                 ?? tokenClaims?.authorizedParty
+                ?? refreshClaims?.authorizedParty
             if let clientID { pairs.append(.init(name: "client_id", value: clientID)) }
             if let csec = secret.oauthClientSecret, !csec.isEmpty { pairs.append(.init(name: "client_secret", value: csec)) }
             var bodyComps = URLComponents()
@@ -741,25 +816,55 @@ public final class SiteAuthCoordinator: ObservableObject {
             return nil
         }
 
+        let cleanedNewToken = Self.cleanToken(newToken)
+        var finalAccessToken = cleanedNewToken.isEmpty ? newToken : cleanedNewToken
+        var resolvedServerURL = account.discoveredServerURL.flatMap(URL.init(string:))
+        if engine == .guest && isFormOAuth {
+            if resolvedServerURL == nil {
+                resolvedServerURL = try? await resolveGuestServerURL(origin: origin, existing: account, session: session)
+            }
+            if let serverURL = resolvedServerURL,
+               let exchanged = await exchangeGuestKeycloakB2BToken(
+                   serverURL: serverURL,
+                   keycloakToken: finalAccessToken,
+                   cookies: secret.cookies,
+                   session: session
+               ),
+               !exchanged.isEmpty {
+                finalAccessToken = exchanged
+            }
+        }
+
         let newRefresh = (json["refresh_token"] as? String) ?? (json["refreshToken"] as? String) ?? refreshToken
-        let expiresAt = Self.extractExpiry(from: json, token: newToken)
-        let claims = JWTClaims.inspect(newToken)
+        let oauthClaims = JWTClaims.inspect(newToken)
+        let finalClaims = JWTClaims.inspect(finalAccessToken)
+        let expiresAt = finalClaims?.expiresAt ?? Self.extractExpiry(from: json, token: newToken)
         var updatedAccount = account
         updatedAccount.tokenEndpoint = endpointURL.absoluteString
+        if let resolvedServerURL {
+            updatedAccount.discoveredServerURL = resolvedServerURL.absoluteString
+        }
         updatedAccount.tokenExpiresAt = expiresAt
         updatedAccount.lastAuthenticatedAt = Date()
         updatedAccount.needsReauthentication = false
-        if let name = claims?.displayName { updatedAccount.userDisplayName = name }
-        if let email = claims?.email { updatedAccount.username = email }
+        if let name = Self.preferredDisplayName(
+            outcomeClaims: finalClaims,
+            initialClaims: oauthClaims,
+            fallback: account.userDisplayName
+        ) {
+            updatedAccount.userDisplayName = name
+        }
+        if let email = finalClaims?.email ?? oauthClaims?.email { updatedAccount.username = email }
 
         var updatedSecret = secret
-        updatedSecret.accessToken = newToken
+        updatedSecret.accessToken = finalAccessToken
         updatedSecret.refreshToken = newRefresh
-        if let cid = claims?.authorizedParty, (updatedSecret.oauthClientID ?? "").isEmpty {
+        if let cid = oauthClaims?.authorizedParty ?? finalClaims?.authorizedParty,
+           (updatedSecret.oauthClientID ?? "").isEmpty {
             updatedSecret.oauthClientID = cid
         }
         let saved = store.upsertAccount(updatedAccount, secret: updatedSecret, preservingCertificate: true)
-        return ResolvedSiteCredentials(account: saved, accessToken: newToken, cookies: updatedSecret.cookies)
+        return ResolvedSiteCredentials(account: saved, accessToken: finalAccessToken, cookies: updatedSecret.cookies)
     }
 
     // MARK: - Provider Helpers
@@ -1098,6 +1203,112 @@ public final class SiteAuthCoordinator: ObservableObject {
         return (user, name)
     }
 
+    private struct GuestVerificationOutcome {
+        var verification: GuestSessionVerification
+        var effectiveToken: String?
+        var claims: JWTClaims?
+        var exchangedViaB2B: Bool
+    }
+
+    private static func preferredDisplayName(
+        outcomeClaims: JWTClaims?,
+        initialClaims: JWTClaims? = nil,
+        profileName: String? = nil,
+        fallback: String? = nil
+    ) -> String? {
+        let explicitOutcomeName: String? = {
+            guard let name = outcomeClaims?.displayName else { return nil }
+            return name != outcomeClaims?.subject ? name : nil
+        }()
+        let explicitInitialName: String? = {
+            guard let name = initialClaims?.displayName else { return nil }
+            return name != initialClaims?.subject ? name : nil
+        }()
+        return explicitOutcomeName
+            ?? profileName
+            ?? explicitInitialName
+            ?? fallback
+            ?? outcomeClaims?.displayName
+            ?? initialClaims?.displayName
+    }
+
+    private func verifyGuestSessionWithB2BFallback(
+        serverURL: URL,
+        origin: URL,
+        initialToken: String?,
+        initialClaims: JWTClaims?,
+        cookies: [SerializedHTTPCookie],
+        session: URLSession
+    ) async throws -> GuestVerificationOutcome {
+        var token = initialToken
+        var claims = initialClaims
+        var verification = try await verifyGuestSession(
+            serverURL: serverURL,
+            origin: origin,
+            token: token,
+            cookies: cookies,
+            session: session
+        )
+        var exchangedViaB2B = false
+        switch verification {
+        case .rejected, .anonymous:
+            if let keycloakToken = token,
+               let exchanged = await exchangeGuestKeycloakB2BToken(
+                   serverURL: serverURL,
+                   keycloakToken: keycloakToken,
+                   cookies: cookies,
+                   session: session
+               ),
+               exchanged != keycloakToken {
+                token = exchanged
+                claims = JWTClaims.inspect(exchanged)
+                exchangedViaB2B = true
+                verification = try await verifyGuestSession(
+                    serverURL: serverURL,
+                    origin: origin,
+                    token: exchanged,
+                    cookies: cookies,
+                    session: session
+                )
+            }
+        case .authenticated, .unavailable:
+            break
+        }
+        return GuestVerificationOutcome(
+            verification: verification,
+            effectiveToken: token,
+            claims: claims,
+            exchangedViaB2B: exchangedViaB2B
+        )
+    }
+
+    private func exchangeGuestKeycloakB2BToken(
+        serverURL: URL,
+        keycloakToken: String,
+        cookies: [SerializedHTTPCookie],
+        session: URLSession
+    ) async -> String? {
+        let cleaned = Self.cleanToken(keycloakToken)
+        guard !cleaned.isEmpty, JWTClaims.inspect(cleaned)?.isLicenseToken != true else {
+            return nil
+        }
+        let endpoint = serverURL.appendingPathComponent("auth/login/b2b")
+        var req = URLRequest(url: endpoint, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 10)
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        req.setValue("Bearer \(cleaned)", forHTTPHeaderField: "Authorization")
+        if let cookieHeader = SerializedHTTPCookie.cookieHeader(from: cookies, for: endpoint) {
+            req.setValue(cookieHeader, forHTTPHeaderField: "Cookie")
+        }
+        guard let (data, response) = try? await BoundedHTTP.load(req, session: session, maximumBytes: 65_536),
+              (200..<300).contains(response.statusCode),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let exchanged = Self.extractAccessToken(from: json) else {
+            return nil
+        }
+        let cleanedExchanged = Self.cleanToken(exchanged)
+        return cleanedExchanged.isEmpty ? nil : cleanedExchanged
+    }
+
     private func exchangeGuestCookieToToken(
         serverURL: URL,
         cookies: [SerializedHTTPCookie],
@@ -1278,6 +1489,23 @@ public final class SiteAuthCoordinator: ObservableObject {
         }
     }
 
+    static func isRefreshableTokenEndpoint(_ raw: String) -> Bool {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              let parsed = URL(string: trimmed),
+              parsed.scheme?.lowercased() == "https" else {
+            return false
+        }
+        let path = parsed.path.lowercased()
+        if path.contains("plat-license-manager") || path.contains("/licenses/") || path.contains("/license/") {
+            return false
+        }
+        return path.contains("openid-connect/token")
+            || path.contains("/oauth")
+            || path.contains("/refresh")
+            || path.hasSuffix("/token")
+    }
+
     static func derivedOIDCTokenEndpoint(issuer: String?, siteOrigin: URL) -> String? {
         guard let rawIssuer = issuer?.trimmingCharacters(in: .whitespacesAndNewlines),
               !rawIssuer.isEmpty,
@@ -1382,9 +1610,13 @@ private enum SilentWebSessionRenewer {
                 guard let rawToken = dict["token"] as? String else { return }
                 let cleaned = SiteAuthCoordinator.cleanToken(rawToken)
                 guard cleaned.count >= 12 else { return }
+                let newClaims = JWTClaims.inspect(cleaned)
+                if newClaims?.isLicenseToken == true {
+                    return
+                }
                 if let existing = capturedToken,
                    JWTClaims.inspect(existing) != nil,
-                   JWTClaims.inspect(cleaned) == nil {
+                   newClaims == nil {
                     return
                 }
                 capturedToken = cleaned
@@ -1503,10 +1735,61 @@ enum SiteAuthWebScript {
                 s.indexOf('mc.yandex') >= 0 ||
                 s.indexOf('firebase') >= 0 ||
                 s.indexOf('google-analytics') >= 0 ||
-                s.indexOf('sentry') >= 0;
+                s.indexOf('googleapis.com') >= 0 ||
+                s.indexOf('sentry') >= 0 ||
+                s.indexOf('plat-license-manager') >= 0 ||
+                s.indexOf('/licenses/') >= 0 ||
+                s.indexOf('/license/') >= 0 ||
+                s.indexOf('/xr/token') >= 0 ||
+                s.indexOf('media-stream-token') >= 0;
         }
         function isJwt(tok) {
             return typeof tok === 'string' && /^eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(tok);
+        }
+        function decodeBase64Url(segment) {
+            var chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+            var clean = String(segment || '').replace(/-/g, '+').replace(/_/g, '/').replace(/[^A-Za-z0-9+/]/g, '');
+            var bytes = [];
+            for (var i = 0; i < clean.length; i += 4) {
+                var c1 = clean.charAt(i);
+                var c2 = clean.charAt(i + 1);
+                var c3 = clean.charAt(i + 2);
+                var c4 = clean.charAt(i + 3);
+                var e1 = c1 ? chars.indexOf(c1) : -1;
+                var e2 = c2 ? chars.indexOf(c2) : -1;
+                var e3 = c3 ? chars.indexOf(c3) : -1;
+                var e4 = c4 ? chars.indexOf(c4) : -1;
+                if (e1 < 0 || e2 < 0) break;
+                bytes.push((e1 << 2) | (e2 >> 4));
+                if (e3 >= 0) bytes.push(((e2 & 15) << 4) | (e3 >> 2));
+                if (e4 >= 0) bytes.push(((e3 & 3) << 6) | e4);
+            }
+            var hex = '';
+            for (var j = 0; j < bytes.length; j++) {
+                hex += '%' + ('0' + bytes[j].toString(16)).slice(-2);
+            }
+            return decodeURIComponent(hex);
+        }
+        function decodeJwtPayload(tok) {
+            if (!isJwt(tok)) return null;
+            try {
+                var parts = tok.split('.');
+                if (parts.length !== 3) return null;
+                return JSON.parse(decodeBase64Url(parts[1]));
+            } catch (e) {
+                return null;
+            }
+        }
+        function isLicenseJwt(tok) {
+            var p = decodeJwtPayload(tok);
+            if (!p || typeof p !== 'object') return false;
+            var hasLicenseClaim = (p.graceExp !== undefined && p.graceExp !== null) ||
+                (p.jazz_premium_user !== undefined && p.jazz_premium_user !== null) ||
+                (p.license_type !== undefined && p.license_type !== null);
+            var sub = (typeof p.sub === 'string') ? p.sub.trim() : '';
+            var email = (typeof p.email === 'string') ? p.email.trim() : '';
+            var pref = (typeof p.preferred_username === 'string') ? p.preferred_username.trim() : '';
+            return hasLicenseClaim && !sub && !email && !pref;
         }
         function cleanAndValidateToken(raw, fromAuthHeader) {
             if (typeof raw !== 'string') return '';
@@ -1556,15 +1839,39 @@ enum SiteAuthWebScript {
                 l.indexOf('session') >= 0 ||
                 l.indexOf('cookie-to-token') >= 0;
         }
-        function post(rawToken, refreshToken, tokenEndpoint, clientId, fromAuthHeader, source) {
+        function isOAuthTokenEndpoint(url) {
+            var l = String(url || '').toLowerCase().split('?')[0].split('#')[0];
+            if (!l || isIgnoredUrl(l)) return false;
+            return l.indexOf('openid-connect/token') >= 0 ||
+                l.indexOf('/oauth') >= 0 ||
+                l.indexOf('/refresh') >= 0 ||
+                /\/token$/.test(l);
+        }
+        function isJazzBackendSource(url, source) {
+            if (source === 'x-jazz-token') return true;
+            if (source !== 'fetch-response' && source !== 'xhr-response') return false;
+            var l = String(url || '').toLowerCase().split('?')[0].split('#')[0];
+            return l.indexOf('/auth/login/b2b') >= 0 || l.indexOf('/auth/cookie-to-token') >= 0;
+        }
+        function post(rawToken, refreshToken, tokenEndpoint, clientId, fromAuthHeader, source, endpointUrl) {
             var token = cleanAndValidateToken(rawToken, Boolean(fromAuthHeader));
-            if (!token) return;
+            if (!token || isLicenseJwt(token)) return;
             var prev = window[BEST_KEY];
             if (prev && isJwt(prev.token) && !isJwt(token)) return;
-            var nextRefresh = (typeof refreshToken === 'string' && refreshToken.trim()) ? refreshToken.trim() : ((prev && prev.token === token && prev.refreshToken) || '');
-            var nextEndpoint = (typeof tokenEndpoint === 'string' && tokenEndpoint.trim()) ? tokenEndpoint.trim() : ((prev && prev.token === token && prev.tokenEndpoint) || '');
-            var nextClient = (typeof clientId === 'string' && clientId.trim()) ? clientId.trim() : ((prev && prev.token === token && prev.clientId) || '');
-            if (prev && prev.token === token && prev.refreshToken === nextRefresh && prev.tokenEndpoint === nextEndpoint && prev.clientId === nextClient) {
+            var incomingIsJazz = isJazzBackendSource(endpointUrl, source);
+            var safeEndpoint = isOAuthTokenEndpoint(tokenEndpoint) ? String(tokenEndpoint).trim() : '';
+            var nextRefresh = (typeof refreshToken === 'string' && refreshToken.trim()) ? refreshToken.trim() : ((prev && prev.refreshToken) || '');
+            var nextEndpoint = safeEndpoint || ((prev && prev.tokenEndpoint) || '');
+            var nextClient = (typeof clientId === 'string' && clientId.trim()) ? clientId.trim() : ((prev && prev.clientId) || '');
+            if (prev && prev.isJazzBackend && !incomingIsJazz) {
+                if (prev.refreshToken === nextRefresh && prev.tokenEndpoint === nextEndpoint && prev.clientId === nextClient) {
+                    return;
+                }
+                token = prev.token;
+                incomingIsJazz = true;
+            }
+            var effectiveSource = source || (prev && prev.source) || '';
+            if (prev && prev.token === token && prev.refreshToken === nextRefresh && prev.tokenEndpoint === nextEndpoint && prev.clientId === nextClient && Boolean(prev.isJazzBackend) === incomingIsJazz) {
                 return;
             }
             var payload = {
@@ -1573,7 +1880,8 @@ enum SiteAuthWebScript {
                 tokenEndpoint: nextEndpoint,
                 clientId: nextClient,
                 pageHost: (window.location && window.location.hostname) || '',
-                source: source || ''
+                source: effectiveSource,
+                isJazzBackend: incomingIsJazz
             };
             window[BEST_KEY] = payload;
             try {
@@ -1588,30 +1896,32 @@ enum SiteAuthWebScript {
             var ref = data.refresh_token || data.refreshToken || '';
             var cid = clientId || data.client_id || data.clientId || '';
             if (tok && typeof tok === 'string') {
-                post(tok, ref, endpointUrl, cid, false, source);
+                post(tok, ref, endpointUrl, cid, false, source, endpointUrl);
             }
         }
-        function inspectHeaders(headers) {
+        function handleAuthHeader(name, value, source, endpointUrl) {
+            if (!value) return;
+            var ln = String(name || '').toLowerCase();
+            if (ln === 'x-jazz-token') post(value, '', '', '', false, 'x-jazz-token', endpointUrl || '');
+            else if (ln === 'x-auth-token') post(value, '', '', '', false, source, endpointUrl || '');
+            else if (ln === 'authorization') post(value, '', '', '', true, source, endpointUrl || '');
+        }
+        function inspectHeaders(headers, endpointUrl) {
             if (!headers) return;
             try {
                 if (typeof headers.get === 'function') {
-                    var jt = headers.get('X-Jazz-Token') || headers.get('x-jazz-token');
-                    if (jt) post(jt, '', '', '', false, 'fetch-header');
-                    var auth = headers.get('Authorization') || headers.get('authorization');
-                    if (auth) post(auth, '', '', '', true, 'fetch-header');
+                    handleAuthHeader('x-jazz-token', headers.get('X-Jazz-Token') || headers.get('x-jazz-token'), 'fetch-header', endpointUrl);
+                    handleAuthHeader('x-auth-token', headers.get('X-Auth-Token') || headers.get('x-auth-token'), 'fetch-header', endpointUrl);
+                    handleAuthHeader('authorization', headers.get('Authorization') || headers.get('authorization'), 'fetch-header', endpointUrl);
                 } else if (Array.isArray(headers)) {
                     for (var i = 0; i < headers.length; i++) {
                         var pair = headers[i];
                         if (!Array.isArray(pair) || pair.length < 2) continue;
-                        var lk = String(pair[0] || '').toLowerCase();
-                        if (lk === 'x-jazz-token') post(pair[1], '', '', '', false, 'fetch-header');
-                        else if (lk === 'authorization') post(pair[1], '', '', '', true, 'fetch-header');
+                        handleAuthHeader(pair[0], pair[1], 'fetch-header', endpointUrl);
                     }
                 } else if (typeof headers === 'object') {
                     for (var k in headers) {
-                        var kl = String(k).toLowerCase();
-                        if (kl === 'x-jazz-token') post(headers[k], '', '', '', false, 'fetch-header');
-                        else if (kl === 'authorization') post(headers[k], '', '', '', true, 'fetch-header');
+                        handleAuthHeader(k, headers[k], 'fetch-header', endpointUrl);
                     }
                 }
             } catch (e) {}
@@ -1624,15 +1934,15 @@ enum SiteAuthWebScript {
                 var ignored = isIgnoredUrl(resolvedUrl);
                 var reqClientId = '';
                 if (!ignored) {
-                    if (input && typeof input === 'object' && input.headers) inspectHeaders(input.headers);
-                    if (init && init.headers) inspectHeaders(init.headers);
+                    if (input && typeof input === 'object' && input.headers) inspectHeaders(input.headers, resolvedUrl);
+                    if (init && init.headers) inspectHeaders(init.headers, resolvedUrl);
                     reqClientId = extractClientId(init && init.body);
                 }
                 return origFetch.apply(this, arguments).then(function(resp) {
                     try {
                         var finalUrl = resolveUrl((resp && resp.url) || resolvedUrl);
-                        var ct = (resp && resp.headers && resp.headers.get('content-type')) || '';
-                        if (!ignored && resp && resp.ok && ct.indexOf('json') >= 0 && looksLikeAuthUrl(finalUrl)) {
+                        var ct = ((resp && resp.headers && resp.headers.get('content-type')) || '').toLowerCase();
+                        if (!ignored && !isIgnoredUrl(finalUrl) && resp && resp.ok && ct.indexOf('json') >= 0 && looksLikeAuthUrl(finalUrl)) {
                             resp.clone().json().then(function(data) {
                                 inspectJsonPayload(data, finalUrl, reqClientId, 'fetch-response');
                             }).catch(function() {});
@@ -1652,9 +1962,7 @@ enum SiteAuthWebScript {
             var origSetHeader = XMLHttpRequest.prototype.setRequestHeader;
             XMLHttpRequest.prototype.setRequestHeader = function(name, value) {
                 if (!isIgnoredUrl(this.__rockUrl)) {
-                    var ln = String(name || '').toLowerCase();
-                    if (ln === 'x-jazz-token') post(value, '', '', '', false, 'xhr-header');
-                    else if (ln === 'authorization') post(value, '', '', '', true, 'xhr-header');
+                    handleAuthHeader(name, value, 'xhr-header', this.__rockUrl);
                 }
                 return origSetHeader.apply(this, arguments);
             };
@@ -1698,10 +2006,13 @@ enum SiteAuthWebScript {
                 var origBcPost = BroadcastChannel.prototype.postMessage;
                 BroadcastChannel.prototype.postMessage = function(msg) {
                     try {
-                        if (msg && typeof msg === 'object' && typeof msg.token === 'string') {
-                            var ref = msg.refreshToken || msg.refresh_token || '';
-                            var cid = msg.clientId || msg.client_id || '';
-                            post(msg.token, ref, '', cid, false, 'broadcast');
+                        if (msg && typeof msg === 'object') {
+                            var bcTok = msg.access_token || msg.accessToken || msg.jazzToken || msg.token;
+                            if (typeof bcTok === 'string') {
+                                var ref = msg.refreshToken || msg.refresh_token || '';
+                                var cid = msg.clientId || msg.client_id || '';
+                                post(bcTok, ref, '', cid, false, 'broadcast', '');
+                            }
                         }
                     } catch (e) {}
                     return origBcPost.apply(this, arguments);
@@ -1715,7 +2026,7 @@ enum SiteAuthWebScript {
                     var params = new URLSearchParams(hash.replace(/^#/, ''));
                     var tok = params.get('access_token');
                     var ref = params.get('refresh_token') || '';
-                    if (tok) post(tok, ref, '', '', false, 'hash');
+                    if (tok) post(tok, ref, '', '', false, 'hash', '');
                 }
             } catch (e) {}
         }
@@ -1724,6 +2035,14 @@ enum SiteAuthWebScript {
             for (var i = 0; i < storage.length; i++) {
                 var key = storage.key(i) || '';
                 var lk = key.toLowerCase();
+                if (lk.indexOf('license') >= 0 ||
+                    lk.indexOf('unleash') >= 0 ||
+                    lk.indexOf('analytics') >= 0 ||
+                    lk.indexOf('amplitude') >= 0 ||
+                    lk.indexOf('telemetry') >= 0 ||
+                    lk.indexOf('firebase') >= 0) {
+                    continue;
+                }
                 if (lk.indexOf('auth') >= 0 || lk.indexOf('token') >= 0 || lk.indexOf('jazz') >= 0 || lk.indexOf('oidc') >= 0 || lk.indexOf('keycloak') >= 0) {
                     var val = storage.getItem(key);
                     if (!val || val.length < 12) continue;
@@ -1731,7 +2050,7 @@ enum SiteAuthWebScript {
                     if (trimmed[0] === '{') {
                         try { inspectJsonPayload(JSON.parse(trimmed), '', '', 'storage'); } catch (e) {}
                     } else if ((lk.indexOf('jazz') >= 0 && lk.indexOf('token') >= 0) || isJwt(trimmed)) {
-                        post(trimmed, '', '', '', false, 'storage');
+                        post(trimmed, '', '', '', false, 'storage', '');
                     }
                 }
             }

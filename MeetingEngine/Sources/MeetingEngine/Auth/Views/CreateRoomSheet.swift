@@ -99,32 +99,36 @@ public struct CreateRoomSheet: View {
     }
 
     public var body: some View {
-        NavigationStack {
-            Form {
-                if let created = createdRoom {
-                    createdSection(created)
-                } else {
-                    siteSelectionSection
-                    roomOptionsSection
-                    errorAndActionsSection
-                }
-            }
+        Group {
             #if os(macOS)
-            .formStyle(.grouped)
-            #endif
-            .navigationTitle(L("New room"))
-            #if os(iOS)
-            .navigationBarTitleDisplayMode(.inline)
-            #endif
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
+            VStack(spacing: 0) {
+                HStack {
+                    Text(L("New room"))
+                        .font(.headline)
+                    Spacer()
                     Button(createdRoom == nil ? L("Cancel") : L("Done")) { dismiss() }
+                        .keyboardShortcut(.cancelAction)
                 }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 12)
+                Divider()
+                roomFormContent
+                    .formStyle(.grouped)
             }
+            .frame(minWidth: 520, idealWidth: 560, minHeight: 460, idealHeight: 520)
+            #else
+            NavigationStack {
+                roomFormContent
+                    .navigationTitle(L("New room"))
+                    .navigationBarTitleDisplayMode(.inline)
+                    .toolbar {
+                        ToolbarItem(placement: .cancellationAction) {
+                            Button(createdRoom == nil ? L("Cancel") : L("Done")) { dismiss() }
+                        }
+                    }
+            }
+            #endif
         }
-        #if os(macOS)
-        .frame(minWidth: 480, minHeight: 420)
-        #endif
         .onAppear {
             initializeOriginSelection()
         }
@@ -138,6 +142,18 @@ public struct CreateRoomSheet: View {
                 SiteSignInSheet(initialOrigin: nil, suggestedOrigins: suggestedOrigins) { account in
                     handleSignedIn(account)
                 }
+            }
+        }
+    }
+
+    private var roomFormContent: some View {
+        Form {
+            if let created = createdRoom {
+                createdSection(created)
+            } else {
+                siteSelectionSection
+                roomOptionsSection
+                errorAndActionsSection
             }
         }
     }

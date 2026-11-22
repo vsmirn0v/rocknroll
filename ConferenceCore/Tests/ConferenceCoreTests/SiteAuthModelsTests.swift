@@ -49,6 +49,12 @@ final class SiteAuthModelsTests: XCTestCase {
         XCTAssertEqual(claims.authorizedParty, "s2b")
         XCTAssertEqual(claims.issuer, "https://meet.example.test/realms/s2b")
         XCTAssertEqual(claims.expiresAt, Date(timeIntervalSince1970: 1_900_000_000))
+        XCTAssertFalse(claims.isLicenseToken)
+
+        let licensePayload = base64URL(Data("{\"jazz_premium_user\":true,\"graceExp\":1900000000}".utf8))
+        let licenseClaims = try XCTUnwrap(JWTClaims.inspect("\(header).\(licensePayload).sig"))
+        XCTAssertTrue(licenseClaims.isLicenseToken)
+
         XCTAssertNil(JWTClaims.inspect("opaque-token"))
     }
 

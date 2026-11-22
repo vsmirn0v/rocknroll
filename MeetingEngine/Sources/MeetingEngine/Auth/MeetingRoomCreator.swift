@@ -131,20 +131,22 @@ public final class MeetingRoomCreator {
 
         while true {
             let headers = creds?.httpHeaders(for: origin, engine: .guest) ?? ["X-Jazz-Token": ""]
-            let roomType = creds != nil ? "MEETING" : "ANONYMOUS"
+            let primaryType = creds != nil ? "MEETING" : "ANONYMOUS"
+            var activeType = primaryType
             do {
-                let invitation = try await bootstrap.createRoom(
-                    origin: origin,
-                    title: title,
-                    roomType: roomType,
-                    guestEnabled: options.allowGuests,
-                    lobbyEnabled: options.enableLobby,
-                    headers: headers
-                )
-                return try makeGuestCreatedRoom(origin: origin, title: title, invitation: invitation)
-            } catch GuestBootstrapError.httpStatus(400) where roomType == "MEETING" {
+                let invitation: GuestInvitation
                 do {
-                    let invitation = try await bootstrap.createRoom(
+                    invitation = try await bootstrap.createRoom(
+                        origin: origin,
+                        title: title,
+                        roomType: primaryType,
+                        guestEnabled: options.allowGuests,
+                        lobbyEnabled: options.enableLobby,
+                        headers: headers
+                    )
+                } catch GuestBootstrapError.httpStatus(400) where primaryType == "MEETING" {
+                    activeType = "ANONYMOUS"
+                    invitation = try await bootstrap.createRoom(
                         origin: origin,
                         title: title,
                         roomType: "ANONYMOUS",
@@ -152,16 +154,24 @@ public final class MeetingRoomCreator {
                         lobbyEnabled: options.enableLobby,
                         headers: headers
                     )
-                    return try makeGuestCreatedRoom(origin: origin, title: title, invitation: invitation)
-                } catch GuestBootstrapError.httpStatus(let code) where code == 401 || code == 403 {
-                    if creds != nil && !didRefresh {
-                        didRefresh = true
-                        creds = await auth.validCredentials(for: origin, engine: .guest, forceRefresh: true)
-                        if creds != nil { continue }
-                    }
-                    throw RoomCreationError.signInRequired(origin: origin, engine: .guest)
                 }
+                probeLog("room-create", [
+                    "engine": "guest",
+                    "roomType": activeType,
+                    "hasToken": creds != nil,
+                    "didRefresh": didRefresh,
+                    "outcome": activeType == primaryType ? "ok" : "ok-fallback"
+                ])
+                return try makeGuestCreatedRoom(origin: origin, title: title, invitation: invitation)
             } catch GuestBootstrapError.httpStatus(let code) where code == 401 || code == 403 {
+                probeLog("room-create", [
+                    "engine": "guest",
+                    "roomType": activeType,
+                    "hasToken": creds != nil,
+                    "didRefresh": didRefresh,
+                    "httpStatus": code,
+                    "outcome": "auth-rejected"
+                ])
                 if creds != nil && !didRefresh {
                     didRefresh = true
                     creds = await auth.validCredentials(for: origin, engine: .guest, forceRefresh: true)
@@ -169,7 +179,25 @@ public final class MeetingRoomCreator {
                 }
                 throw RoomCreationError.signInRequired(origin: origin, engine: .guest)
             } catch GuestBootstrapError.httpStatus(let code) {
+                probeLog("room-create", [
+                    "engine": "guest",
+                    "roomType": activeType,
+                    "hasToken": creds != nil,
+                    "didRefresh": didRefresh,
+                    "httpStatus": code,
+                    "outcome": "http-error"
+                ])
                 throw RoomCreationError.requestFailed(code, nil)
+            } catch {
+                probeLog("room-create", [
+                    "engine": "guest",
+                    "roomType": activeType,
+                    "hasToken": creds != nil,
+                    "didRefresh": didRefresh,
+                    "errorType": String(describing: error),
+                    "outcome": "error"
+                ])
+                throw error
             }
         }
     }

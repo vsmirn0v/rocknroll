@@ -4348,3 +4348,6 @@
 "Auto-engage role assistant" = "Auto-engage role assistant";
 "Keep this Off on shared team calls so multiple assistants do not talk over each other." = "Keep this Off on shared team calls so multiple assistants do not talk over each other.";
 "Meeting settings…" = "Meeting settings…";
+"Open site" = "Open";
+"Found %ld Jira users." = "Found %ld Jira users.";
+"Need user confirmation to match Jira user for “%@”." = "Need user confirmation to match Jira user for “%@”.";

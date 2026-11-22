@@ -46,6 +46,7 @@ public struct SiteSignInSheet: View {
     @State private var isError = false
     @State private var isBusy = false
     @State private var isDetecting = false
+    @State private var isWebLoading = false
 
     @State private var webViewNonce = UUID()
     @State private var capturedAccessToken: String?
@@ -94,29 +95,40 @@ public struct SiteSignInSheet: View {
     }
 
     public var body: some View {
-        NavigationStack {
+        Group {
+            #if os(macOS)
             VStack(spacing: 0) {
-                headerControls
+                HStack(spacing: 10) {
+                    Text(resolvedOrigin?.host ?? L("Sign in to website"))
+                        .font(.headline)
+                    if isWebLoading {
+                        ProgressView()
+                            .controlSize(.small)
+                    }
+                    Spacer()
+                    Button(L("Close")) { dismiss() }
+                        .keyboardShortcut(.cancelAction)
+                        .accessibilityIdentifier("siteAuth.close")
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 12)
                 Divider()
-                if authMode == .webSSO {
-                    webSSOContent
-                } else {
-                    formAuthContent
-                }
+                sheetBodyContent
             }
-            .navigationTitle(resolvedOrigin?.host ?? L("Sign in to website"))
-            #if os(iOS)
-            .navigationBarTitleDisplayMode(.inline)
+            .frame(minWidth: 860, idealWidth: 980, maxWidth: .infinity, minHeight: 700, idealHeight: 800, maxHeight: .infinity)
+            #else
+            NavigationStack {
+                sheetBodyContent
+                    .navigationTitle(resolvedOrigin?.host ?? L("Sign in to website"))
+                    .navigationBarTitleDisplayMode(.inline)
+                    .toolbar {
+                        ToolbarItem(placement: .cancellationAction) {
+                            Button(L("Cancel")) { dismiss() }
+                        }
+                    }
+            }
             #endif
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button(L("Cancel")) { dismiss() }
-                }
-            }
         }
-        #if os(macOS)
-        .frame(minWidth: 740, minHeight: 600)
-        #endif
         .fileImporter(
             isPresented: $certImport.showingFileImporter,
             allowedContentTypes: PKCS12ImportFlow.allowedContentTypes,
@@ -138,6 +150,23 @@ public struct SiteSignInSheet: View {
                 webViewNonce = UUID()
             }
         }
+        .onChange(of: authMode) { mode in
+            if mode != .webSSO {
+                isWebLoading = false
+            }
+        }
+    }
+
+    private var sheetBodyContent: some View {
+        VStack(spacing: 0) {
+            headerControls
+            Divider()
+            if authMode == .webSSO {
+                webSSOContent
+            } else {
+                formAuthContent
+            }
+        }
     }
 
     private var headerControls: some View {
@@ -154,7 +183,7 @@ public struct SiteSignInSheet: View {
                     #endif
                     .onSubmit { commitSiteInput() }
 
-                Button(isDetecting ? L("Checking…") : L("Open")) {
+                Button(isDetecting ? L("Checking…") : L("Open site")) {
                     commitSiteInput()
                 }
                 .buttonStyle(.borderedProminent)
@@ -303,7 +332,7 @@ public struct SiteSignInSheet: View {
         if let origin = resolvedOrigin {
             VStack(spacing: 0) {
                 HStack(spacing: 8) {
-                    if isBusy { ProgressView().controlSize(.small) }
+                    if isBusy || isWebLoading { ProgressView().controlSize(.small) }
                     Text(L("Sign in below. Your session and tokens will be saved automatically."))
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -335,6 +364,7 @@ public struct SiteSignInSheet: View {
                     nonce: webViewNonce,
                     lookup: store.registry,
                     onWebViewReady: { activeWebView = $0 },
+                    onLoadingChanged: { loading in isWebLoading = loading },
                     onCapturedToken: { token, refresh, endpoint, clientID, pageHost in
                         if acceptCapturedToken(
                             token,
@@ -380,7 +410,11 @@ public struct SiteSignInSheet: View {
                     }
                 )
                 .id("\(origin.absoluteString)-\(webViewNonce.uuidString)")
+                #if os(macOS)
+                .frame(maxWidth: .infinity, minHeight: 480, maxHeight: .infinity)
+                #else
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+                #endif
             }
         } else {
             emptyOriginPrompt
@@ -522,6 +556,7 @@ public struct SiteSignInSheet: View {
         capturedClientID = nil
         lastAutoVerifyURL = nil
         pendingAutoVerify = false
+        isWebLoading = false
         isError = false
         statusMessage = nil
 
@@ -691,9 +726,13 @@ public struct SiteSignInSheet: View {
         }
         let cleaned = SiteAuthCoordinator.cleanToken(rawToken)
         guard cleaned.count >= 12 else { return false }
+        let newClaims = JWTClaims.inspect(cleaned)
+        if newClaims?.isLicenseToken == true {
+            return false
+        }
         if let existing = capturedAccessToken,
            JWTClaims.inspect(existing) != nil,
-           JWTClaims.inspect(cleaned) == nil {
+           newClaims == nil {
             return false
         }
         capturedAccessToken = cleaned
@@ -773,6 +812,7 @@ public struct SiteSignInSheet: View {
 private final class SiteAuthWebCoordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
     var lastNonce: UUID?
     let tlsDelegate: SiteTLSDelegate
+    let onLoadingChanged: @MainActor (Bool) -> Void
     let onCapturedToken: @MainActor (String, String, String, String, String) -> Void
     let onNavigationFinished: @MainActor (URL?, WKWebView) async -> Void
     let onNavigationFailed: @MainActor (Error) -> Void
@@ -780,11 +820,13 @@ private final class SiteAuthWebCoordinator: NSObject, WKNavigationDelegate, WKUI
     init(
         origin: URL,
         lookup: any SiteClientIdentityLookup,
+        onLoadingChanged: @escaping @MainActor (Bool) -> Void,
         onCapturedToken: @escaping @MainActor (String, String, String, String, String) -> Void,
         onNavigationFinished: @escaping @MainActor (URL?, WKWebView) async -> Void,
         onNavigationFailed: @escaping @MainActor (Error) -> Void
     ) {
         self.tlsDelegate = SiteTLSDelegate(preferredOrigin: origin, lookup: lookup)
+        self.onLoadingChanged = onLoadingChanged
         self.onCapturedToken = onCapturedToken
         self.onNavigationFinished = onNavigationFinished
         self.onNavigationFailed = onNavigationFailed
@@ -802,9 +844,16 @@ private final class SiteAuthWebCoordinator: NSObject, WKNavigationDelegate, WKUI
         }
     }
 
+    func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+        Task { @MainActor [onLoadingChanged] in
+            onLoadingChanged(true)
+        }
+    }
+
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         let url = webView.url
-        Task { @MainActor [onNavigationFinished] in
+        Task { @MainActor [onLoadingChanged, onNavigationFinished] in
+            onLoadingChanged(false)
             await onNavigationFinished(url, webView)
         }
     }
@@ -818,6 +867,9 @@ private final class SiteAuthWebCoordinator: NSObject, WKNavigationDelegate, WKUI
     }
 
     private func reportFailureIfNeeded(_ error: Error) {
+        Task { @MainActor [onLoadingChanged] in
+            onLoadingChanged(false)
+        }
         let ns = error as NSError
         if ns.domain == NSURLErrorDomain && ns.code == NSURLErrorCancelled { return }
         Task { @MainActor [onNavigationFailed] in
@@ -856,6 +908,11 @@ private func makeSiteAuthWebView(
     config.userContentController.addUserScript(script)
     config.userContentController.add(coordinator, name: "siteAuthBridge")
     let webView = WKWebView(frame: .zero, configuration: config)
+    #if os(macOS)
+    webView.autoresizingMask = [.width, .height]
+    webView.allowsMagnification = true
+    webView.allowsBackForwardNavigationGestures = true
+    #endif
     webView.navigationDelegate = coordinator
     webView.uiDelegate = coordinator
     webView.load(URLRequest(url: startURL))
@@ -869,6 +926,7 @@ private struct SiteAuthWebViewContainer: UIViewRepresentable {
     let nonce: UUID
     let lookup: any SiteClientIdentityLookup
     let onWebViewReady: @MainActor (WKWebView) -> Void
+    let onLoadingChanged: @MainActor (Bool) -> Void
     let onCapturedToken: @MainActor (String, String, String, String, String) -> Void
     let onNavigationFinished: @MainActor (URL?, WKWebView) async -> Void
     let onNavigationFailed: @MainActor (Error) -> Void
@@ -877,6 +935,7 @@ private struct SiteAuthWebViewContainer: UIViewRepresentable {
         SiteAuthWebCoordinator(
             origin: origin,
             lookup: lookup,
+            onLoadingChanged: onLoadingChanged,
             onCapturedToken: onCapturedToken,
             onNavigationFinished: onNavigationFinished,
             onNavigationFailed: onNavigationFailed
@@ -909,6 +968,7 @@ private struct SiteAuthWebViewContainer: NSViewRepresentable {
     let nonce: UUID
     let lookup: any SiteClientIdentityLookup
     let onWebViewReady: @MainActor (WKWebView) -> Void
+    let onLoadingChanged: @MainActor (Bool) -> Void
     let onCapturedToken: @MainActor (String, String, String, String, String) -> Void
     let onNavigationFinished: @MainActor (URL?, WKWebView) async -> Void
     let onNavigationFailed: @MainActor (Error) -> Void
@@ -917,6 +977,7 @@ private struct SiteAuthWebViewContainer: NSViewRepresentable {
         SiteAuthWebCoordinator(
             origin: origin,
             lookup: lookup,
+            onLoadingChanged: onLoadingChanged,
             onCapturedToken: onCapturedToken,
             onNavigationFinished: onNavigationFinished,
             onNavigationFailed: onNavigationFailed
