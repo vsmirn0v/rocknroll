@@ -1532,6 +1532,10 @@ import XCTest
     func testOutcomeHistorySearchTemporarilyRevealsCollapsedDayAndPreservesSelectionOnRefresh() async throws {
         let store = store()
         await store.waitForMeetingLibrary()
+        let showEmptyKey = "native.meetingHistory.showEmptyMeetings"
+        let previousShowEmpty = UserDefaults.standard.object(forKey: showEmptyKey)
+        UserDefaults.standard.set(false, forKey: showEmptyKey)
+        addTeardownBlock { UserDefaults.standard.set(previousShowEmpty, forKey: showEmptyKey) }
         let library = store.meetingLibrary
         let day = Calendar.current.startOfDay(for: Date())
         let previousDay = try XCTUnwrap(Calendar.current.date(byAdding: .day, value: -1, to: day))
@@ -1539,7 +1543,10 @@ import XCTest
         let selected = MeetingSessionRecord(title: selectedTitle, startedAt: day + 14 * 3_600)
         let match = MeetingSessionRecord(title: "Matching release planning", startedAt: day + 9 * 3_600)
         let earlier = MeetingSessionRecord(title: "Previous day occurrence", startedAt: previousDay + 13 * 3_600)
-        for session in [selected, match, earlier] { try await library.store.upsertSession(session) }
+        for session in [selected, match, earlier] {
+            try await library.store.upsertSession(session)
+            _ = try await library.store.saveNote(sessionID: session.id, markdown: "Notes for \(session.title)")
+        }
         await library.refresh()
         let attention = AttentionCoordinator(store: store)
         attention.requestedOutcomeSessionID = selected.id
@@ -1639,6 +1646,79 @@ import XCTest
             (midnight, ["Next-day meeting"]), (dayBefore, ["Renamed overnight"])
         ])
         XCTAssertTrue(containsText(rendered, "Edited after generation"))
+    }
+
+    func testEmptyAndNonMeaningfulMeetingsAreHiddenByDefaultAndCanBeShown() async throws {
+        let store = store()
+        await store.waitForMeetingLibrary()
+        let showEmptyKey = "native.meetingHistory.showEmptyMeetings"
+        let previousShowEmpty = UserDefaults.standard.object(forKey: showEmptyKey)
+        UserDefaults.standard.set(false, forKey: showEmptyKey)
+        addTeardownBlock { UserDefaults.standard.set(previousShowEmpty, forKey: showEmptyKey) }
+
+        let library = store.meetingLibrary
+        let day = Calendar.current.startOfDay(for: Date())
+        let emptySession = MeetingSessionRecord(
+            title: "Empty test join",
+            startedAt: day + 9 * 3_600,
+            endedAt: day + 9 * 3_600 + 60,
+            state: .ended
+        )
+        let noMeaningfulSession = MeetingSessionRecord(
+            title: "Mic check call",
+            startedAt: day + 10 * 3_600,
+            endedAt: day + 10 * 3_600 + 120,
+            state: .ended
+        )
+        let meaningfulSession = MeetingSessionRecord(
+            title: "Architecture review",
+            startedAt: day + 11 * 3_600,
+            endedAt: day + 12 * 3_600,
+            state: .ended
+        )
+        for session in [emptySession, noMeaningfulSession, meaningfulSession] {
+            try await library.store.upsertSession(session)
+        }
+        try await library.store.saveOutcome(
+            MeetingOutcome(
+                meetingID: noMeaningfulSession.id,
+                meetingTitle: noMeaningfulSession.title,
+                endedAt: noMeaningfulSession.endedAt!,
+                summary: "No meaningful discussion took place during this call."
+            ),
+            state: .ready
+        )
+        try await library.store.saveOutcome(
+            MeetingOutcome(
+                meetingID: meaningfulSession.id,
+                meetingTitle: meaningfulSession.title,
+                endedAt: meaningfulSession.endedAt!,
+                summary: "Finalized the sync architecture and storage schema."
+            ),
+            state: .ready
+        )
+        await library.refresh()
+        store.assistant.restorePersistedOutcomes(try await library.store.outcomes())
+
+        let attention = AttentionCoordinator(store: store)
+        let rendered = await present(
+            MeetingHistoryView(attention: attention),
+            size: NSSize(width: 1100, height: 700),
+            name: "hide-empty-meetings"
+        )
+        rendered.window.makeKeyAndOrderFront(nil)
+        await settle()
+
+        try assertOutcomeDayOrder(rendered, expected: [(day, ["Architecture review"])])
+        XCTAssertFalse(containsText(rendered, "Empty test join"))
+        XCTAssertFalse(containsText(rendered, "Mic check call"))
+
+        UserDefaults.standard.set(true, forKey: showEmptyKey)
+        await settle()
+        try assertOutcomeDayOrder(
+            rendered,
+            expected: [(day, ["Architecture review", "Mic check call", "Empty test join"])]
+        )
     }
 
     private func startFixtureOutcome(_ store: AttentionStore, session: MeetingSessionRecord, endedAt: Date) async throws -> MeetingOutcome {

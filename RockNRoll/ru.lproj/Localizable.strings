@@ -4180,3 +4180,7 @@
 "Using your OpenAI API key" = "Используется ваш OpenAI API-ключ";
 "Voice facilitator: %@" = "Голосовой фасилитатор: %@";
 "When Realtime voice (%@) is enabled, live meeting and microphone audio streams over WebSocket for low-latency voice replies." = "Когда Realtime-голос (%@) включён, звук встречи и микрофона передаётся в реальном времени по WebSocket для быстрых голосовых ответов.";
+"Show empty meetings" = "Показывать пустые встречи";
+"Empty meetings are hidden." = "Пустые встречи скрыты.";
+"Empty Meetings Hidden" = "Пустые встречи скрыты";
+"Empty or test meetings are hidden by default." = "Пустые и тестовые встречи скрыты по умолчанию.";

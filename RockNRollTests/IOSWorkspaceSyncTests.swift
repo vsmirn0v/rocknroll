@@ -1145,4 +1145,175 @@ final class IOSWorkspaceSyncTests: XCTestCase {
         XCTAssertNil(finished.endedAt, "Session endedAt must remain nil while another device leg is still active")
         XCTAssertEqual(finished.legs[f.roomSync.deviceID]?.transcriptChunkCount, 2)
     }
+
+    func testVisibleHistorySessionsHidesEmptyAndNonMeaningfulMeetingsByDefault() async throws {
+        let f = try await makeCoordinator(isOnline: { true })
+        let now = Date()
+
+        func makeSession(title: String, offset: TimeInterval) -> IOSMeetingSessionItem {
+            let start = now.addingTimeInterval(offset)
+            return IOSMeetingSessionItem(
+                id: UUID(),
+                occurrenceKey: "room:\(UUID().uuidString)",
+                title: title,
+                hasTitleOverride: false,
+                invitation: URL(string: "https://meet.example.com/test-\(UUID().uuidString)"),
+                roomIdentity: "https://meet.example.com/test",
+                calendarSeriesID: nil,
+                externalSeriesID: nil,
+                startedAt: start,
+                endedAt: start.addingTimeInterval(120),
+                timeZoneID: "UTC",
+                state: "ended",
+                legs: [:],
+                createdAt: start,
+                updatedAt: start
+            )
+        }
+
+        let emptySession = makeSession(title: "Empty test join", offset: -700)
+        let trivialOutcomeSession = makeSession(title: "Mic check call", offset: -600)
+        let testTranscriptSession = makeSession(title: "Audio check 1 2 3", offset: -500)
+        let realSummarySession = makeSession(title: "Release sync", offset: -400)
+        let notesOnlySession = makeSession(title: "1:1 notes", offset: -300)
+        let tasksOnlySession = makeSession(title: "Task review", offset: -200)
+        let substantiveTranscriptSession = makeSession(title: "Architecture chat", offset: -100)
+
+        for session in [
+            emptySession,
+            trivialOutcomeSession,
+            testTranscriptSession,
+            realSummarySession,
+            notesOnlySession,
+            tasksOnlySession,
+            substantiveTranscriptSession,
+        ] {
+            try await f.store.upsertSession(session)
+        }
+
+        try await f.store.saveOutcome(
+            IOSMeetingOutcomeItem(
+                outcomeID: UUID(),
+                sessionID: trivialOutcomeSession.id,
+                state: "ready",
+                summary: "No meaningful discussion took place during this call.",
+                decisions: [],
+                openQuestions: [],
+                summaryEdited: false,
+                decisionsEdited: false,
+                questionsEdited: false,
+                coverageSeconds: 0,
+                writerTier: 1,
+                versions: [],
+                reviewCandidates: [],
+                updatedAt: now
+            )
+        )
+        try await f.store.saveOutcome(
+            IOSMeetingOutcomeItem(
+                outcomeID: UUID(),
+                sessionID: realSummarySession.id,
+                state: "ready",
+                summary: "Approved Q4 deployment rollout.",
+                decisions: [],
+                openQuestions: [],
+                summaryEdited: false,
+                decisionsEdited: false,
+                questionsEdited: false,
+                coverageSeconds: 60,
+                writerTier: 1,
+                versions: [],
+                reviewCandidates: [],
+                updatedAt: now
+            )
+        )
+        _ = try await f.store.saveNote(sessionID: notesOnlySession.id, markdown: "- Follow up with QA")
+        let taskOutcomeID = UUID()
+        try await f.store.saveOutcome(
+            IOSMeetingOutcomeItem(
+                outcomeID: taskOutcomeID,
+                sessionID: tasksOnlySession.id,
+                state: "ready",
+                summary: "",
+                decisions: [],
+                openQuestions: [],
+                summaryEdited: false,
+                decisionsEdited: false,
+                questionsEdited: false,
+                coverageSeconds: 30,
+                writerTier: 1,
+                versions: [],
+                reviewCandidates: [],
+                updatedAt: now
+            )
+        )
+        try await f.store.upsertTask(
+            IOSMeetingTaskItem(
+                id: UUID(),
+                sessionID: tasksOnlySession.id,
+                outcomeID: taskOutcomeID,
+                ordinal: 0,
+                text: "Verify deployment checklist",
+                owner: "Vlad",
+                assigneeID: nil,
+                dueDay: nil,
+                dueAt: nil,
+                reminderAt: nil,
+                done: false,
+                completedAt: nil,
+                updatedAt: now
+            )
+        )
+
+        let testChunk = SyncedTranscriptChunk(
+            sessionID: testTranscriptSession.id,
+            deviceID: "mac-1",
+            chunkIndex: 0,
+            sessionStartedAt: testTranscriptSession.startedAt,
+            events: [
+                SyncedTranscriptEvent(
+                    id: "t-1",
+                    kind: "transcript",
+                    occurredAt: testTranscriptSession.startedAt,
+                    speaker: "Vlad",
+                    isOwn: true,
+                    text: "test 1 2 3 hello mic",
+                    deviceID: "mac-1"
+                )
+            ]
+        )
+        let realChunk = SyncedTranscriptChunk(
+            sessionID: substantiveTranscriptSession.id,
+            deviceID: "mac-1",
+            chunkIndex: 0,
+            sessionStartedAt: substantiveTranscriptSession.startedAt,
+            events: [
+                SyncedTranscriptEvent(
+                    id: "t-2",
+                    kind: "transcript",
+                    occurredAt: substantiveTranscriptSession.startedAt,
+                    speaker: "Vlad",
+                    isOwn: true,
+                    text: "Let's finalize the database migration schedule before Friday.",
+                    deviceID: "mac-1"
+                )
+            ]
+        )
+        f.transcriptCloud.records[testChunk.id] = .chunk(testChunk)
+        f.transcriptCloud.records[realChunk.id] = .chunk(realChunk)
+        await f.workspace.reloadFromStore()
+        await f.workspace.synchronizeNow()
+
+        let filteredIDs = Set(f.workspace.visibleHistorySessions(includeEmpty: false).map(\.id))
+        XCTAssertFalse(filteredIDs.contains(emptySession.id))
+        XCTAssertFalse(filteredIDs.contains(trivialOutcomeSession.id))
+        XCTAssertFalse(filteredIDs.contains(testTranscriptSession.id))
+        XCTAssertTrue(filteredIDs.contains(realSummarySession.id))
+        XCTAssertTrue(filteredIDs.contains(notesOnlySession.id))
+        XCTAssertTrue(filteredIDs.contains(tasksOnlySession.id))
+        XCTAssertTrue(filteredIDs.contains(substantiveTranscriptSession.id))
+
+        let allIDs = Set(f.workspace.visibleHistorySessions(includeEmpty: true).map(\.id))
+        XCTAssertEqual(allIDs.count, 7)
+    }
 }

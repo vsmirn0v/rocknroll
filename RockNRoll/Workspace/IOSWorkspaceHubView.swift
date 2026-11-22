@@ -45,8 +45,13 @@ struct IOSWorkspaceHubView: View {
     @State private var renamingSession: IOSMeetingSessionItem?
     @State private var renameDraft = ""
     @State private var pendingDeleteSession: IOSMeetingSessionItem?
+    @AppStorage("ios.workspace.showEmptyMeetings") private var showEmptyMeetings = false
     @State private var searchQuery = ""
     @State private var searchHits: [IOSWorkspaceSearchHit] = []
+
+    private var visibleHistory: [IOSMeetingSessionItem] {
+        workspace.visibleHistorySessions(includeEmpty: showEmptyMeetings)
+    }
 
     init(
         workspace: IOSWorkspaceCoordinator,
@@ -92,7 +97,7 @@ struct IOSWorkspaceHubView: View {
                 if sizeClass == .regular && selectedTab != .history {
                     tabDetailContent
                         .navigationTitle(selectedTab.title)
-                } else if let selectedID = selectedSessionID ?? workspace.historySessions.first?.id {
+                } else if let selectedID = selectedSessionID ?? visibleHistory.first?.id {
                     IOSMeetingDetailView(workspace: workspace, sync: sync, sessionID: selectedID)
                 } else {
                     ContentUnavailableView(
@@ -275,6 +280,15 @@ struct IOSWorkspaceHubView: View {
     @ToolbarContentBuilder
     private var trailingHubToolbarItems: some ToolbarContent {
         ToolbarItemGroup(placement: .topBarTrailing) {
+            if selectedTab == .history || sizeClass == .regular {
+                Menu {
+                    Toggle(L("Show empty meetings"), isOn: $showEmptyMeetings)
+                } label: {
+                    Image(systemName: showEmptyMeetings ? "line.3.horizontal.decrease.circle.fill" : "line.3.horizontal.decrease.circle")
+                }
+                .accessibilityLabel(L("Show empty meetings"))
+            }
+
             if skills != nil {
                 Menu {
                     Button {
@@ -326,13 +340,22 @@ struct IOSWorkspaceHubView: View {
 
     @ViewBuilder
     private var historyList: some View {
-        let history = workspace.historySessions
-        if history.isEmpty {
+        let allHistory = workspace.historySessions
+        let history = visibleHistory
+        if allHistory.isEmpty {
             ContentUnavailableView(
                 L("No Meetings Yet"),
                 systemImage: "note.text",
                 description: Text(L("Start or join a meeting on iPhone or Mac to capture synced notes, summaries, and tasks."))
             )
+        } else if history.isEmpty {
+            ContentUnavailableView {
+                Label(L("Empty Meetings Hidden"), systemImage: "eye.slash")
+            } description: {
+                Text(L("Empty or test meetings are hidden by default."))
+            } actions: {
+                Button(L("Show empty meetings")) { showEmptyMeetings = true }
+            }
         } else {
             let openTaskCounts = workspace.tasks.reduce(into: [UUID: Int]()) { counts, task in
                 if !task.done {

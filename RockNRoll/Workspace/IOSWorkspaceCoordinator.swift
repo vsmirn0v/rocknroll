@@ -1414,6 +1414,44 @@ final class IOSWorkspaceCoordinator: ObservableObject {
         return sessions.filter { replica.workspaceDoc.resolveHistorySessionID(for: $0.id, visibleIDs: ids) == $0.id }
     }
 
+    func visibleHistorySessions(includeEmpty: Bool) -> [IOSMeetingSessionItem] {
+        let all = historySessions
+        guard !includeEmpty else { return all }
+        let visibleIDs = Set(sessions.map(\.id))
+        var sourcesByHistoryID: [UUID: [IOSMeetingSessionItem]] = [:]
+        for session in sessions {
+            let historyID = replica.workspaceDoc.resolveHistorySessionID(for: session.id, visibleIDs: visibleIDs)
+            sourcesByHistoryID[historyID, default: []].append(session)
+        }
+        let taskCountsBySession = tasks.reduce(into: [UUID: Int]()) { counts, task in
+            counts[task.sessionID, default: 0] += 1
+        }
+        let transcriptTextsBySession = replica.workspaceDoc.transcriptTextsByCanonicalSession()
+        return all.filter { session in
+            let sources = sourcesByHistoryID[session.id] ?? [session]
+            return sources.contains { src in
+                let canonicalID = replica.workspaceDoc.resolveCanonicalSessionID(for: src.id)
+                let note = notesBySession[src.id]
+                let outcome = outcomesBySession[src.id]
+                let texts = transcriptTextsBySession[canonicalID] ?? []
+                let hasFailedWithInput = (outcome?.state == "failed" || outcomeErrors[src.id] != nil) && !texts.isEmpty
+                return MeetingContentMeaningfulness.isMeaningful(
+                    MeetingMeaningfulnessInput(
+                        hasNotes: note?.isEmpty == false,
+                        notePreview: note?.markdown,
+                        outcomeSummary: outcome?.summary,
+                        decisionsCount: outcome?.decisions.count ?? 0,
+                        tasksCount: taskCountsBySession[src.id] ?? 0,
+                        openQuestionsCount: outcome?.openQuestions.count ?? 0,
+                        isGeneratingOutcome: generatingSessionIDs.contains(src.id) || outcome?.state == "pending",
+                        hasFailedOutcomeWithInput: hasFailedWithInput,
+                        transcriptTexts: texts
+                    )
+                )
+            }
+        }
+    }
+
     func linkedHistorySources(for id: UUID) -> [IOSMeetingSessionItem] {
         let ids = Set(sessions.map(\.id))
         return sessions.filter {

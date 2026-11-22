@@ -3953,3 +3953,7 @@
 "Using your OpenAI API key" = "Verwendet Ihren OpenAI-API-Schlüssel";
 "Voice facilitator: %@" = "Sprach-Moderator: %@";
 "When Realtime voice (%@) is enabled, live meeting and microphone audio streams over WebSocket for low-latency voice replies." = "Wenn Realtime-Stimme (%@) aktiviert ist, werden Live-Meeting- und Mikrofon-Audio per WebSocket für Sprachantworten mit geringer Latenz gestreamt.";
+"Show empty meetings" = "Leere Meetings anzeigen";
+"Empty meetings are hidden." = "Leere Meetings sind ausgeblendet.";
+"Empty Meetings Hidden" = "Leere Meetings ausgeblendet";
+"Empty or test meetings are hidden by default." = "Leere oder Test-Meetings sind standardmäßig ausgeblendet.";

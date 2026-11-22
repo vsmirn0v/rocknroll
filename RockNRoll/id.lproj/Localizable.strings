@@ -3953,3 +3953,7 @@
 "Using your OpenAI API key" = "Menggunakan kunci OpenAI API Anda";
 "Voice facilitator: %@" = "Fasilitator suara: %@";
 "When Realtime voice (%@) is enabled, live meeting and microphone audio streams over WebSocket for low-latency voice replies." = "Saat suara Realtime (%@) aktif, audio rapat langsung dan mikrofon dialirkan melalui WebSocket untuk balasan suara berlatensi rendah.";
+"Show empty meetings" = "Tampilkan rapat kosong";
+"Empty meetings are hidden." = "Rapat kosong disembunyikan.";
+"Empty Meetings Hidden" = "Rapat Kosong Disembunyikan";
+"Empty or test meetings are hidden by default." = "Rapat kosong atau uji coba disembunyikan secara default.";

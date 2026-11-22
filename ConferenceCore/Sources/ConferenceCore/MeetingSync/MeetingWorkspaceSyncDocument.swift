@@ -586,6 +586,20 @@ public struct MeetingWorkspaceSyncDocument: Codable, Equatable, Sendable {
         return TranscriptMergeEngine.merge(chunks: Array(chunks))
     }
 
+    public func transcriptTextsByCanonicalSession() -> [UUID: [String]] {
+        var result: [UUID: [String]] = [:]
+        for chunk in transcriptChunks.values where !chunk.isDeleted {
+            let sid = resolveCanonicalSessionID(for: chunk.sessionID)
+            for event in chunk.events where event.kind == "transcript" || event.kind == "chat" {
+                let text = event.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !text.isEmpty {
+                    result[sid, default: []].append(text)
+                }
+            }
+        }
+        return result
+    }
+
     public var allLibraryRecords: [MeetingLibrarySyncRecord] {
         var records: [MeetingLibrarySyncRecord] = []
         records.append(contentsOf: sessions.values.map { .session($0) })

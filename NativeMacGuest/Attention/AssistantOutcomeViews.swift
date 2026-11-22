@@ -31,6 +31,7 @@ struct MeetingHistoryView: View {
     @State private var loadedArchiveID: UUID?
     private let workspace: NativeDesktopWorkspace?
     @AppStorage("native.meetingHistory.readingMode") private var readingMode = false
+    @AppStorage("native.meetingHistory.showEmptyMeetings") private var showEmptyMeetings = false
     @State private var showingGuidance = false
     @State private var showingContext = false
     @State private var showingTranscriptSources = false
@@ -77,10 +78,14 @@ struct MeetingHistoryView: View {
     private var search: String { navigation.query.trimmingCharacters(in: .whitespacesAndNewlines) }
 
     private var groups: [(key: Day, value: [MeetingLibraryCard])] {
-        let cards = historyCards.filter { card in
+        let outcomes = outcomesByID
+        let visibleCards = showEmptyMeetings
+            ? historyCards
+            : historyCards.filter { isMeaningfulCard($0, outcomesByID: outcomes) }
+        let cards = visibleCards.filter { card in
             search.isEmpty || card.title.localizedStandardContains(search) ||
                 card.notePreview?.localizedStandardContains(search) == true ||
-                data.outcomes.first(where: { $0.id == card.outcomeID })?.summary.localizedStandardContains(search) == true ||
+                card.outcomeID.flatMap { outcomes[$0] }?.summary.localizedStandardContains(search) == true ||
                 searchedEvent(card.sessionID) != nil
         }
         return Dictionary(grouping: cards) { card in
@@ -111,9 +116,46 @@ struct MeetingHistoryView: View {
         }
     }
 
+    private var outcomesByID: [UUID: MeetingOutcome] {
+        Dictionary(data.outcomes.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+    }
+
     private var historyCards: [MeetingLibraryCard] {
         _ = syncRevision
         return sourceCards.filter { (workspace?.workspaceSync.historySessionID($0.sessionID) ?? $0.sessionID) == $0.sessionID }
+    }
+
+    private var visibleHistoryCards: [MeetingLibraryCard] {
+        if showEmptyMeetings { return historyCards }
+        let outcomes = outcomesByID
+        return historyCards.filter { isMeaningfulCard($0, outcomesByID: outcomes) }
+    }
+
+    private func isMeaningfulCard(_ card: MeetingLibraryCard, outcomesByID: [UUID: MeetingOutcome]) -> Bool {
+        groupedCards(for: card.sessionID).contains { source in
+            let outcome = source.outcomeID.flatMap { outcomesByID[$0] }
+            if outcome == nil, source.outcomeID != nil,
+               source.outcomeState == .ready || source.outcomeState == .draft {
+                return true
+            }
+            let transcriptTexts = (conversation(source.sessionID)?.visibleEvents ?? []).compactMap { event -> String? in
+                guard !event.isPrivate, event.kind == .transcript || event.kind == .chat else { return nil }
+                return event.text
+            }
+            return MeetingContentMeaningfulness.isMeaningful(
+                MeetingMeaningfulnessInput(
+                    hasNotes: source.hasNotes,
+                    notePreview: source.notePreview,
+                    outcomeSummary: outcome.map { MeetingOutcomePrompt.displayText($0.summary) },
+                    decisionsCount: outcome?.decisions.count ?? 0,
+                    tasksCount: outcome?.tasks.count ?? 0,
+                    openQuestionsCount: outcome?.openQuestions.count ?? 0,
+                    isGeneratingOutcome: source.outcomeState == .pending || attention.outcomeStatus[source.sessionID] != nil,
+                    hasFailedOutcomeWithInput: source.outcomeState == .failed && source.hasOutcomeInput,
+                    transcriptTexts: transcriptTexts
+                )
+            )
+        }
     }
 
     private func groupedCards(for id: UUID) -> [MeetingLibraryCard] {
@@ -162,7 +204,7 @@ struct MeetingHistoryView: View {
         .onReceive(workspace?.workspaceSync.objectWillChange.eraseToAnyPublisher() ?? Empty().eraseToAnyPublisher()) { _ in
             syncRevision += 1
         }
-        .onChange(of: historyCards.map(\.sessionID)) { ids in
+        .onChange(of: visibleHistoryCards.map(\.sessionID)) { ids in
             if navigation.selectedSessionID == nil, !ids.isEmpty { select(groups.first?.value.first) }
         }
         .onChange(of: selectedCard?.sessionID) { _ in showingTranscriptSources = false }
@@ -280,11 +322,20 @@ struct MeetingHistoryView: View {
                     }.padding(8)
                 }
                 if groups.isEmpty {
-                    Text(search.isEmpty ? L("Meeting notes and outcomes appear here.") : L("No matching meetings"))
-                        .font(.callout).foregroundStyle(.secondary).padding()
+                    if search.isEmpty && !showEmptyMeetings && !historyCards.isEmpty {
+                        VStack(spacing: 8) {
+                            Text(L("Empty meetings are hidden."))
+                                .font(.callout).foregroundStyle(.secondary)
+                            Button(L("Show empty meetings")) { showEmptyMeetings = true }
+                        }.padding()
+                    } else {
+                        Text(search.isEmpty ? L("Meeting notes and outcomes appear here.") : L("No matching meetings"))
+                            .font(.callout).foregroundStyle(.secondary).padding()
+                    }
                 }
                 Divider()
                 Menu(L("History options")) {
+                    Toggle(L("Show empty meetings"), isOn: $showEmptyMeetings)
                     Toggle(L("Reading mode"), isOn: $readingMode)
                     Button(L("Saved guidance")) { showingGuidance = true }
                     Button(L("Export Markdown…")) { exportRequest = ExportRequest() }.disabled(library.cards.isEmpty)

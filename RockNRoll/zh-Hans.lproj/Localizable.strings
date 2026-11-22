@@ -3953,3 +3953,7 @@
 "Using your OpenAI API key" = "正在使用您的 OpenAI API 密钥";
 "Voice facilitator: %@" = "语音主持人：%@";
 "When Realtime voice (%@) is enabled, live meeting and microphone audio streams over WebSocket for low-latency voice replies." = "启用 Realtime 语音（%@）后，实时会议与麦克风音频将通过 WebSocket 传输，以提供低延迟语音回复。";
+"Show empty meetings" = "显示空会议";
+"Empty meetings are hidden." = "空会议已隐藏。";
+"Empty Meetings Hidden" = "空会议已隐藏";
+"Empty or test meetings are hidden by default." = "默认情况下会隐藏空会议或测试会议。";
