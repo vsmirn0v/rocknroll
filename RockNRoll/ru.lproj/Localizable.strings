@@ -4193,7 +4193,6 @@
 "Account credentials" = "Учётные данные";
 "Allow guests by link" = "Разрешить вход гостям по ссылке";
 "Another website…" = "Другой сайт…";
-"Auto-detect / SaluteJazz" = "Автоопределение / SaluteJazz";
 "Bearer, X-Jazz-Token, or OAuth token" = "Токен Bearer, X-Jazz-Token или OAuth";
 "Certificate label (optional)" = "Название сертификата (необязательно)";
 "Certificate passphrase" = "Пароль сертификата";
@@ -4225,7 +4224,6 @@
 "Expired" = "Истёк";
 "Expired %@" = "Истёк %@";
 "Expires %@" = "Истекает %@";
-"Guest / SaluteJazz" = "Guest / SaluteJazz";
 "Import .p12 / .pfx certificate…" = "Импортировать сертификат .p12 / .pfx…";
 "Import .p12 / .pfx…" = "Импорт .p12 / .pfx…";
 "Import or remove PKCS#12 client certificates used for mutual TLS authentication." = "Импортируйте или удаляйте клиентские сертификаты PKCS#12 для взаимной аутентификации TLS (mTLS).";
@@ -4304,3 +4302,4 @@
 "mTLS: %@ (Expired)" = "mTLS: %@ (истёк)";
 "mTLS: %@ (Expiring soon)" = "mTLS: %@ (скоро истекает)";
 "macOS Keychain identities (%ld)" = "Сертификаты Связки ключей macOS (%ld)";
+"Auto-detect" = "Автоопределение";

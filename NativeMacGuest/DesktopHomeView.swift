@@ -68,13 +68,11 @@ struct NativeDesktopHomeView: View {
         showingCreateRoom || signInSheetOrigin != nil
     }
     private var suggestedSiteOrigins: [URL] {
-        var origins = JoinDestination.guestInvitations(in: library.history.rooms).compactMap {
-            SiteOrigin.canonicalOrigin(for: $0)
-        }
-        if let custom = SiteOrigin.normalize(library.guestWebsiteOrigin) {
-            origins.insert(custom, at: 0)
-        }
-        return origins
+        SiteOrigin.suggestedOrigins(
+            rooms: library.history.rooms,
+            calendarMeetings: library.calendar.meetings,
+            fallbackOrigin: library.guestWebsiteOrigin
+        )
     }
     /// Discoveries apply immediately; only rows under the pointer or behind an
     /// open editor are held, so a card cannot move as it is clicked.
@@ -888,7 +886,7 @@ struct NativeDesktopSettingsView: View {
                         .nativeSettingAnchor("settings.display-name", nativeControlFocus: true, onFocusChange: { editingName = $0 })
                 }
                 Section(L("Guest meeting website")) {
-                    TextField("https://salutejazz.ru", text: $library.guestWebsiteOrigin).nativeSettingAnchor("settings.website", nativeControlFocus: true)
+                    TextField(L("HTTPS website address"), text: $library.guestWebsiteOrigin).nativeSettingAnchor("settings.website", nativeControlFocus: true)
                     Text(L("Used for guest invitations that contain a room code without a website.")).font(.caption).foregroundStyle(.secondary)
                 }
                 SiteAccountsSection(suggestedOrigins: suggestedOrigins, onCreateRoom: onCreateRoom)

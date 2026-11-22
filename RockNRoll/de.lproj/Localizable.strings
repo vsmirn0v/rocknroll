@@ -3966,7 +3966,6 @@
 "Account credentials" = "Anmeldedaten";
 "Allow guests by link" = "Gäste per Link zulassen";
 "Another website…" = "Andere Website…";
-"Auto-detect / SaluteJazz" = "Automatisch erkennen / SaluteJazz";
 "Bearer, X-Jazz-Token, or OAuth token" = "Bearer-, X-Jazz-Token- oder OAuth-Token";
 "Certificate label (optional)" = "Zertifikatsbezeichnung (optional)";
 "Certificate passphrase" = "Zertifikatspasswort";
@@ -3998,7 +3997,6 @@
 "Expired" = "Abgelaufen";
 "Expired %@" = "Abgelaufen %@";
 "Expires %@" = "Läuft ab %@";
-"Guest / SaluteJazz" = "Guest / SaluteJazz";
 "Import .p12 / .pfx certificate…" = ".p12- / .pfx-Zertifikat importieren…";
 "Import .p12 / .pfx…" = ".p12 / .pfx importieren…";
 "Import or remove PKCS#12 client certificates used for mutual TLS authentication." = "Importieren oder entfernen Sie PKCS#12-Client-Zertifikate für die gegenseitige TLS-Authentifizierung.";
@@ -4077,3 +4075,4 @@
 "mTLS: %@ (Expired)" = "mTLS: %@ (abgelaufen)";
 "mTLS: %@ (Expiring soon)" = "mTLS: %@ (läuft bald ab)";
 "macOS Keychain identities (%ld)" = "macOS-Schlüsselbund-Identitäten (%ld)";
+"Auto-detect" = "Automatisch erkennen";

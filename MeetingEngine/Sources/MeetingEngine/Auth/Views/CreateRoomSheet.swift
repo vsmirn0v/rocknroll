@@ -57,8 +57,6 @@ public struct CreateRoomSheet: View {
             if let url = account.originURL { candidates.append(url) }
         }
         candidates.append(contentsOf: suggestedOrigins)
-        candidates.append(URL(string: "https://salutejazz.ru")!)
-        candidates.append(SiteOrigin.telemostCanonicalOrigin)
         for url in candidates {
             guard let canonical = SiteOrigin.canonicalOrigin(for: url) else { continue }
             if seen.insert(canonical.absoluteString).inserted {
@@ -163,7 +161,7 @@ public struct CreateRoomSheet: View {
                     .keyboardType(.URL)
                     #endif
                 Picker(L("Service"), selection: $selectedEngineOverride) {
-                    Text(L("Auto-detect / SaluteJazz")).tag(MeetingEngineKind?.none)
+                    Text(L("Auto-detect")).tag(MeetingEngineKind?.none)
                     Text(SiteAuthEngineLabel.title(for: .trueconf)).tag(MeetingEngineKind?.some(.trueconf))
                     Text(SiteAuthEngineLabel.title(for: .telemost)).tag(MeetingEngineKind?.some(.telemost))
                 }
@@ -328,6 +326,8 @@ public struct CreateRoomSheet: View {
                 customOriginText = preferred.absoluteString
                 selectedOriginString = availableSites.first?.absoluteString ?? ""
             }
+        } else if availableSites.isEmpty {
+            useCustomOrigin = true
         }
     }
 

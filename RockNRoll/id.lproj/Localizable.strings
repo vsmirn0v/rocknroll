@@ -3966,7 +3966,6 @@
 "Account credentials" = "Kredensial akun";
 "Allow guests by link" = "Izinkan tamu melalui tautan";
 "Another website…" = "Situs web lain…";
-"Auto-detect / SaluteJazz" = "Deteksi otomatis / SaluteJazz";
 "Bearer, X-Jazz-Token, or OAuth token" = "Token Bearer, X-Jazz-Token, atau OAuth";
 "Certificate label (optional)" = "Label sertifikat (opsional)";
 "Certificate passphrase" = "Frasa sandi sertifikat";
@@ -3998,7 +3997,6 @@
 "Expired" = "Kedaluwarsa";
 "Expired %@" = "Kedaluwarsa %@";
 "Expires %@" = "Berakhir %@";
-"Guest / SaluteJazz" = "Guest / SaluteJazz";
 "Import .p12 / .pfx certificate…" = "Impor sertifikat .p12 / .pfx…";
 "Import .p12 / .pfx…" = "Impor .p12 / .pfx…";
 "Import or remove PKCS#12 client certificates used for mutual TLS authentication." = "Impor atau hapus sertifikat klien PKCS#12 yang digunakan untuk autentikasi TLS timbal balik.";
@@ -4077,3 +4075,4 @@
 "mTLS: %@ (Expired)" = "mTLS: %@ (Kedaluwarsa)";
 "mTLS: %@ (Expiring soon)" = "mTLS: %@ (Segera berakhir)";
 "macOS Keychain identities (%ld)" = "Identitas Keychain macOS (%ld)";
+"Auto-detect" = "Deteksi otomatis";

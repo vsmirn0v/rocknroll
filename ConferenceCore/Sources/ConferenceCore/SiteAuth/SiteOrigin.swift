@@ -85,6 +85,55 @@ public enum SiteOrigin {
         let suffix = registrableSuffix(of: rhs)
         return suffix.contains(".") && registrableSuffix(of: lhs) == suffix
     }
+
+    /// Combines unique canonical HTTPS origins from user-configured fallback website,
+    /// starred favorites, calendar invitations, and recent meeting history (excluding community jam hosts).
+    public static func suggestedOrigins(
+        rooms: [RecentRoom],
+        calendarMeetings: [CalendarMeeting] = [],
+        fallbackOrigin: String? = nil
+    ) -> [URL] {
+        var result: [URL] = []
+        var seen = Set<String>()
+
+        func appendOrigin(_ url: URL?, explicitEngine: MeetingEngineKind?) {
+            guard let url, explicitEngine != .community else { return }
+            if explicitEngine == nil, (try? JamTarget.parse(url.absoluteString)) != nil {
+                return
+            }
+            guard let canonical = canonicalOrigin(for: url) else { return }
+            if canonical.host?.lowercased() == "rock.glowsoft.ru" {
+                return
+            }
+            if seen.insert(canonical.absoluteString).inserted {
+                result.append(canonical)
+            }
+        }
+
+        if let fallbackOrigin, let normalized = normalize(fallbackOrigin) {
+            appendOrigin(normalized, explicitEngine: nil)
+        }
+        for room in rooms where room.isStarred {
+            appendOrigin(room.joinURL, explicitEngine: room.engine)
+            appendOrigin(room.invitationURL, explicitEngine: room.engine)
+        }
+        for meeting in calendarMeetings where meeting.engine != .community {
+            appendOrigin(meeting.invitation, explicitEngine: meeting.engine)
+            for link in meeting.links {
+                if let tc = try? TrueConfTarget.parse(link.absoluteString) {
+                    appendOrigin(tc.originURL, explicitEngine: .trueconf)
+                } else if let parsed = try? JoinDestination.parse(link.absoluteString) {
+                    if case .jam = parsed { continue }
+                    appendOrigin(parsed.invitationURL, explicitEngine: nil)
+                }
+            }
+        }
+        for room in rooms where !room.isStarred {
+            appendOrigin(room.joinURL, explicitEngine: room.engine)
+            appendOrigin(room.invitationURL, explicitEngine: room.engine)
+        }
+        return result
+    }
 }
 
 /// Lightweight, signature-agnostic JWT payload inspector for display name, subject, and expiry.

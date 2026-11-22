@@ -3966,7 +3966,6 @@
 "Account credentials" = "账户凭据";
 "Allow guests by link" = "允许访客通过链接加入";
 "Another website…" = "其他网站…";
-"Auto-detect / SaluteJazz" = "自动识别 / SaluteJazz";
 "Bearer, X-Jazz-Token, or OAuth token" = "Bearer、X-Jazz-Token 或 OAuth 令牌";
 "Certificate label (optional)" = "证书名称（可选）";
 "Certificate passphrase" = "证书密码";
@@ -3998,7 +3997,6 @@
 "Expired" = "已过期";
 "Expired %@" = "已于 %@ 过期";
 "Expires %@" = "将于 %@ 到期";
-"Guest / SaluteJazz" = "Guest / SaluteJazz";
 "Import .p12 / .pfx certificate…" = "导入 .p12 / .pfx 证书…";
 "Import .p12 / .pfx…" = "导入 .p12 / .pfx…";
 "Import or remove PKCS#12 client certificates used for mutual TLS authentication." = "导入或移除用于双向 TLS（mTLS）身份验证的 PKCS#12 客户端证书。";
@@ -4077,3 +4075,4 @@
 "mTLS: %@ (Expired)" = "mTLS：%@（已过期）";
 "mTLS: %@ (Expiring soon)" = "mTLS：%@（即将过期）";
 "macOS Keychain identities (%ld)" = "macOS 钥匙串身份（%ld）";
+"Auto-detect" = "自动识别";

@@ -32,7 +32,7 @@ enum SiteAuthClipboard {
 enum SiteAuthEngineLabel {
     static func title(for engine: MeetingEngineKind) -> String {
         switch engine {
-        case .guest: return L("Guest / SaluteJazz")
+        case .guest: return L("Guest meeting")
         case .trueconf: return L("TrueConf Server")
         case .telemost: return L("Yandex Telemost")
         case .community: return L("Rock Jam")

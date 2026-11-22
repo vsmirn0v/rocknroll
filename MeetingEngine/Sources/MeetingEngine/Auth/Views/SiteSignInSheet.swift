@@ -79,10 +79,7 @@ public struct SiteSignInSheet: View {
     private var quickOrigins: [URL] {
         var list: [URL] = []
         var seen = Set<String>()
-        let defaults = suggestedOrigins + store.accounts.compactMap(\.originURL) + [
-            URL(string: "https://salutejazz.ru")!,
-            SiteOrigin.telemostCanonicalOrigin
-        ]
+        let defaults = store.accounts.compactMap(\.originURL) + suggestedOrigins
         for url in defaults {
             guard let canonical = SiteOrigin.canonicalOrigin(for: url) else { continue }
             if seen.insert(canonical.absoluteString).inserted {

@@ -105,6 +105,62 @@ final class SiteAuthModelsTests: XCTestCase {
         XCTAssertTrue(target.supportsBrowser(in: noGuestPayload, allowAuthenticated: true))
     }
 
+    func testSuggestedOriginsDerivedFromUserDataWithoutPrefilledDomains() {
+        XCTAssertTrue(SiteOrigin.suggestedOrigins(rooms: [], calendarMeetings: [], fallbackOrigin: nil).isEmpty)
+        XCTAssertTrue(SiteOrigin.suggestedOrigins(rooms: [], calendarMeetings: [], fallbackOrigin: "   ").isEmpty)
+        XCTAssertTrue(SiteOrigin.suggestedOrigins(rooms: [], calendarMeetings: [], fallbackOrigin: "https://rock.glowsoft.ru").isEmpty)
+
+        let now = Date()
+        var communityRoom = RecentRoom(
+            invitationURL: URL(string: "https://rock.glowsoft.ru/jams/test")!,
+            title: "Practice",
+            identifier: "test",
+            isStarred: true,
+            lastJoined: now
+        )
+        communityRoom.engine = .community
+
+        let favoriteRoom = RecentRoom(
+            invitationURL: URL(string: "https://meet.corp.example/calls/fav1?psw=1")!,
+            title: "Fav",
+            identifier: "fav1",
+            isStarred: true,
+            lastJoined: now
+        )
+        let recentTelemost = RecentRoom(
+            invitationURL: URL(string: "https://telemost.360.yandex.ru/j/999")!,
+            title: "Sync",
+            identifier: "999",
+            isStarred: false,
+            lastJoined: now.addingTimeInterval(-60)
+        )
+        let calendarEvent = CalendarMeeting(
+            id: "ev1",
+            seriesID: "s1",
+            calendarID: "c1",
+            calendarTitle: "Work",
+            title: "Standup",
+            start: now,
+            end: now.addingTimeInterval(1800),
+            links: [URL(string: "https://tc.example.org/c/standup")!]
+        )
+
+        let origins = SiteOrigin.suggestedOrigins(
+            rooms: [communityRoom, recentTelemost, favoriteRoom],
+            calendarMeetings: [calendarEvent],
+            fallbackOrigin: "jazz.internal.example"
+        )
+        XCTAssertEqual(
+            origins.map(\.absoluteString),
+            [
+                "https://jazz.internal.example",
+                "https://meet.corp.example",
+                "https://tc.example.org",
+                "https://telemost.yandex.ru"
+            ]
+        )
+    }
+
     private func base64URL(_ data: Data) -> String {
         data.base64EncodedString()
             .replacingOccurrences(of: "+", with: "-")

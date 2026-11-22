@@ -81,13 +81,11 @@ struct JoinView: View {
     private var favorites: [RecentRoom] { history.rooms.filter(\.isStarred) }
     private var recent: [RecentRoom] { history.rooms.filter { !$0.isStarred } }
     private var suggestedSiteOrigins: [URL] {
-        var origins = JoinDestination.guestInvitations(in: history.rooms).compactMap {
-            SiteOrigin.canonicalOrigin(for: $0)
-        }
-        if let custom = SiteOrigin.normalize(model.guestWebsiteOrigin) {
-            origins.insert(custom, at: 0)
-        }
-        return origins
+        SiteOrigin.suggestedOrigins(
+            rooms: history.rooms,
+            calendarMeetings: calendar.meetings,
+            fallbackOrigin: model.guestWebsiteOrigin
+        )
     }
 
     private func homeFold(in window: GeometryProxy) -> CallFold? {
