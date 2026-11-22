@@ -192,6 +192,10 @@ public struct AssistantSkillRepository: Sendable {
     private static func fileStamp(for url: URL) -> FileStamp? {
         var st = Darwin.stat()
         guard Darwin.lstat(url.path, &st) == 0 else { return nil }
+        if (st.st_mode & S_IFMT) == S_IFLNK {
+            let resolved = url.resolvingSymlinksInPath().path
+            guard Darwin.lstat(resolved, &st) == 0 else { return nil }
+        }
         return FileStamp(
             sec: st.st_mtimespec.tv_sec,
             nsec: st.st_mtimespec.tv_nsec,

@@ -65,12 +65,12 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
             return lastTurnAllowWrites
         }
 
-        func shouldAcceptAudio(isLocal: Bool) -> Bool {
+        func shouldAcceptAudio(isLocal: Bool, externalVoiceReplyInFlight: Bool = false) -> Bool {
             let now = Date()
             lock.lock()
             defer { lock.unlock() }
             if isLocal {
-                if voiceDeliveryInFlight { return false }
+                if voiceDeliveryInFlight || externalVoiceReplyInFlight { return false }
                 if let ended = lastVoiceDeliveryEndedAt, now.timeIntervalSince(ended) < 1.5 {
                     return false
                 }
@@ -613,6 +613,11 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
             }
         )
         state.connected = await state.router.isRealtimeConnected
+        guard realtimeSessions[controllerID] === state else {
+            await state.router.stop()
+            syncRealtimeActiveFlag()
+            return
+        }
         if state.connected {
             attachAudioTap(controllerID: controllerID, state: state, targetSampleRate: targetInputRate)
         }
@@ -622,6 +627,7 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
     private func attachAudioTap(controllerID: UUID, state: SessionRealtimeState, targetSampleRate: Int) {
         let router = state.router
         let gate = state.gate
+        let externalVoiceCheck = resolveBridge(controllerID)?.isVoiceReplyInFlightNonisolated
         let coalescer = RealtimeAudioCoalescer(
             inputSampleRate: 16_000,
             targetSampleRate: targetSampleRate,
@@ -637,7 +643,9 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
         }
         resolveBridge(controllerID)?.setRealtimeAudioTap { [weak gate] streamID, pcm in
             guard let gate else { return }
-            guard gate.shouldAcceptAudio(isLocal: streamID == "local") else { return }
+            let isLocal = (streamID == "local")
+            let externalInFlight = isLocal && (externalVoiceCheck?() == true)
+            guard gate.shouldAcceptAudio(isLocal: isLocal, externalVoiceReplyInFlight: externalInFlight) else { return }
             coalescer.append(trackID: streamID, pcm16: pcm)
         }
     }

@@ -121,8 +121,21 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
     private var providerCanManageTranscript = false
     private var didAutoStartLocalTranscription = false
     private var assistantTranscriptionConsumers: Set<String> = []
-    private var voiceReplyTask: Task<Void, Error>?
+    private var voiceReplyTask: Task<Void, Error>? {
+        didSet {
+            voiceReplyLock.lock()
+            voiceReplyInFlightFlag = (voiceReplyTask != nil)
+            voiceReplyLock.unlock()
+        }
+    }
+    private let voiceReplyLock = NSLock()
+    nonisolated(unsafe) private var voiceReplyInFlightFlag = false
     var isVoiceReplyInFlight: Bool { voiceReplyTask != nil }
+    nonisolated func isVoiceReplyInFlightThreadSafe() -> Bool {
+        voiceReplyLock.lock()
+        defer { voiceReplyLock.unlock() }
+        return voiceReplyInFlightFlag
+    }
     private var assistantHUDContext: (talk: IOSAssistantTalkController, speech: IOSAssistantSpeechCoordinator)?
     private var micActiveStart: Date?
     private var micActiveIntervals: [DateInterval] = []

@@ -92,6 +92,10 @@ import SwiftUI
     deinit {
         holdLimit?.cancel()
         auditionTask?.cancel()
+        warmRealtimeIdleTask?.cancel()
+        if let router = warmRealtimeRouter {
+            Task { await router.stop() }
+        }
         if let carbonHotKey { UnregisterEventHotKey(carbonHotKey) }
         if let carbonHandler { RemoveEventHandler(carbonHandler) }
         for monitor in monitors { NSEvent.removeMonitor(monitor) }

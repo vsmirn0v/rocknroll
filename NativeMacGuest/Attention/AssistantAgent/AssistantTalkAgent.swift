@@ -115,8 +115,11 @@ extension AssistantTalkController {
         final class Collector {
             let auditionID = UUID()
             var pendingPCM = Data()
+            var sampleRate: Double = 24_000
             var streamingToken: UUID?
             var didPlayAnyAudio = false
+            var didFinishStreaming = false
+            var receivedToolCall = false
             var transcript = ""
             var finished = false
             var failed = false
@@ -139,10 +142,15 @@ extension AssistantTalkController {
                 await MainActor.run { [weak self, weak collector] in
                     guard let collector else { return }
                     switch event {
+                    case .toolCall:
+                        collector.receivedToolCall = true
                     case .audioPCM16(let pcm, let sampleRate):
+                        if sampleRate > 0 {
+                            collector.sampleRate = Double(sampleRate)
+                        }
                         collector.pendingPCM.append(pcm)
                         if collector.streamingToken == nil, collector.pendingPCM.count >= streamPreBufferBytes {
-                            if let self, let token = try? self.beginStreamingAudition(id: collector.auditionID, sampleRate: Double(sampleRate)) {
+                            if let self, let token = try? self.beginStreamingAudition(id: collector.auditionID, sampleRate: collector.sampleRate) {
                                 collector.streamingToken = token
                                 collector.didPlayAnyAudio = true
                             }
@@ -152,7 +160,7 @@ extension AssistantTalkController {
                             if alignedBytes > 0 {
                                 let slice = collector.pendingPCM.prefix(alignedBytes)
                                 collector.pendingPCM.removeFirst(alignedBytes)
-                                if let buffer = RealtimeVoiceAudio.pcm16ToAudioBuffer(data: Data(slice), sampleRate: Double(sampleRate)) {
+                                if let buffer = RealtimeVoiceAudio.pcm16ToAudioBuffer(data: Data(slice), sampleRate: collector.sampleRate) {
                                     VoicePreviewPlayer.shared.enqueueStreamBuffer(buffer, sessionToken: token)
                                 }
                             }
@@ -162,12 +170,17 @@ extension AssistantTalkController {
                     case .assistantTranscriptDone(let full):
                         collector.transcript = full
                     case .audioDone:
+                        if collector.receivedToolCall && collector.transcript.trimmed.isEmpty && collector.pendingPCM.isEmpty && !collector.didPlayAnyAudio {
+                            collector.receivedToolCall = false
+                            break
+                        }
                         if let token = collector.streamingToken {
                             if collector.pendingPCM.count >= 2,
-                               let tailBuffer = RealtimeVoiceAudio.pcm16ToAudioBuffer(data: collector.pendingPCM, sampleRate: 24_000) {
+                               let tailBuffer = RealtimeVoiceAudio.pcm16ToAudioBuffer(data: collector.pendingPCM, sampleRate: collector.sampleRate) {
                                 collector.pendingPCM.removeAll()
                                 VoicePreviewPlayer.shared.enqueueStreamBuffer(tailBuffer, sessionToken: token)
                             }
+                            collector.didFinishStreaming = true
                             VoicePreviewPlayer.shared.finishStreaming(sessionToken: token)
                         }
                         collector.complete(failed: false)
@@ -250,7 +263,8 @@ extension AssistantTalkController {
         timeoutTask.cancel()
         await router.waitForPendingToolCalls(timeoutSeconds: 3.0)
         sinkBox.setHandlers(onEvent: nil, executeTool: nil)
-        if collector.failed || Task.isCancelled {
+        let timedOut = !collector.finished && !collector.failed && !Task.isCancelled
+        if collector.failed || timedOut || Task.isCancelled {
             await stopWarmRealtimeRouter()
         } else {
             scheduleWarmRealtimeIdleDisconnect()
@@ -262,12 +276,22 @@ extension AssistantTalkController {
             return false
         }
 
+        if let token = collector.streamingToken, !collector.didFinishStreaming {
+            if collector.pendingPCM.count >= 2,
+               let tailBuffer = RealtimeVoiceAudio.pcm16ToAudioBuffer(data: collector.pendingPCM, sampleRate: collector.sampleRate) {
+                collector.pendingPCM.removeAll()
+                VoicePreviewPlayer.shared.enqueueStreamBuffer(tailBuffer, sessionToken: token)
+            }
+            collector.didFinishStreaming = true
+            VoicePreviewPlayer.shared.finishStreaming(sessionToken: token)
+        }
+
         let displayAnswer = text.isEmpty ? L("Spoken response played.") : text
         let messageID = agentRuntime.appendDeterministicTurnForUI(userText: input, assistantText: displayAnswer)
         lastVoiceAnswer = displayAnswer
         if !collector.didPlayAnyAudio {
             if !collector.pendingPCM.isEmpty,
-               let buffer = AutonomousMeetingFacilitator.pcm16ToAudioBuffer(data: collector.pendingPCM, sampleRate: 24_000) {
+               let buffer = AutonomousMeetingFacilitator.pcm16ToAudioBuffer(data: collector.pendingPCM, sampleRate: collector.sampleRate) {
                 do {
                     try playAuditionBuffer(buffer, id: messageID)
                 } catch {

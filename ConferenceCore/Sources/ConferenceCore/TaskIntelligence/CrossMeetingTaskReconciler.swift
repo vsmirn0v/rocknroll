@@ -759,34 +759,42 @@ public enum CrossMeetingTaskReconciler {
             for item in preparedExisting {
                 let keyMatched = !item.keys.isEmpty && !item.keys.isDisjoint(with: candidateKeys)
                 var score: Double
-                if item.matchesDiscussion {
-                    score = 0.90
-                } else if keyMatched {
+                if keyMatched {
                     score = 1.0
-                } else if candidateTokens.isDisjoint(with: item.tokens) {
-                    continue
                 } else {
-                    if candidateTrigrams == nil {
-                        candidateTrigrams = trigrams(candidate.text)
+                    let computed: Double
+                    if !candidateTokens.isDisjoint(with: item.tokens) {
+                        if candidateTrigrams == nil {
+                            candidateTrigrams = trigrams(candidate.text)
+                        }
+                        let existingTris = existingTrigramsByID[item.existing.id] ?? {
+                            let t = trigrams(item.existing.text)
+                            existingTrigramsByID[item.existing.id] = t
+                            return t
+                        }()
+                        computed = matchScore(
+                            candidate: candidate,
+                            candidateKeys: candidateKeys,
+                            candidateTokens: candidateTokens,
+                            candidateTrigrams: candidateTrigrams,
+                            existing: item.existing,
+                            existingKeys: item.keys,
+                            existingTokens: item.tokens,
+                            existingTrigrams: existingTris,
+                            currentSeriesID: seriesID,
+                            currentRoomIdentity: roomIdentity,
+                            myAliases: myAliases
+                        )
+                    } else {
+                        computed = 0.0
                     }
-                    let existingTris = existingTrigramsByID[item.existing.id] ?? {
-                        let t = trigrams(item.existing.text)
-                        existingTrigramsByID[item.existing.id] = t
-                        return t
-                    }()
-                    score = matchScore(
-                        candidate: candidate,
-                        candidateKeys: candidateKeys,
-                        candidateTokens: candidateTokens,
-                        candidateTrigrams: candidateTrigrams,
-                        existing: item.existing,
-                        existingKeys: item.keys,
-                        existingTokens: item.tokens,
-                        existingTrigrams: existingTris,
-                        currentSeriesID: seriesID,
-                        currentRoomIdentity: roomIdentity,
-                        myAliases: myAliases
-                    )
+                    if item.matchesDiscussion {
+                        score = max(0.90, computed)
+                    } else if candidateTokens.isDisjoint(with: item.tokens) {
+                        continue
+                    } else {
+                        score = computed
+                    }
                 }
                 if let currentBest = bestMatch {
                     if score > currentBest.score {

@@ -235,6 +235,8 @@ public actor TranscriptArchiveStore {
         indexCache = parsed
     }
 
+    private static let formatterLock = NSLock()
+
     private static let monthFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
@@ -262,8 +264,9 @@ public actor TranscriptArchiveStore {
     ) throws {
         let fm = FileManager.default
         let referenceDate = startedAt == .distantPast ? (endedAt ?? Date()) : startedAt
-        let monthFolder = monthFormatter.string(from: referenceDate)
-        let dayPrefix = dayFormatter.string(from: referenceDate)
+        let (monthFolder, dayPrefix) = formatterLock.withLock {
+            (monthFormatter.string(from: referenceDate), dayFormatter.string(from: referenceDate))
+        }
         let folder = root.appendingPathComponent(monthFolder, isDirectory: true)
         try fm.createDirectory(at: folder, withIntermediateDirectories: true)
 
@@ -371,19 +374,21 @@ public actor TranscriptArchiveStore {
         startedAt: Date,
         events: [SyncedTranscriptEvent]
     ) -> String {
-        let clock = isoDateFormatter
-        var lines = ["# " + title, ""]
-        if startedAt != .distantPast {
-            lines.append("Started: \(clock.string(from: startedAt))")
-            lines.append("")
+        formatterLock.withLock {
+            let clock = isoDateFormatter
+            var lines = ["# " + title, ""]
+            if startedAt != .distantPast {
+                lines.append("Started: \(clock.string(from: startedAt))")
+                lines.append("")
+            }
+            for event in events where !event.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                let stamp = clock.string(from: event.occurredAt)
+                let speaker = (event.speaker?.isEmpty == false ? event.speaker! : (event.isOwn ? "You" : "Participant"))
+                let tag = event.kind == "chat" ? " [chat]" : ""
+                lines.append("- **\(speaker)**\(tag) (\(stamp)): \(event.text)")
+            }
+            return lines.joined(separator: "\n") + "\n"
         }
-        for event in events where !event.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            let stamp = clock.string(from: event.occurredAt)
-            let speaker = (event.speaker?.isEmpty == false ? event.speaker! : (event.isOwn ? "You" : "Participant"))
-            let tag = event.kind == "chat" ? " [chat]" : ""
-            lines.append("- **\(speaker)**\(tag) (\(stamp)): \(event.text)")
-        }
-        return lines.joined(separator: "\n") + "\n"
     }
 
     private static func sanitizeSlug(_ title: String) -> String {

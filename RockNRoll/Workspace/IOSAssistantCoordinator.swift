@@ -198,6 +198,7 @@ struct IOSAssistantSessionBridge {
     var ensureFacilitatorTranscription: @MainActor () async -> Void = {}
     var releaseFacilitatorTranscription: @MainActor () async -> Void = {}
     var isVoiceReplyInFlight: @MainActor () -> Bool = { false }
+    var isVoiceReplyInFlightNonisolated: (@Sendable () -> Bool)? = nil
     var setRealtimeAudioTap: @MainActor ((@Sendable (String, Data) -> Void)?) -> Void = { _ in }
     var sendChat: @MainActor (String) async throws -> Void
     var speakVoice: @MainActor (String) async throws -> Void

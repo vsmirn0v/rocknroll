@@ -219,61 +219,61 @@ final class RealtimeVoiceProtocolTests: XCTestCase {
         XCTAssertEqual(firstBatch.count, upsampled24k.count * 3)
     }
 
-    func testNonBlockingRealtimeRouterToolCalls() async {
-        final class FakeTransport: @unchecked Sendable, RealtimeVoiceTransport {
-            private let continuation: AsyncStream<RealtimeVoiceEvent>.Continuation
-            let events: AsyncStream<RealtimeVoiceEvent>
-            var sentToolResults: [(String, String, String)] = []
+    private final class FakeRealtimeTransport: @unchecked Sendable, RealtimeVoiceTransport {
+        private let continuation: AsyncStream<RealtimeVoiceEvent>.Continuation
+        let events: AsyncStream<RealtimeVoiceEvent>
+        var sentToolResults: [(String, String, String)] = []
 
-            init() {
-                var cont: AsyncStream<RealtimeVoiceEvent>.Continuation!
-                self.events = AsyncStream { cont = $0 }
-                self.continuation = cont
-            }
-
-            func connect(config: RealtimeSessionConfig) async throws {
-                continuation.yield(.connected)
-            }
-            func emit(_ event: RealtimeVoiceEvent) { continuation.yield(event) }
-            func sendAudioPCM16(_ data: Data) async throws {}
-            func sendTextTurn(_ text: String) async throws {}
-            func sendToolResult(callID: String, name: String, jsonOutput: String) async throws {
-                sentToolResults.append((callID, name, jsonOutput))
-            }
-            func updateInstructions(_ instructions: String) async throws {}
-            func disconnect() async { continuation.yield(.disconnected(nil)) }
+        init() {
+            var cont: AsyncStream<RealtimeVoiceEvent>.Continuation!
+            self.events = AsyncStream { cont = $0 }
+            self.continuation = cont
         }
 
-        final class GateBox: @unchecked Sendable {
-            private let lock = NSLock()
-            private var continuation: CheckedContinuation<Void, Never>?
-            private var released = false
+        func connect(config: RealtimeSessionConfig) async throws {
+            continuation.yield(.connected)
+        }
+        func emit(_ event: RealtimeVoiceEvent) { continuation.yield(event) }
+        func sendAudioPCM16(_ data: Data) async throws {}
+        func sendTextTurn(_ text: String) async throws {}
+        func sendToolResult(callID: String, name: String, jsonOutput: String) async throws {
+            sentToolResults.append((callID, name, jsonOutput))
+        }
+        func updateInstructions(_ instructions: String) async throws {}
+        func disconnect() async { continuation.yield(.disconnected(nil)) }
+    }
 
-            func wait() async {
-                await withCheckedContinuation { cont in
-                    lock.lock()
-                    if released {
-                        lock.unlock()
-                        cont.resume()
-                    } else {
-                        continuation = cont
-                        lock.unlock()
-                    }
+    private final class AsyncGateBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var continuation: CheckedContinuation<Void, Never>?
+        private var released = false
+
+        func wait() async {
+            await withCheckedContinuation { cont in
+                lock.lock()
+                if released {
+                    lock.unlock()
+                    cont.resume()
+                } else {
+                    continuation = cont
+                    lock.unlock()
                 }
             }
-
-            func release() {
-                lock.lock()
-                released = true
-                let cont = continuation
-                continuation = nil
-                lock.unlock()
-                cont?.resume()
-            }
         }
 
-        let fake = FakeTransport()
-        let gate = GateBox()
+        func release() {
+            lock.lock()
+            released = true
+            let cont = continuation
+            continuation = nil
+            lock.unlock()
+            cont?.resume()
+        }
+    }
+
+    func testNonBlockingRealtimeRouterToolCalls() async {
+        let fake = FakeRealtimeTransport()
+        let gate = AsyncGateBox()
         let toolStarted = expectation(description: "tool started")
         let audioDeliveredEarly = expectation(description: "audio delivered while tool suspended")
         let toolCompleted = expectation(description: "tool completed after release")
@@ -306,6 +306,49 @@ final class RealtimeVoiceProtocolTests: XCTestCase {
         try? await Task.sleep(for: .milliseconds(50))
         XCTAssertEqual(fake.sentToolResults.count, 1)
         XCTAssertEqual(fake.sentToolResults.first?.0, "slow-1")
+        await router.stop()
+    }
+
+    func testFloatSamplesToPCM16HandlesNonFiniteSamples() {
+        let data = RealtimeVoiceAudio.floatSamplesToPCM16Data([.nan, .infinity, -.infinity, 0.5])
+        XCTAssertEqual(data.count, 8)
+        let samples: [Int16] = (0..<4).map { idx in
+            let low = UInt16(data[idx * 2])
+            let high = UInt16(data[idx * 2 + 1]) << 8
+            return Int16(bitPattern: low | high)
+        }
+        XCTAssertEqual(samples[0], 0)
+        XCTAssertEqual(samples[1], 0)
+        XCTAssertEqual(samples[2], 0)
+        XCTAssertEqual(samples[3], Int16((0.5 * Float(Int16.max)).rounded()))
+    }
+
+    func testWaitForPendingToolCallsHonorsTimeoutWhenToolHangs() async {
+        let fake = FakeRealtimeTransport()
+        let gate = AsyncGateBox()
+        let toolStarted = expectation(description: "hanging tool started")
+        let router = RealtimeVoiceRouter()
+
+        await router.start(
+            config: RealtimeSessionConfig(provider: .openAIRealtime, apiKey: "sk-test"),
+            customTransport: fake,
+            executeTool: { _, _ in
+                toolStarted.fulfill()
+                await gate.wait()
+                return "{\"ok\":true}"
+            },
+            onEvent: { _ in }
+        )
+
+        fake.emit(.toolCall(callID: "hang-1", name: "rocknroll_search", argumentsJSON: "{}"))
+        await fulfillment(of: [toolStarted], timeout: 2.0)
+
+        let startedAt = ContinuousClock.now
+        await router.waitForPendingToolCalls(timeoutSeconds: 0.15)
+        let elapsed = ContinuousClock.now - startedAt
+        XCTAssertLessThan(elapsed, .seconds(1))
+
+        gate.release()
         await router.stop()
     }
 }

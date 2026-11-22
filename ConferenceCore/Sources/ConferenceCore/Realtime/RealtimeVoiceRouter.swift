@@ -70,7 +70,7 @@ public enum RealtimeVoiceAudio {
                 let outPtr = outBase.assumingMemoryBound(to: Int16.self)
                 for i in 0..<count {
                     let s = samples[i]
-                    let clamped = s < -1.0 ? -1.0 : (s > 1.0 ? 1.0 : s)
+                    let clamped: Float = s.isFinite ? (s < -1.0 ? -1.0 : (s > 1.0 ? 1.0 : s)) : 0.0
                     outPtr[i] = Int16((clamped * scale).rounded())
                 }
                 return
@@ -78,7 +78,7 @@ public enum RealtimeVoiceAudio {
             #endif
             for i in 0..<count {
                 let s = samples[i]
-                let clamped = s < -1.0 ? -1.0 : (s > 1.0 ? 1.0 : s)
+                let clamped: Float = s.isFinite ? (s < -1.0 ? -1.0 : (s > 1.0 ? 1.0 : s)) : 0.0
                 let le = Int16((clamped * scale).rounded()).littleEndian
                 raw.storeBytes(of: le, toByteOffset: i * MemoryLayout<Int16>.size, as: Int16.self)
             }
@@ -163,6 +163,7 @@ public actor RealtimeVoiceRouter {
     private var transport: (any RealtimeVoiceTransport)?
     private var listenerTask: Task<Void, Never>?
     private var toolTasks: [UUID: Task<Void, Never>] = [:]
+    private var toolDrainWaiters: [UUID: CheckedContinuation<Void, Never>] = [:]
     public private(set) var isRealtimeConnected = false
     public private(set) var lastFailureReason: String?
 
@@ -255,6 +256,7 @@ public actor RealtimeVoiceRouter {
             task.cancel()
         }
         toolTasks.removeAll()
+        resumeAllToolDrainWaiters()
         if let transport {
             await transport.disconnect()
         }
@@ -263,28 +265,46 @@ public actor RealtimeVoiceRouter {
     }
 
     public func waitForPendingToolCalls(timeoutSeconds: TimeInterval = 5.0) async {
-        let deadline = Date().addingTimeInterval(max(0.05, timeoutSeconds))
-        while !toolTasks.isEmpty, Date() < deadline {
-            let remaining = deadline.timeIntervalSinceNow
-            guard remaining > 0 else { break }
-            let tasks = Array(toolTasks.values)
-            await withTaskGroup(of: Void.self) { group in
-                group.addTask {
-                    for task in tasks {
-                        await task.value
-                    }
+        guard !toolTasks.isEmpty else { return }
+        let waiterID = UUID()
+        let timeoutMs = max(10, Int((max(0.05, timeoutSeconds) * 1000).rounded()))
+        let timeoutTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(timeoutMs))
+            await self?.resumeToolDrainWaiter(id: waiterID)
+        }
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                if toolTasks.isEmpty || Task.isCancelled {
+                    continuation.resume()
+                } else {
+                    toolDrainWaiters[waiterID] = continuation
                 }
-                group.addTask {
-                    try? await Task.sleep(for: .milliseconds(max(10, Int((remaining * 1000).rounded()))))
-                }
-                _ = await group.next()
-                group.cancelAll()
             }
+        } onCancel: {
+            Task { [weak self] in
+                await self?.resumeToolDrainWaiter(id: waiterID)
+            }
+        }
+        timeoutTask.cancel()
+    }
+
+    private func resumeToolDrainWaiter(id: UUID) {
+        toolDrainWaiters.removeValue(forKey: id)?.resume()
+    }
+
+    private func resumeAllToolDrainWaiters() {
+        let waiters = Array(toolDrainWaiters.values)
+        toolDrainWaiters.removeAll()
+        for waiter in waiters {
+            waiter.resume()
         }
     }
 
     private func completeToolTask(id: UUID) {
         toolTasks.removeValue(forKey: id)
+        if toolTasks.isEmpty {
+            resumeAllToolDrainWaiters()
+        }
     }
 
     private func handleTransportEvent(
@@ -328,6 +348,7 @@ public final class RealtimeAudioCoalescer: @unchecked Sendable {
     private let flushQueue = DispatchQueue(label: "dev.vsmirn0v.realtime-audio-coalescer", qos: .userInitiated)
     private var buffersByTrack: [String: Data] = [:]
     private var pendingFlushWorkItem: DispatchWorkItem?
+    private var flushToken: UInt64 = 0
     private var finished = false
     private let continuation: AsyncStream<Data>.Continuation
     public let stream: AsyncStream<Data>
@@ -350,7 +371,6 @@ public final class RealtimeAudioCoalescer: @unchecked Sendable {
 
     public func append(trackID: String, pcm16: Data) {
         guard !pcm16.isEmpty else { return }
-        var readyChunks: [Data]?
         var scheduledWorkItem: DispatchWorkItem?
         lock.lock()
         if !finished {
@@ -358,13 +378,22 @@ public final class RealtimeAudioCoalescer: @unchecked Sendable {
             current.append(pcm16)
             buffersByTrack[trackID] = current
             if current.count >= windowByteThreshold {
+                flushToken &+= 1
                 pendingFlushWorkItem?.cancel()
                 pendingFlushWorkItem = nil
-                readyChunks = Array(buffersByTrack.values)
+                let readyChunks = Array(buffersByTrack.values)
                 buffersByTrack.removeAll(keepingCapacity: true)
+                let inRate = inputSampleRate
+                let outRate = targetSampleRate
+                let cont = continuation
+                flushQueue.async {
+                    Self.emitMixed(readyChunks, inputSampleRate: inRate, targetSampleRate: outRate, to: cont)
+                }
             } else if pendingFlushWorkItem == nil {
+                flushToken &+= 1
+                let token = flushToken
                 let work = DispatchWorkItem { [weak self] in
-                    self?.flush()
+                    self?.flushIfCurrent(token: token)
                 }
                 pendingFlushWorkItem = work
                 scheduledWorkItem = work
@@ -375,20 +404,39 @@ public final class RealtimeAudioCoalescer: @unchecked Sendable {
         if let scheduledWorkItem {
             flushQueue.asyncAfter(deadline: .now() + .milliseconds(windowDurationMs), execute: scheduledWorkItem)
         }
-        if let readyChunks {
-            emitMixed(readyChunks)
-        }
     }
 
     public func flush() {
         lock.lock()
+        flushToken &+= 1
         pendingFlushWorkItem?.cancel()
         pendingFlushWorkItem = nil
         let remaining = finished ? [] : Array(buffersByTrack.values)
         buffersByTrack.removeAll(keepingCapacity: true)
+        if !remaining.isEmpty {
+            let inRate = inputSampleRate
+            let outRate = targetSampleRate
+            let cont = continuation
+            flushQueue.async {
+                Self.emitMixed(remaining, inputSampleRate: inRate, targetSampleRate: outRate, to: cont)
+            }
+        }
+        lock.unlock()
+    }
+
+    private func flushIfCurrent(token: UInt64) {
+        lock.lock()
+        guard !finished, pendingFlushWorkItem != nil, token == flushToken else {
+            lock.unlock()
+            return
+        }
+        flushToken &+= 1
+        pendingFlushWorkItem = nil
+        let remaining = Array(buffersByTrack.values)
+        buffersByTrack.removeAll(keepingCapacity: true)
         lock.unlock()
         if !remaining.isEmpty {
-            emitMixed(remaining)
+            Self.emitMixed(remaining, inputSampleRate: inputSampleRate, targetSampleRate: targetSampleRate, to: continuation)
         }
     }
 
@@ -396,20 +444,31 @@ public final class RealtimeAudioCoalescer: @unchecked Sendable {
         lock.lock()
         let wasFinished = finished
         finished = true
+        flushToken &+= 1
         pendingFlushWorkItem?.cancel()
         pendingFlushWorkItem = nil
         let remaining = wasFinished ? [] : Array(buffersByTrack.values)
         buffersByTrack.removeAll()
-        lock.unlock()
         if !wasFinished {
-            if !remaining.isEmpty {
-                emitMixed(remaining)
+            let inRate = inputSampleRate
+            let outRate = targetSampleRate
+            let cont = continuation
+            flushQueue.async {
+                if !remaining.isEmpty {
+                    Self.emitMixed(remaining, inputSampleRate: inRate, targetSampleRate: outRate, to: cont)
+                }
+                cont.finish()
             }
-            continuation.finish()
         }
+        lock.unlock()
     }
 
-    private func emitMixed(_ chunks: [Data]) {
+    private static func emitMixed(
+        _ chunks: [Data],
+        inputSampleRate: Int,
+        targetSampleRate: Int,
+        to continuation: AsyncStream<Data>.Continuation
+    ) {
         let mixed = RealtimeVoiceAudio.mixPCM16Mono(chunks)
         guard !mixed.isEmpty else { return }
         let out = RealtimeVoiceAudio.resamplePCM16Mono(

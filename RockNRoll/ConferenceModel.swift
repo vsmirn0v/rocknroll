@@ -939,6 +939,9 @@ final class ConferenceModel: ObservableObject {
             isVoiceReplyInFlight: { [weak controller] in
                 controller?.isVoiceReplyInFlight ?? false
             },
+            isVoiceReplyInFlightNonisolated: { [weak controller] in
+                controller?.isVoiceReplyInFlightThreadSafe() ?? false
+            },
             setRealtimeAudioTap: { [weak controller] handler in
                 controller?.setRealtimeAudioTap(handler)
             },

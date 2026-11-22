@@ -121,6 +121,7 @@ public struct WorkspaceAPIKeychain: Sendable {
     private final class MemoryCache: @unchecked Sendable {
         static let shared = MemoryCache()
         let lock = NSLock()
+        var generation: UInt64 = 0
         var values: [CacheKey: String?] = [:]
     }
 
@@ -131,7 +132,10 @@ public struct WorkspaceAPIKeychain: Sendable {
     }
 
     private func query(for kind: PortableOutcomeProviderKind) -> [String: Any] {
-        let account = "judge-api-key." + kind.rawValue
+        baseQuery(account: "judge-api-key." + kind.rawValue)
+    }
+
+    private func baseQuery(account: String) -> [String: Any] {
         var result: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -143,21 +147,22 @@ public struct WorkspaceAPIKeychain: Sendable {
         return result
     }
 
-    public func read(kind: PortableOutcomeProviderKind) -> String? {
-        let key = CacheKey(service: service, account: "judge-api-key." + kind.rawValue)
+    private func readCached(account: String, item: [String: Any]) -> String? {
+        let key = CacheKey(service: service, account: account)
         let cache = MemoryCache.shared
         cache.lock.lock()
         if let hit = cache.values[key] {
             cache.lock.unlock()
             return hit
         }
+        let gen = cache.generation
         cache.lock.unlock()
 
-        var item = query(for: kind)
-        item[kSecReturnData as String] = true
-        item[kSecMatchLimit as String] = kSecMatchLimitOne
+        var query = item
+        query[kSecReturnData as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
         var result: CFTypeRef?
-        let status = SecItemCopyMatching(item as CFDictionary, &result)
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
         let resolved: String?
         if status == errSecSuccess, let data = result as? Data {
             resolved = String(data: data, encoding: .utf8)
@@ -166,133 +171,86 @@ public struct WorkspaceAPIKeychain: Sendable {
         }
         if status == errSecSuccess || status == errSecItemNotFound {
             cache.lock.lock()
-            cache.values[key] = resolved
+            if cache.generation == gen {
+                cache.values[key] = resolved
+            }
             cache.lock.unlock()
         }
         return resolved
     }
 
-    @discardableResult
-    public func write(_ value: String, kind: PortableOutcomeProviderKind) -> Bool {
+    private func writeCached(account: String, value: String, base: [String: Any]) -> Bool {
         let clean = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        if clean.isEmpty { return delete(kind: kind) }
+        if clean.isEmpty { return deleteCached(account: account, base: base) }
         let data = Data(clean.utf8)
-        let q = query(for: kind)
-        var status = SecItemUpdate(q as CFDictionary, [kSecValueData as String: data] as CFDictionary)
+        var status = SecItemUpdate(base as CFDictionary, [kSecValueData as String: data] as CFDictionary)
         if status == errSecItemNotFound {
-            var add = q
+            var add = base
             add[kSecValueData as String] = data
             add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
             status = SecItemAdd(add as CFDictionary, nil)
         }
         let ok = status == errSecSuccess
         if ok {
-            let key = CacheKey(service: service, account: "judge-api-key." + kind.rawValue)
+            let key = CacheKey(service: service, account: account)
             let cache = MemoryCache.shared
             cache.lock.lock()
+            cache.generation &+= 1
             cache.values[key] = clean
             cache.lock.unlock()
         }
         return ok
     }
 
-    @discardableResult
-    public func delete(kind: PortableOutcomeProviderKind) -> Bool {
-        let status = SecItemDelete(query(for: kind) as CFDictionary)
+    private func deleteCached(account: String, base: [String: Any]) -> Bool {
+        let status = SecItemDelete(base as CFDictionary)
         let ok = status == errSecSuccess || status == errSecItemNotFound
         if ok {
-            let key = CacheKey(service: service, account: "judge-api-key." + kind.rawValue)
+            let key = CacheKey(service: service, account: account)
             let cache = MemoryCache.shared
             cache.lock.lock()
+            cache.generation &+= 1
             cache.values[key] = .some(nil)
             cache.lock.unlock()
         }
         return ok
+    }
+
+    public func read(kind: PortableOutcomeProviderKind) -> String? {
+        readCached(account: "judge-api-key." + kind.rawValue, item: query(for: kind))
+    }
+
+    @discardableResult
+    public func write(_ value: String, kind: PortableOutcomeProviderKind) -> Bool {
+        writeCached(account: "judge-api-key." + kind.rawValue, value: value, base: query(for: kind))
+    }
+
+    @discardableResult
+    public func delete(kind: PortableOutcomeProviderKind) -> Bool {
+        deleteCached(account: "judge-api-key." + kind.rawValue, base: query(for: kind))
     }
 
     // MARK: - Realtime Provider Credentials (OpenAI Realtime / Gemini Live)
 
     private func realtimeQuery(for provider: RealtimeProviderKind) -> [String: Any] {
-        let account = "realtime-api-key." + provider.rawValue
-        var result: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account
-        ]
-        #if os(macOS)
-        result[kSecUseDataProtectionKeychain as String] = true
-        #endif
-        return result
+        baseQuery(account: "realtime-api-key." + provider.rawValue)
     }
 
     public func readRealtime(provider: RealtimeProviderKind) -> String? {
         guard provider != .disabled else { return nil }
-        let key = CacheKey(service: service, account: "realtime-api-key." + provider.rawValue)
-        let cache = MemoryCache.shared
-        cache.lock.lock()
-        if let hit = cache.values[key] {
-            cache.lock.unlock()
-            return hit
-        }
-        cache.lock.unlock()
-
-        var item = realtimeQuery(for: provider)
-        item[kSecReturnData as String] = true
-        item[kSecMatchLimit as String] = kSecMatchLimitOne
-        var result: CFTypeRef?
-        let status = SecItemCopyMatching(item as CFDictionary, &result)
-        let resolved: String?
-        if status == errSecSuccess, let data = result as? Data {
-            resolved = String(data: data, encoding: .utf8)
-        } else {
-            resolved = nil
-        }
-        if status == errSecSuccess || status == errSecItemNotFound {
-            cache.lock.lock()
-            cache.values[key] = resolved
-            cache.lock.unlock()
-        }
-        return resolved
+        return readCached(account: "realtime-api-key." + provider.rawValue, item: realtimeQuery(for: provider))
     }
 
     @discardableResult
     public func writeRealtime(_ value: String, provider: RealtimeProviderKind) -> Bool {
         guard provider != .disabled else { return false }
-        let clean = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        if clean.isEmpty { return deleteRealtime(provider: provider) }
-        let data = Data(clean.utf8)
-        let q = realtimeQuery(for: provider)
-        var status = SecItemUpdate(q as CFDictionary, [kSecValueData as String: data] as CFDictionary)
-        if status == errSecItemNotFound {
-            var add = q
-            add[kSecValueData as String] = data
-            add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-            status = SecItemAdd(add as CFDictionary, nil)
-        }
-        let ok = status == errSecSuccess
-        if ok {
-            let key = CacheKey(service: service, account: "realtime-api-key." + provider.rawValue)
-            let cache = MemoryCache.shared
-            cache.lock.lock()
-            cache.values[key] = clean
-            cache.lock.unlock()
-        }
-        return ok
+        return writeCached(account: "realtime-api-key." + provider.rawValue, value: value, base: realtimeQuery(for: provider))
     }
 
     @discardableResult
     public func deleteRealtime(provider: RealtimeProviderKind) -> Bool {
         guard provider != .disabled else { return true }
-        let status = SecItemDelete(realtimeQuery(for: provider) as CFDictionary)
-        let ok = status == errSecSuccess || status == errSecItemNotFound
-        if ok {
-            let key = CacheKey(service: service, account: "realtime-api-key." + provider.rawValue)
-            let cache = MemoryCache.shared
-            cache.lock.lock()
-            cache.values[key] = .some(nil)
-            cache.lock.unlock()
-        }
-        return ok
+        return deleteCached(account: "realtime-api-key." + provider.rawValue, base: realtimeQuery(for: provider))
     }
 }
 

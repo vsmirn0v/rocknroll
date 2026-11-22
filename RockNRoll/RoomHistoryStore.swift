@@ -133,11 +133,23 @@ private final class KeychainRoomHistoryMemoryCache: @unchecked Sendable {
     static let shared = KeychainRoomHistoryMemoryCache()
     let lock = NSLock()
     var values: [String: Data] = [:]
+    var generation: UInt64 = 0
 }
 
 struct KeychainRoomHistoryStorage: RoomHistoryStorage {
     var service = "dev.vsmirn0v.conferenceguest.room-history"
     private var cacheKey: String { service + "\0saved-rooms" }
+
+    static func invalidateCache(service: String? = nil) {
+        KeychainRoomHistoryMemoryCache.shared.lock.withLock {
+            if let service {
+                KeychainRoomHistoryMemoryCache.shared.values.removeValue(forKey: service + "\0saved-rooms")
+            } else {
+                KeychainRoomHistoryMemoryCache.shared.values.removeAll()
+            }
+            KeychainRoomHistoryMemoryCache.shared.generation &+= 1
+        }
+    }
 
     func write(_ data: Data) throws {
         if KeychainRoomHistoryMemoryCache.shared.lock.withLock({ KeychainRoomHistoryMemoryCache.shared.values[cacheKey] == data }) {
@@ -155,11 +167,15 @@ struct KeychainRoomHistoryStorage: RoomHistoryStorage {
         guard status == errSecSuccess else { throw NSError(domain: NSOSStatusErrorDomain, code: Int(status)) }
         KeychainRoomHistoryMemoryCache.shared.lock.withLock {
             KeychainRoomHistoryMemoryCache.shared.values[cacheKey] = data
+            KeychainRoomHistoryMemoryCache.shared.generation &+= 1
         }
     }
 
     func read() -> Data? {
-        if let cached = KeychainRoomHistoryMemoryCache.shared.lock.withLock({ KeychainRoomHistoryMemoryCache.shared.values[cacheKey] }) {
+        let (cached, gen) = KeychainRoomHistoryMemoryCache.shared.lock.withLock {
+            (KeychainRoomHistoryMemoryCache.shared.values[cacheKey], KeychainRoomHistoryMemoryCache.shared.generation)
+        }
+        if let cached {
             return cached
         }
         var query = self.query
@@ -169,7 +185,9 @@ struct KeychainRoomHistoryStorage: RoomHistoryStorage {
         guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
               let data = result as? Data else { return nil }
         KeychainRoomHistoryMemoryCache.shared.lock.withLock {
-            KeychainRoomHistoryMemoryCache.shared.values[cacheKey] = data
+            if KeychainRoomHistoryMemoryCache.shared.generation == gen {
+                KeychainRoomHistoryMemoryCache.shared.values[cacheKey] = data
+            }
         }
         return data
     }

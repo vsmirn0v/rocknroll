@@ -61,6 +61,10 @@ public final class AssistantSkillFolderWatcher: @unchecked Sendable {
         func currentInode(_ path: String) -> UInt64? {
             var st = Darwin.stat()
             guard Darwin.lstat(path, &st) == 0 else { return nil }
+            if (st.st_mode & S_IFMT) == S_IFLNK {
+                let resolved = URL(fileURLWithPath: path).resolvingSymlinksInPath().path
+                guard Darwin.lstat(resolved, &st) == 0 else { return nil }
+            }
             return UInt64(st.st_ino)
         }
 

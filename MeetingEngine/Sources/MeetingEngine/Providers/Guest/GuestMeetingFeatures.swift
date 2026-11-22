@@ -434,9 +434,10 @@ struct GuestMeetingFeatures {
     private mutating func upsert(_ message: GuestMeetingMessage, transcript: Bool) {
         var values = transcript ? snapshot.transcript : snapshot.messages
         if let index = values.firstIndex(where: { $0.id == message.id }) {
+            let previousSentAt = values[index].sentAt
             var updated = message; updated.receivedAt = values[index].receivedAt ?? message.receivedAt
             values[index] = updated
-            if values[index].sentAt != message.sentAt {
+            if previousSentAt != updated.sentAt {
                 values.sort {
                     if $0.sentAt != $1.sentAt { return ($0.sentAt ?? .distantPast) < ($1.sentAt ?? .distantPast) }
                     return $0.id < $1.id

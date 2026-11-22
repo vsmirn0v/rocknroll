@@ -124,6 +124,7 @@ struct AttentionKeychain: Sendable {
     private final class MemoryCache: @unchecked Sendable {
         static let shared = MemoryCache()
         let lock = NSLock()
+        var generation: UInt64 = 0
         var values: [CacheKey: String?] = [:]
     }
 
@@ -142,6 +143,7 @@ struct AttentionKeychain: Sendable {
             cache.lock.unlock()
             return hit
         }
+        let gen = cache.generation
         cache.lock.unlock()
 
         var item = query; item[kSecReturnData as String] = true; item[kSecMatchLimit as String] = kSecMatchLimitOne
@@ -155,7 +157,9 @@ struct AttentionKeychain: Sendable {
         }
         if status == errSecSuccess || status == errSecItemNotFound {
             cache.lock.lock()
-            cache.values[key] = resolved
+            if cache.generation == gen {
+                cache.values[key] = resolved
+            }
             cache.lock.unlock()
         }
         return resolved
@@ -173,6 +177,7 @@ struct AttentionKeychain: Sendable {
             let key = CacheKey(service: service, account: account)
             let cache = MemoryCache.shared
             cache.lock.lock()
+            cache.generation &+= 1
             cache.values[key] = value
             cache.lock.unlock()
         }
@@ -185,6 +190,7 @@ struct AttentionKeychain: Sendable {
             let key = CacheKey(service: service, account: account)
             let cache = MemoryCache.shared
             cache.lock.lock()
+            cache.generation &+= 1
             cache.values[key] = .some(nil)
             cache.lock.unlock()
         }

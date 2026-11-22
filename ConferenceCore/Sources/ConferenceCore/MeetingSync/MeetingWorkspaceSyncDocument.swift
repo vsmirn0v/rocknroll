@@ -214,7 +214,18 @@ public struct MeetingWorkspaceSyncDocument: Codable, Equatable, Sendable {
                 guard let occID = calAssoc.value?.occurrenceID else { continue }
                 candidateIndices = activeByOccurrence[occID] ?? []
             } else if first.occurrenceKey.hasPrefix("cal:") {
-                candidateIndices = activeByCalKey[first.occurrenceKey] ?? []
+                let calMatches = activeByCalKey[first.occurrenceKey] ?? []
+                if !first.roomIdentity.isEmpty, let roomMatches = activeByRoom[first.roomIdentity], !roomMatches.isEmpty {
+                    var combined = calMatches
+                    var seen = Set(combined)
+                    for idx in roomMatches where seen.insert(idx).inserted {
+                        combined.append(idx)
+                    }
+                    combined.sort()
+                    candidateIndices = combined
+                } else {
+                    candidateIndices = calMatches
+                }
             } else if !first.roomIdentity.isEmpty {
                 candidateIndices = activeByRoom[first.roomIdentity] ?? []
             } else {

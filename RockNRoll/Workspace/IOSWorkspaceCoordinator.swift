@@ -115,6 +115,7 @@ final class IOSWorkspaceCoordinator: ObservableObject {
     private var noteDebounceTasks: [UUID: Task<Void, Never>] = [:]
     private var liveEventsBySession: [UUID: [SyncedTranscriptEvent]] = [:]
     private var lastPersistedEventsBySession: [UUID: [String: SyncedTranscriptEvent]] = [:]
+    private var transcriptWriteGenerationBySession: [UUID: UInt64] = [:]
     private var micIntervalsBySession: [UUID: [DateInterval]] = [:]
     private var transcriptWriteTasks: [UUID: Task<Void, Never>] = [:]
     private var lastLocalSchedule: (meetings: [CalendarMeeting], bindings: [String: URL], suppressed: [String: Date])?
@@ -431,21 +432,29 @@ final class IOSWorkspaceCoordinator: ObservableObject {
             }
         }
         transcriptWriteTasks[canonical]?.cancel()
+        let writeGen = (transcriptWriteGenerationBySession[canonical] ?? 0) &+ 1
+        transcriptWriteGenerationBySession[canonical] = writeGen
         transcriptWriteTasks[canonical] = Task { @MainActor [weak self] in
             try? await Task.sleep(for: .milliseconds(250))
             guard !Task.isCancelled, let self else { return }
             let latest = self.liveEventsBySession[canonical] ?? events
-            self.transcriptWriteTasks[canonical] = nil
-            var previous = self.lastPersistedEventsBySession[canonical] ?? [:]
+            let previous = self.lastPersistedEventsBySession[canonical] ?? [:]
             let delta = latest.filter { previous[$0.id] != $0 }
-            guard !delta.isEmpty else { return }
-            do {
-                try await self.store.appendTranscriptEvents(sessionID: canonical, events: delta)
-                for ev in delta {
-                    previous[ev.id] = ev
-                }
-                self.lastPersistedEventsBySession[canonical] = previous
-            } catch {}
+            if !delta.isEmpty {
+                do {
+                    try await self.store.appendTranscriptEvents(sessionID: canonical, events: delta)
+                    if !Task.isCancelled, self.liveEventsBySession[canonical] != nil {
+                        var updated = self.lastPersistedEventsBySession[canonical] ?? [:]
+                        for ev in delta {
+                            updated[ev.id] = ev
+                        }
+                        self.lastPersistedEventsBySession[canonical] = updated
+                    }
+                } catch {}
+            }
+            if self.transcriptWriteGenerationBySession[canonical] == writeGen {
+                self.transcriptWriteTasks[canonical] = nil
+            }
         }
     }
 

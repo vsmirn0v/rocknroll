@@ -20,7 +20,12 @@ final class NativeDesktopShareCapture: GuestCameraCapture, @unchecked Sendable {
     private var latestCamera: CVPixelBuffer?
     private var latestExternalPixels: CVPixelBuffer?
     private var externalRevision: UInt64 = 0
+    private var sceneRevision: UInt64 = 0
+    private var hasDeliveredExternalFrame = false
     private var lastDeliveredExternalRevision: UInt64 = 0
+    private var lastDeliveredSceneRevision: UInt64 = 0
+    private var lastDeliveredCameraRevision: UInt64 = 0
+    private var lastDeliveredCameraPrivacyEpoch: UInt64 = 0
     private var lastDeliveredExternalUptime: TimeInterval = 0
     private var cameraRevision: UInt64 = 0
     private var cameraPrivacyEpoch: UInt64 = 0
@@ -79,7 +84,15 @@ final class NativeDesktopShareCapture: GuestCameraCapture, @unchecked Sendable {
     #endif
     private func locked<T>(_ action: () throws -> T) rethrows -> T { lock.lock(); defer { lock.unlock() }; return try action() }
     private func isActive(_ token: UInt64) -> Bool { locked { generation == token && (phase == .starting || phase == .running) } }
-    func setScene(_ scene: PresenterScene?) { locked { if phase != .stopped { latestScene = scene } }; schedule() }
+    func setScene(_ scene: PresenterScene?) {
+        locked {
+            if phase != .stopped {
+                latestScene = scene
+                sceneRevision &+= 1
+            }
+        }
+        schedule()
+    }
     func setSelectionMode(_ mode: MacScreenCaptureSelectionMode) { locked { if phase == .idle { selectionMode = mode } } }
     func updateExternalPixelBuffer(_ pixels: CVPixelBuffer) {
         let shouldSchedule = locked { () -> Bool in
@@ -172,18 +185,22 @@ final class NativeDesktopShareCapture: GuestCameraCapture, @unchecked Sendable {
     }
     private func forward(_ token: UInt64) {
         let now = ProcessInfo.processInfo.systemUptime
-        let input: (CMSampleBuffer?, CVPixelBuffer?, UInt64, PresenterScene?, CVPixelBuffer?, UInt64, UInt64)? = locked {
+        let input: (CMSampleBuffer?, CVPixelBuffer?, UInt64, UInt64, PresenterScene?, CVPixelBuffer?, UInt64, UInt64)? = locked {
             queued = false
             guard generation == token, phase == .starting || phase == .running else { return nil }
             if externalFrames,
+               hasDeliveredExternalFrame,
                latestExternalPixels != nil,
                externalRevision == lastDeliveredExternalRevision,
+               sceneRevision == lastDeliveredSceneRevision,
+               cameraRevision == lastDeliveredCameraRevision,
+               cameraPrivacyEpoch == lastDeliveredCameraPrivacyEpoch,
                (now - lastDeliveredExternalUptime) < 1.0 {
                 return nil
             }
-            return (latest, latestExternalPixels, externalRevision, latestScene, systemOverlay ? nil : latestCamera, cameraRevision, cameraPrivacyEpoch)
+            return (latest, latestExternalPixels, externalRevision, sceneRevision, latestScene, systemOverlay ? nil : latestCamera, cameraRevision, cameraPrivacyEpoch)
         }
-        guard let (sample, externalPixels, extRev, scene, camera, cameraRevision, cameraPrivacyEpoch) = input,
+        guard let (sample, externalPixels, extRev, scnRev, scene, camera, cameraRevision, cameraPrivacyEpoch) = input,
               let screen = externalPixels ?? sample.flatMap(CMSampleBufferGetImageBuffer) ?? (canvasOnly ? blankCanvas() : nil) else { return }
         let size = CGSize(width: CVPixelBufferGetWidth(screen), height: CVPixelBufferGetHeight(screen))
         // A screen without app overlays already contains final, native pixels.
@@ -214,7 +231,11 @@ final class NativeDesktopShareCapture: GuestCameraCapture, @unchecked Sendable {
             }
             if let source, let capturer { source.capturer(capturer, didCapture: frame) }
             if externalFrames {
+                hasDeliveredExternalFrame = true
                 lastDeliveredExternalRevision = extRev
+                lastDeliveredSceneRevision = scnRev
+                lastDeliveredCameraRevision = cameraRevision
+                lastDeliveredCameraPrivacyEpoch = cameraPrivacyEpoch
                 lastDeliveredExternalUptime = now
             }
             #if DEBUG

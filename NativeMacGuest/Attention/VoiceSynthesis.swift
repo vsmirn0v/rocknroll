@@ -100,14 +100,14 @@ enum VoiceSynthesisError: LocalizedError, Equatable {
     func play(_ buffer: AVAudioPCMBuffer, onComplete: (() -> Void)? = nil) throws {
         stop()
         let token = UUID()
-        generation = token
-        completionHandler = onComplete
         let engine = AVAudioEngine(), player = AVAudioPlayerNode()
         engine.attach(player)
         engine.connect(player, to: engine.mainMixerNode, format: buffer.format)
         try engine.start()
+        generation = token
+        completionHandler = onComplete
         isPlaying = true
-        player.scheduleBuffer(buffer) { [weak self] in
+        player.scheduleBuffer(buffer, completionCallbackType: .dataPlayedBack) { [weak self] _ in
             Task { @MainActor [weak self] in
                 guard let self, self.generation == token else { return }
                 let completion = self.completionHandler
@@ -130,13 +130,13 @@ enum VoiceSynthesisError: LocalizedError, Equatable {
     func beginStreaming(format: AVAudioFormat, onComplete: (() -> Void)? = nil) throws -> UUID {
         stop()
         let token = UUID()
-        generation = token
-        completionHandler = onComplete
         let engine = AVAudioEngine(), player = AVAudioPlayerNode()
         engine.attach(player)
         engine.connect(player, to: engine.mainMixerNode, format: format)
         try engine.start()
         player.play()
+        generation = token
+        completionHandler = onComplete
         self.engine = engine
         self.player = player
         self.streamFormat = format
@@ -145,7 +145,9 @@ enum VoiceSynthesisError: LocalizedError, Equatable {
     }
 
     func enqueueStreamBuffer(_ buffer: AVAudioPCMBuffer, sessionToken: UUID) {
-        guard generation == sessionToken, let player else { return }
+        guard generation == sessionToken, let player, let streamFormat,
+              buffer.format.sampleRate == streamFormat.sampleRate,
+              buffer.format.channelCount == streamFormat.channelCount else { return }
         if !player.isPlaying {
             player.play()
         }
@@ -161,7 +163,7 @@ enum VoiceSynthesisError: LocalizedError, Equatable {
         if let channel = sentinel.floatChannelData?[0] {
             channel[0] = 0
         }
-        player.scheduleBuffer(sentinel) { [weak self] in
+        player.scheduleBuffer(sentinel, completionCallbackType: .dataPlayedBack) { [weak self] _ in
             Task { @MainActor [weak self] in
                 guard let self, self.generation == sessionToken else { return }
                 let completion = self.completionHandler

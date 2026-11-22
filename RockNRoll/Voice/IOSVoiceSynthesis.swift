@@ -4,6 +4,7 @@ import Combine
 import ConferenceCore
 import Foundation
 import NaturalLanguage
+import UIKit
 
 enum IOSVoiceEngine: String, Codable, CaseIterable, Identifiable, Sendable {
     case system
@@ -466,11 +467,12 @@ final class IOSVoicePreviewPlayer: ObservableObject {
     private var activatedPlaybackSession = false
     private var scheduledStreamBuffers = 0
     private var streamFinishing = false
+    private var streamFormat: AVAudioFormat?
 
     func play(_ buffer: AVAudioPCMBuffer, onComplete: (() -> Void)? = nil) throws {
         let token = try startPlaybackGraph(format: buffer.format, onComplete: onComplete)
         guard let player else { return }
-        player.scheduleBuffer(buffer) { [weak self] in
+        player.scheduleBuffer(buffer, completionCallbackType: .dataPlayedBack) { [weak self] _ in
             Task { @MainActor [weak self] in
                 guard let self, self.generation == token else { return }
                 self.stop()
@@ -486,9 +488,11 @@ final class IOSVoicePreviewPlayer: ObservableObject {
     }
 
     func enqueueStreamBuffer(_ buffer: AVAudioPCMBuffer, token: UUID) {
-        guard generation == token, let player else { return }
+        guard generation == token, let player, let streamFormat,
+              buffer.format.sampleRate == streamFormat.sampleRate,
+              buffer.format.channelCount == streamFormat.channelCount else { return }
         scheduledStreamBuffers += 1
-        player.scheduleBuffer(buffer) { [weak self] in
+        player.scheduleBuffer(buffer, completionCallbackType: .dataPlayedBack) { [weak self] _ in
             Task { @MainActor [weak self] in
                 guard let self, self.generation == token else { return }
                 self.scheduledStreamBuffers = max(0, self.scheduledStreamBuffers - 1)
@@ -510,10 +514,6 @@ final class IOSVoicePreviewPlayer: ObservableObject {
     private func startPlaybackGraph(format: AVAudioFormat, onComplete: (() -> Void)?) throws -> UUID {
         stop()
         let token = UUID()
-        generation = token
-        completionHandler = onComplete
-        scheduledStreamBuffers = 0
-        streamFinishing = false
         let session = AVAudioSession.sharedInstance()
         let inCall = session.mode == .voiceChat || session.mode == .videoChat ||
             (IOSWorkspaceAudioCoordinator.sharedForVoiceCheck?.activeSessionCount ?? 0) > 0
@@ -526,7 +526,20 @@ final class IOSVoicePreviewPlayer: ObservableObject {
         let player = AVAudioPlayerNode()
         engine.attach(player)
         engine.connect(player, to: engine.mainMixerNode, format: format)
-        try engine.start()
+        do {
+            try engine.start()
+        } catch {
+            if activatedPlaybackSession {
+                activatedPlaybackSession = false
+                try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+            }
+            throw error
+        }
+        generation = token
+        completionHandler = onComplete
+        scheduledStreamBuffers = 0
+        streamFinishing = false
+        streamFormat = format
         self.engine = engine
         self.player = player
         isPlaying = true
@@ -537,6 +550,7 @@ final class IOSVoicePreviewPlayer: ObservableObject {
         generation = UUID()
         scheduledStreamBuffers = 0
         streamFinishing = false
+        streamFormat = nil
         player?.stop()
         engine?.stop()
         player = nil
@@ -686,8 +700,20 @@ final class IOSVoiceStore: ObservableObject {
     }
 
     private static var cachedSystemVoices: (key: String, voices: [AVSpeechSynthesisVoice])?
+    private static let foregroundCacheInvalidator: NSObjectProtocol = {
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.willEnterForegroundNotification,
+            object: nil,
+            queue: .main
+        ) { _ in
+            Task { @MainActor in
+                cachedSystemVoices = nil
+            }
+        }
+    }()
 
     static func availableSystemVoices() -> [AVSpeechSynthesisVoice] {
+        _ = foregroundCacheInvalidator
         let localizations = Bundle.main.preferredLocalizations + Locale.preferredLanguages
         let key = localizations.joined(separator: ",")
         if let cachedSystemVoices, cachedSystemVoices.key == key {

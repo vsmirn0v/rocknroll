@@ -654,9 +654,12 @@ import FoundationModels
         final class TurnState {
             var chunks: [Data] = []
             var bufferedBytes = 0
+            var sampleRate: Double = 24_000
             var transcript = ""
             var finished = false
             var failed = false
+            var didFinishStreaming = false
+            var receivedToolCall = false
             var streamToken: UUID?
             var streamMessageID: UUID?
             var streamingFailed = false
@@ -672,19 +675,29 @@ import FoundationModels
 
         let state = TurnState()
         let canPlayLocally = !isInActiveCall() || !Self.isSpeakerOutputActive
-        let streamFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 24_000, channels: 1, interleaved: false)
         let handleEvent: @MainActor (RealtimeVoiceEvent) -> Void = { [weak self, weak state] event in
             guard let state else { return }
             switch event {
-            case .audioPCM16(let pcm, _):
+            case .toolCall:
+                state.receivedToolCall = true
+            case .audioPCM16(let pcm, let sampleRate):
+                if sampleRate > 0 {
+                    state.sampleRate = Double(sampleRate)
+                }
                 state.chunks.append(pcm)
                 state.bufferedBytes += pcm.count
-                if canPlayLocally, !state.streamingFailed, let streamFormat {
+                if canPlayLocally, !state.streamingFailed {
                     if let token = state.streamToken {
-                        if let buf = RealtimeVoiceAudio.pcm16ToAudioBuffer(data: pcm, sampleRate: 24_000) {
+                        if let buf = RealtimeVoiceAudio.pcm16ToAudioBuffer(data: pcm, sampleRate: state.sampleRate) {
                             IOSVoicePreviewPlayer.shared.enqueueStreamBuffer(buf, token: token)
                         }
-                    } else if state.bufferedBytes >= 7_200, let self {
+                    } else if state.bufferedBytes >= 7_200, let self,
+                              let streamFormat = AVAudioFormat(
+                                  commonFormat: .pcmFormatFloat32,
+                                  sampleRate: state.sampleRate,
+                                  channels: 1,
+                                  interleaved: false
+                              ) {
                         let msgID = UUID()
                         state.streamMessageID = msgID
                         self.stopAudition()
@@ -700,7 +713,7 @@ import FoundationModels
                             }
                             state.streamToken = token
                             for queued in state.chunks {
-                                if let buf = RealtimeVoiceAudio.pcm16ToAudioBuffer(data: queued, sampleRate: 24_000) {
+                                if let buf = RealtimeVoiceAudio.pcm16ToAudioBuffer(data: queued, sampleRate: state.sampleRate) {
                                     IOSVoicePreviewPlayer.shared.enqueueStreamBuffer(buf, token: token)
                                 }
                             }
@@ -715,6 +728,10 @@ import FoundationModels
             case .assistantTranscriptDone(let full):
                 state.transcript = full
             case .audioDone:
+                if state.receivedToolCall && state.transcript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && state.bufferedBytes == 0 {
+                    state.receivedToolCall = false
+                    break
+                }
                 state.finished = true
                 state.resumeIfDone()
             case .error, .disconnected:
@@ -788,11 +805,17 @@ import FoundationModels
                 try? await Task.sleep(for: .seconds(20))
                 state.resumeIfDone()
             }
-            await withCheckedContinuation { continuation in
-                if state.finished || state.failed || Task.isCancelled {
-                    continuation.resume()
-                } else {
-                    state.continuation = continuation
+            await withTaskCancellationHandler {
+                await withCheckedContinuation { continuation in
+                    if state.finished || state.failed || Task.isCancelled {
+                        continuation.resume()
+                    } else {
+                        state.continuation = continuation
+                    }
+                }
+            } onCancel: {
+                Task { @MainActor in
+                    state.resumeIfDone()
                 }
             }
             timeoutTask.cancel()
@@ -801,7 +824,7 @@ import FoundationModels
 
         if usesWarmRouter {
             realtimeTurnSinkBox.handler = nil
-            if state.failed {
+            if state.failed || !state.finished || Task.isCancelled {
                 invalidateWarmRealtimeRouter()
             } else {
                 warmRealtimeIdleTask = Task { @MainActor [weak self] in
@@ -825,12 +848,13 @@ import FoundationModels
         messages.append(message)
         if source.isVoice { lastVoiceAnswer = displayAnswer }
         if let token = state.streamToken {
+            state.didFinishStreaming = true
             IOSVoicePreviewPlayer.shared.finishStreaming(token: token)
         } else if state.bufferedBytes > 0 && canPlayLocally {
             var audioData = Data()
             audioData.reserveCapacity(state.bufferedBytes)
             for chunk in state.chunks { audioData.append(chunk) }
-            if let buffer = RealtimeVoiceAudio.pcm16ToAudioBuffer(data: audioData, sampleRate: 24_000) {
+            if let buffer = RealtimeVoiceAudio.pcm16ToAudioBuffer(data: audioData, sampleRate: state.sampleRate) {
                 stopAudition()
                 auditioningMessageID = message.id
                 speech?.setSpeakingResponse(true)

@@ -114,6 +114,7 @@ final class RockCallViewController: UIViewController, UIScrollViewDelegate, UICo
         let participants: [RenderedParticipantKey]
         let localShareIdentity: ObjectIdentifier?
         let roomIdentifier: String?
+        let hasInvitationURL: Bool
         let layoutMode: MeetingLayoutMode
         let explicitLayout: Bool
         let displayMode: ConferenceDisplayMode
@@ -1567,6 +1568,7 @@ final class RockCallViewController: UIViewController, UIScrollViewDelegate, UICo
             },
             localShareIdentity: snapshot.localShare?.identity,
             roomIdentifier: workspace.roomIdentifier,
+            hasInvitationURL: workspace.invitationURL != nil,
             layoutMode: layoutMode,
             explicitLayout: explicitLayout,
             displayMode: displayMode,
@@ -1590,7 +1592,6 @@ final class RockCallViewController: UIViewController, UIScrollViewDelegate, UICo
             refreshSpeaking(snapshot: snapshot)
             return
         }
-        lastRenderedLayoutKey = layoutKey
         for entry in videoTiles.values where entry.zoom.window != nil { rememberZoom(entry.zoom) }
         displayedSnapshot = snapshot
         let ids = snapshot.participants.map(\.id), existing = Set(rosterOrder)
@@ -1753,6 +1754,7 @@ final class RockCallViewController: UIViewController, UIScrollViewDelegate, UICo
         participantsPanel?.update(participants.map(\.status), pinnedKey: pinnedStreamKey)
         tiles.arrange(size: streamScroll.bounds.size, mode: effectiveLayoutMode)
         refreshSpeaking(snapshot: snapshot)
+        lastRenderedLayoutKey = makeRenderedLayoutKey(snapshot: snapshot)
         configureMoreMenu(); view.setNeedsLayout()
     }
 

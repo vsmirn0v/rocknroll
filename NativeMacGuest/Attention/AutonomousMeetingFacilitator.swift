@@ -541,6 +541,11 @@ final class AutonomousMeetingFacilitator: ObservableObject {
             }
         )
         state.connected = await state.router.isRealtimeConnected
+        guard realtimeSessions[sessionID] === state, !model.isClosed else {
+            await state.router.stop()
+            syncRealtimeActiveFlag()
+            return
+        }
         if state.connected {
             attachAudioTap(to: model, state: state, targetSampleRate: targetInputRate)
         }
@@ -634,10 +639,8 @@ final class AutonomousMeetingFacilitator: ObservableObject {
             state.transcriptBuffer = ""
             if let model, !model.isClosed {
                 if let buffer = Self.pcm16ToAudioBuffer(data: combined, sampleRate: 24_000) {
-                    state.gate.markVoiceDeliveryStarted()
                     await deliverSpokenBuffer(buffer, fallbackText: text, model: model)
                 } else if !text.isEmpty {
-                    state.gate.markVoiceDeliveryStarted()
                     await speakIntoMeeting(text, model: model)
                 }
             }
@@ -667,6 +670,12 @@ final class AutonomousMeetingFacilitator: ObservableObject {
         guard let attention, !model.isClosed else { return }
         lastSpokeAtBySession[model.sessionID] = Date()
         lastSpokenAnswerBySession[model.sessionID] = text
+        realtimeSessions[model.sessionID]?.gate.markVoiceDeliveryStarted()
+        defer {
+            let endedAt = Date()
+            lastVoiceDeliveryEndedAtBySession[model.sessionID] = endedAt
+            realtimeSessions[model.sessionID]?.gate.markVoiceDeliveryEnded(at: endedAt)
+        }
         do {
             let buffer = try await attention.store.voiceConfiguration.synthesize(text)
             await deliverSpokenBuffer(buffer, fallbackText: text, model: model)
