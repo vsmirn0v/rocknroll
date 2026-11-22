@@ -41,10 +41,13 @@ final class SiteAuthModelsTests: XCTestCase {
     func testJWTClaimsInspection() throws {
         let header = base64URL(Data("{\"alg\":\"HS256\",\"typ\":\"JWT\"}".utf8))
         let exp = Int(Date(timeIntervalSince1970: 1_900_000_000).timeIntervalSince1970)
-        let payload = base64URL(Data("{\"sub\":\"user-42\",\"name\":\"Ada Lovelace\",\"exp\":\(exp)}".utf8))
+        let payload = base64URL(Data("{\"sub\":\"user-42\",\"name\":\"Ada Lovelace\",\"email\":\"ada@example.test\",\"azp\":\"s2b\",\"iss\":\"https://meet.example.test/realms/s2b\",\"exp\":\(exp)}".utf8))
         let claims = try XCTUnwrap(JWTClaims.inspect("\(header).\(payload).sig"))
         XCTAssertEqual(claims.subject, "user-42")
         XCTAssertEqual(claims.displayName, "Ada Lovelace")
+        XCTAssertEqual(claims.email, "ada@example.test")
+        XCTAssertEqual(claims.authorizedParty, "s2b")
+        XCTAssertEqual(claims.issuer, "https://meet.example.test/realms/s2b")
         XCTAssertEqual(claims.expiresAt, Date(timeIntervalSince1970: 1_900_000_000))
         XCTAssertNil(JWTClaims.inspect("opaque-token"))
     }

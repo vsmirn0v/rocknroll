@@ -142,12 +142,23 @@ public struct JWTClaims: Equatable, Sendable {
     public var displayName: String?
     public var email: String?
     public var expiresAt: Date?
+    public var authorizedParty: String?
+    public var issuer: String?
 
-    public init(subject: String? = nil, displayName: String? = nil, email: String? = nil, expiresAt: Date? = nil) {
+    public init(
+        subject: String? = nil,
+        displayName: String? = nil,
+        email: String? = nil,
+        expiresAt: Date? = nil,
+        authorizedParty: String? = nil,
+        issuer: String? = nil
+    ) {
         self.subject = subject
         self.displayName = displayName
         self.email = email
         self.expiresAt = expiresAt
+        self.authorizedParty = authorizedParty
+        self.issuer = issuer
     }
 
     public static func inspect(_ token: String) -> JWTClaims? {
@@ -173,8 +184,12 @@ public struct JWTClaims: Equatable, Sendable {
         } else {
             expDate = nil
         }
-        let subject = (json["sub"] as? String).flatMap { $0.isEmpty ? nil : $0 }
-        let email = (json["email"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        let subject = (json["sub"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nilIfEmpty
+        let email = (json["email"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nilIfEmpty
         let displayName = [
             json["name"] as? String,
             json["preferred_username"] as? String,
@@ -183,6 +198,25 @@ public struct JWTClaims: Equatable, Sendable {
             subject
         ].compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
             .first(where: { !$0.isEmpty })
-        return JWTClaims(subject: subject, displayName: displayName, email: email, expiresAt: expDate)
+        let authorizedParty = [
+            json["azp"] as? String,
+            json["client_id"] as? String
+        ].compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first(where: { !$0.isEmpty })
+        let issuer = (json["iss"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nilIfEmpty
+        return JWTClaims(
+            subject: subject,
+            displayName: displayName,
+            email: email,
+            expiresAt: expDate,
+            authorizedParty: authorizedParty,
+            issuer: issuer
+        )
     }
+}
+
+private extension String {
+    var nilIfEmpty: String? { isEmpty ? nil : self }
 }

@@ -51,7 +51,9 @@ public struct SiteSignInSheet: View {
     @State private var capturedAccessToken: String?
     @State private var capturedRefreshToken: String?
     @State private var capturedTokenEndpoint: String?
+    @State private var capturedClientID: String?
     @State private var lastAutoVerifyURL: String?
+    @State private var pendingAutoVerify = false
     @State private var detectTask: Task<Void, Never>?
     @FocusState private var urlFieldFocused: Bool
     @StateObject private var certImport = PKCS12ImportFlow()
@@ -333,11 +335,17 @@ public struct SiteSignInSheet: View {
                     nonce: webViewNonce,
                     lookup: store.registry,
                     onWebViewReady: { activeWebView = $0 },
-                    onCapturedToken: { token, refresh, endpoint in
-                        capturedAccessToken = token
-                        if !refresh.isEmpty { capturedRefreshToken = refresh }
-                        if !endpoint.isEmpty { capturedTokenEndpoint = endpoint }
-                        Task { await verifyWebSession(origin: origin, interactive: false) }
+                    onCapturedToken: { token, refresh, endpoint, clientID, pageHost in
+                        if acceptCapturedToken(
+                            token,
+                            refresh: refresh,
+                            endpoint: endpoint,
+                            clientID: clientID,
+                            pageHost: pageHost,
+                            origin: origin
+                        ) {
+                            Task { await verifyWebSession(origin: origin, interactive: false) }
+                        }
                     },
                     onNavigationFinished: { url, webView in
                         activeWebView = webView
@@ -511,7 +519,9 @@ public struct SiteSignInSheet: View {
         capturedAccessToken = nil
         capturedRefreshToken = nil
         capturedTokenEndpoint = nil
+        capturedClientID = nil
         lastAutoVerifyURL = nil
+        pendingAutoVerify = false
         isError = false
         statusMessage = nil
 
@@ -665,10 +675,64 @@ public struct SiteSignInSheet: View {
     }
 
     #if canImport(WebKit) && (os(iOS) || os(macOS))
+    @discardableResult
+    private func acceptCapturedToken(
+        _ rawToken: String,
+        refresh: String,
+        endpoint: String,
+        clientID: String,
+        pageHost: String,
+        origin: URL
+    ) -> Bool {
+        let trimmedHost = pageHost.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedHost.isEmpty, let targetHost = origin.host,
+           !SiteOrigin.hostMatches(trimmedHost, siteHost: targetHost) {
+            return false
+        }
+        let cleaned = SiteAuthCoordinator.cleanToken(rawToken)
+        guard cleaned.count >= 12 else { return false }
+        if let existing = capturedAccessToken,
+           JWTClaims.inspect(existing) != nil,
+           JWTClaims.inspect(cleaned) == nil {
+            return false
+        }
+        capturedAccessToken = cleaned
+        let cleanRefresh = refresh.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !cleanRefresh.isEmpty { capturedRefreshToken = cleanRefresh }
+        let cleanEndpoint = endpoint.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !cleanEndpoint.isEmpty { capturedTokenEndpoint = cleanEndpoint }
+        let cleanClientID = clientID.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !cleanClientID.isEmpty { capturedClientID = cleanClientID }
+        return true
+    }
+
     private func verifyWebSession(origin: URL, interactive: Bool) async {
-        guard !isBusy, let webView = activeWebView else { return }
+        if isBusy {
+            pendingAutoVerify = true
+            return
+        }
+        guard let webView = activeWebView else { return }
         isBusy = true
-        defer { isBusy = false }
+        var didDismiss = false
+        defer {
+            isBusy = false
+            if !didDismiss && pendingAutoVerify && resolvedOrigin == origin {
+                pendingAutoVerify = false
+                Task { await verifyWebSession(origin: origin, interactive: false) }
+            }
+        }
+
+        if let snapshot = (try? await webView.evaluateJavaScript(SiteAuthWebScript.snapshotExpression)) as? [String: Any],
+           let snapshotToken = snapshot["token"] as? String {
+            _ = acceptCapturedToken(
+                snapshotToken,
+                refresh: snapshot["refreshToken"] as? String ?? "",
+                endpoint: snapshot["tokenEndpoint"] as? String ?? "",
+                clientID: snapshot["clientId"] as? String ?? "",
+                pageHost: snapshot["pageHost"] as? String ?? "",
+                origin: origin
+            )
+        }
 
         let cookies = await withCheckedContinuation { continuation in
             webView.configuration.websiteDataStore.httpCookieStore.getAllCookies { list in
@@ -686,9 +750,13 @@ public struct SiteSignInSheet: View {
                 capturedAccessToken: capturedAccessToken,
                 capturedRefreshToken: capturedRefreshToken,
                 tokenEndpoint: capturedTokenEndpoint,
+                capturedClientID: capturedClientID,
                 cookies: cookies,
                 requireVerifiedProof: !interactive
             )
+            guard resolvedOrigin == origin else { return }
+            didDismiss = true
+            pendingAutoVerify = false
             onSignedIn?(account)
             dismiss()
         } catch {
@@ -705,14 +773,14 @@ public struct SiteSignInSheet: View {
 private final class SiteAuthWebCoordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
     var lastNonce: UUID?
     let tlsDelegate: SiteTLSDelegate
-    let onCapturedToken: @MainActor (String, String, String) -> Void
+    let onCapturedToken: @MainActor (String, String, String, String, String) -> Void
     let onNavigationFinished: @MainActor (URL?, WKWebView) async -> Void
     let onNavigationFailed: @MainActor (Error) -> Void
 
     init(
         origin: URL,
         lookup: any SiteClientIdentityLookup,
-        onCapturedToken: @escaping @MainActor (String, String, String) -> Void,
+        onCapturedToken: @escaping @MainActor (String, String, String, String, String) -> Void,
         onNavigationFinished: @escaping @MainActor (URL?, WKWebView) async -> Void,
         onNavigationFailed: @escaping @MainActor (Error) -> Void
     ) {
@@ -727,8 +795,10 @@ private final class SiteAuthWebCoordinator: NSObject, WKNavigationDelegate, WKUI
               let token = body["token"] as? String, !token.isEmpty else { return }
         let refresh = body["refreshToken"] as? String ?? ""
         let endpoint = body["tokenEndpoint"] as? String ?? ""
+        let clientID = body["clientId"] as? String ?? ""
+        let pageHost = body["pageHost"] as? String ?? ""
         Task { @MainActor [onCapturedToken] in
-            onCapturedToken(token, refresh, endpoint)
+            onCapturedToken(token, refresh, endpoint, clientID, pageHost)
         }
     }
 
@@ -782,7 +852,7 @@ private func makeSiteAuthWebView(
 ) -> WKWebView {
     let config = WKWebViewConfiguration()
     config.websiteDataStore = .nonPersistent()
-    let script = WKUserScript(source: SiteAuthWebScript.captureSource, injectionTime: .atDocumentStart, forMainFrameOnly: true)
+    let script = WKUserScript(source: SiteAuthWebScript.captureSource, injectionTime: .atDocumentStart, forMainFrameOnly: false)
     config.userContentController.addUserScript(script)
     config.userContentController.add(coordinator, name: "siteAuthBridge")
     let webView = WKWebView(frame: .zero, configuration: config)
@@ -799,7 +869,7 @@ private struct SiteAuthWebViewContainer: UIViewRepresentable {
     let nonce: UUID
     let lookup: any SiteClientIdentityLookup
     let onWebViewReady: @MainActor (WKWebView) -> Void
-    let onCapturedToken: @MainActor (String, String, String) -> Void
+    let onCapturedToken: @MainActor (String, String, String, String, String) -> Void
     let onNavigationFinished: @MainActor (URL?, WKWebView) async -> Void
     let onNavigationFailed: @MainActor (Error) -> Void
 
@@ -839,7 +909,7 @@ private struct SiteAuthWebViewContainer: NSViewRepresentable {
     let nonce: UUID
     let lookup: any SiteClientIdentityLookup
     let onWebViewReady: @MainActor (WKWebView) -> Void
-    let onCapturedToken: @MainActor (String, String, String) -> Void
+    let onCapturedToken: @MainActor (String, String, String, String, String) -> Void
     let onNavigationFinished: @MainActor (URL?, WKWebView) async -> Void
     let onNavigationFailed: @MainActor (Error) -> Void
 

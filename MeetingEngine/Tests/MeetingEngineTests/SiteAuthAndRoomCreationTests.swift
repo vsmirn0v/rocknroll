@@ -1,6 +1,9 @@
 import ConferenceCore
 import Foundation
 import XCTest
+#if canImport(JavaScriptCore)
+import JavaScriptCore
+#endif
 @testable import MeetingEngine
 
 @MainActor
@@ -106,7 +109,13 @@ final class SiteAuthAndRoomCreationTests: XCTestCase {
         return URLSession(configuration: config)
     }
 
-    private func makeJWT(exp: TimeInterval, name: String = "Test User") -> String {
+    private func makeJWT(
+        exp: TimeInterval,
+        name: String = "Test User",
+        email: String? = nil,
+        azp: String? = nil,
+        iss: String? = nil
+    ) -> String {
         func b64(_ obj: [String: Any]) -> String {
             let data = try! JSONSerialization.data(withJSONObject: obj)
             return data.base64EncodedString()
@@ -114,7 +123,11 @@ final class SiteAuthAndRoomCreationTests: XCTestCase {
                 .replacingOccurrences(of: "/", with: "_")
                 .replacingOccurrences(of: "=", with: "")
         }
-        return "\(b64(["alg": "HS256", "typ": "JWT"])).\(b64(["sub": "u1", "name": name, "exp": Int(exp)])).sig"
+        var payload: [String: Any] = ["sub": "u1", "name": name, "exp": Int(exp)]
+        if let email { payload["email"] = email }
+        if let azp { payload["azp"] = azp }
+        if let iss { payload["iss"] = iss }
+        return "\(b64(["alg": "HS256", "typ": "JWT"])).\(b64(payload)).sig"
     }
 
     // MARK: - SiteTLSDelegate Tests
@@ -607,4 +620,211 @@ final class SiteAuthAndRoomCreationTests: XCTestCase {
         XCTAssertTrue(store.accounts.isEmpty)
         XCTAssertFalse(store.wasChallengedForClientCertificate(host: "mtls.example.org").challenged)
     }
+
+    func testSaluteJazzUserInfoVerificationAndKeycloakRefresh() async throws {
+        let (store, prefs, suite) = makeIsolatedStore()
+        defer { prefs.removePersistentDomain(forName: suite) }
+
+        let origin = URL(string: "https://jazz.example.test")!
+        let issuer = "https://jazz.example.test/realms/s2b"
+        let expiredJWT = makeJWT(
+            exp: Date().addingTimeInterval(-120).timeIntervalSince1970,
+            name: "Ivan Petrov",
+            email: "ivan@example.ru",
+            azp: "s2b",
+            iss: issuer
+        )
+        let refreshedJWT = makeJWT(
+            exp: Date().addingTimeInterval(3600).timeIntervalSince1970,
+            name: "Ivan Petrov",
+            email: "ivan@example.ru",
+            azp: "s2b",
+            iss: issuer
+        )
+        let coordinator = SiteAuthCoordinator(store: store, makeSession: { _ in self.makeMockSession() })
+        let trackingCookie = HTTPCookie(properties: [
+            .domain: "jazz.example.test",
+            .path: "/",
+            .name: "session_hint",
+            .value: "abc123"
+        ])!
+
+        // 1. 200 ANONYMOUS + TOKEN_MISSING on /user/info must NOT be treated as signed in.
+        MockURLProtocol.reset { req in
+            switch req.url?.path {
+            case "/.well-known/jazz-services.json":
+                return .init(body: Data("{\"jazz\":{\"serverUrl\":\"https://bk.jazz.example.test\"}}".utf8))
+            case "/user/info":
+                return .init(body: Data("{\"authType\":\"ANONYMOUS\",\"authErr\":\"TOKEN_MISSING\"}".utf8))
+            case "/v1/user/info":
+                return .init(status: 403, mime: "text/html", body: Data("<html>403 Forbidden</html>".utf8))
+            default:
+                return .init(status: 404, body: Data())
+            }
+        }
+        do {
+            _ = try await coordinator.completeWebSignIn(
+                origin: origin,
+                engine: .guest,
+                capturedAccessToken: nil,
+                cookies: [trackingCookie],
+                requireVerifiedProof: false
+            )
+            XCTFail("Expected verificationFailed when /user/info returns ANONYMOUS")
+        } catch let error as SiteAuthError {
+            if case .verificationFailed = error {} else {
+                XCTFail("Expected verificationFailed, got \(error)")
+            }
+        }
+
+        // 2. 200 ANONYMOUS + TOKEN_INVALID must throw invalidCredentials.
+        MockURLProtocol.reset { req in
+            switch req.url?.path {
+            case "/.well-known/jazz-services.json":
+                return .init(body: Data("{\"jazz\":{\"serverUrl\":\"https://bk.jazz.example.test\"}}".utf8))
+            case "/user/info":
+                return .init(body: Data("{\"authType\":\"ANONYMOUS\",\"authErr\":\"TOKEN_INVALID\"}".utf8))
+            default:
+                return .init(status: 404, body: Data())
+            }
+        }
+        do {
+            _ = try await coordinator.completeWebSignIn(
+                origin: origin,
+                engine: .guest,
+                capturedAccessToken: expiredJWT,
+                cookies: [trackingCookie]
+            )
+            XCTFail("Expected invalidCredentials for TOKEN_INVALID")
+        } catch let error as SiteAuthError {
+            if case .invalidCredentials = error {} else {
+                XCTFail("Expected invalidCredentials, got \(error)")
+            }
+        }
+
+        // 3. Valid /user/info (S2B) succeeds even though /user/current=404 and /v1/user/info=403 nginx HTML.
+        MockURLProtocol.reset { req in
+            switch req.url?.path {
+            case "/.well-known/jazz-services.json":
+                return .init(body: Data("{\"jazz\":{\"serverUrl\":\"https://bk.jazz.example.test\"}}".utf8))
+            case "/v1/user/info":
+                return .init(status: 403, mime: "text/html", body: Data("<html>403 Forbidden</html>".utf8))
+            case "/user/info":
+                XCTAssertEqual(req.value(forHTTPHeaderField: "X-Jazz-Token"), expiredJWT)
+                XCTAssertEqual(req.value(forHTTPHeaderField: "Authorization"), "Bearer \(expiredJWT)")
+                return .init(body: Data("{\"authType\":\"S2B\",\"authErr\":\"OK\",\"name\":\"Ivan Petrov\",\"email\":\"ivan@example.ru\"}".utf8))
+            default:
+                return .init(status: 404, body: Data())
+            }
+        }
+        let saved = try await coordinator.completeWebSignIn(
+            origin: origin,
+            engine: .guest,
+            capturedAccessToken: expiredJWT,
+            capturedRefreshToken: "kc-ref-1",
+            cookies: []
+        )
+        XCTAssertEqual(saved.userDisplayName, "Ivan Petrov")
+        XCTAssertEqual(saved.username, "ivan@example.ru")
+        XCTAssertEqual(saved.tokenEndpoint, "\(issuer)/protocol/openid-connect/token")
+        XCTAssertEqual(store.readSecret(for: origin.absoluteString)?.oauthClientID, "s2b")
+
+        // 4. Keycloak refresh uses application/x-www-form-urlencoded with client_id=s2b.
+        MockURLProtocol.reset { req in
+            if req.url?.absoluteString == "\(issuer)/protocol/openid-connect/token" {
+                XCTAssertEqual(req.value(forHTTPHeaderField: "Content-Type"), "application/x-www-form-urlencoded")
+                let bodyText = req.httpBody.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+                XCTAssertTrue(bodyText.contains("grant_type=refresh_token"))
+                XCTAssertTrue(bodyText.contains("refresh_token=kc-ref-1"))
+                XCTAssertTrue(bodyText.contains("client_id=s2b"))
+                let json = try! JSONSerialization.data(withJSONObject: [
+                    "access_token": refreshedJWT,
+                    "refresh_token": "kc-ref-2",
+                    "expires_in": 3600
+                ])
+                return .init(body: json)
+            }
+            return .init(status: 404, body: Data())
+        }
+        let creds = await coordinator.validCredentials(for: origin, engine: .guest)
+        XCTAssertEqual(creds?.accessToken, refreshedJWT)
+        XCTAssertEqual(store.readSecret(for: origin.absoluteString)?.refreshToken, "kc-ref-2")
+    }
+
+    #if canImport(JavaScriptCore) && (os(iOS) || os(macOS))
+    func testSiteAuthWebScriptCapturesKeycloakXHRAndIgnoresProxyClientKey() throws {
+        let context = try XCTUnwrap(JSContext())
+        var jsException: String?
+        context.exceptionHandler = { _, exc in
+            jsException = exc?.toString()
+        }
+
+        let jwt1 = makeJWT(exp: Date().addingTimeInterval(3600).timeIntervalSince1970, name: "Jazz User", azp: "s2b")
+        let jwt2 = makeJWT(exp: Date().addingTimeInterval(7200).timeIntervalSince1970, name: "Jazz User 2", azp: "s2b")
+
+        let harness = """
+        var window = this;
+        window.location = { href: 'https://jazz.example.test/?state=1&code=abc', hostname: 'jazz.example.test', hash: '' };
+        window.__messages = [];
+        window.webkit = { messageHandlers: { siteAuthBridge: { postMessage: function(m) { window.__messages.push(m); } } } };
+        window.addEventListener = function() {};
+        window.localStorage = { length: 0, key: function() { return null; }, getItem: function() { return null; } };
+        window.sessionStorage = { length: 0, key: function() { return null; }, getItem: function() { return null; } };
+        function URL(u) { this.href = u; }
+        function XMLHttpRequest() { this._headers = {}; this._listeners = []; }
+        XMLHttpRequest.prototype.open = function(m, u) {};
+        XMLHttpRequest.prototype.setRequestHeader = function(n, v) { this._headers[n] = v; };
+        XMLHttpRequest.prototype.addEventListener = function(ev, fn) { if (ev === 'load') this._listeners.push(fn); };
+        XMLHttpRequest.prototype.send = function(body) { this._sentBody = body; };
+        function BroadcastChannel(name) { this.name = name; }
+        BroadcastChannel.prototype.postMessage = function(msg) {};
+        window.fetch = function(input, init) {
+            return { then: function() { return this; }, catch: function() { return this; } };
+        };
+        """
+        context.evaluateScript(harness)
+        XCTAssertNil(jsException)
+
+        context.evaluateScript(SiteAuthWebScript.captureSource)
+        XCTAssertNil(jsException)
+
+        // 1. Unleash / bare non-JWT Authorization header "proxy-client-key" must be ignored.
+        context.evaluateScript("""
+        window.fetch('https://jazz.example.test/api/unleash/client/features', { headers: { Authorization: 'proxy-client-key' } });
+        window.fetch('https://jazz.example.test/api/other', { headers: { Authorization: 'proxy-client-key' } });
+        """)
+        XCTAssertNil(jsException)
+        XCTAssertEqual(context.evaluateScript("window.__messages.length")?.toInt32(), 0)
+
+        // 2. Keycloak XHR /protocol/openid-connect/token exchange captures access_token, refresh_token, endpoint, clientId.
+        context.evaluateScript("""
+        var x = new XMLHttpRequest();
+        x.open('POST', 'https://jazz.example.test/realms/s2b/protocol/openid-connect/token', true);
+        x.setRequestHeader('Content-type', 'application/x-www-form-urlencoded');
+        x.send('code=abc&grant_type=authorization_code&client_id=s2b');
+        x.status = 200;
+        x.responseType = '';
+        x.responseText = JSON.stringify({ access_token: '\(jwt1)', refresh_token: 'ref-xhr-1', expires_in: 300 });
+        for (var i = 0; i < x._listeners.length; i++) { x._listeners[i](); }
+        """)
+        XCTAssertNil(jsException)
+        XCTAssertEqual(context.evaluateScript("window.__messages.length")?.toInt32(), 1)
+        XCTAssertEqual(context.evaluateScript("window.__messages[0].token")?.toString(), jwt1)
+        XCTAssertEqual(context.evaluateScript("window.__messages[0].refreshToken")?.toString(), "ref-xhr-1")
+        XCTAssertEqual(context.evaluateScript("window.__messages[0].tokenEndpoint")?.toString(), "https://jazz.example.test/realms/s2b/protocol/openid-connect/token")
+        XCTAssertEqual(context.evaluateScript("window.__messages[0].clientId")?.toString(), "s2b")
+
+        // 3. Bare non-JWT X-Jazz-Token cannot downgrade an already captured JWT, while BroadcastChannel JWT updates it.
+        context.evaluateScript("""
+        var x2 = new XMLHttpRequest();
+        x2.open('GET', 'https://bk.jazz.example.test/user/info', true);
+        x2.setRequestHeader('X-Jazz-Token', 'opaque-not-a-jwt-token');
+        new BroadcastChannel('s2b-keycloak').postMessage({ token: '\(jwt2)', refreshToken: 'ref-bc-2' });
+        """)
+        XCTAssertNil(jsException)
+        XCTAssertEqual(context.evaluateScript("window.__messages.length")?.toInt32(), 2)
+        XCTAssertEqual(context.evaluateScript("window.__rockSiteAuthSnapshot().token")?.toString(), jwt2)
+        XCTAssertEqual(context.evaluateScript("window.__rockSiteAuthSnapshot().refreshToken")?.toString(), "ref-bc-2")
+    }
+    #endif
 }
