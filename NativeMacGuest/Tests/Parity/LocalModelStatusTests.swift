@@ -146,7 +146,7 @@ import XCTest
     }
 
     func testPersonalAndRapidMLXVoicesAreManagedWithoutMemory() throws {
-        for engine in [VoiceEngine.personal, .rapidMLX] {
+        for engine in [VoiceEngine.personal, .rapidMLX, .yandexLiveTTS] {
             let listen = listenStore(models: [], enabled: false)
             let (_, voice) = try voiceFixtures()
             let store = statusStore(listen: listen, voice: voice, attention: attentionStore(voiceEngine: engine))

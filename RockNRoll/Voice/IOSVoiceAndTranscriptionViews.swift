@@ -189,6 +189,9 @@ struct TranscriptionAndVoiceSettingsView: View {
     @State private var generatingPreview: ActivePreviewKind?
     @State private var playingPreview: ActivePreviewKind?
     @State private var auditionPreviewError: String?
+    @State private var yandexKeyDraft = ""
+    @State private var yandexKeyFeedback: String?
+    @State private var yandexKeyIsError = false
     @State private var showingEnrollmentSheet = false
     @State private var confirmingDeleteVoxModel = false
     @State private var confirmingDeleteVoxVoice = false
@@ -341,6 +344,85 @@ struct TranscriptionAndVoiceSettingsView: View {
                             .font(.footnote)
                             .foregroundStyle(.secondary)
                     }
+                case .yandexLiveTTS:
+                    TextField(L("Yandex Cloud Folder ID"), text: $voiceStore.yandexFolderID, prompt: Text("b1g..."))
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                    HStack {
+                        TextField(L("Voice"), text: $voiceStore.yandexVoice, prompt: Text(YandexLiveTTSVoice.sofia.rawValue))
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                        Menu {
+                            ForEach(YandexLiveTTSVoice.allCases) { preset in
+                                Button(preset.displayTitle) {
+                                    voiceStore.yandexVoice = preset.rawValue
+                                }
+                            }
+                        } label: {
+                            Label(L("Preset"), systemImage: "chevron.up.chevron.down")
+                                .font(.caption)
+                        }
+                    }
+                    Picker(L("Voice role"), selection: $voiceStore.yandexRole) {
+                        ForEach(YandexLiveTTSRole.allCases) { role in
+                            Text(role.title).tag(role.rawValue)
+                        }
+                    }
+                    TextField(L("Model"), text: $voiceStore.yandexModel, prompt: Text(YandexRealtimePreferences.defaultTTSModel))
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                    TextField(L("Custom WebSocket URL (optional)"), text: $voiceStore.yandexEndpoint, prompt: Text(RealtimeProviderKind.yandexRealtime.defaultEndpoint))
+                        .keyboardType(.URL)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                    SecureField(
+                        voiceStore.hasYandexAPIKey ? L("Saved in the keychain") : L("Yandex API Key (stored in Keychain)"),
+                        text: $yandexKeyDraft
+                    )
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .submitLabel(.done)
+                    .onSubmit { saveYandexAPIKey() }
+
+                    HStack {
+                        Button(L("Save Key")) {
+                            saveYandexAPIKey()
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(yandexKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        if voiceStore.hasYandexAPIKey {
+                            Button(L("Remove"), role: .destructive) {
+                                yandexKeyDraft = ""
+                                if voiceStore.setYandexAPIKey("") {
+                                    yandexKeyFeedback = L("Removed API key from Keychain.")
+                                    yandexKeyIsError = false
+                                } else {
+                                    yandexKeyFeedback = L("Could not remove the API key from the Keychain.")
+                                    yandexKeyIsError = true
+                                }
+                            }
+                            .buttonStyle(.bordered)
+                        }
+                    }
+                    if let yandexKeyFeedback {
+                        Text(yandexKeyFeedback)
+                            .font(.caption)
+                            .foregroundStyle(yandexKeyIsError ? .red : .secondary)
+                    }
+                    if let endpoint = voiceStore.yandexEndpointURL {
+                        Text(L("For previews and meeting replies, including assistant replies, Yandex LiveTTS sends the text, model name and voice selection to %@ over WebSocket.", endpoint.host ?? endpoint.absoluteString))
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                        Toggle(L("Allow speech requests to this server"), isOn: Binding(
+                            get: { voiceStore.hasYandexConsent },
+                            set: { voiceStore.setYandexConsent($0) }
+                        ))
+                        .accessibilityIdentifier("voice.yandex.consent")
+                    } else {
+                        Text(L("Realtime endpoint URL is invalid."))
+                            .font(.footnote)
+                            .foregroundStyle(.red)
+                    }
                 }
 
                 if previewPlayer.isPlaying && playingPreview == .voiceReply {
@@ -359,7 +441,11 @@ struct TranscriptionAndVoiceSettingsView: View {
                             Label(L("Preview voice"), systemImage: "play.circle")
                         }
                     }
-                    .disabled(generatingPreview != nil || (voiceStore.engine == .rapidMLX && !voiceStore.hasRapidMLXConsent))
+                    .disabled(
+                        generatingPreview != nil
+                            || (voiceStore.engine == .rapidMLX && !voiceStore.hasRapidMLXConsent)
+                            || (voiceStore.engine == .yandexLiveTTS && !voiceStore.hasYandexConsent)
+                    )
                     .accessibilityIdentifier("voice.preview")
                 }
 
@@ -465,6 +551,12 @@ struct TranscriptionAndVoiceSettingsView: View {
                         Text(preset.localizedTitle).tag(AssistantAuditionVoiceSelection.voxPreset(preset))
                     }
                 }
+                Section(L("Cloud LiveTTS (Yandex)")) {
+                    ForEach(YandexLiveTTSVoice.allCases) { voice in
+                        Text(L("Yandex LiveTTS · %@", voice.displayTitle))
+                            .tag(AssistantAuditionVoiceSelection.yandexLiveTTS(voice: voice.rawValue))
+                    }
+                }
                 Section(L("Personal & Cloned")) {
                     if voxStore.isDeviceSupported {
                         Text(L("My cloned voice")).tag(AssistantAuditionVoiceSelection.clonedVoice)
@@ -482,6 +574,24 @@ struct TranscriptionAndVoiceSettingsView: View {
                 Text(preset.localizedSubtitle + " " + L("Uses VoxCPM2 when downloaded, or falls back to the iPhone system voice."))
                     .font(.footnote)
                     .foregroundStyle(.secondary)
+            } else if case .yandexLiveTTS = voiceStore.assistantAuditionVoice {
+                if !voiceStore.hasYandexAPIKey || voiceStore.yandexFolderID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    Text(L("Configure your Yandex API key and Folder ID in Voice generation or Realtime settings, or answers will fall back to the iPhone system voice."))
+                        .font(.footnote)
+                        .foregroundStyle(.orange)
+                } else if !voiceStore.hasYandexConsent {
+                    Text(L("Allow speech requests to Yandex LiveTTS above, or answers will fall back to the iPhone system voice."))
+                        .font(.footnote)
+                        .foregroundStyle(.orange)
+                    Toggle(L("Allow speech requests to this server"), isOn: Binding(
+                        get: { voiceStore.hasYandexConsent },
+                        set: { voiceStore.setYandexConsent($0) }
+                    ))
+                } else {
+                    Text(L("Synthesizes Assistant replies via Yandex LiveTTS over WebSocket, or falls back to the iPhone system voice when offline."))
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
             } else if voiceStore.assistantAuditionVoice == .clonedVoice && voxStore.storedVoice == nil {
                 Text(L("Record a sample below to use your cloned voice, or answers will use the iPhone system voice."))
                     .font(.footnote)
@@ -644,6 +754,19 @@ struct TranscriptionAndVoiceSettingsView: View {
             Text(L("VoxCPM2 (On-Device Neural Voice)"))
         } footer: {
             Text(L("Runs VoxCPM2 4-bit on Metal GPU on 8 GB+ iPhones across 30 languages. Only encoded acoustic features are kept on this iPhone, not the raw recording."))
+        }
+    }
+
+    private func saveYandexAPIKey() {
+        let trimmed = yandexKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        if voiceStore.setYandexAPIKey(trimmed) {
+            yandexKeyDraft = ""
+            yandexKeyFeedback = L("Saved API key to Keychain.")
+            yandexKeyIsError = false
+        } else {
+            yandexKeyFeedback = L("Could not save the API key to the Keychain.")
+            yandexKeyIsError = true
         }
     }
 

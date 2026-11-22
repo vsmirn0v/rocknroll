@@ -1187,6 +1187,63 @@ import XCTest
         catch { XCTAssertEqual(error as? VoiceSynthesisError, .server(404, "model not found")) }
     }
 
+    func testYandexLiveTTSConfigurationAndSynthesis() async throws {
+        final class MockYandexTransport: @unchecked Sendable, RealtimeVoiceTransport {
+            private let continuation: AsyncStream<RealtimeVoiceEvent>.Continuation
+            let events: AsyncStream<RealtimeVoiceEvent>
+            var lastConfig: RealtimeSessionConfig?
+
+            init() {
+                var cont: AsyncStream<RealtimeVoiceEvent>.Continuation!
+                self.events = AsyncStream { cont = $0 }
+                self.continuation = cont
+            }
+            func connect(config: RealtimeSessionConfig) async throws {
+                lastConfig = config
+                continuation.yield(.connected)
+            }
+            func sendAudioPCM16(_ data: Data) async throws {}
+            func sendTextTurn(_ text: String) async throws {
+                let pcm = RealtimeVoiceAudio.floatSamplesToPCM16Data([0.2, -0.2, 0.3, -0.3])
+                continuation.yield(.audioPCM16(pcm, sampleRate: 44_100))
+                continuation.yield(.audioDone)
+            }
+            func sendToolResult(callID: String, name: String, jsonOutput: String) async throws {}
+            func updateInstructions(_ instructions: String) async throws {}
+            func disconnect() async { continuation.yield(.disconnected(nil)) }
+        }
+
+        let store = self.store()
+        store.realtimeProvider = .yandexRealtime
+        store.realtimeFolderID = "b1g-mac-folder"
+        store.realtimeVoiceRole = "casual"
+        store.voiceEngine = .yandexLiveTTS
+        store.yandexTTSVoice = "vera"
+        store.yandexTTSRole = "support"
+        store.yandexTTSModel = YandexRealtimePreferences.defaultTTSModel
+        XCTAssertTrue(store.setRealtimeAPIKey("AQVN-mac-key", for: .yandexRealtime))
+
+        XCTAssertEqual(store.voiceConfiguration.speechHost, "ai.api.cloud.yandex.net")
+        XCTAssertEqual(store.voiceConfiguration.title, L("Yandex LiveTTS") + " · vera")
+        XCTAssertEqual(store.realtimeAPIKey(for: .yandexRealtime), "AQVN-mac-key")
+
+        let mock = MockYandexTransport()
+        let buffer = try await VoiceSynthesis.yandexLiveTTS(
+            "Проверка речи Yandex LiveTTS",
+            apiKey: "AQVN-mac-key",
+            folderID: store.realtimeFolderID,
+            model: store.yandexTTSModel,
+            voice: store.yandexTTSVoice,
+            role: store.yandexTTSRole,
+            customTransport: mock
+        )
+        XCTAssertEqual(buffer.format.sampleRate, 44_100, accuracy: 1)
+        XCTAssertEqual(buffer.frameLength, 4)
+        XCTAssertEqual(mock.lastConfig?.folderID, "b1g-mac-folder")
+        XCTAssertEqual(mock.lastConfig?.voice, "vera")
+        XCTAssertEqual(mock.lastConfig?.voiceRole, "support")
+    }
+
     /// Qwen3-TTS through Rapid-MLX on this Mac, when it runs with audio.
     func testLiveRapidMLXSpeaksRussian() async throws {
         let base = AttentionProvider.defaults[.rapidMLX]!.baseURL

@@ -382,6 +382,8 @@ struct LocalModelStatusSnapshot: Equatable, Sendable {
             return managedVoice(L("Personal Voice"), detail: L("Personal Voice is managed by macOS; this app does not attribute its memory."))
         case .rapidMLX:
             return managedVoice(L("Rapid-MLX"), detail: L("The model runs in Rapid-MLX, a separate process on this Mac."))
+        case .yandexLiveTTS:
+            return managedVoice(L("Yandex LiveTTS"), detail: L("Speech is synthesized over WebSocket by Yandex Cloud AI Studio; no local model memory is used."))
         case .cloned: break
         }
 

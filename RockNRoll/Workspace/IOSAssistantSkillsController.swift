@@ -27,6 +27,22 @@ final class IOSAssistantSkillsController: ObservableObject {
     @Published var realtimeEndpoint: String {
         didSet { preferences.set(realtimeEndpoint, forKey: Keys.realtimeEndpoint) }
     }
+    @Published var realtimeFolderID: String {
+        didSet {
+            guard oldValue != realtimeFolderID else { return }
+            preferences.set(realtimeFolderID, forKey: YandexRealtimePreferences.folderIDKey)
+            if !suppressCredentialBroadcast {
+                NotificationCenter.default.post(
+                    name: YandexRealtimePreferences.credentialsChangedNotification,
+                    object: self,
+                    userInfo: ["isStandard": preferences === UserDefaults.standard]
+                )
+            }
+        }
+    }
+    @Published var realtimeVoiceRole: String {
+        didSet { preferences.set(realtimeVoiceRole, forKey: YandexRealtimePreferences.voiceRoleKey) }
+    }
     @Published var selectedSkillIDs: [String] {
         didSet { preferences.set(selectedSkillIDs, forKey: Keys.selectedSkillIDs) }
     }
@@ -52,6 +68,8 @@ final class IOSAssistantSkillsController: ObservableObject {
     private var folderWatcher: AssistantSkillFolderWatcher?
     private var watchedVaultURL: URL?
     private var hasLoadedOnce = false
+    private var suppressCredentialBroadcast = false
+    private var credentialObserver: NSObjectProtocol?
 
     init(
         workspace: IOSWorkspaceCoordinator?,
@@ -69,17 +87,41 @@ final class IOSAssistantSkillsController: ObservableObject {
         self.realtimeModel = preferences.string(forKey: Keys.realtimeModel) ?? ""
         self.realtimeVoice = preferences.string(forKey: Keys.realtimeVoice) ?? ""
         self.realtimeEndpoint = preferences.string(forKey: Keys.realtimeEndpoint) ?? ""
+        self.realtimeFolderID = preferences.string(forKey: YandexRealtimePreferences.folderIDKey) ?? ""
+        self.realtimeVoiceRole = preferences.string(forKey: YandexRealtimePreferences.voiceRoleKey) ?? ""
         self.selectedSkillIDs = preferences.stringArray(forKey: Keys.selectedSkillIDs) ?? ["scrum-master"]
         self.autonomousMeetingVoiceEnabled = preferences.object(forKey: Keys.autonomousMeetingVoice) as? Bool ?? true
 
         refreshRealtimeKeyIndicators()
         refresh()
         startWatcher()
+        credentialObserver = NotificationCenter.default.addObserver(
+            forName: YandexRealtimePreferences.credentialsChangedNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] note in
+            let posterIsStandard = (note.userInfo?["isStandard"] as? Bool) ?? false
+            let posterObject = note.object as AnyObject?
+            Task { @MainActor [weak self] in
+                guard let self, posterObject !== self else { return }
+                guard self.preferences === UserDefaults.standard && posterIsStandard else { return }
+                self.suppressCredentialBroadcast = true
+                defer { self.suppressCredentialBroadcast = false }
+                let updatedFolder = self.preferences.string(forKey: YandexRealtimePreferences.folderIDKey) ?? ""
+                if self.realtimeFolderID != updatedFolder {
+                    self.realtimeFolderID = updatedFolder
+                }
+                self.refreshRealtimeKeyIndicators()
+            }
+        }
     }
 
     deinit {
         folderWatcher?.stop()
         watchedVaultURL?.stopAccessingSecurityScopedResource()
+        if let credentialObserver {
+            NotificationCenter.default.removeObserver(credentialObserver)
+        }
     }
 
     // MARK: - Storage Resolution & Watcher
@@ -384,6 +426,13 @@ final class IOSAssistantSkillsController: ObservableObject {
             ? keychain.deleteRealtime(provider: target)
             : keychain.writeRealtime(clean, provider: target)
         refreshRealtimeKeyIndicators()
+        if saved && target == .yandexRealtime && !suppressCredentialBroadcast {
+            NotificationCenter.default.post(
+                name: YandexRealtimePreferences.credentialsChangedNotification,
+                object: self,
+                userInfo: ["isStandard": preferences === UserDefaults.standard]
+            )
+        }
         return saved
     }
 

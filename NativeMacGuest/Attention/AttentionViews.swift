@@ -649,6 +649,7 @@ struct NativeDesktopIntelligenceSettings: View {
     @State private var writerKey = ""
     @State private var escalationKey = ""
     @State private var realtimeKey = ""
+    @State private var yandexVoiceKey = ""
     @State private var keychainErrors: [String: String] = [:]
     @State private var aliases = ""
     @State private var testing = false
@@ -752,6 +753,8 @@ struct NativeDesktopIntelligenceSettings: View {
         switch store.voiceEngine {
         case .system: L("The macOS voice")
         case .rapidMLX: (voiceOnThisMac ? L("Rapid-MLX on this Mac") : L("Rapid-MLX voice server")) + " · " + store.voiceModel
+        case .yandexLiveTTS:
+            L("Yandex LiveTTS") + " · " + (store.yandexTTSVoice.trimmed.isEmpty ? YandexLiveTTSVoice.sofia.rawValue : store.yandexTTSVoice.trimmed)
         case .personal: L("Your Personal Voice")
         case .cloned: L("Your voice, on the Neural Engine")
         }
@@ -771,9 +774,15 @@ struct NativeDesktopIntelligenceSettings: View {
     }
 
     private var voiceOnThisMac: Bool {
-        guard store.voiceEngine == .rapidMLX else { return true }
-        guard let host = URL(string: store.voiceBaseURL.trimmed)?.host?.lowercased() else { return false }
-        return ["127.0.0.1", "localhost", "::1", "[::1]"].contains(host)
+        switch store.voiceEngine {
+        case .rapidMLX:
+            guard let host = URL(string: store.voiceBaseURL.trimmed)?.host?.lowercased() else { return false }
+            return ["127.0.0.1", "localhost", "::1", "[::1]"].contains(host)
+        case .yandexLiveTTS:
+            return false
+        case .system, .personal, .cloned:
+            return true
+        }
     }
 
     private func settingsLink(_ destination: NativeDesktopAssistantSettingsArea, detail: String) -> some View {
@@ -988,15 +997,51 @@ struct NativeDesktopIntelligenceSettings: View {
                     id: "settings.realtime-provider"
                 )
                 if store.realtimeProvider != .disabled {
+                    if store.realtimeProvider == .yandexRealtime {
+                        TextField(
+                            L("Yandex Cloud Folder ID"),
+                            text: $store.realtimeFolderID,
+                            prompt: Text("b1g...")
+                        )
+                    }
                     TextField(
                         L("Model"),
                         text: $store.realtimeModel,
                         prompt: Text(store.realtimeProvider.defaultModel)
                     )
+                    if store.realtimeProvider == .yandexRealtime {
+                        HStack {
+                            TextField(
+                                L("Voice"),
+                                text: $store.realtimeVoice,
+                                prompt: Text(store.realtimeProvider.defaultVoice)
+                            )
+                            Menu(L("Preset")) {
+                                ForEach(YandexLiveTTSVoice.allCases) { preset in
+                                    Button(preset.displayTitle) {
+                                        store.realtimeVoice = preset.rawValue
+                                    }
+                                }
+                            }
+                            .menuStyle(.borderlessButton)
+                            .fixedSize()
+                        }
+                        Picker(L("Voice role"), selection: $store.realtimeVoiceRole) {
+                            ForEach(YandexLiveTTSRole.allCases) { role in
+                                Text(role.title).tag(role.rawValue)
+                            }
+                        }
+                    } else {
+                        TextField(
+                            L("Voice"),
+                            text: $store.realtimeVoice,
+                            prompt: Text(store.realtimeProvider.defaultVoice)
+                        )
+                    }
                     TextField(
-                        L("Voice"),
-                        text: $store.realtimeVoice,
-                        prompt: Text(store.realtimeProvider.defaultVoice)
+                        L("Custom WebSocket URL (optional)"),
+                        text: $store.realtimeEndpoint,
+                        prompt: Text(store.realtimeProvider.defaultEndpoint)
                     )
                     HStack {
                         let hasDedicatedKey = store.keyedRealtimeProviders.contains(store.realtimeProvider)
@@ -1153,6 +1198,12 @@ struct NativeDesktopIntelligenceSettings: View {
                             Text(preset.localizedTitle).tag(AssistantAuditionVoiceSelection.voxPreset(preset))
                         }
                     }
+                    Section(L("Cloud LiveTTS (Yandex)")) {
+                        ForEach(YandexLiveTTSVoice.allCases) { voice in
+                            Text(L("Yandex LiveTTS · %@", voice.displayTitle))
+                                .tag(AssistantAuditionVoiceSelection.yandexLiveTTS(voice: voice.rawValue))
+                        }
+                    }
                     Section(L("Personal & Cloned")) {
                         if clone.available {
                             Text(L("My cloned voice")).tag(AssistantAuditionVoiceSelection.clonedVoice)
@@ -1171,6 +1222,14 @@ struct NativeDesktopIntelligenceSettings: View {
                 if case .voxPreset(let preset) = store.assistantAuditionVoice {
                     Text(preset.localizedSubtitle + " " + L("Uses on-device VoxCPM2 when downloaded, or falls back to the macOS voice."))
                         .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                } else if case .yandexLiveTTS = store.assistantAuditionVoice {
+                    if (store.realtimeAPIKey(for: .yandexRealtime) ?? "").isEmpty || store.realtimeFolderID.trimmed.isEmpty {
+                        Text(L("Configure your Yandex API key and Folder ID below or in AI providers, or responses will fall back to the macOS voice."))
+                            .font(.caption).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
+                    } else {
+                        Text(L("Synthesizes Assistant replies via Yandex LiveTTS over WebSocket, or falls back to the macOS voice when offline."))
+                            .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    }
                 } else if store.assistantAuditionVoice == .clonedVoice && clone.stored == nil {
                     Text(L("Record your cloned voice below first, or responses will fall back to the macOS voice."))
                         .font(.caption).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
@@ -1219,12 +1278,17 @@ struct NativeDesktopIntelligenceSettings: View {
                         switch choice {
                         case .system: L("The macOS voice")
                         case .rapidMLX: L("Rapid-MLX voice server")
+                        case .yandexLiveTTS: L("Yandex LiveTTS")
                         case .personal: L("Your Personal Voice")
                         case .cloned: L("Your voice, on the Neural Engine")
                         }
                     },
                     id: "settings.voice-engine",
-                    fallbackFor: (store.voiceEngine == .rapidMLX ? Set<String>() : ["settings.voice-model", "settings.voice-description", "settings.voice-address"])
+                    fallbackFor: (store.voiceEngine == .rapidMLX
+                        ? Set<String>()
+                        : (store.voiceEngine == .yandexLiveTTS
+                            ? Set<String>(["settings.voice-description", "settings.voice-address"])
+                            : Set<String>(["settings.voice-model", "settings.voice-description", "settings.voice-address"])))
                         .union(store.voiceEngine == .cloned && clone.available && clone.model != nil ? [] : ["settings.saved-voice", "settings.voice-preparation", "settings.voice-download", "settings.voice-delete", "settings.voice-gpu", "settings.voice-gpu-remove"])
                         .union(store.voiceEngine == .cloned && clone.available && clone.model != nil && clone.gpuModel == nil ? ["settings.voice-gpu", "settings.voice-gpu-remove"] : [])
                 )
@@ -1261,6 +1325,67 @@ struct NativeDesktopIntelligenceSettings: View {
                             .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                     }
                     Text(L("Start Rapid-MLX with --enable-audio. The first reply loads the voice model and takes longer.")).font(.caption).foregroundStyle(.secondary)
+                }
+                if store.voiceEngine == .yandexLiveTTS {
+                    TextField(L("Yandex Cloud Folder ID"), text: $store.realtimeFolderID, prompt: Text("b1g..."))
+                    HStack {
+                        TextField(L("Voice"), text: $store.yandexTTSVoice, prompt: Text(YandexLiveTTSVoice.sofia.rawValue))
+                        Menu(L("Preset")) {
+                            ForEach(YandexLiveTTSVoice.allCases) { preset in
+                                Button(preset.displayTitle) {
+                                    store.yandexTTSVoice = preset.rawValue
+                                }
+                            }
+                        }
+                        .menuStyle(.borderlessButton)
+                        .fixedSize()
+                    }
+                    Picker(L("Voice role"), selection: $store.yandexTTSRole) {
+                        ForEach(YandexLiveTTSRole.allCases) { role in
+                            Text(role.title).tag(role.rawValue)
+                        }
+                    }
+                    TextField(L("Voice model"), text: $store.yandexTTSModel, prompt: Text(YandexRealtimePreferences.defaultTTSModel))
+                        .nativeSettingAnchor("settings.voice-model", nativeControlFocus: true)
+                    TextField(L("Custom WebSocket URL (optional)"), text: $store.yandexTTSEndpoint, prompt: Text(RealtimeProviderKind.yandexRealtime.defaultEndpoint))
+                    HStack {
+                        let hasKey = store.keyedRealtimeProviders.contains(.yandexRealtime)
+                        SecureField(hasKey ? L("Saved in the keychain") : L("Yandex API Key (stored in Keychain)"), text: $yandexVoiceKey)
+                            .onSubmit {
+                                guard !yandexVoiceKey.trimmed.isEmpty else { return }
+                                if store.setRealtimeAPIKey(yandexVoiceKey, for: .yandexRealtime) {
+                                    yandexVoiceKey = ""
+                                    keychainErrors.removeValue(forKey: "settings.yandex-voice-key")
+                                } else {
+                                    keychainErrors["settings.yandex-voice-key"] = L("Could not save the API key to the Keychain.")
+                                }
+                            }
+                        Button(L("Save")) {
+                            if store.setRealtimeAPIKey(yandexVoiceKey, for: .yandexRealtime) {
+                                yandexVoiceKey = ""
+                                keychainErrors.removeValue(forKey: "settings.yandex-voice-key")
+                            } else {
+                                keychainErrors["settings.yandex-voice-key"] = L("Could not save the API key to the Keychain.")
+                            }
+                        }
+                        .disabled(yandexVoiceKey.trimmed.isEmpty)
+                        if hasKey {
+                            Button(L("Remove")) {
+                                if store.setRealtimeAPIKey("", for: .yandexRealtime) {
+                                    keychainErrors.removeValue(forKey: "settings.yandex-voice-key")
+                                } else {
+                                    keychainErrors["settings.yandex-voice-key"] = L("Could not remove the API key from the Keychain.")
+                                }
+                            }
+                        }
+                    }
+                    if let err = keychainErrors["settings.yandex-voice-key"] {
+                        Text(err).font(.caption).foregroundStyle(.red)
+                    }
+                    if let host = store.voiceConfiguration.speechHost {
+                        Text(L("Text for spoken replies is sent to the configured voice server at %@.", host))
+                            .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    }
                 }
                 HStack {
                     NativeSettingsButton(title: previewing ? L("Preparing…") : L("Listen"), id: "settings.voice-preview") {
@@ -1313,7 +1438,7 @@ struct NativeDesktopIntelligenceSettings: View {
                     Label(L("When Realtime voice (%@) is enabled, live meeting and microphone audio streams over WebSocket for low-latency voice replies.", store.realtimeProvider.title), systemImage: "waveform.badge.mic")
                         .foregroundStyle(.orange)
                 }
-                if store.voiceEngine == .rapidMLX, let host = store.voiceConfiguration.speechHost {
+                if (store.voiceEngine == .rapidMLX || store.voiceEngine == .yandexLiveTTS), let host = store.voiceConfiguration.speechHost {
                     Label(L("Text for spoken replies is sent to the configured voice server at %@.", host), systemImage: "arrow.up.forward")
                 }
                 Label(L("Decisions are kept on this Mac for 30 days so you can see why a card appeared."), systemImage: "clock")
@@ -1446,7 +1571,7 @@ struct NativeDesktopIntelligenceSettings: View {
             defer { auditionPreviewing = false }
             do {
                 let sample = L("Hello! This is how Assistant answers sound on this Mac.")
-                let result = try await VoiceSynthesis.auditionWithStatus(sample, selection: selection)
+                let result = try await VoiceSynthesis.auditionWithStatus(sample, selection: selection, store: store)
                 try VoicePreviewPlayer.shared.play(result.buffer)
                 auditionUsedFallback = result.usedSystemFallback
                 if result.usedSystemFallback {

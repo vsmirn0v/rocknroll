@@ -100,7 +100,9 @@ extension AssistantTalkController {
             voice: attention.store.realtimeVoice,
             endpointOverride: attention.store.realtimeEndpoint,
             systemInstructions: instructions,
-            tools: exportedTools
+            tools: exportedTools,
+            folderID: attention.store.realtimeFolderID,
+            voiceRole: attention.store.realtimeVoiceRole
         )
         let configKey = [
             kind.rawValue,
@@ -108,6 +110,8 @@ extension AssistantTalkController {
             config.model,
             config.voice,
             config.endpointOverride,
+            config.folderID,
+            config.voiceRole,
             exportedTools.map(\.name).joined(separator: ",")
         ].joined(separator: "|")
 

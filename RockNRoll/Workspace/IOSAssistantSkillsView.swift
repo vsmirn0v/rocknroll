@@ -523,12 +523,40 @@ struct IOSAssistantSkillsView: View {
                 }
 
                 if skills.realtimeProvider != .disabled {
+                    if skills.realtimeProvider == .yandexRealtime {
+                        TextField(L("Yandex Cloud Folder ID"), text: $skills.realtimeFolderID, prompt: Text("b1g..."))
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                    }
                     TextField(L("Realtime Model"), text: $skills.realtimeModel, prompt: Text(skills.realtimeProvider.defaultModel))
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
-                    TextField(L("Voice"), text: $skills.realtimeVoice, prompt: Text(skills.realtimeProvider.defaultVoice))
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
+                    if skills.realtimeProvider == .yandexRealtime {
+                        HStack {
+                            TextField(L("Voice"), text: $skills.realtimeVoice, prompt: Text(skills.realtimeProvider.defaultVoice))
+                                .textInputAutocapitalization(.never)
+                                .autocorrectionDisabled()
+                            Menu {
+                                ForEach(YandexLiveTTSVoice.allCases) { preset in
+                                    Button(preset.displayTitle) {
+                                        skills.realtimeVoice = preset.rawValue
+                                    }
+                                }
+                            } label: {
+                                Label(L("Preset"), systemImage: "chevron.up.chevron.down")
+                                    .font(.caption)
+                            }
+                        }
+                        Picker(L("Voice role"), selection: $skills.realtimeVoiceRole) {
+                            ForEach(YandexLiveTTSRole.allCases) { role in
+                                Text(role.title).tag(role.rawValue)
+                            }
+                        }
+                    } else {
+                        TextField(L("Voice"), text: $skills.realtimeVoice, prompt: Text(skills.realtimeProvider.defaultVoice))
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                    }
                     TextField(L("Custom WebSocket URL (optional)"), text: $skills.realtimeEndpoint, prompt: Text(skills.realtimeProvider.defaultEndpoint))
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
@@ -565,7 +593,7 @@ struct IOSAssistantSkillsView: View {
                     }
                 }
             } header: {
-                Text(L("Optional Realtime Voice (gpt-live / Gemini Live)"))
+                Text(L("Optional Realtime Voice (gpt-live / Gemini Live / Yandex LiveTTS)"))
             } footer: {
                 Text(L("Speeds up voice turns inside meetings. Rock still works automatically via your standard LLM + local TTS when off."))
             }

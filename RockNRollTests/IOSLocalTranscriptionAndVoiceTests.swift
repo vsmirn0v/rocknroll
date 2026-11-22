@@ -270,6 +270,91 @@ final class IOSLocalTranscriptionAndVoiceTests: XCTestCase {
         }
     }
 
+    func testYandexLiveTTSPersistenceConsentAndSynthesis() async throws {
+        final class MockYandexTTSTransport: @unchecked Sendable, RealtimeVoiceTransport {
+            private let continuation: AsyncStream<RealtimeVoiceEvent>.Continuation
+            let events: AsyncStream<RealtimeVoiceEvent>
+            var lastConfig: RealtimeSessionConfig?
+
+            init() {
+                var cont: AsyncStream<RealtimeVoiceEvent>.Continuation!
+                self.events = AsyncStream { cont = $0 }
+                self.continuation = cont
+            }
+
+            func connect(config: RealtimeSessionConfig) async throws {
+                lastConfig = config
+                continuation.yield(.connected)
+            }
+            func sendAudioPCM16(_ data: Data) async throws {}
+            func sendTextTurn(_ text: String) async throws {
+                let pcm = RealtimeVoiceAudio.floatSamplesToPCM16Data([0.1, -0.1, 0.25, -0.25])
+                continuation.yield(.audioPCM16(pcm, sampleRate: 44_100))
+                continuation.yield(.audioDone)
+            }
+            func sendToolResult(callID: String, name: String, jsonOutput: String) async throws {}
+            func updateInstructions(_ instructions: String) async throws {}
+            func disconnect() async { continuation.yield(.disconnected(nil)) }
+        }
+
+        let suite = "IOSYandexLiveTTSTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defaults.removePersistentDomain(forName: suite)
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let keychain = WorkspaceAPIKeychain(service: "dev.vsmirn0v.ios.yandex.voice.\(UUID().uuidString)")
+        defer { _ = keychain.deleteRealtime(provider: .yandexRealtime) }
+
+        let store = IOSVoiceStore(preferences: defaults, keychain: keychain)
+        store.engine = .yandexLiveTTS
+        store.yandexFolderID = "b1g-tts"
+        store.yandexVoice = "vera"
+        store.yandexRole = "support"
+        store.yandexModel = "speech-realtime-tts-live"
+        store.assistantAuditionVoice = .yandexLiveTTS(voice: "vera")
+        XCTAssertTrue(store.setYandexAPIKey("AQVN-voice-secret"))
+        XCTAssertTrue(store.hasYandexAPIKey)
+        XCTAssertFalse(store.hasYandexConsent)
+
+        let reloaded = IOSVoiceStore(preferences: defaults, keychain: keychain)
+        XCTAssertEqual(reloaded.engine, .yandexLiveTTS)
+        XCTAssertEqual(reloaded.yandexFolderID, "b1g-tts")
+        XCTAssertEqual(reloaded.yandexVoice, "vera")
+        XCTAssertEqual(reloaded.yandexRole, "support")
+        XCTAssertEqual(reloaded.yandexModel, "speech-realtime-tts-live")
+        XCTAssertEqual(reloaded.assistantAuditionVoice, .yandexLiveTTS(voice: "vera"))
+        XCTAssertEqual(reloaded.yandexAPIKey(), "AQVN-voice-secret")
+
+        do {
+            _ = try await reloaded.synthesize("Привет")
+            XCTFail("Expected consent error before permission")
+        } catch let error as IOSVoiceSynthesisError {
+            XCTAssertEqual(error, .remoteVoicePermissionRequired)
+        }
+
+        reloaded.setYandexConsent(true)
+        XCTAssertTrue(reloaded.hasYandexConsent)
+
+        let firstTransport = MockYandexTTSTransport()
+        reloaded.customYandexTransportFactory = { firstTransport }
+        let buffer = try await reloaded.synthesize("Привет, проверка Yandex LiveTTS")
+        XCTAssertEqual(buffer.format.sampleRate, 44_100, accuracy: 1)
+        XCTAssertEqual(buffer.frameLength, 4)
+        XCTAssertEqual(firstTransport.lastConfig?.folderID, "b1g-tts")
+        XCTAssertEqual(firstTransport.lastConfig?.voice, "vera")
+        XCTAssertEqual(firstTransport.lastConfig?.voiceRole, "support")
+        XCTAssertEqual(firstTransport.lastConfig?.model, "speech-realtime-tts-live")
+
+        let secondTransport = MockYandexTTSTransport()
+        reloaded.customYandexTransportFactory = { secondTransport }
+        let auditionBuffer = try await reloaded.synthesizeAssistantResponse("Ответ ассистента")
+        XCTAssertEqual(auditionBuffer.format.sampleRate, 44_100, accuracy: 1)
+        XCTAssertEqual(secondTransport.lastConfig?.voice, "vera")
+
+        reloaded.yandexEndpoint = "wss://custom.yandex.test/v1/realtime/openai"
+        XCTAssertFalse(reloaded.hasYandexConsent, "Changing endpoint must revoke prior consent")
+    }
+
     func testCoreMLGigaAMFrontEndShapeAndDetokenize() throws {
         let front = GigaAMMelFrontEnd()
         let samples = (0..<16_000).map { 0.1 * sin(2 * Float.pi * 220 * Float($0) / 16_000) }

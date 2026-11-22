@@ -374,11 +374,15 @@ final class IOSAssistantTalkTests: XCTestCase {
         actor Storage {
             var connectCount = 0
             var disconnectCount = 0
+            var lastConfig: RealtimeSessionConfig?
             var sentTexts: [String] = []
             var audioChunks: [Data] = []
             var toolResults: [(callID: String, name: String, json: String)] = []
 
-            func recordConnect() { connectCount += 1 }
+            func recordConnect(_ config: RealtimeSessionConfig) {
+                connectCount += 1
+                lastConfig = config
+            }
             func recordAudio(_ data: Data) { audioChunks.append(data) }
             func recordText(_ text: String) { sentTexts.append(text) }
             func recordToolResult(_ callID: String, _ name: String, _ json: String) {
@@ -399,7 +403,7 @@ final class IOSAssistantTalkTests: XCTestCase {
         }
 
         func connect(config: RealtimeSessionConfig) async throws {
-            await storage.recordConnect()
+            await storage.recordConnect(config)
             continuation.yield(.connected)
         }
 
@@ -1137,6 +1141,75 @@ final class IOSAssistantTalkTests: XCTestCase {
         XCTAssertTrue(board.isSharing)
 
         board.stopSharing()
+        await store.close()
+        try? FileManager.default.removeItem(at: tempRoot)
+    }
+
+    func testIOSYandexRealtimeTurnExecutesToolAndPassesFolderIDAndSampleRates() async throws {
+        let suite = SuiteBox()
+        let tempRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ios-yandex-rt-\(UUID().uuidString)", isDirectory: true)
+        let (workspace, store) = try await makeTestWorkspace(tempRoot: tempRoot, prefs: suite.defaults)
+
+        let cid = UUID()
+        let sid = workspace.beginSession(
+            controllerID: cid,
+            requestedWorkspaceID: nil,
+            title: "Yandex Sync",
+            invitation: URL(string: "https://meet.example.com/yandex-sync")!,
+            roomIdentity: "meet.example.com/yandex-sync",
+            calendarMeeting: nil,
+            engine: .guest
+        )
+        let skills = IOSAssistantSkillsController(
+            workspace: workspace,
+            preferences: suite.defaults,
+            keychain: WorkspaceAPIKeychain(service: "dev.vsmirn0v.ios.yandexrt.\(UUID().uuidString)"),
+            customRootURL: tempRoot.appendingPathComponent("skills", isDirectory: true)
+        )
+        defer { skills.stopWatcher() }
+        skills.realtimeProvider = .yandexRealtime
+        skills.realtimeFolderID = "b1g-ios-folder"
+        skills.realtimeVoice = "vera"
+        skills.realtimeVoiceRole = "support"
+        XCTAssertTrue(skills.setRealtimeAPIKey("AQVN-ios-key", for: .yandexRealtime))
+
+        let transport = MockRealtimeTransport()
+        transport.onTextTurn = { _, cont in
+            let pcm = RealtimeVoiceAudio.floatSamplesToPCM16Data([0.1, -0.1, 0.2, -0.2])
+            cont.yield(.toolCall(
+                callID: "yc-call-1",
+                name: "rocknroll_create_task",
+                argumentsJSON: "{\"title\":\"Verify Yandex LiveTTS\"}"
+            ))
+            cont.yield(.audioPCM16(pcm, sampleRate: 44_100))
+            cont.yield(.assistantTranscriptDone("Готово, добавил задачу Verify Yandex LiveTTS."))
+            cont.yield(.audioDone)
+        }
+
+        let talk = IOSAssistantTalkController()
+        talk.workspace = workspace
+        talk.skills = skills
+        talk.targetControllerID = cid
+        talk.activeMeetingsProvider = { [(id: cid, title: "Yandex Sync", isUnmuted: false, canSendChat: false, sessionID: sid)] }
+        talk.customRealtimeTransportFactory = { transport }
+        await talk.run("Помоги задокументировать чейнджлог Yandex LiveTTS", source: .voiceWake)
+
+        let connectedConfig = await transport.storage.lastConfig
+        XCTAssertEqual(connectedConfig?.provider, .yandexRealtime)
+        XCTAssertEqual(connectedConfig?.folderID, "b1g-ios-folder")
+        XCTAssertEqual(connectedConfig?.model, "speech-realtime-max-tts-live")
+        XCTAssertEqual(connectedConfig?.voice, "vera")
+        XCTAssertEqual(connectedConfig?.voiceRole, "support")
+        XCTAssertEqual(connectedConfig?.inputSampleRate, 24_000)
+        XCTAssertEqual(connectedConfig?.outputSampleRate, 44_100)
+
+        let toolResults = await transport.storage.toolResults
+        XCTAssertEqual(toolResults.count, 1)
+        XCTAssertEqual(toolResults.first?.name, "rocknroll_create_task")
+        XCTAssertTrue(workspace.tasks.contains(where: { $0.text == "Verify Yandex LiveTTS" }))
+        XCTAssertEqual(talk.lastVoiceAnswer, "Готово, добавил задачу Verify Yandex LiveTTS.")
+
         await store.close()
         try? FileManager.default.removeItem(at: tempRoot)
     }

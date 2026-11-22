@@ -91,6 +91,8 @@ final class AssistantWakeAndPresetsTests: XCTestCase {
         XCTAssertEqual(AssistantVoicePreferences.loadAuditionVoice(from: defaults), .clonedVoice)
         AssistantVoicePreferences.saveAuditionVoice(.systemVoice(identifier: "com.apple.voice.ru"), to: defaults)
         XCTAssertEqual(AssistantVoicePreferences.loadAuditionVoice(from: defaults), .systemVoice(identifier: "com.apple.voice.ru"))
+        AssistantVoicePreferences.saveAuditionVoice(.yandexLiveTTS(voice: "vera"), to: defaults)
+        XCTAssertEqual(AssistantVoicePreferences.loadAuditionVoice(from: defaults), .yandexLiveTTS(voice: "vera"))
     }
 
     func testCurrentMeetingTargetResolverPrioritizesOngoingThenImminentThenRooms() {

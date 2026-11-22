@@ -158,6 +158,7 @@ enum NativeSettingsResultPresentation {
             switch engine {
             case .system: return L("The macOS voice")
             case .rapidMLX: return L("Rapid-MLX voice server")
+            case .yandexLiveTTS: return L("Yandex LiveTTS")
             case .personal: return L("Your Personal Voice")
             case .cloned: return L("Your voice, on the Neural Engine")
             }

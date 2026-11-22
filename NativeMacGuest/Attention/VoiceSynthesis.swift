@@ -9,6 +9,8 @@ enum VoiceEngine: String, Codable, CaseIterable, Sendable {
     case system
     /// Qwen3-TTS (or another speech model) served by a configured Rapid-MLX endpoint.
     case rapidMLX
+    /// Yandex Cloud AI Studio LiveTTS over Realtime WebSocket (`speech-realtime-tts-live`).
+    case yandexLiveTTS
     /// The Personal Voice you created in System Settings → Accessibility (macOS 14+).
     case personal
     /// Your voice, cloned from a short sample by VoxCPM2 on the Neural Engine (macOS 27+).
@@ -21,13 +23,37 @@ struct AssistantVoiceConfiguration: Equatable, Sendable {
     private let baseURL: String
     private let model: String
     private let description: String
+    private let yandexFolderID: String
+    private let yandexVoice: String
+    private let yandexRole: String
+    private let yandexModel: String
+    private let yandexEndpoint: String
+    private let yandexAPIKey: String
 
-    init(engine: VoiceEngine, baseURL: String, model: String, description: String, cloneRecordedAt: Date?) {
+    init(
+        engine: VoiceEngine,
+        baseURL: String,
+        model: String,
+        description: String,
+        cloneRecordedAt: Date?,
+        yandexFolderID: String = "",
+        yandexVoice: String = YandexLiveTTSVoice.sofia.rawValue,
+        yandexRole: String = "",
+        yandexModel: String = YandexRealtimePreferences.defaultTTSModel,
+        yandexEndpoint: String = "",
+        yandexAPIKey: String = ""
+    ) {
         self.engine = engine
         self.cloneRecordedAt = engine == .cloned ? cloneRecordedAt : nil
         self.baseURL = engine == .rapidMLX ? baseURL : ""
         self.model = engine == .rapidMLX ? model : ""
         self.description = engine == .rapidMLX ? description : ""
+        self.yandexFolderID = engine == .yandexLiveTTS ? yandexFolderID : ""
+        self.yandexVoice = engine == .yandexLiveTTS ? yandexVoice : ""
+        self.yandexRole = engine == .yandexLiveTTS ? yandexRole : ""
+        self.yandexModel = engine == .yandexLiveTTS ? yandexModel : ""
+        self.yandexEndpoint = engine == .yandexLiveTTS ? yandexEndpoint : ""
+        self.yandexAPIKey = engine == .yandexLiveTTS ? yandexAPIKey : ""
     }
 
     var title: String {
@@ -36,12 +62,23 @@ struct AssistantVoiceConfiguration: Equatable, Sendable {
         case .personal: L("Your Personal Voice")
         case .cloned: L("Your voice, on the Neural Engine")
         case .rapidMLX: "Rapid-MLX · " + model
+        case .yandexLiveTTS:
+            L("Yandex LiveTTS") + " · " + (yandexVoice.trimmed.isEmpty ? YandexLiveTTSVoice.sofia.rawValue : yandexVoice.trimmed)
         }
     }
 
     var speechHost: String? {
-        guard engine == .rapidMLX, let url = URL(string: baseURL.trimmed), let host = url.host else { return nil }
-        return url.port.map { "\(host):\($0)" } ?? host
+        switch engine {
+        case .rapidMLX:
+            guard let url = URL(string: baseURL.trimmed), let host = url.host else { return nil }
+            return url.port.map { "\(host):\($0)" } ?? host
+        case .yandexLiveTTS:
+            let raw = yandexEndpoint.trimmed.isEmpty ? RealtimeProviderKind.yandexRealtime.defaultEndpoint : yandexEndpoint.trimmed
+            guard let url = URL(string: raw), let host = url.host else { return nil }
+            return url.port.map { "\(host):\($0)" } ?? host
+        case .system, .personal, .cloned:
+            return nil
+        }
     }
 
     func synthesize(_ text: String, language: String? = nil, session: URLSession = .shared,
@@ -54,12 +91,23 @@ struct AssistantVoiceConfiguration: Equatable, Sendable {
             return try await VoiceSynthesis.cloned(text, recordedAt: cloneRecordedAt, request: cloneRequest, expiresAt: cloneDeadline)
         case .rapidMLX:
             return try await VoiceSynthesis.rapidMLX(text, baseURL: baseURL, model: model, description: description, session: session)
+        case .yandexLiveTTS:
+            return try await VoiceSynthesis.yandexLiveTTS(
+                text,
+                apiKey: yandexAPIKey,
+                folderID: yandexFolderID,
+                model: yandexModel,
+                voice: yandexVoice,
+                role: yandexRole,
+                endpointOverride: yandexEndpoint
+            )
         }
     }
 }
 
 enum VoiceSynthesisError: LocalizedError, Equatable {
     case empty, system, server(Int, String?), transport, audio, personalUnsupported, personalDenied, personalMissing
+    case yandexCredentialsMissing, yandexFolderIDMissing, yandexFailed(String)
     case cloneUnsupported, cloneModelMissing, cloneVoiceMissing, clonePreparing, clonePreparationFailed, clonePreviewWaiting, cloneTranscriptMissing
     case cloneSampleTooShort, cloneSampleTooLong, microphoneDenied
     var errorDescription: String? {
@@ -73,6 +121,9 @@ enum VoiceSynthesisError: LocalizedError, Equatable {
         case .personalUnsupported: L("Personal Voice needs macOS 14 or later.")
         case .personalDenied: L("Allow this app to use your Personal Voice in System Settings → Privacy & Security → Personal Voice.")
         case .personalMissing: L("No Personal Voice found. Create one in System Settings → Accessibility → Personal Voice.")
+        case .yandexCredentialsMissing: L("Save your Yandex API key in Voice settings first.")
+        case .yandexFolderIDMissing: L("Enter your Yandex Cloud Folder ID or a full gpt:// model URI first.")
+        case .yandexFailed(let detail): L("Yandex LiveTTS failed: %@", detail)
         case .cloneUnsupported: L("Your cloned voice needs macOS 27 and a Mac with Apple silicon.")
         case .cloneModelMissing: L("Download the voice model in Settings → Assistant → Voice first.")
         case .cloneVoiceMissing: L("Record your voice in Settings → Assistant → Voice first.")
@@ -310,6 +361,45 @@ enum VoiceSynthesis {
         return try buffer(fromAudio: data)
     }
 
+    static func yandexLiveTTS(
+        _ text: String,
+        apiKey: String,
+        folderID: String,
+        model: String = YandexRealtimePreferences.defaultTTSModel,
+        voice: String = YandexLiveTTSVoice.sofia.rawValue,
+        role: String = "",
+        endpointOverride: String = "",
+        customTransport: (any RealtimeVoiceTransport)? = nil
+    ) async throws -> AVAudioPCMBuffer {
+        let clean = text.trimmed
+        guard !clean.isEmpty else { throw VoiceSynthesisError.empty }
+        do {
+            return try await YandexRealtimeTTS.synthesize(
+                text: clean,
+                apiKey: apiKey,
+                folderID: folderID,
+                model: model,
+                voice: voice,
+                role: role,
+                endpointOverride: endpointOverride,
+                customTransport: customTransport
+            )
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch let err as YandexRealtimeTTSError {
+            switch err {
+            case .emptyText: throw VoiceSynthesisError.empty
+            case .missingAPIKey: throw VoiceSynthesisError.yandexCredentialsMissing
+            case .missingFolderID: throw VoiceSynthesisError.yandexFolderIDMissing
+            case .invalidEndpoint, .timedOut: throw VoiceSynthesisError.transport
+            case .emptyAudio: throw VoiceSynthesisError.audio
+            case .serverError(let detail): throw VoiceSynthesisError.yandexFailed(detail)
+            }
+        } catch {
+            throw VoiceSynthesisError.transport
+        }
+    }
+
     struct AuditionSynthesisResult {
         let buffer: AVAudioPCMBuffer
         let usedSystemFallback: Bool
@@ -317,13 +407,15 @@ enum VoiceSynthesis {
     }
 
     /// Synthesizes local audio for an Assistant response using the user's chosen audition voice
-    /// (curated VoxCPM2 neural preset, cloned voice, Personal Voice, or macOS system voice),
-    /// falling back to the local macOS system voice if a neural/cloned voice is not ready yet.
-    static func audition(_ text: String, selection: AssistantAuditionVoiceSelection) async throws -> AVAudioPCMBuffer {
-        try await auditionWithStatus(text, selection: selection).buffer
+    /// (curated VoxCPM2 neural preset, cloned voice, Personal Voice, Yandex LiveTTS, or macOS system voice),
+    /// falling back to the local macOS system voice if a neural/cloned/cloud voice is not ready yet.
+    @MainActor
+    static func audition(_ text: String, selection: AssistantAuditionVoiceSelection, store: AttentionStore? = nil) async throws -> AVAudioPCMBuffer {
+        try await auditionWithStatus(text, selection: selection, store: store).buffer
     }
 
-    static func auditionWithStatus(_ text: String, selection: AssistantAuditionVoiceSelection) async throws -> AuditionSynthesisResult {
+    @MainActor
+    static func auditionWithStatus(_ text: String, selection: AssistantAuditionVoiceSelection, store: AttentionStore? = nil) async throws -> AuditionSynthesisResult {
         let clean = text.trimmed
         guard !clean.isEmpty else { throw VoiceSynthesisError.empty }
         switch selection {
@@ -366,6 +458,45 @@ enum VoiceSynthesis {
             }
             let buffer = try await system(clean)
             return AuditionSynthesisResult(buffer: buffer, usedSystemFallback: false, failureReason: nil)
+        case .yandexLiveTTS(let voice):
+            let apiKey: String
+            let folderID: String
+            let role: String
+            let model: String
+            let endpoint: String
+            if let store {
+                apiKey = store.realtimeAPIKey(for: .yandexRealtime) ?? ""
+                folderID = store.realtimeFolderID
+                role = store.yandexTTSRole
+                model = store.yandexTTSModel
+                endpoint = store.yandexTTSEndpoint
+            } else {
+                var kc = AttentionKeychain()
+                kc.account = "realtime-api-key." + RealtimeProviderKind.yandexRealtime.rawValue
+                apiKey = kc.read()?.trimmed ?? ""
+                let defaults = UserDefaults.standard
+                folderID = defaults.string(forKey: YandexRealtimePreferences.folderIDKey) ?? ""
+                role = defaults.string(forKey: YandexRealtimePreferences.ttsRoleKey) ?? ""
+                model = defaults.string(forKey: YandexRealtimePreferences.ttsModelKey) ?? YandexRealtimePreferences.defaultTTSModel
+                endpoint = defaults.string(forKey: YandexRealtimePreferences.ttsEndpointKey) ?? ""
+            }
+            do {
+                let buffer = try await yandexLiveTTS(
+                    clean,
+                    apiKey: apiKey,
+                    folderID: folderID,
+                    model: model,
+                    voice: voice,
+                    role: role,
+                    endpointOverride: endpoint
+                )
+                return AuditionSynthesisResult(buffer: buffer, usedSystemFallback: false, failureReason: nil)
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                let buffer = try await system(clean)
+                return AuditionSynthesisResult(buffer: buffer, usedSystemFallback: true, failureReason: error.localizedDescription)
+            }
         }
     }
 

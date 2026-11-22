@@ -8,7 +8,7 @@ import FoundationModels
 
 /// Runs autonomous in-meeting voice facilitation on iOS using Obsidian-backed skills,
 /// `People.md` speaker approval (owner is always approved), optional `OpenAI Realtime` /
-/// `Gemini Live` WebSocket acceleration with live PCM16 audio streaming, and local
+/// `Gemini Live` / `Yandex Realtime` WebSocket acceleration with live PCM16 audio streaming, and local
 /// STT -> LLM (with function calling / Apple FoundationModels) -> TTS fallback.
 @MainActor
 final class IOSAutonomousMeetingFacilitator: ObservableObject {
@@ -99,12 +99,14 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
         let gate = AudioTapGate()
         var connected = false
         var audioChunks: [Data] = []
+        var outputSampleRate: Double = 24_000
         var transcriptBuffer = ""
         var activeSkillID: String
         var turnTimeoutTask: Task<Void, Never>?
 
-        init(activeSkillID: String) {
+        init(activeSkillID: String, outputSampleRate: Double = 24_000) {
             self.activeSkillID = activeSkillID
+            self.outputSampleRate = outputSampleRate
         }
     }
 
@@ -587,7 +589,7 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
             .filter { !$0.isEmpty }
             .joined(separator: "\n\n")
         let tools = Self.buildToolDeclarations(allowedGroups: skill.map { Set($0.tools) })
-        let targetInputRate = kind == .openAIRealtime ? 24_000 : 16_000
+        let targetInputRate = kind.defaultInputSampleRate
         let config = RealtimeSessionConfig(
             provider: kind,
             apiKey: apiKey,
@@ -596,10 +598,12 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
             endpointOverride: skills.realtimeEndpoint,
             systemInstructions: instructions,
             inputSampleRate: targetInputRate,
-            tools: tools
+            tools: tools,
+            folderID: skills.realtimeFolderID,
+            voiceRole: skills.realtimeVoiceRole
         )
 
-        let state = SessionRealtimeState(activeSkillID: skillID)
+        let state = SessionRealtimeState(activeSkillID: skillID, outputSampleRate: Double(config.outputSampleRate))
         state.gate.setApprovedSpeakersOnly(skill?.approvedSpeakersOnly ?? true)
         realtimeSessions[controllerID] = state
         await state.router.start(
@@ -965,7 +969,10 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
         case .connected:
             state.connected = true
             syncRealtimeActiveFlag()
-        case .audioPCM16(let pcm, _):
+        case .audioPCM16(let pcm, let sampleRate):
+            if sampleRate > 0 {
+                state.outputSampleRate = Double(sampleRate)
+            }
             state.audioChunks.append(pcm)
         case .assistantTranscriptDelta(let delta):
             state.transcriptBuffer += delta
@@ -984,7 +991,7 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
             state.audioChunks.removeAll()
             let text = state.transcriptBuffer.trimmingCharacters(in: .whitespacesAndNewlines)
             state.transcriptBuffer = ""
-            if let buffer = RealtimeVoiceAudio.pcm16ToAudioBuffer(data: combined, sampleRate: 24_000) {
+            if let buffer = RealtimeVoiceAudio.pcm16ToAudioBuffer(data: combined, sampleRate: state.outputSampleRate) {
                 state.gate.markVoiceDeliveryStarted()
                 await deliverSpokenBuffer(buffer, fallbackText: text, controllerID: controllerID)
             } else if !text.isEmpty {

@@ -351,4 +351,238 @@ final class RealtimeVoiceProtocolTests: XCTestCase {
         gate.release()
         await router.stop()
     }
+
+    func testYandexRealtimeWirePayloadsAuthAndParsing() throws {
+        // 1. Model URI & Folder ID resolution
+        let shortResolved = try XCTUnwrap(YandexRealtimeClient.resolveModelURI(model: "speech-realtime-max-tts-live", folderID: "b1g123"))
+        XCTAssertEqual(shortResolved.uri, "gpt://b1g123/speech-realtime-max-tts-live/latest")
+        XCTAssertEqual(shortResolved.folderID, "b1g123")
+
+        let versionedResolved = try XCTUnwrap(YandexRealtimeClient.resolveModelURI(model: "speech-realtime-tts-live/rc", folderID: "b1g123"))
+        XCTAssertEqual(versionedResolved.uri, "gpt://b1g123/speech-realtime-tts-live/rc")
+        XCTAssertEqual(versionedResolved.folderID, "b1g123")
+
+        let fullURIResolved = try XCTUnwrap(YandexRealtimeClient.resolveModelURI(model: "gpt://b1g999/speech-realtime-tts-live", folderID: ""))
+        XCTAssertEqual(fullURIResolved.uri, "gpt://b1g999/speech-realtime-tts-live/latest")
+        XCTAssertEqual(fullURIResolved.folderID, "b1g999")
+
+        XCTAssertNil(YandexRealtimeClient.resolveModelURI(model: "speech-realtime-max-tts-live", folderID: "   "))
+
+        let endpointURL = try XCTUnwrap(YandexRealtimeClient.makeEndpointURL(
+            base: RealtimeProviderKind.yandexRealtime.defaultEndpoint,
+            modelURI: shortResolved.uri
+        ))
+        XCTAssertTrue(endpointURL.absoluteString.hasPrefix("wss://ai.api.cloud.yandex.net/v1/realtime/openai?model="))
+        XCTAssertNil(YandexRealtimeClient.makeEndpointURL(
+            base: "wss://user:pass@ai.api.cloud.yandex.net/v1/realtime/openai",
+            modelURI: shortResolved.uri
+        ))
+
+        // 2. Authorization headers
+        XCTAssertEqual(YandexRealtimeClient.authorizationHeaderValue(for: "AQVN-secret"), "Api-Key AQVN-secret")
+        XCTAssertEqual(YandexRealtimeClient.authorizationHeaderValue(for: "t1.9euelZq-iam"), "Bearer t1.9euelZq-iam")
+        XCTAssertEqual(YandexRealtimeClient.authorizationHeaderValue(for: "Api-Key already-prefixed"), "Api-Key already-prefixed")
+        XCTAssertEqual(YandexRealtimeClient.authorizationHeaderValue(for: "Bearer already-bearer"), "Bearer already-bearer")
+
+        // 3. Conversational Realtime session.update (speech-realtime-max-tts-live)
+        let tool = RealtimeToolDeclaration(
+            name: "rocknroll_create_task",
+            description: "Create a task",
+            parametersJSONSchema: ["type": "object", "properties": ["title": ["type": "string"]]]
+        )
+        let maxConfig = RealtimeSessionConfig(
+            provider: .yandexRealtime,
+            apiKey: "AQVN-secret",
+            model: "speech-realtime-max-tts-live",
+            voice: "sofia",
+            systemInstructions: "Facilitate standup.",
+            tools: [tool],
+            folderID: "b1g123",
+            voiceRole: "casual"
+        )
+        XCTAssertEqual(maxConfig.inputSampleRate, 24_000)
+        XCTAssertEqual(maxConfig.outputSampleRate, 44_100)
+        XCTAssertFalse(YandexRealtimeClient.isTTSOnlyModel(maxConfig.model))
+
+        let maxPayload = YandexRealtimeClient.sessionUpdatePayload(config: maxConfig, isTTSOnly: false)
+        XCTAssertEqual(maxPayload["type"] as? String, "session.update")
+        let maxSession = try XCTUnwrap(maxPayload["session"] as? [String: Any])
+        XCTAssertEqual(maxSession["type"] as? String, "realtime")
+        XCTAssertEqual(maxSession["output_modalities"] as? [String], ["audio"])
+        XCTAssertEqual(maxSession["instructions"] as? String, "Facilitate standup.")
+        XCTAssertEqual(maxSession["tool_choice"] as? String, "auto")
+        XCTAssertEqual((maxSession["tools"] as? [[String: Any]])?.count, 1)
+        let maxAudio = try XCTUnwrap(maxSession["audio"] as? [String: Any])
+        let maxInput = try XCTUnwrap(maxAudio["input"] as? [String: Any])
+        XCTAssertEqual((maxInput["format"] as? [String: Any])?["rate"] as? Int, 24_000)
+        XCTAssertEqual((maxInput["turn_detection"] as? [String: Any])?["type"] as? String, "server_vad")
+        let maxOutput = try XCTUnwrap(maxAudio["output"] as? [String: Any])
+        XCTAssertEqual((maxOutput["format"] as? [String: Any])?["type"] as? String, "audio/pcm")
+        XCTAssertEqual((maxOutput["format"] as? [String: Any])?["rate"] as? Int, 44_100)
+        XCTAssertEqual(maxOutput["voice"] as? String, "sofia")
+        XCTAssertEqual(maxOutput["role"] as? String, "casual")
+
+        // 4. Pure TTS-only session.update (speech-realtime-tts-live) with voice:role splitting
+        let ttsConfig = RealtimeSessionConfig(
+            provider: .yandexRealtime,
+            apiKey: "AQVN-secret",
+            model: YandexRealtimePreferences.defaultTTSModel,
+            voice: "sofia:support",
+            systemInstructions: "Ignored for TTS-only",
+            tools: [tool],
+            folderID: "b1g123"
+        )
+        XCTAssertTrue(YandexRealtimeClient.isTTSOnlyModel(ttsConfig.model))
+        let ttsPayload = YandexRealtimeClient.sessionUpdatePayload(config: ttsConfig, isTTSOnly: true)
+        let ttsSession = try XCTUnwrap(ttsPayload["session"] as? [String: Any])
+        XCTAssertNil(ttsSession["instructions"])
+        XCTAssertNil(ttsSession["tools"])
+        let ttsAudio = try XCTUnwrap(ttsSession["audio"] as? [String: Any])
+        XCTAssertNil(ttsAudio["input"])
+        let ttsOutput = try XCTUnwrap(ttsAudio["output"] as? [String: Any])
+        XCTAssertEqual(ttsOutput["voice"] as? String, "sofia")
+        XCTAssertEqual(ttsOutput["role"] as? String, "support")
+        XCTAssertEqual((ttsOutput["format"] as? [String: Any])?["rate"] as? Int, 44_100)
+
+        // 5. Server event parsing (44.1 kHz PCM16 + response.output_audio.done + response.done + failed response.done)
+        let pcm = Data([0x11, 0x22, 0x33, 0x44])
+        let deltaData = try JSONSerialization.data(withJSONObject: [
+            "type": "response.output_audio.delta",
+            "delta": pcm.base64EncodedString(),
+        ])
+        let parsedDelta = try XCTUnwrap(YandexRealtimeClient.parseServerEvent(deltaData, outputSampleRate: 44_100))
+        guard case .audioPCM16(let parsedBytes, let parsedRate) = parsedDelta.events.first else {
+            return XCTFail("Expected audioPCM16 event")
+        }
+        XCTAssertEqual(parsedBytes, pcm)
+        XCTAssertEqual(parsedRate, 44_100)
+
+        let audioDoneData = try JSONSerialization.data(withJSONObject: ["type": "response.output_audio.done"])
+        let parsedAudioDone = try XCTUnwrap(YandexRealtimeClient.parseServerEvent(audioDoneData))
+        XCTAssertFalse(parsedAudioDone.isTerminalResponseDone)
+        guard case .audioDone = parsedAudioDone.events.first else {
+            return XCTFail("Expected audioDone")
+        }
+
+        let responseDoneData = try JSONSerialization.data(withJSONObject: ["type": "response.done"])
+        let parsedResponseDone = try XCTUnwrap(YandexRealtimeClient.parseServerEvent(responseDoneData))
+        XCTAssertTrue(parsedResponseDone.isTerminalResponseDone)
+
+        let failedDoneData = try JSONSerialization.data(withJSONObject: [
+            "type": "response.done",
+            "response": [
+                "status": "failed",
+                "status_details": ["error": ["message": "Invalid voice for model"]],
+            ],
+        ])
+        let parsedFailed = try XCTUnwrap(YandexRealtimeClient.parseServerEvent(failedDoneData))
+        guard case .error(let errMsg) = parsedFailed.events.first else {
+            return XCTFail("Expected error event for failed response.done")
+        }
+        XCTAssertEqual(errMsg, "Invalid voice for model")
+    }
+
+    func testYandexRealtimeTTSSynthesizeBuildsAudioBuffer() async throws {
+        final class FakeTTSTransport: @unchecked Sendable, RealtimeVoiceTransport {
+            private let continuation: AsyncStream<RealtimeVoiceEvent>.Continuation
+            let events: AsyncStream<RealtimeVoiceEvent>
+            var lastConfig: RealtimeSessionConfig?
+            var disconnected = false
+
+            init() {
+                var cont: AsyncStream<RealtimeVoiceEvent>.Continuation!
+                self.events = AsyncStream { cont = $0 }
+                self.continuation = cont
+            }
+
+            func connect(config: RealtimeSessionConfig) async throws {
+                lastConfig = config
+                continuation.yield(.connected)
+            }
+            func sendAudioPCM16(_ data: Data) async throws {}
+            func sendTextTurn(_ text: String) async throws {
+                let pcm = RealtimeVoiceAudio.floatSamplesToPCM16Data([0.2, -0.2, 0.4, -0.4])
+                continuation.yield(.audioPCM16(pcm, sampleRate: 44_100))
+                continuation.yield(.audioDone)
+            }
+            func sendToolResult(callID: String, name: String, jsonOutput: String) async throws {}
+            func updateInstructions(_ instructions: String) async throws {}
+            func disconnect() async {
+                disconnected = true
+                continuation.yield(.disconnected(nil))
+            }
+        }
+
+        do {
+            _ = try await YandexRealtimeTTS.synthesize(
+                text: "Привет!",
+                apiKey: "AQVN-key",
+                folderID: ""
+            )
+            XCTFail("Expected missingFolderID error")
+        } catch let error as YandexRealtimeTTSError {
+            XCTAssertEqual(error, .missingFolderID)
+        }
+
+        let fake = FakeTTSTransport()
+        let buffer = try await YandexRealtimeTTS.synthesize(
+            text: "Привет! Чем я могу помочь?",
+            apiKey: "AQVN-key",
+            folderID: "b1g123",
+            voice: "vera",
+            role: "support",
+            customTransport: fake
+        )
+        XCTAssertEqual(buffer.format.sampleRate, 44_100, accuracy: 1)
+        XCTAssertEqual(buffer.frameLength, 4)
+        XCTAssertEqual(fake.lastConfig?.model, YandexRealtimePreferences.defaultTTSModel)
+        XCTAssertEqual(fake.lastConfig?.folderID, "b1g123")
+        XCTAssertEqual(fake.lastConfig?.voice, "vera")
+        XCTAssertEqual(fake.lastConfig?.voiceRole, "support")
+        XCTAssertTrue(fake.disconnected)
+    }
+
+    func testYandexRealtimeTTSSynthesizeTimesOutAndDisconnects() async throws {
+        final class HangingTTSTransport: @unchecked Sendable, RealtimeVoiceTransport {
+            private let continuation: AsyncStream<RealtimeVoiceEvent>.Continuation
+            let events: AsyncStream<RealtimeVoiceEvent>
+            var disconnected = false
+
+            init() {
+                var cont: AsyncStream<RealtimeVoiceEvent>.Continuation!
+                self.events = AsyncStream { cont = $0 }
+                self.continuation = cont
+            }
+
+            func connect(config: RealtimeSessionConfig) async throws {
+                continuation.yield(.connected)
+            }
+            func sendAudioPCM16(_ data: Data) async throws {}
+            func sendTextTurn(_ text: String) async throws {}
+            func sendToolResult(callID: String, name: String, jsonOutput: String) async throws {}
+            func updateInstructions(_ instructions: String) async throws {}
+            func disconnect() async {
+                disconnected = true
+                continuation.yield(.disconnected(nil))
+            }
+        }
+
+        let hanging = HangingTTSTransport()
+        let started = ContinuousClock.now
+        do {
+            _ = try await YandexRealtimeTTS.synthesize(
+                text: "Привет!",
+                apiKey: "AQVN-key",
+                folderID: "b1g123",
+                customTransport: hanging,
+                timeoutSeconds: 0.15
+            )
+            XCTFail("Expected timeout error")
+        } catch let error as YandexRealtimeTTSError {
+            XCTAssertEqual(error, .timedOut)
+        }
+        let elapsed = ContinuousClock.now - started
+        XCTAssertLessThan(elapsed, .seconds(1))
+        XCTAssertTrue(hanging.disconnected)
+    }
 }

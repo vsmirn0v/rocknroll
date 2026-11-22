@@ -329,9 +329,24 @@ struct AttentionDecisionRecord: Codable, Equatable, Sendable {
     /// How the voice should sound, for a VoiceDesign model.
     @Published var voiceDescription: String { didSet { defaults.set(voiceDescription, forKey: Self.voiceDescriptionKey) } }
     @Published var voiceBaseURL: String { didSet { defaults.set(voiceBaseURL, forKey: Self.voiceBaseURLKey) } }
+    @Published var yandexTTSVoice: String { didSet { defaults.set(yandexTTSVoice, forKey: YandexRealtimePreferences.ttsVoiceKey) } }
+    @Published var yandexTTSRole: String { didSet { defaults.set(yandexTTSRole, forKey: YandexRealtimePreferences.ttsRoleKey) } }
+    @Published var yandexTTSModel: String { didSet { defaults.set(yandexTTSModel, forKey: YandexRealtimePreferences.ttsModelKey) } }
+    @Published var yandexTTSEndpoint: String { didSet { defaults.set(yandexTTSEndpoint, forKey: YandexRealtimePreferences.ttsEndpointKey) } }
     var voiceConfiguration: AssistantVoiceConfiguration {
-        .init(engine: voiceEngine, baseURL: voiceBaseURL, model: voiceModel, description: voiceDescription,
-              cloneRecordedAt: voiceEngine == .cloned ? VoiceCloneStore.shared.stored?.recordedAt : nil)
+        .init(
+            engine: voiceEngine,
+            baseURL: voiceBaseURL,
+            model: voiceModel,
+            description: voiceDescription,
+            cloneRecordedAt: voiceEngine == .cloned ? VoiceCloneStore.shared.stored?.recordedAt : nil,
+            yandexFolderID: realtimeFolderID,
+            yandexVoice: yandexTTSVoice,
+            yandexRole: yandexTTSRole,
+            yandexModel: yandexTTSModel,
+            yandexEndpoint: yandexTTSEndpoint,
+            yandexAPIKey: realtimeAPIKey(for: .yandexRealtime) ?? ""
+        )
     }
     static let voiceEngineKey = "attention.voice.engine", voiceModelKey = "attention.voice.model"
     static let voiceDescriptionKey = "attention.voice.description", voiceBaseURLKey = "attention.voice.baseURL"
@@ -368,7 +383,7 @@ struct AttentionDecisionRecord: Codable, Equatable, Sendable {
         didSet { defaults.set(agentMeetingSendDefault.rawValue, forKey: Self.agentMeetingSendDefaultKey) }
     }
     static let agentMeetingSendDefaultKey = "assistant.agent.meetingSendDefault"
-    /// Optional WebSocket Realtime voice provider (`openai_realtime` / `gemini_live`).
+    /// Optional WebSocket Realtime voice provider (`openai_realtime` / `gemini_live` / `yandex_realtime`).
     /// Standard STT → LLM → TTS works independently whenever `.disabled` or unavailable.
     @Published var realtimeProvider: RealtimeProviderKind {
         didSet { defaults.set(realtimeProvider.rawValue, forKey: Self.realtimeProviderKey) }
@@ -386,6 +401,12 @@ struct AttentionDecisionRecord: Codable, Equatable, Sendable {
         didSet { defaults.set(realtimeEndpoint, forKey: Self.realtimeEndpointKey) }
     }
     static let realtimeEndpointKey = "assistant.realtime.endpoint"
+    @Published var realtimeFolderID: String {
+        didSet { defaults.set(realtimeFolderID, forKey: YandexRealtimePreferences.folderIDKey) }
+    }
+    @Published var realtimeVoiceRole: String {
+        didSet { defaults.set(realtimeVoiceRole, forKey: YandexRealtimePreferences.voiceRoleKey) }
+    }
     @Published var selectedSkillIDs: [String] {
         didSet { defaults.set(selectedSkillIDs, forKey: Self.selectedSkillsKey) }
     }
@@ -529,6 +550,10 @@ struct AttentionDecisionRecord: Codable, Equatable, Sendable {
         voiceModel = defaults.string(forKey: Self.voiceModelKey) ?? Self.defaultVoiceModel
         voiceDescription = defaults.string(forKey: Self.voiceDescriptionKey) ?? Self.defaultVoiceDescription
         voiceBaseURL = defaults.string(forKey: Self.voiceBaseURLKey) ?? AttentionProvider.defaults[.rapidMLX]!.baseURL
+        yandexTTSVoice = defaults.string(forKey: YandexRealtimePreferences.ttsVoiceKey) ?? YandexLiveTTSVoice.sofia.rawValue
+        yandexTTSRole = defaults.string(forKey: YandexRealtimePreferences.ttsRoleKey) ?? ""
+        yandexTTSModel = defaults.string(forKey: YandexRealtimePreferences.ttsModelKey) ?? YandexRealtimePreferences.defaultTTSModel
+        yandexTTSEndpoint = defaults.string(forKey: YandexRealtimePreferences.ttsEndpointKey) ?? ""
         generateOutcomes = defaults.object(forKey: Self.outcomesKey) as? Bool ?? true
         remoteOutcomes = defaults.bool(forKey: Self.remoteOutcomesKey)
         // On for an upgraded install: the previous implicit default was on and never wrote
@@ -549,6 +574,8 @@ struct AttentionDecisionRecord: Codable, Equatable, Sendable {
         realtimeModel = defaults.string(forKey: Self.realtimeModelKey) ?? ""
         realtimeVoice = defaults.string(forKey: Self.realtimeVoiceKey) ?? ""
         realtimeEndpoint = defaults.string(forKey: Self.realtimeEndpointKey) ?? ""
+        realtimeFolderID = defaults.string(forKey: YandexRealtimePreferences.folderIDKey) ?? ""
+        realtimeVoiceRole = defaults.string(forKey: YandexRealtimePreferences.voiceRoleKey) ?? ""
         selectedSkillIDs = defaults.stringArray(forKey: Self.selectedSkillsKey) ?? []
         autonomousMeetingVoiceEnabled = defaults.object(forKey: Self.autonomousVoiceKey) as? Bool ?? true
         headphoneUIDs = Set(defaults.stringArray(forKey: Self.headphoneUIDsKey) ?? [])

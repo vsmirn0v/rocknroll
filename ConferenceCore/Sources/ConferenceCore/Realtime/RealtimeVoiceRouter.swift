@@ -154,7 +154,7 @@ public enum RealtimeVoiceAudio {
     }
 }
 
-/// Coordinates optional WebSocket realtime voice sessions (`OpenAI Realtime` / `Gemini Live`)
+/// Coordinates optional WebSocket realtime voice sessions (`OpenAI Realtime` / `Gemini Live` / `Yandex Realtime`)
 /// and reports fallback status whenever standard STT → LLM → TTS should handle turns instead.
 public actor RealtimeVoiceRouter {
     public typealias ToolExecutor = @Sendable (_ name: String, _ argumentsJSON: String) async -> String
@@ -197,6 +197,8 @@ public actor RealtimeVoiceRouter {
                 selected = OpenAIRealtimeClient()
             case .geminiLive:
                 selected = GeminiLiveClient()
+            case .yandexRealtime:
+                selected = YandexRealtimeClient()
             }
         }
 

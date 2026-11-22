@@ -87,6 +87,8 @@ import FoundationModels
         let model: String
         let voice: String
         let endpointOverride: String
+        let folderID: String
+        let voiceRole: String
         let instructions: String
         let toolCount: Int
     }
@@ -638,7 +640,9 @@ import FoundationModels
             voice: skills.realtimeVoice,
             endpointOverride: skills.realtimeEndpoint,
             systemInstructions: instructions,
-            tools: tools
+            tools: tools,
+            folderID: skills.realtimeFolderID,
+            voiceRole: skills.realtimeVoiceRole
         )
         let configKey = WarmRealtimeConfigKey(
             provider: kind,
@@ -646,6 +650,8 @@ import FoundationModels
             model: skills.realtimeModel,
             voice: skills.realtimeVoice,
             endpointOverride: skills.realtimeEndpoint,
+            folderID: skills.realtimeFolderID,
+            voiceRole: skills.realtimeVoiceRole,
             instructions: instructions,
             toolCount: tools.count
         )

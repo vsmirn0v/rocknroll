@@ -4,7 +4,7 @@ import Foundation
 
 /// Runs autonomous in-meeting voice facilitation using Obsidian-backed skills,
 /// `People.md` speaker approval (owner is always approved), per-session optional
-/// `OpenAI Realtime` / `Gemini Live` WebSocket acceleration with live audio streaming,
+/// `OpenAI Realtime` / `Gemini Live` / `Yandex Realtime` WebSocket acceleration with live audio streaming,
 /// and automatic local STT -> LLM -> TTS fallback.
 @MainActor
 final class AutonomousMeetingFacilitator: ObservableObject {
@@ -92,12 +92,14 @@ final class AutonomousMeetingFacilitator: ObservableObject {
         let gate = AudioTapGate()
         var connected = false
         var audioChunks: [Data] = []
+        var outputSampleRate: Double = 24_000
         var transcriptBuffer = ""
         var activeSkillID: String
         var turnTimeoutTask: Task<Void, Never>?
 
-        init(activeSkillID: String) {
+        init(activeSkillID: String, outputSampleRate: Double = 24_000) {
             self.activeSkillID = activeSkillID
+            self.outputSampleRate = outputSampleRate
         }
     }
 
@@ -513,7 +515,7 @@ final class AutonomousMeetingFacilitator: ObservableObject {
         let skillsText = promptCtx["obsidian_skills"] ?? "Facilitate the meeting concisely in the user's language."
         let instructions = [basePersona, skillsText].filter { !$0.isEmpty }.joined(separator: "\n\n")
         let tools = AssistantSkillToolRegistrar.exportRealtimeTools(from: registry)
-        let targetInputRate = kind == .openAIRealtime ? 24_000 : 16_000
+        let targetInputRate = kind.defaultInputSampleRate
         let config = RealtimeSessionConfig(
             provider: kind,
             apiKey: apiKey,
@@ -522,10 +524,12 @@ final class AutonomousMeetingFacilitator: ObservableObject {
             endpointOverride: attention.store.realtimeEndpoint,
             systemInstructions: instructions,
             inputSampleRate: targetInputRate,
-            tools: tools
+            tools: tools,
+            folderID: attention.store.realtimeFolderID,
+            voiceRole: attention.store.realtimeVoiceRole
         )
 
-        let state = SessionRealtimeState(activeSkillID: skillID)
+        let state = SessionRealtimeState(activeSkillID: skillID, outputSampleRate: Double(config.outputSampleRate))
         state.gate.setApprovedSpeakersOnly(skill?.approvedSpeakersOnly ?? true)
         realtimeSessions[model.sessionID] = state
         let sessionID = model.sessionID
@@ -621,7 +625,10 @@ final class AutonomousMeetingFacilitator: ObservableObject {
         case .connected:
             state.connected = true
             syncRealtimeActiveFlag()
-        case .audioPCM16(let pcm, _):
+        case .audioPCM16(let pcm, let sampleRate):
+            if sampleRate > 0 {
+                state.outputSampleRate = Double(sampleRate)
+            }
             state.audioChunks.append(pcm)
         case .assistantTranscriptDelta(let delta):
             state.transcriptBuffer += delta
@@ -638,7 +645,7 @@ final class AutonomousMeetingFacilitator: ObservableObject {
             let text = state.transcriptBuffer.trimmed
             state.transcriptBuffer = ""
             if let model, !model.isClosed {
-                if let buffer = Self.pcm16ToAudioBuffer(data: combined, sampleRate: 24_000) {
+                if let buffer = Self.pcm16ToAudioBuffer(data: combined, sampleRate: state.outputSampleRate) {
                     await deliverSpokenBuffer(buffer, fallbackText: text, model: model)
                 } else if !text.isEmpty {
                     await speakIntoMeeting(text, model: model)
@@ -711,7 +718,8 @@ final class AutonomousMeetingFacilitator: ObservableObject {
         if (try? VoicePreviewPlayer.shared.play(buffer)) == nil, !fallbackText.isEmpty {
             _ = try? await VoiceSynthesis.auditionWithStatus(
                 fallbackText,
-                selection: attention.store.assistantAuditionVoice
+                selection: attention.store.assistantAuditionVoice,
+                store: attention.store
             )
         }
         lastStatusBySession[model.sessionID] = L("Auditioned locally (meeting audio off).")

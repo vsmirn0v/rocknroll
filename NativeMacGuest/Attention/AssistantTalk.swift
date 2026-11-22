@@ -542,7 +542,7 @@ import SwiftUI
         auditionTask = Task { @MainActor [weak self] in
             guard let self else { return }
             do {
-                let buffer = try await VoiceSynthesis.audition(clean, selection: selection)
+                let buffer = try await VoiceSynthesis.audition(clean, selection: selection, store: attention.store)
                 guard !Task.isCancelled, self.auditioningItemID == id else { return }
                 try self.playAuditionBuffer(buffer, id: id)
             } catch is CancellationError {

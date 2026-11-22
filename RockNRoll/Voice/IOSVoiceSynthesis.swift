@@ -11,6 +11,7 @@ enum IOSVoiceEngine: String, Codable, CaseIterable, Identifiable, Sendable {
     case personal
     case voxCPM2
     case rapidMLX
+    case yandexLiveTTS
 
     var id: String { rawValue }
 
@@ -20,6 +21,7 @@ enum IOSVoiceEngine: String, Codable, CaseIterable, Identifiable, Sendable {
         case .personal: return L("Personal Voice")
         case .voxCPM2: return L("VoxCPM2 (On-Device Neural)")
         case .rapidMLX: return L("Rapid-MLX Server")
+        case .yandexLiveTTS: return L("Yandex LiveTTS (Realtime)")
         }
     }
 }
@@ -31,6 +33,9 @@ enum IOSVoiceSynthesisError: LocalizedError, Equatable {
     case transport
     case remoteVoicePermissionRequired
     case audio
+    case yandexCredentialsMissing
+    case yandexFolderIDMissing
+    case yandexFailed(String)
     case personalUnsupported
     case personalDenied
     case personalMissing
@@ -63,6 +68,12 @@ enum IOSVoiceSynthesisError: LocalizedError, Equatable {
             return L("The voice server could not be reached. Check its address and network access.")
         case .audio:
             return L("The voice server returned audio this iPhone could not read.")
+        case .yandexCredentialsMissing:
+            return L("Save your Yandex API key in Voice settings first.")
+        case .yandexFolderIDMissing:
+            return L("Enter your Yandex Cloud Folder ID or a full gpt:// model URI first.")
+        case .yandexFailed(let detail):
+            return L("Yandex LiveTTS failed: %@", detail)
         case .personalUnsupported:
             return L("Personal Voice requires iOS 17 or later.")
         case .personalDenied:
@@ -325,6 +336,65 @@ enum IOSVoiceSynthesis {
         return try buffer(fromAudio: data)
     }
 
+    static func yandexTTSEndpointURL(for override: String) -> URL? {
+        let trimmed = override.trimmingCharacters(in: .whitespacesAndNewlines)
+        let candidate = trimmed.isEmpty ? RealtimeProviderKind.yandexRealtime.defaultEndpoint : trimmed
+        guard let components = URLComponents(string: candidate),
+              let scheme = components.scheme?.lowercased(),
+              ["wss", "ws"].contains(scheme),
+              let host = components.host, !host.isEmpty,
+              components.user == nil, components.password == nil, components.fragment == nil else {
+            return nil
+        }
+        return components.url
+    }
+
+    static func yandexLiveTTS(
+        _ text: String,
+        apiKey: String,
+        folderID: String,
+        model: String,
+        voice: String,
+        role: String,
+        endpointOverride: String,
+        approvedEndpoint: String?,
+        customTransport: (any RealtimeVoiceTransport)? = nil
+    ) async throws -> AVAudioPCMBuffer {
+        let clean = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty else { throw IOSVoiceSynthesisError.empty }
+        guard let endpoint = yandexTTSEndpointURL(for: endpointOverride) else {
+            throw IOSVoiceSynthesisError.transport
+        }
+        guard endpoint.absoluteString == approvedEndpoint else {
+            throw IOSVoiceSynthesisError.remoteVoicePermissionRequired
+        }
+        do {
+            return try await YandexRealtimeTTS.synthesize(
+                text: clean,
+                apiKey: apiKey,
+                folderID: folderID,
+                model: model,
+                voice: voice,
+                role: role,
+                endpointOverride: endpointOverride,
+                customTransport: customTransport
+            )
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch let err as YandexRealtimeTTSError {
+            switch err {
+            case .emptyText: throw IOSVoiceSynthesisError.empty
+            case .missingAPIKey: throw IOSVoiceSynthesisError.yandexCredentialsMissing
+            case .missingFolderID: throw IOSVoiceSynthesisError.yandexFolderIDMissing
+            case .invalidEndpoint, .timedOut: throw IOSVoiceSynthesisError.transport
+            case .emptyAudio: throw IOSVoiceSynthesisError.audio
+            case .serverError(let detail): throw IOSVoiceSynthesisError.yandexFailed(detail)
+            }
+        } catch {
+            throw IOSVoiceSynthesisError.transport
+        }
+    }
+
     static func buffer(fromAudio data: Data) throws -> AVAudioPCMBuffer {
         if let fastBuffer = parseWAVInMemory(data) {
             return fastBuffer
@@ -577,6 +647,7 @@ final class IOSVoiceStore: ObservableObject {
         static let approvedRapidMLXEndpoint = "ios.voice.rapidMLX.approvedEndpoint"
         static let rapidMLXModel = "ios.voice.rapidMLX.model"
         static let rapidMLXDescription = "ios.voice.rapidMLX.description"
+        static let approvedYandexEndpoint = "ios.voice.yandexLiveTTS.approvedEndpoint"
     }
 
     @Published var engine: IOSVoiceEngine {
@@ -599,6 +670,37 @@ final class IOSVoiceStore: ObservableObject {
     @Published var rapidMLXDescription: String {
         didSet { preferences.set(rapidMLXDescription, forKey: Keys.rapidMLXDescription) }
     }
+    @Published var yandexFolderID: String {
+        didSet {
+            guard oldValue != yandexFolderID else { return }
+            preferences.set(yandexFolderID, forKey: YandexRealtimePreferences.folderIDKey)
+            if !suppressCredentialBroadcast {
+                NotificationCenter.default.post(
+                    name: YandexRealtimePreferences.credentialsChangedNotification,
+                    object: self,
+                    userInfo: ["isStandard": preferences === UserDefaults.standard]
+                )
+            }
+        }
+    }
+    @Published var yandexVoice: String {
+        didSet { preferences.set(yandexVoice, forKey: YandexRealtimePreferences.ttsVoiceKey) }
+    }
+    @Published var yandexRole: String {
+        didSet { preferences.set(yandexRole, forKey: YandexRealtimePreferences.ttsRoleKey) }
+    }
+    @Published var yandexModel: String {
+        didSet { preferences.set(yandexModel, forKey: YandexRealtimePreferences.ttsModelKey) }
+    }
+    @Published var yandexEndpoint: String {
+        didSet {
+            preferences.set(yandexEndpoint, forKey: YandexRealtimePreferences.ttsEndpointKey)
+            if approvedYandexEndpoint != yandexEndpointURL?.absoluteString {
+                setYandexConsent(false)
+            }
+        }
+    }
+    @Published private(set) var hasYandexAPIKey = false
     @Published var wakeWordEnabled: Bool {
         didSet { preferences.set(wakeWordEnabled, forKey: AssistantVoicePreferences.wakeWordEnabledKey) }
     }
@@ -613,7 +715,12 @@ final class IOSVoiceStore: ObservableObject {
     }
 
     @Published private var approvedRapidMLXEndpoint: String?
+    @Published private var approvedYandexEndpoint: String?
     private let preferences: UserDefaults
+    private let keychain: WorkspaceAPIKeychain
+    private var suppressCredentialBroadcast = false
+    private var credentialObserver: NSObjectProtocol?
+    var customYandexTransportFactory: (@Sendable () -> any RealtimeVoiceTransport)?
 
     var rapidMLXEndpoint: URL? { IOSVoiceSynthesis.rapidMLXEndpoint(for: rapidMLXBaseURL) }
 
@@ -627,18 +734,86 @@ final class IOSVoiceStore: ObservableObject {
         preferences.set(approvedRapidMLXEndpoint, forKey: Keys.approvedRapidMLXEndpoint)
     }
 
-    init(preferences: UserDefaults = .standard) {
+    var yandexEndpointURL: URL? { IOSVoiceSynthesis.yandexTTSEndpointURL(for: yandexEndpoint) }
+
+    var hasYandexConsent: Bool {
+        guard let endpoint = yandexEndpointURL else { return false }
+        return approvedYandexEndpoint == endpoint.absoluteString
+    }
+
+    func setYandexConsent(_ allowed: Bool) {
+        approvedYandexEndpoint = allowed ? yandexEndpointURL?.absoluteString : nil
+        preferences.set(approvedYandexEndpoint, forKey: Keys.approvedYandexEndpoint)
+    }
+
+    func yandexAPIKey() -> String {
+        keychain.readRealtime(provider: .yandexRealtime)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    }
+
+    @discardableResult
+    func setYandexAPIKey(_ value: String) -> Bool {
+        let clean = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        let saved = clean.isEmpty
+            ? keychain.deleteRealtime(provider: .yandexRealtime)
+            : keychain.writeRealtime(clean, provider: .yandexRealtime)
+        hasYandexAPIKey = !yandexAPIKey().isEmpty
+        if saved && !suppressCredentialBroadcast {
+            NotificationCenter.default.post(
+                name: YandexRealtimePreferences.credentialsChangedNotification,
+                object: self,
+                userInfo: ["isStandard": preferences === UserDefaults.standard]
+            )
+        }
+        return saved
+    }
+
+    init(preferences: UserDefaults = .standard, keychain: WorkspaceAPIKeychain = WorkspaceAPIKeychain()) {
         self.preferences = preferences
+        self.keychain = keychain
         self.engine = preferences.string(forKey: Keys.engine).flatMap(IOSVoiceEngine.init(rawValue:)) ?? .system
         self.systemVoiceIdentifier = preferences.string(forKey: Keys.systemVoiceID) ?? ""
         self.approvedRapidMLXEndpoint = preferences.string(forKey: Keys.approvedRapidMLXEndpoint)
         self.rapidMLXBaseURL = preferences.string(forKey: Keys.rapidMLXBaseURL) ?? ""
         self.rapidMLXModel = preferences.string(forKey: Keys.rapidMLXModel) ?? "Qwen/Qwen3-TTS-12Hz-0.6B-Base-8bit"
         self.rapidMLXDescription = preferences.string(forKey: Keys.rapidMLXDescription) ?? ""
+        self.approvedYandexEndpoint = preferences.string(forKey: Keys.approvedYandexEndpoint)
+        self.yandexFolderID = preferences.string(forKey: YandexRealtimePreferences.folderIDKey) ?? ""
+        self.yandexVoice = preferences.string(forKey: YandexRealtimePreferences.ttsVoiceKey) ?? YandexLiveTTSVoice.sofia.rawValue
+        self.yandexRole = preferences.string(forKey: YandexRealtimePreferences.ttsRoleKey) ?? ""
+        self.yandexModel = preferences.string(forKey: YandexRealtimePreferences.ttsModelKey) ?? YandexRealtimePreferences.defaultTTSModel
+        self.yandexEndpoint = preferences.string(forKey: YandexRealtimePreferences.ttsEndpointKey) ?? ""
         self.wakeWordEnabled = AssistantVoicePreferences.loadWakeWordEnabled(from: preferences)
         self.assistantAuditionVoice = AssistantVoicePreferences.loadAuditionVoice(from: preferences)
         self.autoAuditionVoiceReplies = AssistantVoicePreferences.loadAutoSpeakVoiceReplies(from: preferences)
         self.autoAuditionTypedReplies = AssistantVoicePreferences.loadAutoSpeakTypedReplies(from: preferences)
+        self.hasYandexAPIKey = !(keychain.readRealtime(provider: .yandexRealtime)?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+
+        self.credentialObserver = NotificationCenter.default.addObserver(
+            forName: YandexRealtimePreferences.credentialsChangedNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] note in
+            let posterIsStandard = (note.userInfo?["isStandard"] as? Bool) ?? false
+            let posterObject = note.object as AnyObject?
+            Task { @MainActor [weak self] in
+                guard let self, posterObject !== self else { return }
+                guard self.preferences === UserDefaults.standard && posterIsStandard else { return }
+                self.suppressCredentialBroadcast = true
+                defer { self.suppressCredentialBroadcast = false }
+                let latestFolder = self.preferences.string(forKey: YandexRealtimePreferences.folderIDKey) ?? ""
+                if self.yandexFolderID != latestFolder {
+                    self.yandexFolderID = latestFolder
+                }
+                self.hasYandexAPIKey = !self.yandexAPIKey().isEmpty
+            }
+        }
+    }
+
+    deinit {
+        if let credentialObserver {
+            NotificationCenter.default.removeObserver(credentialObserver)
+        }
     }
 
     func synthesizeAssistantResponse(_ text: String) async throws -> AVAudioPCMBuffer {
@@ -673,6 +848,24 @@ final class IOSVoiceStore: ObservableObject {
         case .systemVoice(let identifier):
             let resolvedID = identifier.isEmpty ? fallbackVoiceID : identifier
             return try await IOSVoiceSynthesis.system(clean, voiceIdentifier: resolvedID)
+        case .yandexLiveTTS(let voice):
+            do {
+                return try await IOSVoiceSynthesis.yandexLiveTTS(
+                    clean,
+                    apiKey: yandexAPIKey(),
+                    folderID: yandexFolderID,
+                    model: yandexModel,
+                    voice: voice,
+                    role: yandexRole,
+                    endpointOverride: yandexEndpoint,
+                    approvedEndpoint: approvedYandexEndpoint,
+                    customTransport: customYandexTransportFactory?()
+                )
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                return try await IOSVoiceSynthesis.system(clean, voiceIdentifier: fallbackVoiceID)
+            }
         }
     }
 
@@ -695,6 +888,18 @@ final class IOSVoiceStore: ObservableObject {
                 model: rapidMLXModel,
                 description: rapidMLXDescription,
                 session: session
+            )
+        case .yandexLiveTTS:
+            return try await IOSVoiceSynthesis.yandexLiveTTS(
+                text,
+                apiKey: yandexAPIKey(),
+                folderID: yandexFolderID,
+                model: yandexModel,
+                voice: yandexVoice,
+                role: yandexRole,
+                endpointOverride: yandexEndpoint,
+                approvedEndpoint: approvedYandexEndpoint,
+                customTransport: customYandexTransportFactory?()
             )
         }
     }

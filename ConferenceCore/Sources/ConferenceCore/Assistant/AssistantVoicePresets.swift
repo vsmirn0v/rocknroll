@@ -50,21 +50,22 @@ public enum AssistantVoxVoicePreset: String, Codable, CaseIterable, Identifiable
     }
 }
 
-/// Which local voice auditions Assistant answers on the user's device.
+/// Which voice auditions Assistant answers on the user's device.
 public enum AssistantAuditionVoiceSelection: Codable, Equatable, Hashable, Sendable {
     case voxPreset(AssistantVoxVoicePreset)
     case clonedVoice
     case personalVoice
     case systemVoice(identifier: String)
+    case yandexLiveTTS(voice: String)
 
     public static let defaultSelection: Self = .voxPreset(.calmAssistant)
 
     private enum CodingKeys: String, CodingKey {
-        case kind, preset, identifier
+        case kind, preset, identifier, voice
     }
 
     private enum Kind: String, Codable {
-        case voxPreset, clonedVoice, personalVoice, systemVoice
+        case voxPreset, clonedVoice, personalVoice, systemVoice, yandexLiveTTS
     }
 
     public init(from decoder: Decoder) throws {
@@ -81,6 +82,9 @@ public enum AssistantAuditionVoiceSelection: Codable, Equatable, Hashable, Senda
         case .systemVoice:
             let identifier = try container.decodeIfPresent(String.self, forKey: .identifier) ?? ""
             self = .systemVoice(identifier: identifier)
+        case .yandexLiveTTS:
+            let voice = try container.decodeIfPresent(String.self, forKey: .voice) ?? YandexLiveTTSVoice.sofia.rawValue
+            self = .yandexLiveTTS(voice: voice)
         }
     }
 
@@ -97,6 +101,9 @@ public enum AssistantAuditionVoiceSelection: Codable, Equatable, Hashable, Senda
         case .systemVoice(let identifier):
             try container.encode(Kind.systemVoice, forKey: .kind)
             try container.encode(identifier, forKey: .identifier)
+        case .yandexLiveTTS(let voice):
+            try container.encode(Kind.yandexLiveTTS, forKey: .kind)
+            try container.encode(voice, forKey: .voice)
         }
     }
 
@@ -110,6 +117,8 @@ public enum AssistantAuditionVoiceSelection: Codable, Equatable, Hashable, Senda
             return L("Personal Voice")
         case .systemVoice(let id):
             return id.isEmpty ? L("System voice (automatic)") : L("System voice")
+        case .yandexLiveTTS(let voice):
+            return L("Yandex LiveTTS · %@", YandexLiveTTSVoice.displayTitle(for: voice))
         }
     }
 }
