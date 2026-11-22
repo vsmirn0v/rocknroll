@@ -1013,7 +1013,10 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
                 if IOSListenModelStore.shared.autoStartLocalTranscription && !didAutoStartLocalTranscription {
                     didAutoStartLocalTranscription = true
                     Task { @MainActor [weak self] in
-                        guard let self, self.phase == .connected, !self.leaving else { return }
+                        guard let self,
+                              self.phase == .connected,
+                              !self.leaving,
+                              !(self.providerTranscriptActive && self.providerCanViewTranscript == true) else { return }
                         _ = await self.localTranscriber.start()
                         self.refreshLocalAudioSink()
                         self.syncCatchUpTranscript()
@@ -1069,11 +1072,18 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
                     isOwn: msg.isOwn
                 )
             }
+            let wasServerVisible = providerTranscriptActive && (providerCanViewTranscript == true)
             providerTranscriptSegments = segments
             providerCanViewTranscript = features.permissions.canViewTranscript
             providerTranscriptActive = (features.transcriptionStatus == .active)
             providerCanManageTranscript = features.permissions.canManageTranscript && features.connected
+            let isServerVisible = providerTranscriptActive && (providerCanViewTranscript == true)
             syncCatchUpTranscript()
+            if wasServerVisible != isServerVisible {
+                Task { @MainActor [weak self] in
+                    await self?.reconcileLocalTranscriptionMode()
+                }
+            }
             if features.connected && features.permissions.canViewTranscript {
                 if !requestedInitialTranscriptHistory {
                     requestedInitialTranscriptHistory = true
@@ -1346,9 +1356,14 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
     func ensureTranscriptionRunning(consumer: String) async {
         guard !leaving, phase == .connected else { return }
         assistantTranscriptionConsumers.insert(consumer)
-        let needsRawAudioTap = consumer == "facilitator"
-        guard needsRawAudioTap || !(providerTranscriptActive && providerCanViewTranscript == true),
-              !localTranscriber.state.isRunning else { return }
+        if providerTranscriptActive && providerCanViewTranscript == true {
+            if consumer == "facilitator" && !localTranscriber.isCapturingAudio {
+                _ = await localTranscriber.startAudioTapOnly()
+                refreshLocalAudioSink()
+            }
+            return
+        }
+        guard !localTranscriber.state.isRunning else { return }
         _ = await localTranscriber.start()
         refreshLocalAudioSink()
         syncCatchUpTranscript()
@@ -1356,9 +1371,34 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
 
     func releaseTranscription(consumer: String) async {
         assistantTranscriptionConsumers.remove(consumer)
-        guard assistantTranscriptionConsumers.isEmpty, !didAutoStartLocalTranscription, !leaving else { return }
-        if localTranscriber.state.isRunning {
-            await localTranscriber.stop()
+        guard !leaving else { return }
+        if assistantTranscriptionConsumers.isEmpty && !didAutoStartLocalTranscription {
+            if localTranscriber.isCapturingAudio {
+                await localTranscriber.stop()
+                refreshLocalAudioSink()
+                syncCatchUpTranscript()
+            }
+        } else if !assistantTranscriptionConsumers.contains("facilitator") && localTranscriber.isAudioTapOnly {
+            await localTranscriber.stopAudioTapOnly()
+            refreshLocalAudioSink()
+        }
+    }
+
+    private func reconcileLocalTranscriptionMode() async {
+        guard !leaving, phase == .connected else { return }
+        let serverVisible = providerTranscriptActive && (providerCanViewTranscript == true)
+        if serverVisible {
+            if localTranscriber.state.isRunning && !assistantTranscriptionConsumers.contains("user") {
+                await localTranscriber.stop(keepAudioTap: assistantTranscriptionConsumers.contains("facilitator"))
+                refreshLocalAudioSink()
+                syncCatchUpTranscript()
+            } else if !localTranscriber.isCapturingAudio && assistantTranscriptionConsumers.contains("facilitator") {
+                _ = await localTranscriber.startAudioTapOnly()
+                refreshLocalAudioSink()
+            }
+        } else if (!assistantTranscriptionConsumers.isEmpty || didAutoStartLocalTranscription),
+                  !localTranscriber.state.isRunning {
+            _ = await localTranscriber.start()
             refreshLocalAudioSink()
             syncCatchUpTranscript()
         }
@@ -1409,7 +1449,7 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
 
     private func refreshLocalAudioSink() {
         let privateSink = privateCheckAudioSink
-        let transcribeLocal = localTranscriber.state.isRunning
+        let transcribeLocal = localTranscriber.isCapturingAudio
         if privateSink == nil && !transcribeLocal {
             session.setLocalAudioSink(nil)
             return

@@ -6,6 +6,9 @@ final class RealtimeVoiceProtocolTests: XCTestCase {
     func testOpenAIRealtimeWirePayloadsAndParsing() throws {
         let url = try XCTUnwrap(OpenAIRealtimeClient.makeEndpointURL(base: "wss://api.openai.com/v1/realtime", model: "gpt-realtime"))
         XCTAssertTrue(url.absoluteString.contains("model=gpt-realtime"))
+        let req = OpenAIRealtimeClient.makeWebSocketRequest(url: url, apiKey: "sk-test")
+        XCTAssertEqual(req.value(forHTTPHeaderField: "Authorization"), "Bearer sk-test")
+        XCTAssertNil(req.value(forHTTPHeaderField: "OpenAI-Beta"), "GA API rejects legacy OpenAI-Beta header")
 
         let tool = RealtimeToolDeclaration(
             name: "rocknroll_create_task",
@@ -25,7 +28,18 @@ final class RealtimeVoiceProtocolTests: XCTestCase {
         let update = OpenAIRealtimeClient.sessionUpdatePayload(config: config)
         XCTAssertEqual(update["type"] as? String, "session.update")
         let session = try XCTUnwrap(update["session"] as? [String: Any])
-        XCTAssertEqual(session["voice"] as? String, "alloy")
+        XCTAssertEqual(session["type"] as? String, "realtime")
+        XCTAssertEqual(session["output_modalities"] as? [String], ["audio"])
+        let audio = try XCTUnwrap(session["audio"] as? [String: Any])
+        let audioInput = try XCTUnwrap(audio["input"] as? [String: Any])
+        let inputFormat = try XCTUnwrap(audioInput["format"] as? [String: Any])
+        XCTAssertEqual(inputFormat["type"] as? String, "audio/pcm")
+        XCTAssertEqual(inputFormat["rate"] as? Int, 24_000)
+        let audioOutput = try XCTUnwrap(audio["output"] as? [String: Any])
+        let outputFormat = try XCTUnwrap(audioOutput["format"] as? [String: Any])
+        XCTAssertEqual(outputFormat["type"] as? String, "audio/pcm")
+        XCTAssertEqual(outputFormat["rate"] as? Int, 24_000)
+        XCTAssertEqual(audioOutput["voice"] as? String, "alloy")
         XCTAssertEqual((session["tools"] as? [[String: Any]])?.count, 1)
 
         let audioChunk = Data([0x01, 0x02, 0x03, 0x04])

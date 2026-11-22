@@ -22,9 +22,7 @@ public actor OpenAIRealtimeClient: RealtimeVoiceTransport {
         }
 
         let urlSession = URLSession(configuration: .ephemeral)
-        var request = URLRequest(url: url)
-        request.setValue("Bearer \(config.apiKey)", forHTTPHeaderField: "Authorization")
-        request.setValue("realtime=v1", forHTTPHeaderField: "OpenAI-Beta")
+        let request = Self.makeWebSocketRequest(url: url, apiKey: config.apiKey)
 
         let ws = urlSession.webSocketTask(with: request)
         ws.resume()
@@ -38,6 +36,12 @@ public actor OpenAIRealtimeClient: RealtimeVoiceTransport {
         receiveTask = Task { [weak self] in
             await self?.receiveLoop(ws: ws)
         }
+    }
+
+    public static func makeWebSocketRequest(url: URL, apiKey: String) -> URLRequest {
+        var request = URLRequest(url: url)
+        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        return request
     }
 
     public func sendAudioPCM16(_ data: Data) async throws {
@@ -66,7 +70,10 @@ public actor OpenAIRealtimeClient: RealtimeVoiceTransport {
         guard let ws = task else { throw RealtimeTransportError.notConnected }
         let payload: [String: Any] = [
             "type": "session.update",
-            "session": ["instructions": instructions],
+            "session": [
+                "type": "realtime",
+                "instructions": instructions,
+            ],
         ]
         try await sendJSON(payload, on: ws)
     }
@@ -136,17 +143,35 @@ public actor OpenAIRealtimeClient: RealtimeVoiceTransport {
                 "parameters": tool.parametersDictionary(),
             ]
         }
+        let voice = config.voice.isEmpty ? RealtimeProviderKind.openAIRealtime.defaultVoice : config.voice
+        let inputRate = config.inputSampleRate > 0 ? config.inputSampleRate : RealtimeProviderKind.openAIRealtime.defaultInputSampleRate
+        let outputRate = config.outputSampleRate > 0 ? config.outputSampleRate : RealtimeProviderKind.openAIRealtime.defaultOutputSampleRate
         var sessionObject: [String: Any] = [
-            "modalities": ["audio", "text"],
+            "type": "realtime",
+            "output_modalities": ["audio"],
             "instructions": config.systemInstructions,
-            "voice": config.voice,
-            "input_audio_format": "pcm16",
-            "output_audio_format": "pcm16",
-            "input_audio_transcription": ["model": "whisper-1"],
-            "turn_detection": [
-                "type": "server_vad",
-                "threshold": 0.5,
-                "silence_duration_ms": 600,
+            "audio": [
+                "input": [
+                    "format": [
+                        "type": "audio/pcm",
+                        "rate": inputRate,
+                    ],
+                    "transcription": [
+                        "model": "gpt-4o-mini-transcribe",
+                    ],
+                    "turn_detection": [
+                        "type": "server_vad",
+                        "threshold": 0.5,
+                        "silence_duration_ms": 600,
+                    ],
+                ],
+                "output": [
+                    "format": [
+                        "type": "audio/pcm",
+                        "rate": outputRate,
+                    ],
+                    "voice": voice,
+                ],
             ],
         ]
         if !toolDefs.isEmpty {
@@ -209,12 +234,12 @@ public actor OpenAIRealtimeClient: RealtimeVoiceTransport {
             }
         case "response.audio.done", "response.output_audio.done":
             return [.audioDone]
-        case "response.audio_transcript.delta", "response.output_audio_transcript.delta":
+        case "response.audio_transcript.delta", "response.output_audio_transcript.delta", "response.output_text.delta":
             if let delta = json["delta"] as? String {
                 return [.assistantTranscriptDelta(delta)]
             }
-        case "response.audio_transcript.done", "response.output_audio_transcript.done":
-            if let transcript = json["transcript"] as? String {
+        case "response.audio_transcript.done", "response.output_audio_transcript.done", "response.output_text.done":
+            if let transcript = json["transcript"] as? String ?? json["text"] as? String {
                 return [.assistantTranscriptDone(transcript)]
             }
         case "response.function_call_arguments.done":

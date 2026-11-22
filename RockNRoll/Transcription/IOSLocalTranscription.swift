@@ -118,6 +118,7 @@ private final class AudioIngressRouter: @unchecked Sendable {
     private let lock = NSLock()
 
     private var running = false
+    private var audioTapOnly = false
     private var backend: IOSListenModel = .appleSpeech
     private var language: IOSTranscriptionLanguage = .english
     private var gigaam: CoreMLGigaAMRecognizer?
@@ -128,6 +129,7 @@ private final class AudioIngressRouter: @unchecked Sendable {
 
     // Worker-queue-only state
     private var pipelines: [String: SpeakerPipeline] = [:]
+    private var rawConverters: [String: IOSPCM16kConverter] = [:]
     private var timeline = IOSSpeakingTimeline()
 
     var onText: (@Sendable (String, String?, String, Bool, Date) -> Void)?
@@ -141,6 +143,7 @@ private final class AudioIngressRouter: @unchecked Sendable {
 
     func updateMetadata(
         running: Bool,
+        audioTapOnly: Bool = false,
         backend: IOSListenModel,
         language: IOSTranscriptionLanguage,
         gigaam: CoreMLGigaAMRecognizer?,
@@ -149,6 +152,7 @@ private final class AudioIngressRouter: @unchecked Sendable {
     ) {
         lock.withLock {
             self.running = running
+            self.audioTapOnly = audioTapOnly
             self.backend = backend
             self.language = language
             self.gigaam = gigaam
@@ -156,6 +160,9 @@ private final class AudioIngressRouter: @unchecked Sendable {
             self.speakerNames = speakerNames
         }
         workerQueue.async { [self] in
+            if !audioTapOnly {
+                self.rawConverters.removeAll()
+            }
             for (id, pipeline) in self.pipelines {
                 if id == "local" {
                     pipeline.updateSpeaker(localSpeaker)
@@ -171,10 +178,10 @@ private final class AudioIngressRouter: @unchecked Sendable {
     }
 
     func enqueueLocal(_ buffer: AVAudioPCMBuffer) {
-        let state: (running: Bool, backend: IOSListenModel, language: IOSTranscriptionLanguage, gigaam: CoreMLGigaAMRecognizer?, speaker: String)? = lock.withLock {
+        let state: (running: Bool, tapOnly: Bool, backend: IOSListenModel, language: IOSTranscriptionLanguage, gigaam: CoreMLGigaAMRecognizer?, speaker: String)? = lock.withLock {
             guard running, pendingWorkCount < Self.maxPendingWorkCount else { return nil }
             pendingWorkCount += 1
-            return (running, backend, language, gigaam, localSpeaker)
+            return (running, audioTapOnly, backend, language, gigaam, localSpeaker)
         }
         guard let state else { return }
         workerQueue.async { [self] in
@@ -186,6 +193,7 @@ private final class AudioIngressRouter: @unchecked Sendable {
             self.processOnWorker(
                 streamID: "local",
                 speakerName: state.speaker,
+                tapOnly: state.tapOnly,
                 backend: state.backend,
                 language: state.language,
                 gigaam: state.gigaam,
@@ -195,10 +203,10 @@ private final class AudioIngressRouter: @unchecked Sendable {
     }
 
     func enqueueRemote(streamID: String, buffer: AVAudioPCMBuffer) {
-        let state: (running: Bool, backend: IOSListenModel, language: IOSTranscriptionLanguage, gigaam: CoreMLGigaAMRecognizer?, speaker: String?)? = lock.withLock {
+        let state: (running: Bool, tapOnly: Bool, backend: IOSListenModel, language: IOSTranscriptionLanguage, gigaam: CoreMLGigaAMRecognizer?, speaker: String?)? = lock.withLock {
             guard running, pendingWorkCount < Self.maxPendingWorkCount else { return nil }
             pendingWorkCount += 1
-            return (running, backend, language, gigaam, speakerNames[streamID])
+            return (running, audioTapOnly, backend, language, gigaam, speakerNames[streamID])
         }
         guard let state else { return }
         workerQueue.async { [self] in
@@ -210,6 +218,7 @@ private final class AudioIngressRouter: @unchecked Sendable {
             self.processOnWorker(
                 streamID: streamID,
                 speakerName: state.speaker,
+                tapOnly: state.tapOnly,
                 backend: state.backend,
                 language: state.language,
                 gigaam: state.gigaam,
@@ -222,17 +231,35 @@ private final class AudioIngressRouter: @unchecked Sendable {
         workerQueue.async { [self] in
             let closing = self.pipelines.removeValue(forKey: id)
             closing?.finishAndFlush()
+            self.rawConverters.removeValue(forKey: id)
+        }
+    }
+
+    func stopASRKeepAudioTap() {
+        lock.withLock {
+            self.running = true
+            self.audioTapOnly = true
+            self.gigaam = nil
+        }
+        workerQueue.async { [self] in
+            let active = self.pipelines.values
+            self.pipelines.removeAll()
+            for pipeline in active {
+                pipeline.stop()
+            }
         }
     }
 
     func stopAll(resetTimeline: Bool = false) {
         lock.withLock {
             self.running = false
+            self.audioTapOnly = false
             self.gigaam = nil
         }
         workerQueue.async { [self] in
             let active = self.pipelines.values
             self.pipelines.removeAll()
+            self.rawConverters.removeAll()
             for pipeline in active {
                 pipeline.stop()
             }
@@ -245,11 +272,28 @@ private final class AudioIngressRouter: @unchecked Sendable {
     private func processOnWorker(
         streamID: String,
         speakerName: String?,
+        tapOnly: Bool,
         backend: IOSListenModel,
         language: IOSTranscriptionLanguage,
         gigaam: CoreMLGigaAMRecognizer?,
         buffer: AVAudioPCMBuffer
     ) {
+        let isTapOnly = lock.withLock { self.audioTapOnly } || tapOnly
+        if isTapOnly {
+            let converter = rawConverters[streamID] ?? {
+                let created = IOSPCM16kConverter()
+                rawConverters[streamID] = created
+                return created
+            }()
+            let samples = converter.convert(buffer)
+            if let handler = lock.withLock({ onPCM16Audio }), !samples.isEmpty {
+                let pcmData = RealtimeVoiceAudio.floatSamplesToPCM16Data(samples)
+                if !pcmData.isEmpty {
+                    handler(streamID, pcmData)
+                }
+            }
+            return
+        }
         let pipeline: SpeakerPipeline
         if let existing = pipelines[streamID] {
             pipeline = existing
@@ -291,6 +335,9 @@ private final class AudioIngressRouter: @unchecked Sendable {
 final class IOSMeetingTranscriber: ObservableObject {
     @Published private(set) var segments: [TranscriptSegment] = []
     @Published private(set) var state: IOSTranscriptionState = .off
+    @Published private(set) var isAudioTapOnly = false
+
+    var isCapturingAudio: Bool { running || isAudioTapOnly }
 
     var onSegmentsChanged: (([TranscriptSegment]) -> Void)?
 
@@ -354,7 +401,7 @@ final class IOSMeetingTranscriber: ObservableObject {
         remoteSources = sources
         // Tracks can arrive while the selected recognizer is loading. Bind them after startup
         // so their first PCM buffer cannot create a pipeline using the fallback backend.
-        guard running, currentBackend != nil else { return }
+        guard isCapturingAudio, isAudioTapOnly || currentBackend != nil else { return }
         syncTaps()
     }
 
@@ -364,13 +411,34 @@ final class IOSMeetingTranscriber: ObservableObject {
     }
 
     func receiveLocalAudio(_ buffer: AVAudioPCMBuffer) {
-        guard running, let copy = MeetingAudioSink.copy(buffer) else { return }
+        guard isCapturingAudio, let copy = MeetingAudioSink.copy(buffer) else { return }
         pushRouterMetadata()
         router.enqueueLocal(copy)
     }
 
+    /// Streams raw 16 kHz PCM16 audio to Realtime voice providers without running
+    /// on-device speech recognition or producing duplicate local transcript lines.
+    func startAudioTapOnly() async -> Bool {
+        if running || isAudioTapOnly { return true }
+        isAudioTapOnly = true
+        pushRouterMetadata()
+        _ = await setOutputDemand(true)
+        guard isAudioTapOnly, !running else { return running || isAudioTapOnly }
+        syncTaps()
+        return true
+    }
+
+    func stopAudioTapOnly() async {
+        guard isAudioTapOnly, !running else { return }
+        isAudioTapOnly = false
+        detachAllTaps()
+        router.stopAll(resetTimeline: false)
+        _ = await setOutputDemand(false)
+    }
+
     func start() async -> Bool {
         guard !running else { return true }
+        isAudioTapOnly = false
         let run = UUID()
         activeRun = run
         state = .starting
@@ -418,11 +486,27 @@ final class IOSMeetingTranscriber: ObservableObject {
         return true
     }
 
-    func stop() async {
+    func stop(keepAudioTap: Bool = false) async {
         partialPublishTask?.cancel()
         partialPublishTask = nil
-        guard running || state != .off else { return }
+        if keepAudioTap {
+            guard running || state != .off else {
+                _ = await startAudioTapOnly()
+                return
+            }
+            activeRun = nil
+            activeUtteranceByStream.removeAll()
+            currentBackend = nil
+            gigaamRecognizer = nil
+            state = .off
+            isAudioTapOnly = true
+            router.stopASRKeepAudioTap()
+            syncTaps()
+            return
+        }
+        guard running || isAudioTapOnly || state != .off else { return }
         activeRun = nil
+        isAudioTapOnly = false
         detachAllTaps()
         router.stopAll(resetTimeline: false)
         activeUtteranceByStream.removeAll()
@@ -452,7 +536,8 @@ final class IOSMeetingTranscriber: ObservableObject {
             }
         }
         router.updateMetadata(
-            running: running && currentBackend != nil,
+            running: (running && currentBackend != nil) || isAudioTapOnly,
+            audioTapOnly: isAudioTapOnly && !running,
             backend: currentBackend ?? .appleSpeech,
             language: modelStore.language,
             gigaam: gigaamRecognizer,

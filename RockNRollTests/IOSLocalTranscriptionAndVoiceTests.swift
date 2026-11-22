@@ -761,6 +761,101 @@ final class IOSLocalTranscriptionAndVoiceTests: XCTestCase {
         transcriber.enqueueLocalAudio(buffer)
     }
 
+    func testMeetingTranscriberAudioTapOnlyAndStopKeepingAudioTap() async throws {
+        let store = try installedGigaAMStore()
+        store.selectedModel = .appleSpeech
+
+        final class CapturedPCM: @unchecked Sendable {
+            private let lock = NSLock()
+            private var chunks: [(String, Data)] = []
+
+            func append(_ streamID: String, _ data: Data) {
+                lock.lock()
+                chunks.append((streamID, data))
+                lock.unlock()
+            }
+
+            func totalBytes(for streamID: String) -> Int {
+                lock.lock()
+                defer { lock.unlock() }
+                return chunks.filter { $0.0 == streamID }.reduce(0) { $0 + $1.1.count }
+            }
+
+            func reset() {
+                lock.lock()
+                chunks.removeAll()
+                lock.unlock()
+            }
+        }
+
+        let captured = CapturedPCM()
+        let transcriber = IOSMeetingTranscriber(
+            modelStore: store,
+            localDisplayName: { "Tester" },
+            participantNameLookup: { _ in nil },
+            setOutputDemand: { _ in true },
+            speechAuthorization: { true },
+            localAppleSpeechAvailable: { true }
+        )
+        transcriber.setPCM16AudioHandler { streamID, data in
+            captured.append(streamID, data)
+        }
+
+        func makeToneBuffer(frames: AVAudioFrameCount = 1600) throws -> AVAudioPCMBuffer {
+            let buffer = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: IOSPCM16kConverter.targetFormat, frameCapacity: frames))
+            buffer.frameLength = frames
+            if let channel = buffer.floatChannelData?[0] {
+                for i in 0..<Int(frames) {
+                    channel[i] = 0.25 * sin(2.0 * Float.pi * 220.0 * Float(i) / 16_000.0)
+                }
+            }
+            return buffer
+        }
+
+        func waitForLocalPCMBytes(minimum: Int = 1) async -> Int {
+            for _ in 0..<50 {
+                let bytes = captured.totalBytes(for: "local")
+                if bytes >= minimum { return bytes }
+                try? await Task.sleep(for: .milliseconds(20))
+            }
+            return captured.totalBytes(for: "local")
+        }
+
+        let tapStarted = await transcriber.startAudioTapOnly()
+        XCTAssertTrue(tapStarted)
+        XCTAssertTrue(transcriber.isAudioTapOnly)
+        XCTAssertTrue(transcriber.isCapturingAudio)
+        XCTAssertEqual(transcriber.state, .off)
+        XCTAssertFalse(transcriber.state.isRunning)
+
+        transcriber.receiveLocalAudio(try makeToneBuffer())
+        let tapBytes = await waitForLocalPCMBytes()
+        XCTAssertGreaterThan(tapBytes, 0)
+        XCTAssertTrue(transcriber.segments.isEmpty)
+
+        let startedASR = await transcriber.start()
+        XCTAssertTrue(startedASR)
+        XCTAssertTrue(transcriber.state.isRunning)
+        XCTAssertFalse(transcriber.isAudioTapOnly)
+        XCTAssertTrue(transcriber.isCapturingAudio)
+
+        captured.reset()
+        await transcriber.stop(keepAudioTap: true)
+        XCTAssertEqual(transcriber.state, .off)
+        XCTAssertFalse(transcriber.state.isRunning)
+        XCTAssertTrue(transcriber.isAudioTapOnly)
+        XCTAssertTrue(transcriber.isCapturingAudio)
+
+        transcriber.receiveLocalAudio(try makeToneBuffer())
+        let keptTapBytes = await waitForLocalPCMBytes()
+        XCTAssertGreaterThan(keptTapBytes, 0)
+
+        await transcriber.stopAudioTapOnly()
+        XCTAssertFalse(transcriber.isAudioTapOnly)
+        XCTAssertFalse(transcriber.isCapturingAudio)
+        XCTAssertEqual(transcriber.state, .off)
+    }
+
     private static func makeSpeechWithStopTap(
         rate: Int,
         totalSeconds: Double,
