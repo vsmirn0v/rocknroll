@@ -21,6 +21,23 @@ final class TrueConfTargetTests: XCTestCase {
         for value in [try data(id: "other"), try data(browser: "https://server.test/webrtc/id"), try data(browser: "https://evil.test/webrtc/id"), try data(allowed: false)] {
             XCTAssertFalse(target.supportsBrowser(in: value))
         }
+        // TrueConf Server 5.5+ omits web_client_url and returns same-origin url on stopped rooms.
+        let tc55Payload = try JSONSerialization.data(withJSONObject: [
+            "conference": ["id": "id", "url": "https://server.test:8443/c/id", "allow_guests": true]
+        ])
+        XCTAssertTrue(target.supportsBrowser(in: tc55Payload))
+        let wrongOriginURLPayload = try JSONSerialization.data(withJSONObject: [
+            "conference": ["id": "id", "url": "https://evil.test:8443/c/id", "allow_guests": true]
+        ])
+        let wrongRoomURLPayload = try JSONSerialization.data(withJSONObject: [
+            "conference": ["id": "id", "url": "https://server.test:8443/c/other", "allow_guests": true]
+        ])
+        let missingURLsPayload = try JSONSerialization.data(withJSONObject: [
+            "conference": ["id": "id", "allow_guests": true]
+        ])
+        XCTAssertFalse(target.supportsBrowser(in: wrongOriginURLPayload))
+        XCTAssertFalse(target.supportsBrowser(in: wrongRoomURLPayload))
+        XCTAssertFalse(target.supportsBrowser(in: missingURLsPayload))
         XCTAssertFalse(target.supportsBrowser(in: Data("{}".utf8)))
         XCTAssertNil(MeetingEngineKind.trueconf.persistenceHint, "Older cloud clients must still decode history")
     }

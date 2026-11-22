@@ -3,6 +3,18 @@ import Foundation
 import SwiftUI
 
 public struct CreateRoomSheet: View {
+    private enum SignInRequest: Identifiable {
+        case origin(URL)
+        case newSite
+
+        var id: String {
+            switch self {
+            case .origin(let url): return "origin:\(url.absoluteString)"
+            case .newSite: return "newSite"
+            }
+        }
+    }
+
     private static let lastOriginKey = "siteAuth.lastCreateRoomOrigin"
 
     public let initialOrigin: URL?
@@ -14,9 +26,8 @@ public struct CreateRoomSheet: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject private var store = SiteAccountStore.shared
 
-    @State private var selectedOriginString: String = ""
+    @State private var sitePickerValue: String = "__custom__"
     @State private var customOriginText: String = ""
-    @State private var useCustomOrigin = false
     @State private var selectedEngineOverride: MeetingEngineKind?
 
     @State private var roomTitle: String = ""
@@ -27,8 +38,7 @@ public struct CreateRoomSheet: View {
     @State private var isCreating = false
     @State private var errorMessage: String?
     @State private var signInRequiredOrigin: URL?
-    @State private var presentedSignInOrigin: IdentifiableSiteOrigin?
-    @State private var showingSignInNewSite = false
+    @State private var signInRequest: SignInRequest?
     @State private var retryAfterSignInJoin = false
     @State private var lastAttemptJoinImmediately = true
     @State private var createdRoom: CreatedMeetingRoom?
@@ -66,11 +76,15 @@ public struct CreateRoomSheet: View {
         return result
     }
 
+    private var useCustomOrigin: Bool {
+        sitePickerValue == "__custom__"
+    }
+
     private var activeOrigin: URL? {
         if useCustomOrigin {
             return SiteOrigin.normalize(customOriginText)
         }
-        return SiteOrigin.normalize(selectedOriginString)
+        return SiteOrigin.normalize(sitePickerValue)
     }
 
     private var activeAccount: SiteAccountRecord? {
@@ -114,35 +128,23 @@ public struct CreateRoomSheet: View {
         .onAppear {
             initializeOriginSelection()
         }
-        .sheet(item: $presentedSignInOrigin) { target in
-            SiteSignInSheet(initialOrigin: target.url, suggestedOrigins: suggestedOrigins) { account in
-                handleSignedIn(account)
-            }
-        }
-        .sheet(isPresented: $showingSignInNewSite) {
-            SiteSignInSheet(initialOrigin: nil, suggestedOrigins: suggestedOrigins) { account in
-                handleSignedIn(account)
+        .sheet(item: $signInRequest) { request in
+            switch request {
+            case .origin(let url):
+                SiteSignInSheet(initialOrigin: url, suggestedOrigins: suggestedOrigins) { account in
+                    handleSignedIn(account)
+                }
+            case .newSite:
+                SiteSignInSheet(initialOrigin: nil, suggestedOrigins: suggestedOrigins) { account in
+                    handleSignedIn(account)
+                }
             }
         }
     }
 
     private var siteSelectionSection: some View {
         Section {
-            Picker(L("Website"), selection: Binding(
-                get: { useCustomOrigin ? "__custom__" : selectedOriginString },
-                set: { value in
-                    errorMessage = nil
-                    signInRequiredOrigin = nil
-                    if value == "__custom__" {
-                        useCustomOrigin = true
-                    } else {
-                        useCustomOrigin = false
-                        selectedOriginString = value
-                        selectedEngineOverride = nil
-                        UserDefaults.standard.set(value, forKey: Self.lastOriginKey)
-                    }
-                }
-            )) {
+            Picker(L("Website"), selection: $sitePickerValue) {
                 ForEach(availableSites, id: \.absoluteString) { origin in
                     let account = store.account(for: origin)
                     let host = origin.host ?? origin.absoluteString
@@ -152,6 +154,14 @@ public struct CreateRoomSheet: View {
                 Text(L("Another website…")).tag("__custom__")
             }
             .accessibilityIdentifier("createRoom.site")
+            .onChange(of: sitePickerValue) { value in
+                errorMessage = nil
+                signInRequiredOrigin = nil
+                if value != "__custom__" {
+                    selectedEngineOverride = nil
+                    UserDefaults.standard.set(value, forKey: Self.lastOriginKey)
+                }
+            }
 
             if useCustomOrigin {
                 TextField("https://meetings.example.com", text: $customOriginText)
@@ -181,7 +191,7 @@ public struct CreateRoomSheet: View {
                     Button(account.needsReauthentication ? L("Sign in…") : L("Switch…")) {
                         if let origin = activeOrigin {
                             retryAfterSignInJoin = false
-                            presentedSignInOrigin = IdentifiableSiteOrigin(origin)
+                            signInRequest = .origin(origin)
                         }
                     }
                     .font(.caption)
@@ -194,7 +204,7 @@ public struct CreateRoomSheet: View {
                     Spacer()
                     Button(L("Sign in…")) {
                         retryAfterSignInJoin = false
-                        presentedSignInOrigin = IdentifiableSiteOrigin(origin)
+                        signInRequest = .origin(origin)
                     }
                     .font(.caption)
                 }
@@ -202,7 +212,7 @@ public struct CreateRoomSheet: View {
 
             Button {
                 retryAfterSignInJoin = false
-                showingSignInNewSite = true
+                signInRequest = .newSite
             } label: {
                 Label(L("Sign in to another website…"), systemImage: "person.badge.plus")
             }
@@ -233,7 +243,7 @@ public struct CreateRoomSheet: View {
                     if let required = signInRequiredOrigin {
                         Button {
                             retryAfterSignInJoin = true
-                            presentedSignInOrigin = IdentifiableSiteOrigin(required)
+                            signInRequest = .origin(required)
                         } label: {
                             Label(L("Sign in to %@…", required.host ?? required.absoluteString), systemImage: "person.badge.key")
                         }
@@ -319,22 +329,19 @@ public struct CreateRoomSheet: View {
             ?? availableSites.first
         if let preferred {
             if availableSites.contains(preferred) {
-                useCustomOrigin = false
-                selectedOriginString = preferred.absoluteString
+                sitePickerValue = preferred.absoluteString
             } else {
-                useCustomOrigin = true
                 customOriginText = preferred.absoluteString
-                selectedOriginString = availableSites.first?.absoluteString ?? ""
+                sitePickerValue = "__custom__"
             }
         } else if availableSites.isEmpty {
-            useCustomOrigin = true
+            sitePickerValue = "__custom__"
         }
     }
 
     private func handleSignedIn(_ account: SiteAccountRecord) {
         if let url = account.originURL {
-            useCustomOrigin = false
-            selectedOriginString = url.absoluteString
+            sitePickerValue = url.absoluteString
             selectedEngineOverride = account.engine
             UserDefaults.standard.set(url.absoluteString, forKey: Self.lastOriginKey)
         }

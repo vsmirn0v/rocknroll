@@ -23,12 +23,23 @@ public struct SiteAccountsSettingsSections: View {
 }
 
 public struct SiteAccountsSection: View {
+    private enum SignInSheetRequest: Identifiable {
+        case blank
+        case origin(URL)
+
+        var id: String {
+            switch self {
+            case .blank: return "blank"
+            case .origin(let url): return "origin:\(url.absoluteString)"
+            }
+        }
+    }
+
     public let suggestedOrigins: [URL]
     public let onCreateRoom: (@MainActor (URL) -> Void)?
 
     @ObservedObject private var store = SiteAccountStore.shared
-    @State private var signInTarget: IdentifiableSiteOrigin?
-    @State private var showingBlankSignIn = false
+    @State private var presentedSignIn: SignInSheetRequest?
     @State private var showingCertPickerForAccount: SiteAccountRecord?
 
     public init(
@@ -52,7 +63,7 @@ public struct SiteAccountsSection: View {
             }
 
             Button {
-                showingBlankSignIn = true
+                presentedSignIn = .blank
             } label: {
                 Label(L("Sign in to a website…"), systemImage: "person.badge.plus")
             }
@@ -63,12 +74,17 @@ public struct SiteAccountsSection: View {
             Text(L("Keeps one saved login and optional mTLS client certificate per website for automatic relogin and token renewal."))
                 .font(.caption)
         }
-        .sheet(isPresented: $showingBlankSignIn) {
-            SiteSignInSheet(initialOrigin: nil, suggestedOrigins: suggestedOrigins)
-        }
-        .sheet(item: $signInTarget) { target in
-            SiteSignInSheet(initialOrigin: target.url, suggestedOrigins: suggestedOrigins)
-        }
+        .background(
+            Color.clear
+                .sheet(item: $presentedSignIn) { request in
+                    switch request {
+                    case .blank:
+                        SiteSignInSheet(initialOrigin: nil, suggestedOrigins: suggestedOrigins)
+                    case .origin(let origin):
+                        SiteSignInSheet(initialOrigin: origin, suggestedOrigins: suggestedOrigins)
+                    }
+                }
+        )
     }
 
     @ViewBuilder
@@ -109,24 +125,32 @@ public struct SiteAccountsSection: View {
                         onCreateRoom(origin)
                     }
                     .font(.caption.weight(.semibold))
+                    .frame(minHeight: 36)
+                    .contentShape(Rectangle())
                 }
                 Button(account.needsReauthentication ? L("Sign in again…") : L("Edit / Re-sign in…")) {
                     if let origin = account.originURL {
-                        signInTarget = IdentifiableSiteOrigin(origin)
+                        presentedSignIn = .origin(origin)
                     }
                 }
                 .font(.caption)
+                .frame(minHeight: 36)
+                .contentShape(Rectangle())
                 Spacer()
                 if account.hasClientCertificate && account.authMethod != .mtlsOnly {
                     Button(L("Sign out")) {
                         store.signOut(originKey: account.originKey, keepCertificate: true)
                     }
                     .font(.caption)
+                    .frame(minHeight: 36)
+                    .contentShape(Rectangle())
                 }
                 Button(L("Remove"), role: .destructive) {
                     store.removeSite(originKey: account.originKey)
                 }
                 .font(.caption)
+                .frame(minHeight: 36)
+                .contentShape(Rectangle())
             }
             .buttonStyle(.borderless)
         }
@@ -232,15 +256,18 @@ public struct SiteCertificatesSection: View {
             Text(L("Imported certificates are stored in your device Keychain and never synced to iCloud."))
                 .font(.caption)
         }
-        .fileImporter(
-            isPresented: $certImport.showingFileImporter,
-            allowedContentTypes: PKCS12ImportFlow.allowedContentTypes,
-            allowsMultipleSelection: false
-        ) { result in
-            certImport.handleFileResult(result, store: store) { record in
-                infoMessage = L("Imported certificate %@.", record.label)
-            }
-        }
+        .background(
+            Color.clear
+                .fileImporter(
+                    isPresented: $certImport.showingFileImporter,
+                    allowedContentTypes: PKCS12ImportFlow.allowedContentTypes,
+                    allowsMultipleSelection: false
+                ) { result in
+                    certImport.handleFileResult(result, store: store) { record in
+                        infoMessage = L("Imported certificate %@.", record.label)
+                    }
+                }
+        )
     }
 
     private func certificateDetails(_ cert: ClientCertificateRecord) -> String {

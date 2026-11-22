@@ -52,6 +52,8 @@ public struct SiteSignInSheet: View {
     @State private var capturedRefreshToken: String?
     @State private var capturedTokenEndpoint: String?
     @State private var lastAutoVerifyURL: String?
+    @State private var detectTask: Task<Void, Never>?
+    @FocusState private var urlFieldFocused: Bool
     @StateObject private var certImport = PKCS12ImportFlow()
 
     #if canImport(WebKit) && (os(iOS) || os(macOS))
@@ -125,6 +127,10 @@ public struct SiteSignInSheet: View {
         .onAppear {
             loadInitialAccountState()
         }
+        .onDisappear {
+            detectTask?.cancel()
+            detectTask = nil
+        }
         .onChange(of: certSelection) { newSelection in
             if applyCertificateSelectionToSite(newSelection) {
                 webViewNonce = UUID()
@@ -137,6 +143,7 @@ public struct SiteSignInSheet: View {
             HStack(spacing: 8) {
                 TextField("https://meetings.example.com", text: $siteInput)
                     .textFieldStyle(.roundedBorder)
+                    .focused($urlFieldFocused)
                     .accessibilityIdentifier("siteAuth.url")
                     #if os(iOS)
                     .textInputAutocapitalization(.never)
@@ -154,24 +161,23 @@ public struct SiteSignInSheet: View {
 
             if !quickOrigins.isEmpty {
                 ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 6) {
+                    HStack(spacing: 8) {
                         ForEach(quickOrigins, id: \.absoluteString) { origin in
                             Button {
+                                urlFieldFocused = false
                                 siteInput = origin.absoluteString
                                 commitSiteInput()
                             } label: {
                                 Text(origin.host ?? origin.absoluteString)
                                     .font(.caption.weight(.medium))
-                                    .padding(.horizontal, 10)
-                                    .padding(.vertical, 5)
-                                    .background(
-                                        resolvedOrigin == origin ? Color.accentColor.opacity(0.2) : Color.secondary.opacity(0.14),
-                                        in: Capsule()
-                                    )
+                                    .contentShape(Capsule())
                             }
-                            .buttonStyle(.plain)
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .tint(resolvedOrigin == origin ? .accentColor : .secondary)
                         }
                     }
+                    .padding(.vertical, 2)
                 }
             }
 
@@ -471,22 +477,30 @@ public struct SiteSignInSheet: View {
         if let existing = store.account(for: origin) {
             selectedEngine = existing.engine
             username = existing.username ?? ""
-            if let certID = existing.clientCertificateID {
+            if let certID = existing.clientCertificateID, store.certificate(for: certID) != nil {
                 certSelection = .imported(certID)
                 showCertificateOptions = true
             } else if let fp = existing.systemCertificateFingerprint, !fp.isEmpty {
-                certSelection = .system(fp)
-                showCertificateOptions = true
+                #if os(macOS)
+                certSelection = store.systemCertificate(fingerprint: fp) != nil ? .system(fp) : .none
+                showCertificateOptions = certSelection != .none
+                #else
+                certSelection = .none
+                #endif
+            } else {
+                certSelection = .none
             }
             if existing.engine == .telemost && authMode == .credentials {
                 authMode = .webSSO
             }
         } else {
-            Task { await detectEngine(for: origin) }
+            detectTask?.cancel()
+            detectTask = Task { await detectEngine(for: origin) }
         }
     }
 
     private func commitSiteInput() {
+        urlFieldFocused = false
         guard let normalized = SiteOrigin.normalize(siteInput) else {
             isError = true
             statusMessage = SiteAuthError.invalidSiteURL.localizedDescription
@@ -504,25 +518,35 @@ public struct SiteSignInSheet: View {
         if let existing = store.account(for: normalized) {
             selectedEngine = existing.engine
             username = existing.username ?? ""
-            if let id = existing.clientCertificateID {
+            if let id = existing.clientCertificateID, store.certificate(for: id) != nil {
                 certSelection = .imported(id)
                 showCertificateOptions = true
             } else if let fp = existing.systemCertificateFingerprint, !fp.isEmpty {
-                certSelection = .system(fp)
-                showCertificateOptions = true
+                #if os(macOS)
+                certSelection = store.systemCertificate(fingerprint: fp) != nil ? .system(fp) : .none
+                showCertificateOptions = certSelection != .none
+                #else
+                certSelection = .none
+                #endif
             } else {
                 certSelection = .none
             }
+        } else {
+            certSelection = .none
         }
         webViewNonce = UUID()
-        Task { await detectEngine(for: normalized) }
+        detectTask?.cancel()
+        detectTask = Task { await detectEngine(for: normalized) }
     }
 
     private func detectEngine(for origin: URL) async {
         isDetecting = true
-        defer { isDetecting = false }
+        defer {
+            if !Task.isCancelled { isDetecting = false }
+        }
         do {
             let detected = try await coordinator.detectEngine(for: origin)
+            guard !Task.isCancelled else { return }
             selectedEngine = detected.engine
             engineAutoDetected = true
             if detected.engine == .telemost && authMode == .credentials {
@@ -533,14 +557,17 @@ public struct SiteSignInSheet: View {
                 statusMessage = nil
             }
         } catch SiteAuthError.clientCertificateRequired(let host) {
+            guard !Task.isCancelled else { return }
             showCertificateOptions = true
             isError = true
             statusMessage = SiteAuthError.clientCertificateRequired(host: host).localizedDescription
         } catch SiteAuthError.clientCertificateRejected(let host) {
+            guard !Task.isCancelled else { return }
             showCertificateOptions = true
             isError = true
             statusMessage = SiteAuthError.clientCertificateRejected(host: host).localizedDescription
         } catch {
+            guard !Task.isCancelled else { return }
             // Keep manual engine picker selectable if discovery endpoint is behind SSO/WAF.
             engineAutoDetected = false
         }
