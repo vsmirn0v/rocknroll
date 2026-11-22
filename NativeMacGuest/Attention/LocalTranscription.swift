@@ -296,6 +296,7 @@ final class MeetingTranscriber: @unchecked Sendable {
     private var acceptingAudio = true
     private var discardQueuedAudio = false
     private var localCapture = false
+    private var localMicOnly = false
     private var microphoneGeneration = 0
     private var pendingBuffers = 0
     private var pendingBytes = 0
@@ -321,6 +322,17 @@ final class MeetingTranscriber: @unchecked Sendable {
 
     func setPCM16AudioHandler(_ handler: (@Sendable (String, Data) -> Void)?) {
         ingressLock.withLock { onPCM16Audio = handler }
+    }
+
+    @MainActor func setLocalMicrophoneOnly(_ enabled: Bool) {
+        ingressLock.withLock { localMicOnly = enabled }
+        if enabled {
+            queue.async { [self] in
+                for id in Array(speakers.keys) where id != Self.localTrackID {
+                    finish(id)
+                }
+            }
+        }
     }
 
     private final class Speaker {
@@ -435,6 +447,7 @@ final class MeetingTranscriber: @unchecked Sendable {
         let isMicrophone = trackID == Self.localTrackID
         let generation: Int? = ingressLock.withLock {
             guard acceptingAudio, !isMicrophone || localCapture else { return nil }
+            if localMicOnly && !isMicrophone && onPCM16Audio == nil { return nil }
             guard pendingBuffers < Self.maxPendingBuffers, bytes <= Self.maxPendingBytes - pendingBytes else {
                 recordInputDrop(seconds: Double(buffer.frameLength) / buffer.format.sampleRate, at: receivedAt)
                 return nil
@@ -488,6 +501,9 @@ final class MeetingTranscriber: @unchecked Sendable {
         guard !stopped, let speaker = speaker(trackID), let samples = convert(buffer, speaker) else { return }
         if let handler = ingressLock.withLock({ onPCM16Audio }), !samples.isEmpty {
             handler(trackID, RealtimeVoiceAudio.floatSamplesToPCM16Data(samples))
+        }
+        if ingressLock.withLock({ localMicOnly }) && trackID != Self.localTrackID {
+            return
         }
         // Sample counts advance only while audio flows; a playout stall (device change,
         // audio service restart) would date every later line early by the gap. Each

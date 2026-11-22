@@ -175,7 +175,7 @@ private struct JiraWebViewContainer: UIViewRepresentable {
 
     func makeUIView(context: Context) -> WKWebView {
         let config = WKWebViewConfiguration()
-        config.websiteDataStore = .nonPersistent()
+        config.websiteDataStore = .default()
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = context.coordinator
         context.coordinator.lastNonce = nonce
@@ -204,7 +204,7 @@ private struct JiraWebViewContainer: NSViewRepresentable {
 
     func makeNSView(context: Context) -> WKWebView {
         let config = WKWebViewConfiguration()
-        config.websiteDataStore = .nonPersistent()
+        config.websiteDataStore = .default()
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = context.coordinator
         context.coordinator.lastNonce = nonce

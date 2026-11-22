@@ -89,6 +89,8 @@ final class IOSWorkspaceCoordinator: ObservableObject {
     private let syncPreferences: RoomSyncCoordinator
     private let preferences: UserDefaults
     var summaryPromptProvider: (() -> String?)?
+    var assistantSyncInputProvider: (() -> AssistantCloudSync.LocalSnapshotInput)?
+    var onAssistantSettingsSynced: (([String: SyncedMeetingContextSettings], AssistantLocalSyncBaseline?) -> AssistantLocalSyncBaseline?)?
     private let outcomeWriter: any PortableOutcomeWriting
     let keychain: WorkspaceAPIKeychain
     let archiveStore: TranscriptArchiveStore
@@ -140,6 +142,7 @@ final class IOSWorkspaceCoordinator: ObservableObject {
         var pendingCloudSessions: Set<UUID>?
         var pendingCloudSettings: Set<String>?
         var lastExportedNoteMarkdown: [UUID: String]?
+        var lastExportedAssistantBaseline: AssistantLocalSyncBaseline?
     }
 
     init(
@@ -252,6 +255,7 @@ final class IOSWorkspaceCoordinator: ObservableObject {
         Task { @MainActor [weak self] in
             guard let self else { return }
             await self.loadReplicaFromDiskIfNeeded()
+            await self.ingestLocalAssistantStateIntoDocument()
             await self.reloadFromStore()
             await self.migrateLegacyTaskProfileName()
             await self.seedTaskProfileWithMeetingName(self.preferences.string(forKey: "savedDisplayName") ?? "")
@@ -283,8 +287,54 @@ final class IOSWorkspaceCoordinator: ObservableObject {
                 taskSync.updatePreferencesFromRemoteSync(remotePrefs)
             }
             taskSync.refreshHandoverState()
+            applySyncedAssistantSettingsIfAvailable(snapshotSettings: snapshot.contextSettings)
         } catch {
             syncError = error.localizedDescription
+        }
+    }
+
+    func syncAssistantStateToCloudNow() {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.loadReplicaFromDiskIfNeeded()
+            await self.ingestLocalAssistantStateIntoDocument()
+            self.persistReplica()
+            if self.syncPreferences.enabled && self.syncPreferences.syncWorkspace {
+                self.scheduleSync(delayMilliseconds: 250)
+            }
+        }
+    }
+
+    private func ingestLocalAssistantStateIntoDocument() async {
+        guard let input = assistantSyncInputProvider?() else { return }
+        let changedKeys = AssistantCloudSync.exportLocalState(
+            input,
+            into: &replica.workspaceDoc,
+            baseline: &replica.lastExportedAssistantBaseline
+        )
+        guard !changedKeys.isEmpty else { return }
+        for key in changedKeys {
+            if let entry = replica.workspaceDoc.contextSettings[key] {
+                try? await store.saveContextSettings(entry)
+            }
+        }
+    }
+
+    private func applySyncedAssistantSettingsIfAvailable(snapshotSettings: [String: SyncedMeetingContextSettings]) {
+        guard let onAssistantSettingsSynced else { return }
+        var assistantSettings = snapshotSettings.filter { AssistantCloudSync.isAssistantScopeKey($0.key) }
+        for (key, value) in replica.workspaceDoc.contextSettings where AssistantCloudSync.isAssistantScopeKey(key) {
+            if let existing = assistantSettings[key] {
+                assistantSettings[key] = existing.merging(value)
+            } else {
+                assistantSettings[key] = value
+            }
+        }
+        guard !assistantSettings.isEmpty else { return }
+        if let updated = onAssistantSettingsSynced(assistantSettings, replica.lastExportedAssistantBaseline),
+           updated != replica.lastExportedAssistantBaseline {
+            replica.lastExportedAssistantBaseline = updated
+            persistReplica()
         }
     }
 
@@ -1673,6 +1723,7 @@ final class IOSWorkspaceCoordinator: ObservableObject {
         replica.acknowledgedLibrary.removeAll()
         replica.acknowledgedTranscripts.removeAll()
         replica.acknowledgedSchedule.removeAll()
+        replica.lastExportedAssistantBaseline = nil
         calendar?.applyRemoteSchedule([], localDeviceID: deviceID)
         persistReplica()
     }
@@ -1808,6 +1859,7 @@ final class IOSWorkspaceCoordinator: ObservableObject {
         try await applyPendingCloudChanges()
         try await recoverPersistedTasks()
         await ingestLocalNotesIntoDocument()
+        await ingestLocalAssistantStateIntoDocument()
         let preMergeLocalNoteMarkdown = replica.workspaceDoc.notes.mapValues(\.markdown)
         let session = try await connectZone(name: "library", transport: libraryTransport) {
             self.replica.libraryToken = nil
@@ -2297,6 +2349,9 @@ final class IOSWorkspaceCoordinator: ObservableObject {
         }
         for (k, v) in loaded.acknowledgedSchedule where replica.acknowledgedSchedule[k] == nil {
             replica.acknowledgedSchedule[k] = v
+        }
+        if replica.lastExportedAssistantBaseline == nil {
+            replica.lastExportedAssistantBaseline = loaded.lastExportedAssistantBaseline
         }
     }
 

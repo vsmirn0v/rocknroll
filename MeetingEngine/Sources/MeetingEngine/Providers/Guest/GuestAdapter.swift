@@ -988,6 +988,11 @@ public enum NativeDesktopGuestError: LocalizedError {
                 })
             } catch {
                 if !(error is CancellationError) {
+                    if let transport = error as? GuestTransportError, transport.isPermissionDeniedServerError {
+                        engine.noteHistoryForbidden(transcript: transcript)
+                        probeLog("guest-history-error", ["kind": transcript ? "transcript" : "chat", "category": "forbidden"])
+                        return
+                    }
                     let category: String
                     if let transport = error as? GuestTransportError {
                         switch transport {

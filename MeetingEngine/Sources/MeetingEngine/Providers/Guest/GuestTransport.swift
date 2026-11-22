@@ -86,6 +86,17 @@ public enum GuestTransportError: Error, LocalizedError {
     case invalidEnvelope, queueOverflow, frameTooLarge, networkFailure
     case server(code: String)
 
+    public var isPermissionDeniedServerError: Bool {
+        guard case .server(let code) = self else { return false }
+        return [
+            "FORBIDDEN",
+            "PERMISSION_DENIED",
+            "NOT_ALLOWED",
+            "TRANSCRIPTION_NOT_AVAILABLE",
+            "TRANSCRIPTION_DISABLED"
+        ].contains(code.uppercased())
+    }
+
     public var errorDescription: String? {
         switch self {
         case .invalidURL: return "Invalid secure WebSocket URL."

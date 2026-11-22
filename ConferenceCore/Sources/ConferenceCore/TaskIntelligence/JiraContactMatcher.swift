@@ -144,6 +144,19 @@ public enum JiraContactMatcher {
         "і": "i", "ї": "yi", "є": "ye", "ґ": "g"
     ]
 
+    private static let latinDigraphsToCyrillic: [(String, String)] = [
+        ("shch", "щ"), ("sch", "щ"), ("yo", "ё"), ("yu", "ю"), ("ya", "я"),
+        ("zh", "ж"), ("kh", "х"), ("ts", "ц"), ("ch", "ч"), ("sh", "ш"),
+        ("ye", "е"), ("ey", "ей"), ("iy", "ий"), ("ii", "ий")
+    ]
+
+    private static let latinSingleToCyrillic: [Character: String] = [
+        "a": "а", "b": "б", "v": "в", "g": "г", "d": "д", "e": "е",
+        "z": "з", "i": "и", "j": "дж", "k": "к", "l": "л", "m": "м",
+        "n": "н", "o": "о", "p": "п", "r": "р", "s": "с", "t": "т",
+        "u": "у", "f": "ф", "h": "х", "c": "к", "y": "и", "w": "в", "x": "кс", "q": "к"
+    ]
+
     public static func cleanedName(_ raw: String) -> String {
         raw.split(whereSeparator: \.isWhitespace).joined(separator: " ")
     }
@@ -164,6 +177,92 @@ public enum JiraContactMatcher {
             }
         }
         return out
+    }
+
+    public static func transliterateLatinToCyrillic(_ text: String) -> String {
+        let lower = text.lowercased()
+        var out = ""
+        out.reserveCapacity(lower.count)
+        var idx = lower.startIndex
+        while idx < lower.endIndex {
+            var matchedDigraph = false
+            for (lat, cyr) in latinDigraphsToCyrillic {
+                if lower[idx...].hasPrefix(lat) {
+                    out.append(cyr)
+                    idx = lower.index(idx, offsetBy: lat.count)
+                    matchedDigraph = true
+                    break
+                }
+            }
+            if matchedDigraph { continue }
+            let ch = lower[idx]
+            out.append(latinSingleToCyrillic[ch] ?? String(ch))
+            idx = lower.index(after: idx)
+        }
+        return out
+    }
+
+    /// Generates ordered search query variants covering original spelling, reversed word order,
+    /// surname-first / initial.surname forms, and Cyrillic<->Latin transliterations.
+    public static func searchTerms(for rawQuery: String) -> [String] {
+        let stripped = AssistantPeopleDirectory.strippedMeetingDisplayName(rawQuery)
+        var clean = (stripped.isEmpty ? rawQuery : stripped).trimmingCharacters(in: .whitespacesAndNewlines)
+        if clean.hasPrefix("@") {
+            clean.removeFirst()
+            clean = clean.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        guard !clean.isEmpty else { return [""] }
+
+        var terms: [String] = []
+        var seen: Set<String> = []
+        func add(_ value: String) {
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return }
+            let key = trimmed.lowercased()
+            if seen.insert(key).inserted {
+                terms.append(trimmed)
+            }
+        }
+
+        add(clean)
+        let rawWords = clean.split(whereSeparator: \.isWhitespace).map(String.init)
+        if rawWords.count >= 2 {
+            add(rawWords.reversed().joined(separator: " "))
+        }
+        let latinFull = transliterateCyrillicToLatin(clean)
+        if latinFull.lowercased() != clean.lowercased() {
+            add(latinFull)
+            let latinWords = latinFull.split(whereSeparator: \.isWhitespace).map(String.init)
+            if latinWords.count >= 2 {
+                add(latinWords.reversed().joined(separator: " "))
+            }
+        }
+        let cyrFull = transliterateLatinToCyrillic(clean)
+        if cyrFull.lowercased() != clean.lowercased() {
+            add(cyrFull)
+            let cyrWords = cyrFull.split(whereSeparator: \.isWhitespace).map(String.init)
+            if cyrWords.count >= 2 {
+                add(cyrWords.reversed().joined(separator: " "))
+            }
+        }
+        let latinTokens = tokens(clean)
+        if latinTokens.count >= 2, let first = latinTokens.first, let last = latinTokens.last {
+            if !first.isEmpty && !last.isEmpty {
+                add("\(first.prefix(1)).\(last)")
+            }
+            if last.count >= 2 { add(last) }
+            if first.count >= 2 { add(first) }
+        }
+        for token in rawWords where token.count >= 2 {
+            add(token)
+            let latToken = transliterateCyrillicToLatin(token)
+            if latToken.count >= 2 { add(latToken) }
+        }
+        if rawWords.count == 1 && rawWords[0].count >= 2 {
+            let cyr = transliterateLatinToCyrillic(rawWords[0])
+            if cyr.count >= 2 { add(cyr) }
+        }
+        return terms
     }
 
     public static func nameVariants(_ raw: String) -> [String] {

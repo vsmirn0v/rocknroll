@@ -119,6 +119,7 @@ private final class AudioIngressRouter: @unchecked Sendable {
 
     private var running = false
     private var audioTapOnly = false
+    private var localMicOnly = false
     private var backend: IOSListenModel = .appleSpeech
     private var language: IOSTranscriptionLanguage = .english
     private var gigaam: CoreMLGigaAMRecognizer?
@@ -144,6 +145,7 @@ private final class AudioIngressRouter: @unchecked Sendable {
     func updateMetadata(
         running: Bool,
         audioTapOnly: Bool = false,
+        localMicOnly: Bool = false,
         backend: IOSListenModel,
         language: IOSTranscriptionLanguage,
         gigaam: CoreMLGigaAMRecognizer?,
@@ -153,6 +155,7 @@ private final class AudioIngressRouter: @unchecked Sendable {
         lock.withLock {
             self.running = running
             self.audioTapOnly = audioTapOnly
+            self.localMicOnly = localMicOnly
             self.backend = backend
             self.language = language
             self.gigaam = gigaam
@@ -162,6 +165,11 @@ private final class AudioIngressRouter: @unchecked Sendable {
         workerQueue.async { [self] in
             if !audioTapOnly {
                 self.rawConverters.removeAll()
+            }
+            if localMicOnly {
+                for id in Array(self.pipelines.keys) where id != "local" {
+                    self.pipelines.removeValue(forKey: id)?.stop()
+                }
             }
             for (id, pipeline) in self.pipelines {
                 if id == "local" {
@@ -205,8 +213,12 @@ private final class AudioIngressRouter: @unchecked Sendable {
     func enqueueRemote(streamID: String, buffer: AVAudioPCMBuffer) {
         let state: (running: Bool, tapOnly: Bool, backend: IOSListenModel, language: IOSTranscriptionLanguage, gigaam: CoreMLGigaAMRecognizer?, speaker: String?)? = lock.withLock {
             guard running, pendingWorkCount < Self.maxPendingWorkCount else { return nil }
+            let effectiveTapOnly = audioTapOnly || localMicOnly
+            if effectiveTapOnly && onPCM16Audio == nil {
+                return nil
+            }
             pendingWorkCount += 1
-            return (running, audioTapOnly, backend, language, gigaam, speakerNames[streamID])
+            return (running, effectiveTapOnly, backend, language, gigaam, speakerNames[streamID])
         }
         guard let state else { return }
         workerQueue.async { [self] in
@@ -336,8 +348,16 @@ final class IOSMeetingTranscriber: ObservableObject {
     @Published private(set) var segments: [TranscriptSegment] = []
     @Published private(set) var state: IOSTranscriptionState = .off
     @Published private(set) var isAudioTapOnly = false
+    @Published private(set) var isLocalMicrophoneOnly = false
 
     var isCapturingAudio: Bool { running || isAudioTapOnly }
+    var canStartWithoutPermissionPrompt: Bool {
+        if modelStore.effectiveBackend() == .gigaamV3CoreML,
+           modelStore.installedGigaAMDirectoryIfReady() != nil {
+            return true
+        }
+        return SFSpeechRecognizer.authorizationStatus() == .authorized && localAppleSpeechAvailable()
+    }
 
     var onSegmentsChanged: (([TranscriptSegment]) -> Void)?
 
@@ -507,6 +527,7 @@ final class IOSMeetingTranscriber: ObservableObject {
         guard running || isAudioTapOnly || state != .off else { return }
         activeRun = nil
         isAudioTapOnly = false
+        isLocalMicrophoneOnly = false
         detachAllTaps()
         router.stopAll(resetTimeline: false)
         activeUtteranceByStream.removeAll()
@@ -526,6 +547,12 @@ final class IOSMeetingTranscriber: ObservableObject {
         onSegmentsChanged?([])
     }
 
+    func setLocalMicrophoneOnly(_ enabled: Bool) {
+        guard isLocalMicrophoneOnly != enabled else { return }
+        isLocalMicrophoneOnly = enabled
+        pushRouterMetadata()
+    }
+
     private func pushRouterMetadata() {
         let rawLocal = localDisplayName().trimmingCharacters(in: .whitespacesAndNewlines)
         let localSpeaker = rawLocal.isEmpty ? L("You") : rawLocal
@@ -538,6 +565,7 @@ final class IOSMeetingTranscriber: ObservableObject {
         router.updateMetadata(
             running: (running && currentBackend != nil) || isAudioTapOnly,
             audioTapOnly: isAudioTapOnly && !running,
+            localMicOnly: isLocalMicrophoneOnly,
             backend: currentBackend ?? .appleSpeech,
             language: modelStore.language,
             gigaam: gigaamRecognizer,
@@ -656,7 +684,8 @@ final class IOSMeetingTranscriber: ObservableObject {
             speaker: attributedSpeaker,
             text: clean,
             spokenAt: effectiveTime,
-            isOwn: streamID == "local"
+            isOwn: streamID == "local",
+            speakerRole: streamID == "local" ? AssistantSpeechLedger.speakerRoleUser : AssistantSpeechLedger.speakerRoleParticipant
         )
 
         if isFinal {

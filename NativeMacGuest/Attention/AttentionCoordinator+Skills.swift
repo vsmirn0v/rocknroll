@@ -48,16 +48,24 @@ extension AttentionCoordinator {
         }
     }
 
+    private func notifyLocalAssistantDataChanged() {
+        guard !isApplyingRemoteCloudSync else { return }
+        onLocalAssistantDataChanged?()
+    }
+
     func saveAssistantSkill(_ skill: AssistantSkill) async throws -> AssistantSkill {
-        try await withSkillRepository { repo, _ in
+        let saved = try await withSkillRepository { repo, _ in
             try repo.saveSkill(skill)
         }
+        notifyLocalAssistantDataChanged()
+        return saved
     }
 
     func deleteAssistantSkill(id: String) async throws {
         try await withSkillRepository { repo, _ in
             try repo.deleteSkill(id: id)
         }
+        notifyLocalAssistantDataChanged()
     }
 
     func restoreDefaultAssistantSkills(id: String? = nil) async throws {
@@ -68,6 +76,7 @@ extension AttentionCoordinator {
                 try repo.restoreAllDefaultSkills()
             }
         }
+        notifyLocalAssistantDataChanged()
     }
 
     func loadPeopleDirectory() async -> AssistantPeopleDirectory {
@@ -80,27 +89,40 @@ extension AttentionCoordinator {
         try await withSkillRepository { repo, _ in
             try repo.savePeople(directory)
         }
+        for entry in directory.entries {
+            await mirrorJiraMappingIfConfirmed(entry)
+        }
+        notifyLocalAssistantDataChanged()
     }
 
     func upsertPersonMapping(_ entry: AssistantPersonEntry, allowPrivilegeChange: Bool = true) async throws -> AssistantPeopleDirectory {
         let updated = try await withSkillRepository { repo, _ in
             try repo.upsertPerson(entry, allowPrivilegeChange: allowPrivilegeChange)
         }
+        await mirrorJiraMappingIfConfirmed(entry)
+        notifyLocalAssistantDataChanged()
+        return updated
+    }
+
+    private func mirrorJiraMappingIfConfirmed(_ entry: AssistantPersonEntry) async {
         // Mirror confirmed Jira handle into WorkspaceTaskSyncController so issue creation/reassignment sees it immediately.
         let handle = entry.jiraAccountID ?? entry.jiraUsername
-        if let handle, !handle.isEmpty {
-            let appPerson = entry.toAppContactPerson()
-            let jiraUser = JiraUserContact(
-                identifier: handle,
-                username: entry.jiraUsername ?? handle,
-                accountId: entry.jiraAccountID,
-                displayName: entry.displayName,
-                emailAddress: entry.email,
-                isServerOrDC: entry.jiraAccountID == nil
-            )
-            await taskSync.setManualContactMapping(appContact: appPerson, jiraUser: jiraUser)
+        guard let handle, !handle.isEmpty else { return }
+        let appPerson = entry.toAppContactPerson()
+        if let existing = taskSync.preferences.contactMappings.first(where: { $0.appContactKey == appPerson.key }),
+           existing.isConfirmedByUser,
+           existing.jiraIdentifier == handle {
+            return
         }
-        return updated
+        let jiraUser = JiraUserContact(
+            identifier: handle,
+            username: entry.jiraUsername ?? handle,
+            accountId: entry.jiraAccountID,
+            displayName: entry.displayName,
+            emailAddress: entry.email,
+            isServerOrDC: entry.jiraAccountID == nil
+        )
+        await taskSync.setManualContactMapping(appContact: appPerson, jiraUser: jiraUser)
     }
 
     func loadTeamContext() async -> AssistantTeamContextDocument {
@@ -113,6 +135,7 @@ extension AttentionCoordinator {
         try await withSkillRepository { repo, _ in
             try repo.saveTeamContext(doc)
         }
+        notifyLocalAssistantDataChanged()
     }
 
     // MARK: - Core Obsidian Prompts
@@ -141,6 +164,7 @@ extension AttentionCoordinator {
             try repo.savePrompt(kind, content: content)
         }
         cachedPromptTexts[kind] = doc.content
+        notifyLocalAssistantDataChanged()
         return doc
     }
 
@@ -150,6 +174,7 @@ extension AttentionCoordinator {
             try repo.restoreDefaultPrompt(kind)
         }
         cachedPromptTexts[kind] = doc.content
+        notifyLocalAssistantDataChanged()
         return doc
     }
 
@@ -160,6 +185,83 @@ extension AttentionCoordinator {
         for doc in docs {
             cachedPromptTexts[doc.kind] = doc.content
         }
+    }
+
+    func currentAssistantCloudInput() async -> AssistantCloudSync.LocalSnapshotInput {
+        let repoSnapshot = await withSkillRepository { repo, _ in
+            (
+                people: repo.loadPeople(),
+                teamContext: repo.loadTeamContext(),
+                skills: repo.listSkills(),
+                prompts: repo.listPrompts()
+            )
+        }
+        return AssistantCloudSync.LocalSnapshotInput(
+            people: repoSnapshot.people,
+            teamContext: repoSnapshot.teamContext,
+            skills: repoSnapshot.skills,
+            prompts: repoSnapshot.prompts,
+            preferences: LocalAssistantPortablePreferences(
+                selectedSkillIDs: store.selectedSkillIDs,
+                autonomousMeetingVoiceEnabled: store.autonomousMeetingVoiceEnabled,
+                realtimeProvider: store.realtimeProvider.rawValue,
+                realtimeModel: store.realtimeModel,
+                realtimeVoice: store.realtimeVoice,
+                realtimeEndpoint: store.realtimeEndpoint,
+                realtimeFolderID: store.realtimeFolderID,
+                realtimeVoiceRole: store.realtimeVoiceRole,
+                lastBoardURL: store.lastBoardURL
+            )
+        )
+    }
+
+    func applyRemoteAssistantCloudSync(
+        settings: [String: SyncedMeetingContextSettings],
+        previousBaseline: AssistantLocalSyncBaseline?
+    ) async -> AssistantLocalSyncBaseline? {
+        let currentInput = await currentAssistantCloudInput()
+        guard let plan = AssistantCloudSync.planRemoteApplication(
+            from: settings,
+            currentInput: currentInput,
+            previousBaseline: previousBaseline
+        ) else {
+            return previousBaseline
+        }
+        guard plan.hasAnyChange else {
+            return plan.updatedBaseline
+        }
+
+        isApplyingRemoteCloudSync = true
+        defer { isApplyingRemoteCloudSync = false }
+
+        try? await withSkillRepository { repo, _ in
+            try AssistantCloudSync.applyRepositoryChanges(from: plan, to: repo)
+        }
+
+        if let prefs = plan.updatedPreferences {
+            if store.selectedSkillIDs != prefs.selectedSkillIDs { store.selectedSkillIDs = prefs.selectedSkillIDs }
+            if store.autonomousMeetingVoiceEnabled != prefs.autonomousMeetingVoiceEnabled {
+                store.autonomousMeetingVoiceEnabled = prefs.autonomousMeetingVoiceEnabled
+            }
+            let nextProvider = RealtimeProviderKind(rawValue: prefs.realtimeProvider) ?? .disabled
+            if store.realtimeProvider != nextProvider { store.realtimeProvider = nextProvider }
+            if store.realtimeModel != prefs.realtimeModel { store.realtimeModel = prefs.realtimeModel }
+            if store.realtimeVoice != prefs.realtimeVoice { store.realtimeVoice = prefs.realtimeVoice }
+            if store.realtimeEndpoint != prefs.realtimeEndpoint { store.realtimeEndpoint = prefs.realtimeEndpoint }
+            if store.realtimeFolderID != prefs.realtimeFolderID { store.realtimeFolderID = prefs.realtimeFolderID }
+            if store.realtimeVoiceRole != prefs.realtimeVoiceRole { store.realtimeVoiceRole = prefs.realtimeVoiceRole }
+            if store.lastBoardURL != prefs.lastBoardURL { store.lastBoardURL = prefs.lastBoardURL }
+        }
+
+        await refreshCachedPrompts()
+        facilitator?.invalidateSkillCache()
+        if let updatedPeople = plan.updatedPeople {
+            for entry in updatedPeople.entries {
+                await mirrorJiraMappingIfConfirmed(entry)
+            }
+        }
+        objectWillChange.send()
+        return plan.updatedBaseline
     }
 
     func startSkillFolderWatcher() async {
@@ -190,6 +292,7 @@ extension AttentionCoordinator {
                 await self.refreshCachedPrompts()
                 self.facilitator?.invalidateSkillCache()
                 self.objectWillChange.send()
+                self.notifyLocalAssistantDataChanged()
             }
         }
         watcher.start()

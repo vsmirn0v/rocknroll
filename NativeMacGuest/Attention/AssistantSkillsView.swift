@@ -125,12 +125,21 @@ struct AssistantSkillsView: View {
     }
 
     private var storageHeader: some View {
-        HStack(spacing: 8) {
-            Image(systemName: isObsidianBacked ? "folder.badge.gearshape" : "internaldrive")
-                .foregroundStyle(isObsidianBacked ? Color.accentColor : Color.secondary)
+        let cloudSyncActive = !isObsidianBacked
+            && RoomSyncCoordinator.active?.enabled == true
+            && RoomSyncCoordinator.active?.syncWorkspace == true
+        return HStack(spacing: 8) {
+            Image(systemName: isObsidianBacked ? "folder.badge.gearshape" : (cloudSyncActive ? "icloud" : "internaldrive"))
+                .foregroundStyle((isObsidianBacked || cloudSyncActive) ? Color.accentColor : Color.secondary)
             VStack(alignment: .leading, spacing: 2) {
-                Text(isObsidianBacked ? L("Synced with Obsidian vault (Git-ready Markdown)") : L("Stored on this Mac (connect Obsidian in Settings → Integrations to share)"))
-                    .font(.callout.weight(.medium))
+                Text(
+                    isObsidianBacked
+                        ? L("Synced with Obsidian vault (Git-ready Markdown)")
+                        : (cloudSyncActive
+                            ? L("Synced across Mac & iPhone via iCloud (connect Obsidian in Settings → Integrations for vault files)")
+                            : L("Stored on this Mac (connect Obsidian in Settings → Integrations to share)"))
+                )
+                .font(.callout.weight(.medium))
                 if !storagePath.isEmpty {
                     Text(storagePath)
                         .font(.caption2)

@@ -16,6 +16,9 @@ final class MacWorkspaceSyncCoordinator: ObservableObject {
     var onTranscriptChanged: ((UUID) -> Void)?
     var onTaskSyncPreferencesChanged: ((TaskSyncPreferences) -> Void)?
     var onJiraHandoverPacketsChanged: (() -> Void)?
+    var assistantSyncInputProvider: (() async -> AssistantCloudSync.LocalSnapshotInput)?
+    var onAssistantSettingsSynced: (([String: SyncedMeetingContextSettings], AssistantLocalSyncBaseline?) async -> AssistantLocalSyncBaseline?)?
+    var isApplyingRemoteAssistantSettings: (() -> Bool)?
     private let meetingLibrary: MeetingLibraryController
     private let notes: MeetingNotesController
     private let assistant: AssistantDataStore
@@ -79,6 +82,7 @@ final class MacWorkspaceSyncCoordinator: ObservableObject {
         var lastExportedProfile: PersonalTaskProfile?
         var lastExportedSettingsRaw: [String: SettingsFingerprint] = [:]
         var lastRemoteSettingsRaw: [String: SettingsFingerprint] = [:]
+        var lastExportedAssistantBaseline: AssistantLocalSyncBaseline?
     }
 
     private struct ExportedOutcomeSnapshot: Codable, Equatable, Sendable {
@@ -453,6 +457,7 @@ final class MacWorkspaceSyncCoordinator: ObservableObject {
         replica.acknowledgedLibrary.removeAll()
         replica.acknowledgedTranscripts.removeAll()
         replica.acknowledgedSchedule.removeAll()
+        replica.lastExportedAssistantBaseline = nil
         calendar?.applyRemoteSchedule([], localDeviceID: deviceID)
         persistReplica()
     }
@@ -505,6 +510,22 @@ final class MacWorkspaceSyncCoordinator: ObservableObject {
                 guard let self else { return }
                 self.scheduleSync(delayMilliseconds: 400)
             }.store(in: &cancellables)
+
+            func observeAssistantPref<V: Equatable>(_ publisher: Published<V>.Publisher) {
+                publisher.removeDuplicates().dropFirst().sink { [weak self] _ in
+                    guard let self, self.isApplyingRemoteAssistantSettings?() != true else { return }
+                    self.exportAssistantStateNow()
+                }.store(in: &cancellables)
+            }
+            observeAssistantPref(attentionStore.$selectedSkillIDs)
+            observeAssistantPref(attentionStore.$autonomousMeetingVoiceEnabled)
+            observeAssistantPref(attentionStore.$realtimeProvider)
+            observeAssistantPref(attentionStore.$realtimeModel)
+            observeAssistantPref(attentionStore.$realtimeVoice)
+            observeAssistantPref(attentionStore.$realtimeEndpoint)
+            observeAssistantPref(attentionStore.$realtimeFolderID)
+            observeAssistantPref(attentionStore.$realtimeVoiceRole)
+            observeAssistantPref(attentionStore.$lastBoardURL)
         }
 
         meetingLibrary.workspaceJournal.$sessions.removeDuplicates().dropFirst().sink { [weak self] _ in
@@ -668,6 +689,7 @@ final class MacWorkspaceSyncCoordinator: ObservableObject {
         }
         ingestLocalSnapshotIntoDocument(snapshot)
         ingestLocalContextSettings()
+        _ = await ingestLocalAssistantStateIntoDocument()
         exportLocalTranscriptsAndArchive(snapshot: snapshot)
         let associations = (calendar?.meetings ?? []).compactMap { event -> MeetingCalendarAssociation? in
             guard !event.allDay, !event.tentative, let room = event.roomIdentity else { return nil }
@@ -708,6 +730,7 @@ final class MacWorkspaceSyncCoordinator: ObservableObject {
     }
 
     private func syncWorkspacePass() async throws -> CloudZoneSession? {
+        _ = await ingestLocalAssistantStateIntoDocument()
         let preMergeLocalNoteMarkdown = replica.workspaceDoc.notes.mapValues(\.markdown)
         let zoneSession = try await connectZone(name: "library", transport: libraryTransport) {
             self.replica.libraryToken = nil
@@ -1439,9 +1462,52 @@ final class MacWorkspaceSyncCoordinator: ObservableObject {
 
         if !report.changedSettingsKeys.isEmpty {
             applyRemoteContextSettings(report.changedSettingsKeys)
+            if report.changedSettingsKeys.contains(where: { AssistantCloudSync.isAssistantScopeKey($0) }) {
+                await applySyncedAssistantSettingsIfAvailable()
+            }
         }
 
         await meetingLibrary.refresh()
+    }
+
+    func exportAssistantStateNow(schedule: Bool = true) {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            if await self.ingestLocalAssistantStateIntoDocument() {
+                self.persistReplica()
+                if schedule {
+                    self.scheduleSync(delayMilliseconds: 300)
+                }
+            }
+        }
+    }
+
+    @discardableResult
+    func ingestLocalAssistantStateIntoDocument() async -> Bool {
+        guard let assistantSyncInputProvider else { return false }
+        let input = await assistantSyncInputProvider()
+        let changed = AssistantCloudSync.exportLocalState(
+            input,
+            into: &replica.workspaceDoc,
+            baseline: &replica.lastExportedAssistantBaseline
+        )
+        if !changed.isEmpty {
+            persistReplica()
+        }
+        return !changed.isEmpty
+    }
+
+    func applySyncedAssistantSettingsIfAvailable() async {
+        guard let onAssistantSettingsSynced else { return }
+        let assistantSettings = replica.workspaceDoc.contextSettings.filter {
+            AssistantCloudSync.isAssistantScopeKey($0.key)
+        }
+        guard !assistantSettings.isEmpty else { return }
+        if let updated = await onAssistantSettingsSynced(assistantSettings, replica.lastExportedAssistantBaseline),
+           updated != replica.lastExportedAssistantBaseline {
+            replica.lastExportedAssistantBaseline = updated
+            persistReplica()
+        }
     }
 
     func currentSyncedTaskSyncPreferences() -> TaskSyncPreferences? {
@@ -1523,6 +1589,9 @@ final class MacWorkspaceSyncCoordinator: ObservableObject {
             }
             if key.hasPrefix(MacJiraHandoverPacket.scopeKeyPrefix) {
                 sawHandoverChange = true
+                continue
+            }
+            if AssistantCloudSync.isAssistantScopeKey(key) {
                 continue
             }
             guard let attentionStore else { continue }

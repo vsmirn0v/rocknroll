@@ -1,3 +1,4 @@
+import ConferenceCore
 import Foundation
 
 struct MeetingMarkdownSections: OptionSet, Codable, Sendable {
@@ -113,8 +114,19 @@ enum MeetingMarkdownTemplate {
             guard !line.isEmpty else { return nil }
             let elapsed = Int(max(0, event.occurredAt.timeIntervalSince(origin)))
             let time = String(format: "%02ld:%02ld:%02ld", elapsed / 3600, elapsed / 60 % 60, elapsed % 60)
-            let speaker = transcriptText(event.speaker ?? "")
-            let label = speaker.isEmpty ? time : "\(time) \(speaker)"
+            let isAssistant = AssistantSpeechLedger.isAssistantSpeaker(event.speaker, role: event.speakerRole)
+            let formattedSpeaker: String
+            if isAssistant {
+                formattedSpeaker = "Rock Assistant (Assistant)"
+            } else {
+                let rawSpeaker = transcriptText(event.speaker ?? "")
+                if event.isOwn {
+                    formattedSpeaker = rawSpeaker.isEmpty ? "You" : "\(rawSpeaker) (You)"
+                } else {
+                    formattedSpeaker = rawSpeaker
+                }
+            }
+            let label = formattedSpeaker.isEmpty ? time : "\(time) \(formattedSpeaker)"
             return "**\(label)** — \(line)"
         }
         return paragraphs.isEmpty ? nil : paragraphs.joined(separator: "\n\n")

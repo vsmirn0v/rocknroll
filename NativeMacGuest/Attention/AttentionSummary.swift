@@ -23,7 +23,10 @@ enum MomentSummaryPrompt {
     static func messages(_ request: MomentSummaryRequest) -> [[String: String]] {
         let language = Localization.englishLanguageName(for: request.language)
         let transcript = request.window.lines.map { line in
-            "\(line.speaker)\(line.isYou ? " (you)" : "")\(line.source == .chat ? " [chat]" : ""): \(line.text)"
+            let isAssistant = line.id.hasPrefix("assistant:") || line.id.hasPrefix("transcript:assistant:")
+                || AssistantSpeechLedger.isAssistantSpeaker(line.speaker, role: nil)
+            let roleTag = isAssistant ? " [assistant]" : (line.isYou ? " (you)" : "")
+            return "\(line.speaker)\(roleTag)\(line.source == .chat ? " [chat]" : ""): \(line.text)"
         }.joined(separator: "\n")
         return [["role": "system", "content": system + "\nWrite in " + language + "."],
                 ["role": "user", "content": "Earlier decision: \(request.moment.verdict.reason)\n\nLater meeting lines:\n\(transcript)"]]

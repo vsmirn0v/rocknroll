@@ -334,12 +334,41 @@ extension NativeDesktopMCPBackend {
             let (id, replay) = try beginAction(args, client: client)
             if let replay { return replay }
 
+            let jiraUsername = try MCPValue.optionalString(args["jira_username"], key: "jira_username")?.trimmed
+            let jiraAccountID = try MCPValue.optionalString(args["jira_account_id"], key: "jira_account_id")?.trimmed
+            let forceWithoutJira = try MCPValue.optionalBool(args["force_without_jira"], key: "force_without_jira") ?? false
+            let directory = await attention.loadPeopleDirectory()
+            let existingMatch = directory.resolvePerson(matching: cleanName)
+            let hasExistingHandle = !((existingMatch?.jiraAccountID ?? existingMatch?.jiraUsername ?? "").isEmpty)
+            let hasNewHandle = !(jiraUsername ?? "").isEmpty || !(jiraAccountID ?? "").isEmpty
+            let jiraConnected = await MainActor.run { (try? attention.taskSync.activeJiraConnector()) != nil }
+
+            if !hasNewHandle && !hasExistingHandle && !forceWithoutJira && jiraConnected {
+                let team = await attention.loadTeamContext()
+                let proj = team.defaultJiraProjectKey.trimmed
+                let candidates = (try? await attention.taskSync.searchJiraUsers(
+                    query: cleanName,
+                    projectKey: proj.isEmpty ? nil : proj,
+                    maxResults: 8
+                )) ?? []
+                let result: MCPJSON = [
+                    "action_id": id,
+                    "status": "needs_user_confirmation",
+                    "observed_at": mcpNow(),
+                    "saved": false,
+                    "display_name": cleanName,
+                    "jira_user_candidates": candidates.map(WorkspaceTaskSyncController.jiraUserPayload),
+                    "warnings": [],
+                ]
+                return actions.finish(id, client: client, type: "people", target: cleanName, status: "needs_user_confirmation", result: result)
+            }
+
             let explicitApproved = try MCPValue.optionalBool(args["approved_voice_commander"], key: "approved_voice_commander")
             let entry = AssistantPersonEntry(
                 displayName: cleanName,
                 aliases: args["aliases"] as? [String] ?? [],
-                jiraUsername: try MCPValue.optionalString(args["jira_username"], key: "jira_username"),
-                jiraAccountID: try MCPValue.optionalString(args["jira_account_id"], key: "jira_account_id"),
+                jiraUsername: jiraUsername,
+                jiraAccountID: jiraAccountID,
                 email: try MCPValue.optionalString(args["email"], key: "email"),
                 role: try MCPValue.optionalString(args["role"], key: "role"),
                 approvedVoiceCommander: explicitApproved ?? false,
@@ -355,6 +384,7 @@ extension NativeDesktopMCPBackend {
                 "observed_at": mcpNow(),
                 "entity_id": entry.id,
                 "directory_count": updated.entries.count,
+                "jira_bound": hasNewHandle || hasExistingHandle,
                 "warnings": [],
             ]
             return actions.finish(id, client: client, type: "people", target: entry.id, status: "applied", result: result)
@@ -410,6 +440,9 @@ extension NativeDesktopMCPBackend {
         let query = try MCPValue.optionalString(args["query"], key: "query")
         let selector = try MCPValue.optionalString(args["selector"], key: "selector")
         let text = try MCPValue.optionalString(args["text"], key: "text")
+        let issueKey = try MCPValue.optionalString(args["issue_key"], key: "issue_key")?.trimmed
+        let targetStatus = try MCPValue.optionalString(args["status"], key: "status")?.trimmed
+        let comment = try MCPValue.optionalString(args["comment"], key: "comment")
         let deltaY = args["delta_y"] as? Int
         let coordX = (args["x"] as? NSNumber)?.doubleValue
         let coordY = (args["y"] as? NSNumber)?.doubleValue
@@ -474,6 +507,40 @@ extension NativeDesktopMCPBackend {
             let message = try await board.filter(query: query ?? text ?? "")
             return actions.finish(id, client: client, type: "board", target: "filter", status: "applied",
                                   result: ["action_id": id, "status": "applied", "observed_at": mcpNow(), "message": message, "warnings": []])
+        case "select_person_filter":
+            let people = await attention.loadPeopleDirectory()
+            let message = try await board.selectPersonFilter(query: query ?? text ?? "", people: people)
+            return actions.finish(id, client: client, type: "board", target: "select_person_filter", status: "applied",
+                                  result: ["action_id": id, "status": "applied", "observed_at": mcpNow(), "message": message, "warnings": []])
+        case "clear_filters":
+            let message = try await board.clearFilters()
+            return actions.finish(id, client: client, type: "board", target: "clear_filters", status: "applied",
+                                  result: ["action_id": id, "status": "applied", "observed_at": mcpNow(), "message": message, "warnings": []])
+        case "move_issue":
+            guard let issueKey, !issueKey.isEmpty,
+                  let resolvedStatus = (targetStatus?.isEmpty == false ? targetStatus : text?.trimmed), !resolvedStatus.isEmpty else {
+                throw MCPToolFailure("INVALID_ARGUMENT", "issue_key and status are required for move_issue.",
+                                     details: ["field": "issue_key", "reason": "required"])
+            }
+            let updated = try await attention.taskSync.transitionJiraIssue(
+                key: issueKey,
+                targetStatus: resolvedStatus,
+                comment: comment
+            )
+            return actions.finish(
+                id,
+                client: client,
+                type: "board",
+                target: updated.key,
+                status: "applied",
+                result: [
+                    "action_id": id,
+                    "status": "applied",
+                    "observed_at": mcpNow(),
+                    "issue": WorkspaceTaskSyncController.jiraIssuePayload(updated),
+                    "warnings": [],
+                ]
+            )
         case "click":
             let message = try await board.click(selector: selector, text: text)
             return actions.finish(id, client: client, type: "board", target: "click", status: "applied",
@@ -565,6 +632,10 @@ extension NativeDesktopMCPBackend {
         let maxResults = try MCPValue.integer(args["max_results"], key: "max_results", default: 15, maximum: 50)
         let issueKey = try MCPValue.optionalString(args["issue_key"], key: "issue_key")?.trimmingCharacters(in: .whitespacesAndNewlines)
         let comment = try MCPValue.optionalString(args["comment"], key: "comment")?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let targetStatus = try MCPValue.optionalString(args["status"], key: "status")?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let role = try MCPValue.optionalString(args["role"], key: "role") ?? "assignee"
+        let saveToPeopleName = try MCPValue.optionalString(args["save_to_people_name"], key: "save_to_people_name")?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let summary = try MCPValue.optionalString(args["summary"], key: "summary")?.trimmingCharacters(in: .whitespacesAndNewlines)
 
         if operation == "comment" {
             guard let issueKey, !issueKey.isEmpty else {
@@ -575,6 +646,18 @@ extension NativeDesktopMCPBackend {
                 throw MCPToolFailure("INVALID_ARGUMENT", "comment is required for comment.",
                                      details: ["field": "comment", "reason": "required"])
             }
+        }
+        if operation == "transition" && ((issueKey ?? "").isEmpty || (targetStatus ?? "").isEmpty) {
+            throw MCPToolFailure("INVALID_ARGUMENT", "issue_key and status are required for transition.",
+                                 details: ["field": "issue_key", "reason": "required"])
+        }
+        if operation == "assign" && (issueKey ?? "").isEmpty {
+            throw MCPToolFailure("INVALID_ARGUMENT", "issue_key is required for assign.",
+                                 details: ["field": "issue_key", "reason": "required"])
+        }
+        if operation == "create" && ((summary ?? "").isEmpty) {
+            throw MCPToolFailure("INVALID_ARGUMENT", "summary is required for create.",
+                                 details: ["field": "summary", "reason": "required"])
         }
         guard let attention else { throw MCPToolFailure("APP_NOT_RUNNING", "The native workspace is unavailable.") }
 
@@ -618,6 +701,196 @@ extension NativeDesktopMCPBackend {
                 "warnings": [],
             ]
             return actions.finish(id, client: client, type: "jira", target: cleanQuery, status: "applied", result: result)
+        }
+
+        if operation == "board_users" {
+            let (users, issues) = try await attention.taskSync.fetchBoardUsersAndIssues(maxResults: max(maxResults, 40))
+            let result: MCPJSON = [
+                "action_id": id,
+                "status": "applied",
+                "observed_at": mcpNow(),
+                "operation": "board_users",
+                "users": users.map(WorkspaceTaskSyncController.jiraUserPayload),
+                "issues": issues.map(WorkspaceTaskSyncController.jiraIssuePayload),
+                "warnings": [],
+            ]
+            return actions.finish(id, client: client, type: "jira", target: "board_users", status: "applied", result: result)
+        }
+
+        if operation == "copy_user_from_issue" {
+            let (copiedUser, sourceIssueKey) = try await attention.taskSync.copyJiraUserFromIssue(
+                issueKey: issueKey,
+                searchQuery: query,
+                role: role
+            )
+            var savedToPeople = false
+            if let saveToPeopleName, !saveToPeopleName.isEmpty {
+                guard await actions.approval("Save Jira user to People.md", ["display_name": saveToPeopleName, "issue_key": sourceIssueKey]) else {
+                    return actions.finish(id, client: client, type: "jira", target: sourceIssueKey, status: "rejected", failure: "APPROVAL_DENIED")
+                }
+                let people = await attention.loadPeopleDirectory()
+                let existing = people.resolvePerson(matching: saveToPeopleName)
+                let extraAliases = (args["aliases"] as? [String]) ?? []
+                var mergedAliases = (existing?.aliases ?? []) + extraAliases
+                if existing?.displayName.caseInsensitiveCompare(saveToPeopleName) != .orderedSame {
+                    mergedAliases.append(saveToPeopleName)
+                }
+                let entry = AssistantPersonEntry(
+                    id: existing?.id,
+                    displayName: existing?.displayName ?? saveToPeopleName,
+                    aliases: AssistantPersonEntry.deduped(mergedAliases),
+                    jiraUsername: copiedUser.username ?? (copiedUser.isServerOrDC ? copiedUser.identifier : existing?.jiraUsername),
+                    jiraAccountID: copiedUser.accountId ?? (!copiedUser.isServerOrDC ? copiedUser.identifier : existing?.jiraAccountID),
+                    email: copiedUser.emailAddress ?? existing?.email,
+                    role: existing?.role,
+                    approvedVoiceCommander: existing?.approvedVoiceCommander ?? false,
+                    notes: existing?.notes
+                )
+                _ = try await attention.upsertPersonMapping(entry, allowPrivilegeChange: false)
+                savedToPeople = true
+            }
+            let result: MCPJSON = [
+                "action_id": id,
+                "status": "applied",
+                "observed_at": mcpNow(),
+                "operation": "copy_user_from_issue",
+                "issue_key": sourceIssueKey,
+                "copied_user": WorkspaceTaskSyncController.jiraUserPayload(copiedUser),
+                "saved_to_people": savedToPeople,
+                "warnings": [],
+            ]
+            return actions.finish(id, client: client, type: "jira", target: sourceIssueKey, status: "applied", result: result)
+        }
+
+        if operation == "transition" {
+            guard await actions.approval("Transition Jira issue", ["issue_key": issueKey ?? "", "status": targetStatus ?? ""]) else {
+                return actions.finish(id, client: client, type: "jira", target: issueKey ?? "", status: "rejected", failure: "APPROVAL_DENIED")
+            }
+            let updated = try await attention.taskSync.transitionJiraIssue(
+                key: issueKey ?? "",
+                targetStatus: targetStatus ?? "",
+                comment: comment
+            )
+            let result: MCPJSON = [
+                "action_id": id,
+                "status": "applied",
+                "observed_at": mcpNow(),
+                "operation": "transition",
+                "issue": WorkspaceTaskSyncController.jiraIssuePayload(updated),
+                "warnings": [],
+            ]
+            return actions.finish(id, client: client, type: "jira", target: updated.key, status: "applied", result: result)
+        }
+
+        if operation == "assign" {
+            guard await actions.approval("Assign Jira issue", ["issue_key": issueKey ?? "", "assignee": assignee ?? ""]) else {
+                return actions.finish(id, client: client, type: "jira", target: issueKey ?? "", status: "rejected", failure: "APPROVAL_DENIED")
+            }
+            let assigneeContact: JiraUserContact?
+            if let accountID = (try MCPValue.optionalString(args["jira_account_id"], key: "jira_account_id"))?.trimmed, !accountID.isEmpty {
+                assigneeContact = JiraUserContact(
+                    identifier: accountID,
+                    username: try MCPValue.optionalString(args["jira_username"], key: "jira_username")?.trimmed,
+                    accountId: accountID,
+                    displayName: assignee ?? accountID,
+                    isServerOrDC: false
+                )
+            } else if let username = (try MCPValue.optionalString(args["jira_username"], key: "jira_username"))?.trimmed, !username.isEmpty {
+                assigneeContact = JiraUserContact(
+                    identifier: username,
+                    username: username,
+                    accountId: nil,
+                    displayName: assignee ?? username,
+                    isServerOrDC: true
+                )
+            } else if let assignee, !assignee.isEmpty {
+                let people = await attention.loadPeopleDirectory()
+                let team = await attention.loadTeamContext()
+                switch await attention.taskSync.resolveJiraAssignee(assignee, people: people, defaultProjectKey: team.defaultJiraProjectKey) {
+                case .resolved(let handle, let person):
+                    let isDC = !attention.taskSync.preferences.jira.isCloudHost
+                    assigneeContact = JiraUserContact(
+                        identifier: handle,
+                        username: person?.jiraUsername ?? handle,
+                        accountId: person?.jiraAccountID,
+                        displayName: person?.displayName ?? assignee,
+                        isServerOrDC: person?.jiraAccountID == nil && isDC
+                    )
+                case .unresolved(let unresolvedQuery, let candidates):
+                    var result = WorkspaceTaskSyncController.unresolvedJiraAssigneePayload(query: unresolvedQuery, candidates: candidates)
+                    result["action_id"] = id
+                    result["status"] = "applied"
+                    result["observed_at"] = mcpNow()
+                    result["operation"] = "assign"
+                    result["warnings"] = []
+                    return actions.finish(id, client: client, type: "jira", target: unresolvedQuery, status: "applied", result: result)
+                }
+            } else {
+                assigneeContact = nil
+            }
+            let updated = try await attention.taskSync.assignJiraIssue(key: issueKey ?? "", assignee: assigneeContact)
+            let result: MCPJSON = [
+                "action_id": id,
+                "status": "applied",
+                "observed_at": mcpNow(),
+                "operation": "assign",
+                "issue": WorkspaceTaskSyncController.jiraIssuePayload(updated),
+                "warnings": [],
+            ]
+            return actions.finish(id, client: client, type: "jira", target: updated.key, status: "applied", result: result)
+        }
+
+        if operation == "create" {
+            guard await actions.approval("Create Jira issue", ["summary": summary ?? ""]) else {
+                return actions.finish(id, client: client, type: "jira", target: summary ?? "", status: "rejected", failure: "APPROVAL_DENIED")
+            }
+            let team = await attention.loadTeamContext()
+            var assigneeContact: JiraUserContact?
+            if let assignee, !assignee.isEmpty {
+                let people = await attention.loadPeopleDirectory()
+                switch await attention.taskSync.resolveJiraAssignee(assignee, people: people, defaultProjectKey: team.defaultJiraProjectKey) {
+                case .resolved(let handle, let person):
+                    let isDC = !attention.taskSync.preferences.jira.isCloudHost
+                    assigneeContact = JiraUserContact(
+                        identifier: handle,
+                        username: person?.jiraUsername ?? handle,
+                        accountId: person?.jiraAccountID,
+                        displayName: person?.displayName ?? assignee,
+                        isServerOrDC: person?.jiraAccountID == nil && isDC
+                    )
+                case .unresolved(let unresolvedQuery, let candidates):
+                    var result = WorkspaceTaskSyncController.unresolvedJiraAssigneePayload(query: unresolvedQuery, candidates: candidates)
+                    result["action_id"] = id
+                    result["status"] = "applied"
+                    result["observed_at"] = mcpNow()
+                    result["operation"] = "create"
+                    result["warnings"] = []
+                    return actions.finish(id, client: client, type: "jira", target: unresolvedQuery, status: "applied", result: result)
+                }
+            }
+            let explicitProj = try MCPValue.optionalString(args["project_key"], key: "project_key")?.trimmed ?? ""
+            let teamProj = team.defaultJiraProjectKey.trimmed
+            let resolvedProject = explicitProj.isEmpty ? (teamProj.isEmpty ? nil : teamProj) : explicitProj
+            let kind = (try MCPValue.optionalString(args["issue_kind"], key: "issue_kind")).flatMap(TaskIssueKind.init(rawValue:)) ?? .task
+            let priority = (try MCPValue.optionalString(args["priority"], key: "priority")).flatMap(TaskPriorityLevel.init(rawValue:))
+            let created = try await attention.taskSync.createJiraIssueDirect(
+                summary: summary ?? "",
+                description: try MCPValue.optionalString(args["description"], key: "description") ?? "",
+                projectKey: resolvedProject,
+                issueKind: kind,
+                assignee: assigneeContact,
+                priority: priority,
+                parentEpicKey: try MCPValue.optionalString(args["parent_epic_key"], key: "parent_epic_key")
+            )
+            let result: MCPJSON = [
+                "action_id": id,
+                "status": "applied",
+                "observed_at": mcpNow(),
+                "operation": "create",
+                "issue": WorkspaceTaskSyncController.jiraIssuePayload(created),
+                "warnings": [],
+            ]
+            return actions.finish(id, client: client, type: "jira", target: created.key, status: "applied", result: result)
         }
 
         // search

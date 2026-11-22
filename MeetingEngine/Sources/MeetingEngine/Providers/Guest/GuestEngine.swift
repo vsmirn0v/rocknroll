@@ -336,11 +336,13 @@ public final class NativeGuestEngine {
         }
         reader = Task { [weak self] in
             for await event in transport.events {
-                guard let self, !closing else { break }
+                guard let self, !closing, !Task.isCancelled else { break }
                 do { try await receive(event) }
                 catch { recordFailure(error); break }
             }
-            if let self, !closing { recordFailure(await transport.terminalError ?? GuestTransportError.closed) }
+            if let self, !closing, !Task.isCancelled {
+                recordFailure(await transport.terminalError ?? GuestTransportError.closed)
+            }
         }
         try await transport.connect()
         try checkActive()
@@ -359,6 +361,47 @@ public final class NativeGuestEngine {
                 onLobbyChange?(lobbyState)
             }
             probeLog("guest-lobby-entered", ["client": probeClient])
+        } catch GuestTransportError.server(let code) where prepared.joinPayload["jazzToken"] != nil &&
+            ["FORBIDDEN", "UNAUTHORIZED", "TOKEN_INVALID", "INVALID_TOKEN"].contains(code.uppercased()) {
+            try checkActive()
+            reader?.cancel(); reader = nil
+            await transport.close(graceTimeout: 0.15)
+            failure = nil
+            let anonTransport = GuestTransport(
+                url: prepared.connectorURL,
+                roomID: prepared.roomID,
+                origin: invitation.origin,
+                tlsDelegate: tlsDelegate
+            )
+            self.transport = anonTransport
+            reader = Task { [weak self] in
+                for await event in anonTransport.events {
+                    guard let self, !closing, !Task.isCancelled else { break }
+                    do { try await receive(event) }
+                    catch { recordFailure(error); break }
+                }
+                if let self, !closing, !Task.isCancelled {
+                    recordFailure(await anonTransport.terminalError ?? GuestTransportError.closed)
+                }
+            }
+            try await anonTransport.connect()
+            try checkActive()
+            var anonPayload = prepared.joinPayload
+            anonPayload.removeValue(forKey: "jazzToken")
+            do {
+                let response = try await anonTransport.request(event: "join", payload: anonPayload)
+                try checkActive()
+                if let payload = response["payload"] as? [String: Any], payload["participant"] != nil {
+                    try await receive(["event": "joined", "payload": payload])
+                }
+            } catch GuestTransportError.server(let retryCode) where retryCode == "JOINED_TO_LOBBY" {
+                try checkActive()
+                if !lobbyState.inLobby {
+                    lobbyState.inLobby = true
+                    onLobbyChange?(lobbyState)
+                }
+                probeLog("guest-lobby-entered", ["client": probeClient])
+            }
         }
         let lobbyDeadline = ProcessInfo.processInfo.systemUptime + 1800
         var nonLobbyDeadline: TimeInterval? = lobbyState.inLobby ? nil : (ProcessInfo.processInfo.systemUptime + 10)
@@ -1931,6 +1974,11 @@ extension NativeGuestEngine {
 
     func loadChatHistory() async throws { try await loadHistory(transcript: false) }
     func loadTranscriptHistory() async throws { try await loadHistory(transcript: true) }
+
+    func noteHistoryForbidden(transcript: Bool) {
+        meetingFeatures.revokeHistoryPermission(transcript: transcript)
+        emitMeetingChange()
+    }
 
     private func loadHistory(transcript: Bool) async throws {
         try checkActive()

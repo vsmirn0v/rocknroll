@@ -22,6 +22,8 @@ public struct JiraRemoteIssue: Codable, Equatable, Identifiable, Sendable {
     public var assigneeIdentifier: String?
     public var updatedAt: Date?
     public var browseURL: String?
+    public var assigneeContact: JiraUserContact?
+    public var reporterContact: JiraUserContact?
 
     public init(
         id: String,
@@ -38,7 +40,9 @@ public struct JiraRemoteIssue: Codable, Equatable, Identifiable, Sendable {
         assigneeName: String? = nil,
         assigneeIdentifier: String? = nil,
         updatedAt: Date? = nil,
-        browseURL: String? = nil
+        browseURL: String? = nil,
+        assigneeContact: JiraUserContact? = nil,
+        reporterContact: JiraUserContact? = nil
     ) {
         self.id = id
         self.key = key
@@ -55,6 +59,8 @@ public struct JiraRemoteIssue: Codable, Equatable, Identifiable, Sendable {
         self.assigneeIdentifier = assigneeIdentifier
         self.updatedAt = updatedAt
         self.browseURL = browseURL
+        self.assigneeContact = assigneeContact
+        self.reporterContact = reporterContact
     }
 }
 
@@ -141,11 +147,27 @@ public protocol JiraTaskConnecting: Sendable {
         comment: String?
     ) async throws -> JiraRemoteIssue
     func addIssueComment(key: String, comment: String) async throws
+    func transitionIssue(key: String, targetStatusText: String, comment: String?) async throws -> JiraRemoteIssue
+    func assignIssue(key: String, assignee: JiraUserContact?) async throws -> JiraRemoteIssue
+    func fetchIssueDetails(key: String) async throws -> JiraRemoteIssue
 }
 
 public extension JiraTaskConnecting {
     func addIssueComment(key: String, comment: String) async throws {}
     func searchUsers(query: String, projectKey: String?, maxResults: Int) async throws -> [JiraUserContact] { [] }
+    func transitionIssue(key: String, targetStatusText: String, comment: String?) async throws -> JiraRemoteIssue {
+        throw JiraConnectorError.badRequest(L("Jira transitions are not supported by this connector."))
+    }
+    func assignIssue(key: String, assignee: JiraUserContact?) async throws -> JiraRemoteIssue {
+        throw JiraConnectorError.badRequest(L("Jira assignment is not supported by this connector."))
+    }
+    func fetchIssueDetails(key: String) async throws -> JiraRemoteIssue {
+        let issues = try await searchIssues(jql: "key = \"\(key)\"", maxResults: 1)
+        guard let issue = issues.first else {
+            throw JiraConnectorError.notFound(nil)
+        }
+        return issue
+    }
 }
 
 public final class JiraTaskConnector: JiraTaskConnecting, @unchecked Sendable {
@@ -184,13 +206,13 @@ public final class JiraTaskConnector: JiraTaskConnecting, @unchecked Sendable {
     public func verifyMyself() async throws -> JiraUserContact {
         let data = try await send(path: "/rest/api/2/myself", method: "GET")
         guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let user = parseUser(object, isServerOrDC: !settings.isCloudHost) else {
+              let user = Self.parseUserObject(object, isServerOrDC: !settings.isCloudHost) else {
             throw JiraConnectorError.invalidResponse
         }
         return user
     }
 
-    private static func validatedJiraKey(_ raw: String) throws -> String {
+    public static func validatedJiraKey(_ raw: String) throws -> String {
         let key = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard key.range(of: #"^[A-Za-z][A-Za-z0-9_]+(?:-[0-9]+)?$"#, options: .regularExpression) != nil else {
             throw JiraConnectorError.badRequest(L("Invalid Jira key."))
@@ -240,7 +262,7 @@ public final class JiraTaskConnector: JiraTaskConnecting, @unchecked Sendable {
         guard let array = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
             throw JiraConnectorError.invalidResponse
         }
-        return array.compactMap { parseUser($0, isServerOrDC: !settings.isCloudHost) }
+        return array.compactMap { Self.parseUserObject($0, isServerOrDC: !settings.isCloudHost) }
     }
 
     public func searchUsers(query: String, projectKey: String? = nil, maxResults: Int = 15) async throws -> [JiraUserContact] {
@@ -252,73 +274,64 @@ public final class JiraTaskConnector: JiraTaskConnecting, @unchecked Sendable {
             rawQuery = rawQuery.trimmingCharacters(in: .whitespacesAndNewlines)
         }
 
-        var terms: [String] = []
-        var seenTerms: Set<String> = []
-        func addTerm(_ value: String) {
-            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmed.isEmpty else { return }
-            let key = trimmed.lowercased()
-            if seenTerms.insert(key).inserted {
-                terms.append(trimmed)
-            }
-        }
-
-        if rawQuery.isEmpty {
-            terms.append("")
-        } else {
-            addTerm(rawQuery)
-            let latinFull = JiraContactMatcher.transliterateCyrillicToLatin(rawQuery)
-            if latinFull.lowercased() != rawQuery.lowercased() {
-                addTerm(latinFull)
-            }
-            let latinTokens = JiraContactMatcher.tokens(rawQuery)
-            if latinTokens.count >= 2 {
-                if let surname = latinTokens.last, !surname.isEmpty {
-                    addTerm("\(latinTokens[0].prefix(1)).\(surname)")
-                    if surname.count >= 2 { addTerm(surname) }
-                }
-                if latinTokens[0].count >= 2 { addTerm(latinTokens[0]) }
-            } else {
-                for token in rawQuery.split(whereSeparator: \.isWhitespace) where token.count >= 2 {
-                    addTerm(String(token))
-                }
-            }
-        }
-
+        let terms = JiraContactMatcher.searchTerms(for: rawQuery)
         let cleanProject = (projectKey ?? settings.cleanProjectKey).trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
         let isServerOrDC = !settings.isCloudHost
         let path = settings.isCloudHost ? "/rest/api/3/user/search" : "/rest/api/2/user/search"
+        let pickerPath = settings.isCloudHost ? "/rest/api/3/user/picker" : "/rest/api/2/user/picker"
         let paramName = settings.isCloudHost ? "query" : "username"
 
         func runSearch(term: String) async throws -> [JiraUserContact] {
-            var items = [
+            var hits: [JiraUserContact] = []
+            var searchItems = [
                 URLQueryItem(name: paramName, value: term),
                 URLQueryItem(name: "maxResults", value: String(cap)),
             ]
             do {
-                let data = try await send(path: path, method: "GET", queryItems: items)
-                guard let array = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
-                    throw JiraConnectorError.invalidResponse
+                let data = try await send(path: path, method: "GET", queryItems: searchItems)
+                if let array = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
+                    hits.append(contentsOf: array.compactMap { Self.parseUserObject($0, isServerOrDC: isServerOrDC) })
                 }
-                return array.compactMap { parseUser($0, isServerOrDC: isServerOrDC) }
             } catch JiraConnectorError.badRequest(let detail) where isServerOrDC && term.isEmpty {
-                items[0] = URLQueryItem(name: "username", value: ".")
-                if let data = try? await send(path: path, method: "GET", queryItems: items),
+                searchItems[0] = URLQueryItem(name: "username", value: ".")
+                if let data = try? await send(path: path, method: "GET", queryItems: searchItems),
                    let array = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
-                    return array.compactMap { parseUser($0, isServerOrDC: isServerOrDC) }
+                    hits.append(contentsOf: array.compactMap { Self.parseUserObject($0, isServerOrDC: isServerOrDC) })
+                } else if !cleanProject.isEmpty,
+                          let assignable = try? await fetchAssignableUsers(projectKey: cleanProject, query: term) {
+                    hits.append(contentsOf: assignable)
+                } else {
+                    throw JiraConnectorError.badRequest(detail)
                 }
-                if !cleanProject.isEmpty {
-                    return try await fetchAssignableUsers(projectKey: cleanProject, query: term)
-                }
-                throw JiraConnectorError.badRequest(detail)
             } catch let error as JiraConnectorError where !cleanProject.isEmpty {
                 switch error {
                 case .badRequest, .forbidden, .notFound:
-                    return try await fetchAssignableUsers(projectKey: cleanProject, query: term)
+                    if let assignable = try? await fetchAssignableUsers(projectKey: cleanProject, query: term) {
+                        hits.append(contentsOf: assignable)
+                    }
                 default:
                     throw error
                 }
             }
+
+            if !term.isEmpty && hits.count < cap {
+                let pickerItems = [
+                    URLQueryItem(name: "query", value: term),
+                    URLQueryItem(name: "maxResults", value: String(cap)),
+                ]
+                if let pickerData = try? await send(path: pickerPath, method: "GET", queryItems: pickerItems),
+                   let root = try? JSONSerialization.jsonObject(with: pickerData) as? [String: Any],
+                   let users = root["users"] as? [[String: Any]] {
+                    hits.append(contentsOf: users.compactMap { Self.parseUserObject($0, isServerOrDC: isServerOrDC) })
+                }
+            }
+
+            if !cleanProject.isEmpty && hits.isEmpty {
+                if let assignable = try? await fetchAssignableUsers(projectKey: cleanProject, query: term) {
+                    hits.append(contentsOf: assignable)
+                }
+            }
+            return hits
         }
 
         var collectedByID: [String: JiraUserContact] = [:]
@@ -326,7 +339,7 @@ public final class JiraTaskConnector: JiraTaskConnecting, @unchecked Sendable {
         var succeededAtLeastOnce = false
         var firstError: Error?
 
-        for term in terms.prefix(4) {
+        for term in terms.prefix(6) {
             do {
                 let hits = try await runSearch(term: term)
                 succeededAtLeastOnce = true
@@ -404,7 +417,9 @@ public final class JiraTaskConnector: JiraTaskConnecting, @unchecked Sendable {
               let issues = root["issues"] as? [[String: Any]] else {
             throw JiraConnectorError.invalidResponse
         }
-        return issues.compactMap { parseIssue($0) }
+        return issues.compactMap {
+            Self.parseIssueObject($0, baseURL: settings.normalizedBaseURL, isServerOrDC: !settings.isCloudHost)
+        }
     }
 
     public func createIssue(_ payload: JiraIssueWritePayload) async throws -> JiraRemoteIssue {
@@ -539,10 +554,63 @@ public final class JiraTaskConnector: JiraTaskConnecting, @unchecked Sendable {
         let encodedKey = try Self.validatedJiraKey(key)
         let data = try await send(path: "/rest/api/2/issue/\(encodedKey)", method: "GET")
         guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let issue = parseIssue(object) else {
+              let issue = Self.parseIssueObject(object, baseURL: settings.normalizedBaseURL, isServerOrDC: !settings.isCloudHost) else {
             throw JiraConnectorError.invalidResponse
         }
         return issue
+    }
+
+    public func fetchIssueDetails(key: String) async throws -> JiraRemoteIssue {
+        try await fetchIssue(key: key)
+    }
+
+    public func transitionIssue(key: String, targetStatusText: String, comment: String? = nil) async throws -> JiraRemoteIssue {
+        let encodedKey = try Self.validatedJiraKey(key)
+        let cleanTarget = targetStatusText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanTarget.isEmpty else {
+            throw JiraConnectorError.badRequest(L("Target status is required."))
+        }
+        let data = try await send(path: "/rest/api/2/issue/\(encodedKey)/transitions", method: "GET")
+        guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let transitions = root["transitions"] as? [[String: Any]] else {
+            throw JiraConnectorError.invalidResponse
+        }
+        guard let match = Self.selectTransition(from: transitions, matchingText: cleanTarget),
+              let transitionID = match["id"] as? String else {
+            let available = transitions.compactMap {
+                ($0["to"] as? [String: Any])?["name"] as? String ?? ($0["name"] as? String)
+            }.joined(separator: ", ")
+            throw JiraConnectorError.badRequest(
+                available.isEmpty
+                    ? L("No matching Jira status transition found for %@.", cleanTarget)
+                    : L("No Jira transition matches %@. Available: %@", cleanTarget, available)
+            )
+        }
+        _ = try await send(
+            path: "/rest/api/2/issue/\(encodedKey)/transitions",
+            method: "POST",
+            jsonBody: ["transition": ["id": transitionID]]
+        )
+        if let comment = comment?.trimmingCharacters(in: .whitespacesAndNewlines), !comment.isEmpty {
+            try await addIssueComment(key: encodedKey, comment: comment)
+        }
+        return try await fetchIssue(key: encodedKey)
+    }
+
+    public func assignIssue(key: String, assignee: JiraUserContact?) async throws -> JiraRemoteIssue {
+        let encodedKey = try Self.validatedJiraKey(key)
+        let body: [String: Any]
+        if let assignee {
+            body = assignee.assigneePayload()
+        } else {
+            body = settings.isCloudHost ? ["accountId": NSNull()] : ["name": NSNull()]
+        }
+        _ = try await send(
+            path: "/rest/api/2/issue/\(encodedKey)/assignee",
+            method: "PUT",
+            jsonBody: body
+        )
+        return try await fetchIssue(key: encodedKey)
     }
 
     private func transitionIssueIfNeeded(encodedKey: String, targetStatus: TaskWorkflowStatus) async throws {
@@ -559,7 +627,30 @@ public final class JiraTaskConnector: JiraTaskConnecting, @unchecked Sendable {
         )
     }
 
-    static func selectTransition(from transitions: [[String: Any]], for target: TaskWorkflowStatus) -> [String: Any]? {
+    public static func selectTransition(from transitions: [[String: Any]], matchingText targetText: String) -> [String: Any]? {
+        let needle = targetText.workspaceFolded
+        if !needle.isEmpty {
+            if let exact = transitions.first(where: { candidate in
+                let name = ((candidate["name"] as? String) ?? "").workspaceFolded
+                let toName = (((candidate["to"] as? [String: Any])?["name"] as? String) ?? "").workspaceFolded
+                return name == needle || toName == needle
+            }) {
+                return exact
+            }
+            if let contains = transitions.first(where: { candidate in
+                let name = ((candidate["name"] as? String) ?? "").workspaceFolded
+                let toName = (((candidate["to"] as? [String: Any])?["name"] as? String) ?? "").workspaceFolded
+                return (!name.isEmpty && (name.contains(needle) || needle.contains(name))) ||
+                    (!toName.isEmpty && (toName.contains(needle) || needle.contains(toName)))
+            }) {
+                return contains
+            }
+        }
+        let mapped = mapWorkflowStatus(statusName: targetText, categoryKey: nil)
+        return selectTransition(from: transitions, for: mapped)
+    }
+
+    public static func selectTransition(from transitions: [[String: Any]], for target: TaskWorkflowStatus) -> [String: Any]? {
         let preferredNames: [String]
         let desiredCategory: String
         switch target {
@@ -673,44 +764,62 @@ public final class JiraTaskConnector: JiraTaskConnecting, @unchecked Sendable {
         }
     }
 
-    private func parseUser(_ object: [String: Any], isServerOrDC: Bool) -> JiraUserContact? {
+    public static func stripHTMLTags(_ raw: String) -> String {
+        raw.replacingOccurrences(of: #"<[^>]+>"#, with: "", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    public static func parseUserObject(_ object: [String: Any], isServerOrDC: Bool) -> JiraUserContact? {
         if let active = object["active"] as? Bool, !active { return nil }
-        let accountId = object["accountId"] as? String
-        let name = object["name"] as? String
-        let key = object["key"] as? String
+        let accountId = (object["accountId"] as? String)?.cleanedNilIfEmpty
+        let name = (object["name"] as? String)?.cleanedNilIfEmpty
+        let key = (object["key"] as? String)?.cleanedNilIfEmpty
         let identifier = isServerOrDC ? (name ?? key ?? accountId) : (accountId ?? name ?? key)
         guard let identifier, !identifier.isEmpty else { return nil }
-        let displayName = (object["displayName"] as? String) ?? identifier
+        let rawDisplay = (object["displayName"] as? String)
+            ?? (object["html"] as? String).map(stripHTMLTags)
+            ?? identifier
+        let cleanedDisplay = stripHTMLTags(rawDisplay)
+        let displayName = cleanedDisplay.isEmpty ? identifier : cleanedDisplay
         return JiraUserContact(
             identifier: identifier,
             username: name ?? key,
             accountId: accountId,
             displayName: displayName,
-            emailAddress: object["emailAddress"] as? String,
+            emailAddress: (object["emailAddress"] as? String)?.cleanedNilIfEmpty,
             isServerOrDC: isServerOrDC
         )
     }
 
-    private func parseIssue(_ object: [String: Any]) -> JiraRemoteIssue? {
+    public static func parseIssueObject(
+        _ object: [String: Any],
+        baseURL: URL?,
+        isServerOrDC: Bool
+    ) -> JiraRemoteIssue? {
         guard let key = object["key"] as? String, !key.isEmpty else { return nil }
         let id = (object["id"] as? String) ?? key
         let fields = object["fields"] as? [String: Any] ?? [:]
         let summary = (fields["summary"] as? String) ?? key
-        let description = Self.extractDescriptionText(fields["description"])
+        let description = extractDescriptionText(fields["description"])
         let statusObj = fields["status"] as? [String: Any] ?? [:]
         let statusName = (statusObj["name"] as? String) ?? "To Do"
         let categoryKey = (statusObj["statusCategory"] as? [String: Any])?["key"] as? String
-        let workflowStatus = Self.mapWorkflowStatus(statusName: statusName, categoryKey: categoryKey)
+        let workflowStatus = mapWorkflowStatus(statusName: statusName, categoryKey: categoryKey)
         let issueTypeName = ((fields["issuetype"] as? [String: Any])?["name"] as? String) ?? "Task"
-        let issueKind = Self.mapIssueKind(issueTypeName)
-        let parentKey = Self.extractParentEpicKey(from: fields)
+        let issueKind = mapIssueKind(issueTypeName)
+        let parentKey = extractParentEpicKey(from: fields)
         let priorityName = (fields["priority"] as? [String: Any])?["name"] as? String
         let dueDay = (fields["duedate"] as? String).flatMap { $0.count >= 10 ? String($0.prefix(10)) : nil }
         let assigneeObj = fields["assignee"] as? [String: Any]
-        let assigneeName = assigneeObj?["displayName"] as? String
-        let assigneeIdentifier = (assigneeObj?["name"] as? String) ?? (assigneeObj?["accountId"] as? String)
-        let updatedAt = (fields["updated"] as? String).flatMap(Self.parseJiraDate)
-        let browseURL = settings.normalizedBaseURL?.appendingPathComponent("browse/\(key)").absoluteString
+        let assigneeContact = assigneeObj.flatMap { parseUserObject($0, isServerOrDC: isServerOrDC) }
+        let reporterObj = fields["reporter"] as? [String: Any]
+        let reporterContact = reporterObj.flatMap { parseUserObject($0, isServerOrDC: isServerOrDC) }
+        let assigneeName = assigneeContact?.displayName ?? (assigneeObj?["displayName"] as? String)
+        let assigneeIdentifier = assigneeContact?.identifier
+            ?? (assigneeObj?["accountId"] as? String)
+            ?? (assigneeObj?["name"] as? String)
+        let updatedAt = (fields["updated"] as? String).flatMap(parseJiraDate)
+        let browseURL = baseURL?.appendingPathComponent("browse/\(key)").absoluteString
 
         return JiraRemoteIssue(
             id: id,
@@ -722,12 +831,14 @@ public final class JiraTaskConnector: JiraTaskConnecting, @unchecked Sendable {
             issueTypeName: issueTypeName,
             issueKind: issueKind,
             parentEpicKey: issueKind == .epic ? nil : parentKey,
-            priority: Self.mapPriority(priorityName),
+            priority: mapPriority(priorityName),
             dueDay: dueDay,
             assigneeName: assigneeName,
             assigneeIdentifier: assigneeIdentifier,
             updatedAt: updatedAt,
-            browseURL: browseURL
+            browseURL: browseURL,
+            assigneeContact: assigneeContact,
+            reporterContact: reporterContact
         )
     }
 
@@ -805,7 +916,7 @@ public final class JiraTaskConnector: JiraTaskConnecting, @unchecked Sendable {
         return nil
     }
 
-    private static func jiraPriorityName(_ priority: TaskPriorityLevel) -> String {
+    public static func jiraPriorityName(_ priority: TaskPriorityLevel) -> String {
         switch priority {
         case .critical: return "Critical"
         case .high: return "High"

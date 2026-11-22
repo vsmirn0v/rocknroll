@@ -381,6 +381,27 @@ import UserNotifications
         self.attention.onCalendarEventCreated = { [weak self] in
             self?.library.calendar.refresh()
         }
+        self.workspaceSync.assistantSyncInputProvider = { [weak self] in
+            guard let self else {
+                return AssistantCloudSync.LocalSnapshotInput(
+                    people: AssistantPeopleDirectory(),
+                    teamContext: AssistantTeamContextDocument(),
+                    skills: [],
+                    prompts: [],
+                    preferences: LocalAssistantPortablePreferences()
+                )
+            }
+            return await self.attention.currentAssistantCloudInput()
+        }
+        self.workspaceSync.onAssistantSettingsSynced = { [weak self] settings, baseline in
+            await self?.attention.applyRemoteAssistantCloudSync(settings: settings, previousBaseline: baseline)
+        }
+        self.workspaceSync.isApplyingRemoteAssistantSettings = { [weak self] in
+            self?.attention.isApplyingRemoteCloudSync ?? false
+        }
+        self.attention.onLocalAssistantDataChanged = { [weak self] in
+            self?.workspaceSync.exportAssistantStateNow()
+        }
         self.workspaceSync.onTaskSyncPreferencesChanged = { [weak self] prefs in
             self?.attention.taskSync.updatePreferencesFromRemoteSync(prefs)
         }
@@ -396,7 +417,10 @@ import UserNotifications
         self.attention.start()
         self.workspaceSync.start()
         Task { @MainActor [weak self] in
-            await self?.attention.handleRemoteJiraHandovers()
+            guard let self else { return }
+            _ = await self.workspaceSync.ingestLocalAssistantStateIntoDocument()
+            await self.workspaceSync.applySyncedAssistantSettingsIfAvailable()
+            await self.attention.handleRemoteJiraHandovers()
         }
         SiteAccountStore.shared.objectWillChange
             .sink { [weak self] _ in

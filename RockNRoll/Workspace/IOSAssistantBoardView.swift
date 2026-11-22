@@ -37,7 +37,7 @@ private final class IOSBoardDirtyScriptHandlerProxy: NSObject, WKScriptMessageHa
 /// Sandbox-safe in-app WebView controller for inspecting, filtering, clicking,
 /// and streaming desktop-sized Jira or project boards directly into an active iOS meeting.
 @MainActor
-final class IOSAssistantBoardController: NSObject, ObservableObject, WKNavigationDelegate, WKUIDelegate {
+final class IOSAssistantBoardController: NSObject, ObservableObject, WKNavigationDelegate, WKUIDelegate, JiraBoardWebEvaluating {
     static let desktopViewportSize = CGSize(width: 1440, height: 810)
     static let sharedOutputSize = CGSize(width: 1920, height: 1080)
     static let desktopUserAgent =
@@ -100,6 +100,8 @@ final class IOSAssistantBoardController: NSObject, ObservableObject, WKNavigatio
     var resolveShareTarget: ((UUID?) -> (any IOSBoardShareSession)?)?
     var defaultBoardURLProvider: (() -> String)?
     var snapshotOverrideForTesting: (() async -> CGImage?)?
+    weak var taskSync: WorkspaceTaskSyncController?
+    var onBoardURLChanged: ((String) -> Void)?
 
     private(set) lazy var webView: WKWebView = {
         let config = WKWebViewConfiguration()
@@ -248,6 +250,8 @@ final class IOSAssistantBoardController: NSObject, ObservableObject, WKNavigatio
             ?? url.host
             ?? url.absoluteString
         pageTitle = title
+        onBoardURLChanged?(url.absoluteString)
+        await taskSync?.adoptJiraSessionFromBoardIfAvailable(self)
         lastActionSummary = L("Opened %@", title)
         return L("Opened %@ (%@).", title, url.absoluteString)
     }
@@ -514,25 +518,47 @@ final class IOSAssistantBoardController: NSObject, ObservableObject, WKNavigatio
             throw MeetingSessionError.unavailable(L("Open a board first before filtering."))
         }
         let clean = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        let arg = try jsonLiteral(clean)
-        let js = """
-        const q = \(arg);
-        const candidates = Array.from(document.querySelectorAll('input[type="search"], input[aria-label*="Search" i], input[placeholder*="Search" i], input[placeholder*="Filter" i], input[name="search"], [data-testid*="search"] input'));
-        const input = candidates.find(el => el.offsetParent !== null) || candidates[0];
-        if (!input) { return { matched: false }; }
-        input.focus();
-        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
-        if (setter) { setter.call(input, q); } else { input.value = q; }
-        input.dispatchEvent(new Event('input', { bubbles: true }));
-        input.dispatchEvent(new Event('change', { bubbles: true }));
-        input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true }));
-        return { matched: true };
-        """
-        let res = try await evaluateJS(js)
+        let msg = try await callBoardAsyncJS(JiraBoardDOMScripts.filterBoardScript(query: clean), arguments: [:])
         markBoardDirty()
-        let ok = (res as? [String: Any])?["matched"] as? Bool ?? false
-        lastActionSummary = ok ? L("Filtered board: %@", clean) : L("No search box found on board")
-        return ok ? L("Applied board filter “%@”.", clean) : L("No search input was found on the current board page.")
+        let ok = !msg.contains("No board search input")
+        lastActionSummary = ok ? (clean.isEmpty ? L("Cleared board search") : L("Filtered board: %@", clean)) : L("No search box found on board")
+        return ok
+            ? (clean.isEmpty ? L("Cleared board search filter.") : L("Applied board filter “%@”.", clean))
+            : L("No search input was found on the current board page.")
+    }
+
+    func selectPersonFilter(query: String, people: AssistantPeopleDirectory) async throws -> String {
+        guard currentURL != nil else {
+            throw MeetingSessionError.unavailable(L("Open a board first before filtering."))
+        }
+        let clean = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty else {
+            return try await clearFilters()
+        }
+        let (terms, label) = JiraBoardDOMScripts.personFilterCandidateTerms(query: clean, directory: people)
+        let raw = try await callBoardAsyncJS(
+            JiraBoardDOMScripts.selectPersonFilterScript(candidateTerms: terms, displayLabel: label),
+            arguments: [:]
+        )
+        markBoardDirty()
+        let parsed = (raw.data(using: .utf8).flatMap { try? JSONSerialization.jsonObject(with: $0) }) as? [String: Any]
+        let matched = parsed?["matched"] as? Bool ?? false
+        let resolvedLabel = (parsed?["label"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let shownLabel = (resolvedLabel?.isEmpty == false ? resolvedLabel! : label)
+        lastActionSummary = matched ? L("Filtered board by %@", shownLabel) : L("No filter matched %@", shownLabel)
+        return matched
+            ? L("Selected board filter for “%@”.", shownLabel)
+            : L("No person filter or search box on the board matched “%@”.", shownLabel)
+    }
+
+    func clearFilters() async throws -> String {
+        guard currentURL != nil else {
+            throw MeetingSessionError.unavailable(L("Open a board first before clearing filters."))
+        }
+        let msg = try await callBoardAsyncJS(JiraBoardDOMScripts.clearFiltersScript(), arguments: [:])
+        markBoardDirty()
+        lastActionSummary = L("Cleared board filters")
+        return msg.isEmpty ? L("Cleared board filters.") : msg
     }
 
     func click(selector: String?, text: String?) async throws -> String {
@@ -642,19 +668,16 @@ final class IOSAssistantBoardController: NSObject, ObservableObject, WKNavigatio
         guard currentURL != nil else {
             return ["open": false, "url": "", "title": "", "issues": []]
         }
-        let js = """
-        const title = document.title || '';
-        const url = window.location.href || '';
-        const keyRe = /\\b[A-Z][A-Z0-9]{1,9}-\\d{1,6}\\b/g;
-        const bodyText = (document.body?.innerText || '').slice(0, 24000);
-        const foundKeys = Array.from(new Set(bodyText.match(keyRe) || [])).slice(0, 40);
-        const cards = Array.from(document.querySelectorAll('[data-issue-key], [data-testid*="issue"], [data-testid*="card"], [role="listitem"]'))
-          .slice(0, 30)
-          .map(n => (n.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 180))
-          .filter(Boolean);
-        return { open: true, url, title, issues: foundKeys, cards };
-        """
-        return (try? await evaluateJS(js)) as? [String: Any] ?? ["open": true, "url": currentURL?.absoluteString ?? ""]
+        if let raw = try? await callBoardAsyncJS(JiraBoardDOMScripts.enhancedInspectScript(), arguments: [:]),
+           let data = raw.data(using: .utf8),
+           var dict = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
+            dict["open"] = true
+            let cards = (dict["cards"] as? [[String: Any]]) ?? []
+            let keys = Array(Set(cards.compactMap { $0["key"] as? String })).sorted()
+            dict["issues"] = keys
+            return dict
+        }
+        return ["open": true, "url": currentURL?.absoluteString ?? ""]
     }
 
     func snapshotBase64(maxWidth: CGFloat = 1280) async throws -> (width: Int, height: Int, jpegBase64: String) {
@@ -881,11 +904,71 @@ final class IOSAssistantBoardController: NSObject, ObservableObject, WKNavigatio
         currentURL = webView.url
         canGoBack = webView.canGoBack
         canGoForward = webView.canGoForward
-        if let u = webView.url { urlDraft = u.absoluteString }
+        if let u = webView.url {
+            urlDraft = u.absoluteString
+            onBoardURLChanged?(u.absoluteString)
+        }
         if let t = webView.title?.trimmingCharacters(in: .whitespacesAndNewlines), !t.isEmpty { pageTitle = t }
         markBoardDirty()
         finishPendingNavigation()
         ensureWebViewHostedForRendering()
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.taskSync?.adoptJiraSessionFromBoardIfAvailable(self)
+        }
+    }
+
+    // MARK: - JiraBoardWebEvaluating
+
+    var currentBoardURL: URL? { currentURL }
+
+    func callBoardAsyncJS(_ functionBody: String, arguments: [String: Any]) async throws -> String {
+        ensureWebViewHostedForRendering(force: true)
+        defer { ensureWebViewHostedForRendering() }
+        let result = try await webView.callAsyncJavaScript(
+            functionBody,
+            arguments: arguments,
+            in: nil,
+            contentWorld: .page
+        )
+        if let str = result as? String { return str }
+        if let obj = result, JSONSerialization.isValidJSONObject(obj),
+           let data = try? JSONSerialization.data(withJSONObject: obj),
+           let str = String(data: data, encoding: .utf8) {
+            return str
+        }
+        return ""
+    }
+
+    func cookiesForBoard(matching origin: URL) async -> [HTTPCookie] {
+        let all = await webView.configuration.websiteDataStore.httpCookieStore.allCookies()
+        return JiraBoardContextInfo.matchingCookies(all, for: origin)
+    }
+
+    func refreshBoardAfterJiraMutation(highlightIssueKey: String?) async {
+        guard currentURL != nil else { return }
+        let raw = (try? await callBoardAsyncJS(
+            JiraBoardDOMScripts.refreshBoardAfterMutationScript(highlightIssueKey: highlightIssueKey),
+            arguments: [:]
+        )) ?? ""
+        if !JiraBoardDOMScripts.parseRefreshedInPlace(raw) {
+            finishPendingNavigation()
+            isLoading = true
+            ensureWebViewHostedForRendering(force: true)
+            webView.reload()
+            await waitForLoadFinish(timeoutSeconds: 4)
+            ensureWebViewHostedForRendering()
+            if let key = highlightIssueKey?.trimmingCharacters(in: .whitespacesAndNewlines), !key.isEmpty {
+                _ = try? await callBoardAsyncJS(
+                    JiraBoardDOMScripts.highlightIssueScript(issueKey: key),
+                    arguments: [:]
+                )
+            }
+        }
+        markBoardDirty()
+        if let key = highlightIssueKey?.trimmingCharacters(in: .whitespacesAndNewlines), !key.isEmpty {
+            lastActionSummary = L("Updated %@", key)
+        }
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {

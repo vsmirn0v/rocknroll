@@ -1270,6 +1270,8 @@ final class ParticipationCoordinator: ObservableObject {
         if !directlyAddressed { unsolicited.append(now) }
         sentText.append((now, draft))
 
+        var recordedUtterance = false
+        let utteranceStartedAt = Date()
         let outcome = await model.playParticipationVoice(buffer, audience: grant.setup.audience, permit: permit,
             preflight: {
                 guard self.decisionGrant(trace, turn: turn, stage: .playback) != nil else { return false }
@@ -1280,10 +1282,15 @@ final class ParticipationCoordinator: ObservableObject {
                 self.current(grant.id, revision: trace.revision, turn: turn) != nil
                     && context.validates(model: model, store: grant.attentionStore)
             }, onStarted: {
+                recordedUtterance = true
+                model.recordAssistantSpokenUtterance(id: id, text: draft, startedAt: utteranceStartedAt, endedAt: nil)
                 self.beginVoiceEchoWindow()
                 self.setVoiceStatus(.speaking, for: id)
                 self.noteDecision(.audioStarted, at: .playback, trace)
             })
+        if recordedUtterance {
+            model.assistantSpeechLedger.endUtterance(id: id, endedAt: Date())
+        }
         probeLog("participation-voice", ["voice": grant.setup.voice.engine.rawValue, "result": String(describing: outcome)])
         let result: (ParticipationVoiceReply.Status, ParticipationReceipt.State)
         switch outcome {

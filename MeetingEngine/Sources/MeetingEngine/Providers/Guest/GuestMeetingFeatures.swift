@@ -366,6 +366,11 @@ struct GuestMeetingFeatures {
         roomID = nil; groupID = nil; chatPage = nil; transcriptPage = nil
     }
 
+    mutating func revokeHistoryPermission(transcript: Bool) {
+        permissions[transcript ? "canViewTranscription" : "canViewChat"] = false
+        updatePermissions([:])
+    }
+
     private mutating func addMember(_ value: [String: Any]) {
         guard let id = Self.identifier(value["participantId"]) else { return }
         members[id] = .init(id: id, name: String((value["name"] as? String ?? "Participant").prefix(256)),
@@ -379,11 +384,13 @@ struct GuestMeetingFeatures {
         snapshot.permissions.canSendChat = permissions["canSendChatMessage"] == true
         snapshot.permissions.canSendReaction = permissions["canSendReaction"] == true
         // The official transcription plugin grants owner/moderator access in
-        // addition to the explicit room permission flags.
+        // addition to the explicit room permission flags when not restricted
+        // and when the server omits an explicit boolean value.
         let localRole = snapshot.localParticipantID.flatMap { members[$0]?.role }
         let privileged = localRole == "OWNER" || localRole == "MODERATOR"
-        snapshot.permissions.canViewTranscript = permissions["canViewTranscription"] == true || privileged
-        snapshot.permissions.canManageTranscript = permissions["canStartTranscription"] == true || privileged
+        let fallbackPrivileged = privileged && !snapshot.transcriptNetworkRestricted
+        snapshot.permissions.canViewTranscript = permissions["canViewTranscription"] ?? fallbackPrivileged
+        snapshot.permissions.canManageTranscript = permissions["canStartTranscription"] ?? fallbackPrivileged
         snapshot.permissions.canShareScreen = permissions["canShareScreen"] == true
         if old.canViewChat && !snapshot.permissions.canViewChat {
             snapshot.messages.removeAll(); chatPage = nil; snapshot.chatHistoryLoaded = false; snapshot.chatHasMore = false; epoch &+= 1

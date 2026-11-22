@@ -615,11 +615,20 @@ struct IOSMeetingDetailView: View {
                 )
             } else {
                 List(filtered) { event in
+                    let isAssistant = AssistantSpeechLedger.isAssistantSpeaker(event.speaker, role: event.speakerRole)
+                    let speakerLabel = isAssistant
+                        ? L("Rock Assistant")
+                        : AssistantSpeechLedger.displayAuthor(
+                            speaker: event.speaker,
+                            isOwn: event.isOwn,
+                            speakerRole: event.speakerRole,
+                            youLabel: L("You")
+                        )
                     VStack(alignment: .leading, spacing: 3) {
                         HStack {
-                            Text((event.speaker.flatMap { $0.isEmpty ? nil : $0 }) ?? (event.isOwn ? L("You") : L("Speaker")))
+                            Text(speakerLabel.isEmpty ? L("Speaker") : speakerLabel)
                                 .font(.caption.weight(.semibold))
-                                .foregroundStyle(event.isOwn ? Color.accentColor : .secondary)
+                                .foregroundStyle(isAssistant ? Color.purple : (event.isOwn ? Color.accentColor : .secondary))
                             Spacer()
                             Text(event.occurredAt.formatted(date: .omitted, time: .shortened))
                                 .font(.caption2)

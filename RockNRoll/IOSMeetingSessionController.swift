@@ -105,7 +105,6 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
     private var cachedLiveCaptureDevice: AVCaptureDevice?
     private var compositeSources: [String: CompositeVideoSource] = [:]
     private var receivedReactionIDs: Set<UUID> = []
-    private var requestedInitialTranscriptHistory = false
     private var screenShare: IOSScreenShareCapture?
     private var connectTask: Task<Void, Never>?
     private var broadcastObservation: AnyCancellable?
@@ -120,6 +119,8 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
     private var appLifecycleObservers: [NSObjectProtocol] = []
     private var backgroundRecoveryTask: UIBackgroundTaskIdentifier = .invalid
     private var privateCheckAudioSink: ((AVAudioPCMBuffer) -> Void)?
+    let assistantSpeechLedger = AssistantSpeechLedger()
+    private var assistantTranscriptSegments: [TranscriptSegment] = []
     private var providerTranscriptSegments: [TranscriptSegment] = []
     private var providerCanViewTranscript: Bool?
     private var providerTranscriptActive = false
@@ -387,6 +388,7 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
         _ = prepareCallView()
         catchUp.enter(roomKey: destination.invitationURL.absoluteString)
         providerTranscriptSegments = []
+        assistantTranscriptSegments = []
         providerCanViewTranscript = nil
         providerTranscriptActive = false
         providerCanManageTranscript = false
@@ -396,7 +398,6 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
         catchUp.transcriptUnavailableReason = nil
         chat.clear()
         chat.reactionHistory.beginMeeting(id: id)
-        requestedInitialTranscriptHistory = false
         bindChatCallbacks()
         bindReactionsCallbacks()
         bindTranscriptCallbacks()
@@ -1092,14 +1093,70 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
         }
 
         if session.capabilities.supportsProviderTranscript {
-            let segments = features.transcript.map { msg in
-                TranscriptSegment(
-                    id: msg.id,
-                    speaker: msg.participantName,
-                    text: String(msg.text.prefix(4_096)),
-                    spokenAt: msg.sentAt ?? msg.receivedAt,
-                    isOwn: msg.isOwn
-                )
+            var segments: [TranscriptSegment] = []
+            segments.reserveCapacity(features.transcript.count)
+            for msg in features.transcript {
+                let rawText = String(msg.text.prefix(4_096))
+                let occurredAt = msg.sentAt ?? msg.receivedAt
+                func appendAssistantIfMissing(_ assistantText: String, segmentID: String) {
+                    let cleanAssistant = assistantText.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !cleanAssistant.isEmpty else { return }
+                    let alreadyRecorded = assistantTranscriptSegments.contains { existing in
+                        guard let existingAt = existing.spokenAt, let msgAt = occurredAt else {
+                            return existing.text == cleanAssistant
+                        }
+                        return abs(existingAt.timeIntervalSince(msgAt)) <= 25.0 &&
+                            AssistantWakePhraseMatcher.isLikelySelfEcho(
+                                candidate: rawText,
+                                lastSpoken: existing.text,
+                                isLocal: true,
+                                withinEchoWindow: true
+                            )
+                    }
+                    guard !alreadyRecorded else { return }
+                    segments.append(TranscriptSegment(
+                        id: segmentID,
+                        speaker: AssistantSpeechLedger.canonicalSpeakerName,
+                        text: cleanAssistant,
+                        spokenAt: occurredAt,
+                        isOwn: false,
+                        speakerRole: AssistantSpeechLedger.speakerRoleAssistant
+                    ))
+                }
+                if msg.isOwn {
+                    switch assistantSpeechLedger.classifyOwnServerSegment(text: rawText, occurredAt: occurredAt) {
+                    case .pureUser(let cleanUser):
+                        segments.append(TranscriptSegment(
+                            id: msg.id,
+                            speaker: msg.participantName,
+                            text: cleanUser,
+                            spokenAt: occurredAt,
+                            isOwn: true,
+                            speakerRole: AssistantSpeechLedger.speakerRoleUser
+                        ))
+                    case .mixed(let cleanUser, let assistantText):
+                        segments.append(TranscriptSegment(
+                            id: msg.id,
+                            speaker: msg.participantName,
+                            text: cleanUser,
+                            spokenAt: occurredAt,
+                            isOwn: true,
+                            speakerRole: AssistantSpeechLedger.speakerRoleUser
+                        ))
+                        appendAssistantIfMissing(assistantText, segmentID: msg.id + ":assistant")
+                    case .pureAssistant(let assistantText):
+                        appendAssistantIfMissing(assistantText, segmentID: msg.id)
+                    }
+                } else {
+                    segments.append(TranscriptSegment(
+                        id: msg.id,
+                        speaker: msg.participantName,
+                        text: rawText,
+                        spokenAt: occurredAt,
+                        isOwn: false,
+                        speakerRole: AssistantSpeechLedger.speakerRoleParticipant
+                    ))
+                }
             }
             let wasServerVisible = providerTranscriptActive && (providerCanViewTranscript == true)
             providerTranscriptSegments = segments
@@ -1112,16 +1169,6 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
                 Task { @MainActor [weak self] in
                     await self?.reconcileLocalTranscriptionMode()
                 }
-            }
-            if features.connected && features.permissions.canViewTranscript {
-                if !requestedInitialTranscriptHistory {
-                    requestedInitialTranscriptHistory = true
-                    Task { @MainActor [weak self] in
-                        try? await self?.session.transcriptService?.loadTranscriptHistory()
-                    }
-                }
-            } else {
-                requestedInitialTranscriptHistory = false
             }
         } else {
             syncCatchUpTranscript()
@@ -1307,8 +1354,14 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
                 guard !leaving, phase == .connected, !isHeld else { throw MeetingSessionError.notConnected }
                 stage = "send"
                 AppDiagnostics.log("voice-reply-prepared", ["frames": Int(buffer.frameLength), "sampleRate": buffer.format.sampleRate])
+                let utteranceID = UUID().uuidString
+                let startedAt = Date()
+                self.recordAssistantSpokenUtterance(id: utteranceID, text: text, startedAt: startedAt)
                 voiceReplyEchoGate.begin()
-                defer { voiceReplyEchoGate.end() }
+                defer {
+                    voiceReplyEchoGate.end()
+                    self.assistantSpeechLedger.endUtterance(id: utteranceID, endedAt: Date())
+                }
                 let played = await session.playVoiceReply(buffer)
                 try Task.checkCancellation()
                 guard played else { throw MeetingSessionError.unavailable(L("Could not send the voice reply into this meeting.")) }
@@ -1387,16 +1440,57 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
         await releaseTranscription(consumer: "assistant")
     }
 
+    func recordAssistantSpokenUtterance(
+        id: String = UUID().uuidString,
+        text: String,
+        startedAt: Date = Date(),
+        endedAt: Date? = nil
+    ) {
+        let clean = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty else { return }
+        if let endedAt {
+            assistantSpeechLedger.recordCompletedUtterance(id: id, text: clean, startedAt: startedAt, endedAt: endedAt)
+        } else {
+            assistantSpeechLedger.beginUtterance(id: id, text: clean, startedAt: startedAt)
+        }
+        let segID = "assistant:" + id
+        let seg = TranscriptSegment(
+            id: segID,
+            speaker: AssistantSpeechLedger.canonicalSpeakerName,
+            text: clean,
+            spokenAt: startedAt,
+            isOwn: false,
+            speakerRole: AssistantSpeechLedger.speakerRoleAssistant
+        )
+        if let idx = assistantTranscriptSegments.firstIndex(where: { $0.id == segID }) {
+            assistantTranscriptSegments[idx] = seg
+        } else {
+            assistantTranscriptSegments.append(seg)
+            if assistantTranscriptSegments.count > 200 {
+                assistantTranscriptSegments.removeFirst(assistantTranscriptSegments.count - 200)
+            }
+        }
+        syncCatchUpTranscript()
+    }
+
     func ensureTranscriptionRunning(consumer: String) async {
         guard !leaving, phase == .connected else { return }
         assistantTranscriptionConsumers.insert(consumer)
         if providerTranscriptActive && providerCanViewTranscript == true {
-            if consumer == "facilitator" && !localTranscriber.isCapturingAudio {
-                _ = await localTranscriber.startAudioTapOnly()
-                refreshLocalAudioSink()
+            if !assistantTranscriptionConsumers.contains("user") {
+                localTranscriber.setLocalMicrophoneOnly(true)
+                if localTranscriber.canStartWithoutPermissionPrompt && !localTranscriber.state.isRunning {
+                    _ = await localTranscriber.start()
+                    refreshLocalAudioSink()
+                    syncCatchUpTranscript()
+                } else if consumer == "facilitator" && !localTranscriber.isCapturingAudio {
+                    _ = await localTranscriber.startAudioTapOnly()
+                    refreshLocalAudioSink()
+                }
             }
             return
         }
+        localTranscriber.setLocalMicrophoneOnly(false)
         guard !localTranscriber.state.isRunning else { return }
         _ = await localTranscriber.start()
         refreshLocalAudioSink()
@@ -1422,19 +1516,33 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
         guard !leaving, phase == .connected else { return }
         let serverVisible = providerTranscriptActive && (providerCanViewTranscript == true)
         if serverVisible {
-            if localTranscriber.state.isRunning && !assistantTranscriptionConsumers.contains("user") {
-                await localTranscriber.stop(keepAudioTap: assistantTranscriptionConsumers.contains("facilitator"))
+            if assistantTranscriptionConsumers.contains("user") {
+                localTranscriber.setLocalMicrophoneOnly(false)
+                if !localTranscriber.state.isRunning {
+                    _ = await localTranscriber.start()
+                    refreshLocalAudioSink()
+                    syncCatchUpTranscript()
+                }
+                return
+            }
+            if localTranscriber.canStartWithoutPermissionPrompt || localTranscriber.state.isRunning {
+                localTranscriber.setLocalMicrophoneOnly(true)
+                if !localTranscriber.state.isRunning {
+                    _ = await localTranscriber.start()
+                }
                 refreshLocalAudioSink()
                 syncCatchUpTranscript()
-            } else if !localTranscriber.isCapturingAudio && assistantTranscriptionConsumers.contains("facilitator") {
+            } else if assistantTranscriptionConsumers.contains("facilitator") && !localTranscriber.isCapturingAudio {
                 _ = await localTranscriber.startAudioTapOnly()
                 refreshLocalAudioSink()
             }
-        } else if (!assistantTranscriptionConsumers.isEmpty || didAutoStartLocalTranscription),
-                  !localTranscriber.state.isRunning {
-            _ = await localTranscriber.start()
-            refreshLocalAudioSink()
-            syncCatchUpTranscript()
+        } else if (!assistantTranscriptionConsumers.isEmpty || didAutoStartLocalTranscription) {
+            localTranscriber.setLocalMicrophoneOnly(false)
+            if !localTranscriber.state.isRunning {
+                _ = await localTranscriber.start()
+                refreshLocalAudioSink()
+                syncCatchUpTranscript()
+            }
         }
     }
 
@@ -1501,11 +1609,27 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
     private func syncCatchUpTranscript() {
         guard !leaving else { return }
         let localRunning = localTranscriber.state.isRunning
-        let merged = providerTranscriptSegments + localTranscriber.segments
+        let ownServerSegments = providerTranscriptSegments.filter { $0.isOwn == true }
+        let visibleLocalSegments = localTranscriber.segments.filter { localSeg in
+            guard localSeg.isOwn == true, !ownServerSegments.isEmpty else { return true }
+            let localAt = localSeg.spokenAt
+            return !ownServerSegments.contains { srv in
+                if let localAt, let srvAt = srv.spokenAt, abs(localAt.timeIntervalSince(srvAt)) > 6.0 {
+                    return false
+                }
+                return AssistantWakePhraseMatcher.isLikelySelfEcho(
+                    candidate: localSeg.text,
+                    lastSpoken: srv.text,
+                    isLocal: true,
+                    withinEchoWindow: true
+                )
+            }
+        }
+        let merged = providerTranscriptSegments + assistantTranscriptSegments + visibleLocalSegments
         catchUp.observe(
             messages: merged,
             canView: true,
-            enabled: providerTranscriptActive || localRunning
+            enabled: providerTranscriptActive || localRunning || !assistantTranscriptSegments.isEmpty
         )
         catchUp.canManageTranscript = (phase == .connected)
         if case .unavailable(let reason) = localTranscriber.state {
@@ -1521,6 +1645,7 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
         let device = workspaceDeviceID.isEmpty ? "ios" : workspaceDeviceID
         var out: [SyncedTranscriptEvent] = []
         for seg in providerTranscriptSegments {
+            let role = seg.speakerRole ?? (seg.isOwn == true ? AssistantSpeechLedger.speakerRoleUser : AssistantSpeechLedger.speakerRoleParticipant)
             out.append(SyncedTranscriptEvent(
                 id: seg.id,
                 providerMessageID: seg.id,
@@ -1529,11 +1654,27 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
                 occurredAt: seg.spokenAt ?? Date(),
                 speaker: seg.speaker,
                 isOwn: seg.isOwn ?? false,
+                speakerRole: role,
+                text: seg.text,
+                deviceID: device
+            ))
+        }
+        for seg in assistantTranscriptSegments {
+            out.append(SyncedTranscriptEvent(
+                id: seg.id,
+                providerMessageID: nil,
+                kind: "transcript",
+                sourceTier: 3,
+                occurredAt: seg.spokenAt ?? Date(),
+                speaker: seg.speaker ?? AssistantSpeechLedger.canonicalSpeakerName,
+                isOwn: false,
+                speakerRole: AssistantSpeechLedger.speakerRoleAssistant,
                 text: seg.text,
                 deviceID: device
             ))
         }
         for seg in localTranscriber.segments {
+            let isOwn = seg.isOwn ?? false
             out.append(SyncedTranscriptEvent(
                 id: "local:" + seg.id,
                 providerMessageID: nil,
@@ -1541,7 +1682,8 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
                 sourceTier: 2,
                 occurredAt: seg.spokenAt ?? Date(),
                 speaker: seg.speaker,
-                isOwn: seg.isOwn ?? false,
+                isOwn: isOwn,
+                speakerRole: seg.speakerRole ?? (isOwn ? AssistantSpeechLedger.speakerRoleUser : AssistantSpeechLedger.speakerRoleParticipant),
                 text: seg.text,
                 deviceID: device
             ))
@@ -1555,6 +1697,7 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
                 occurredAt: msg.sentAt,
                 speaker: msg.sender,
                 isOwn: msg.isOwn,
+                speakerRole: msg.isOwn ? AssistantSpeechLedger.speakerRoleUser : AssistantSpeechLedger.speakerRoleParticipant,
                 text: msg.text,
                 deviceID: device
             ))
@@ -1958,7 +2101,6 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
         privateCheckAudioSink = nil
         session.setTranscriptionAudioHandler(nil)
         session.setLocalAudioSink(nil)
-        requestedInitialTranscriptHistory = false
         broadcastObservation = nil
         IOSCameraCapture.removeObserver(id: id)
         appLifecycleObservers.forEach(NotificationCenter.default.removeObserver)

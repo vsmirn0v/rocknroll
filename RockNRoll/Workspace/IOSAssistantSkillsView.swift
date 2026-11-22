@@ -263,10 +263,22 @@ struct IOSAssistantSkillsView: View {
     private var skillsTab: some View {
         Form {
             Section {
+                let cloudSyncActive = !skills.isObsidianBacked
+                    && RoomSyncCoordinator.active?.enabled == true
+                    && RoomSyncCoordinator.active?.syncWorkspace == true
                 HStack {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(skills.isObsidianBacked ? L("Obsidian Vault Connected") : L("Local Documents Storage"))
-                            .font(.subheadline.weight(.semibold))
+                        Text(
+                            skills.isObsidianBacked
+                                ? L("Obsidian Vault Connected")
+                                : (cloudSyncActive ? L("Synced via iCloud") : L("Local Documents Storage"))
+                        )
+                        .font(.subheadline.weight(.semibold))
+                        if cloudSyncActive {
+                            Text(L("People.md, team context, skills and settings sync privately via iCloud across Mac & iPhone. Choosing an Obsidian folder is optional."))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
                         Text(skills.folderPath)
                             .font(.caption2)
                             .foregroundStyle(.secondary)

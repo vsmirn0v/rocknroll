@@ -151,7 +151,8 @@ final class ConferenceModel: ObservableObject {
     lazy var assistantBoard: IOSAssistantBoardController = {
         let controller = IOSAssistantBoardController()
         controller.defaultBoardURLProvider = { [weak self] in
-            self?.assistantSkills.teamContext.defaultJiraBoardURL ?? ""
+            let configured = self?.assistantSkills.teamContext.defaultJiraBoardURL ?? ""
+            return configured.isEmpty ? (self?.assistantSkills.lastBoardURL ?? "") : configured
         }
         controller.resolveShareTarget = { [weak self] requestedID in
             guard let self else { return nil }
@@ -500,7 +501,31 @@ final class ConferenceModel: ObservableObject {
         sync.onSyncPreferencesChanged = { [weak self] in
             self?.workspace.scheduleSync(delayMilliseconds: 100)
         }
+        workspace.assistantSyncInputProvider = { [weak self] in
+            guard let self else {
+                return AssistantCloudSync.LocalSnapshotInput(
+                    people: AssistantPeopleDirectory(),
+                    teamContext: AssistantTeamContextDocument(),
+                    skills: [],
+                    prompts: [],
+                    preferences: LocalAssistantPortablePreferences()
+                )
+            }
+            return self.assistantSkills.currentCloudSyncInput()
+        }
+        workspace.onAssistantSettingsSynced = { [weak self] settings, baseline in
+            self?.assistantSkills.applyRemoteCloudSync(settings: settings, previousBaseline: baseline)
+        }
+        assistantSkills.onLocalCloudSyncableChange = { [weak self] in
+            self?.workspace.syncAssistantStateToCloudNow()
+        }
+        assistantBoard.onBoardURLChanged = { [weak self] urlString in
+            guard let self, self.assistantSkills.lastBoardURL != urlString else { return }
+            self.assistantSkills.lastBoardURL = urlString
+        }
         workspace.start()
+        assistantBoard.taskSync = workspace.taskSync
+        workspace.taskSync.boardWebEvaluator = assistantBoard
         _ = assistantTalk
         assistantSpeech.startObservingEnvironment()
 
@@ -524,9 +549,10 @@ final class ConferenceModel: ObservableObject {
                           !self.assistantBoard.isInlineSheetActive,
                           !self.isCallMinimized,
                           let foreground = self.foregroundSession else { return }
+                    let configuredURL = self.assistantSkills.teamContext.defaultJiraBoardURL
                     foreground.presentBoardSheet(
                         controller: self.assistantBoard,
-                        defaultBoardURL: self.assistantSkills.teamContext.defaultJiraBoardURL
+                        defaultBoardURL: configuredURL.isEmpty ? self.assistantSkills.lastBoardURL : configuredURL
                     )
                 }
             }
@@ -856,6 +882,9 @@ final class ConferenceModel: ObservableObject {
 
     func presentSession(id: UUID) {
         guard let target = sessions.first(where: { $0.id == id }) else { return }
+        if foregroundSessionID != id {
+            mediaStatus = nil
+        }
         isCallMinimized = false
         guard let container else {
             foregroundSessionID = id
@@ -905,6 +934,9 @@ final class ConferenceModel: ObservableObject {
 
     private func showForegroundSession(_ target: IOSMeetingSessionController, container: UIViewController) {
         let previous = foregroundSession
+        if foregroundSessionID != target.id {
+            mediaStatus = nil
+        }
         foregroundSessionID = target.id
         isCallMinimized = false
         workspaceAudio.setPreferredForegroundSession(target.id)
@@ -1001,6 +1033,9 @@ final class ConferenceModel: ObservableObject {
             speakAudioBuffer: { [weak controller] buffer in
                 guard let controller else { throw MeetingSessionError.notConnected }
                 try await controller.speakVoiceBuffer(buffer)
+            },
+            recordAssistantSpeech: { [weak controller] id, text, startedAt, endedAt in
+                controller?.recordAssistantSpokenUtterance(id: id, text: text, startedAt: startedAt, endedAt: endedAt)
             }
         )
     }
@@ -1388,6 +1423,7 @@ final class ConferenceModel: ObservableObject {
 
         status = L("Finding this jam…")
         statusIsError = false
+        mediaStatus = nil
         #if DEBUG
         joinStartedAt = ProcessInfo.processInfo.systemUptime
         #endif
@@ -1558,9 +1594,10 @@ final class ConferenceModel: ObservableObject {
                 }
                 controller.onOpenBoard = { [weak self, weak controller] in
                     guard let self, let controller else { return }
+                    let configuredURL = self.assistantSkills.teamContext.defaultJiraBoardURL
                     controller.presentBoardSheet(
                         controller: self.assistantBoard,
-                        defaultBoardURL: self.assistantSkills.teamContext.defaultJiraBoardURL
+                        defaultBoardURL: configuredURL.isEmpty ? self.assistantSkills.lastBoardURL : configuredURL
                     )
                 }
                 controller.configureAssistantHUD(talk: self.assistantTalk, speech: self.assistantSpeech)
@@ -1806,6 +1843,7 @@ final class ConferenceModel: ObservableObject {
 
             let replacingSession = replacementAfterLeave != nil && (event == .left || event == .canceled)
             if foregroundSessionID == id {
+                mediaStatus = nil
                 if let next = sessions.last {
                     foregroundSessionID = next.id
                     activeRoomTitle = next.title
@@ -1825,6 +1863,7 @@ final class ConferenceModel: ObservableObject {
                 connectedURL = nil
                 activeRoute = nil
                 liveSessionID = nil
+                mediaStatus = nil
                 companionAudioPaused = false
                 meetingReconnecting = false
                 resumeDepartureWaiters(forSessionID: nil)

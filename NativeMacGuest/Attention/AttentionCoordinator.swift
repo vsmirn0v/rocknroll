@@ -256,6 +256,8 @@ final class AttentionMemoryPressure: @unchecked Sendable {
     var saveJiraHandoverPacketToCloud: (MacJiraHandoverPacket) -> Void = { _ in }
     var loadJiraHandoverPacketsFromCloud: () -> [MacJiraHandoverPacket] = { [] }
     var onCalendarEventCreated: () -> Void = {}
+    var isApplyingRemoteCloudSync = false
+    var onLocalAssistantDataChanged: (() -> Void)?
     private var lastRecurringReminderCheck: Date = .distantPast
     private(set) lazy var taskSync: WorkspaceTaskSyncController = makeTaskSyncController()
 
@@ -276,6 +278,12 @@ final class AttentionMemoryPressure: @unchecked Sendable {
         ruleStore = AssistantRuleStore(root: store.root)
         facilitator = AutonomousMeetingFacilitator(attention: self)
         bindFacilitatorObserver()
+        boardController.taskSync = taskSync
+        taskSync.boardWebEvaluator = boardController
+        boardController.onBoardURLChanged = { [weak store] urlString in
+            guard let store, store.lastBoardURL != urlString else { return }
+            store.lastBoardURL = urlString
+        }
         Task { @MainActor [weak self] in
             await self?.refreshCachedPrompts()
         }
@@ -1869,6 +1877,8 @@ final class AttentionMemoryPressure: @unchecked Sendable {
                     throw MeetingLibraryError.persistenceFailed(L("The meeting conversation could not be read."))
                 }
                 attempted = true
+                model.recordAssistantSpokenUtterance(id: id, text: text, startedAt: Date(), endedAt: nil)
+                defer { model.assistantSpeechLedger.endUtterance(id: id, endedAt: Date()) }
                 try await deliverVoice(model, buffer)
                 journal?.updateReplyStatus(sessionID: journalID, id: id, status: .spoken)
                 return .success(())
@@ -1950,6 +1960,8 @@ final class AttentionMemoryPressure: @unchecked Sendable {
                     throw MeetingLibraryError.persistenceFailed(L("The meeting conversation could not be read."))
                 }
                 playbackAttempted = true
+                model.recordAssistantSpokenUtterance(id: id, text: clean, startedAt: Date(), endedAt: nil)
+                defer { model.assistantSpeechLedger.endUtterance(id: id, endedAt: Date()) }
                 try await deliverVoice(model, buffer)
                 journal?.updateReplyStatus(sessionID: journalID, id: id, status: .spoken)
                 probeLog("attention-spoken", ["voice": store.voiceEngine.rawValue, "seconds": Double(buffer.frameLength) / buffer.format.sampleRate,

@@ -204,6 +204,7 @@ struct IOSAssistantSessionBridge {
     var sendChat: @MainActor (String) async throws -> Void
     var speakVoice: @MainActor (String) async throws -> Void
     var speakAudioBuffer: (@MainActor (AVAudioPCMBuffer) async throws -> Void)? = nil
+    var recordAssistantSpeech: @MainActor (String, String, Date, Date?) -> Void = { _, _, _, _ in }
 }
 
 struct IOSAssistantLLMService: IOSAssistantEvaluating {

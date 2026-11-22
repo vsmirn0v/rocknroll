@@ -77,6 +77,8 @@ public final class WorkspaceTaskSyncController: ObservableObject {
     @Published public var lastReport: TaskSyncExecutionReport?
     @Published public var assignableJiraUsers: [JiraUserContact] = []
     public var jiraConnectorForTesting: (any JiraTaskConnecting)?
+    public weak var boardWebEvaluator: (any JiraBoardWebEvaluating)?
+    @Published public private(set) var boardJiraSessionActive = false
     @Published public var currentJiraUser: JiraUserContact?
     @Published public var reminderLists: [ReminderListInfo] = []
     @Published public var appContacts: [AppContactPerson] = []
@@ -794,6 +796,18 @@ public final class WorkspaceTaskSyncController: ObservableObject {
         ]
     }
 
+    nonisolated public static func jiraIssuePayload(_ issue: JiraRemoteIssue) -> [String: Any] {
+        [
+            "key": issue.key,
+            "summary": issue.summary,
+            "status": issue.statusName,
+            "issue_type": issue.issueTypeName,
+            "assignee": issue.assigneeName ?? "",
+            "assignee_id": issue.assigneeIdentifier ?? "",
+            "browse_url": issue.browseURL ?? "",
+        ]
+    }
+
     nonisolated public static func unresolvedJiraAssigneePayload(
         query: String,
         candidates: [JiraUserContact]
@@ -806,17 +820,154 @@ public final class WorkspaceTaskSyncController: ObservableObject {
         ]
     }
 
+    public func activeJiraConnector() throws -> any JiraTaskConnecting {
+        if let testConnector = jiraConnectorForTesting {
+            return testConnector
+        }
+        if let evaluator = boardWebEvaluator,
+           let boardURL = evaluator.currentBoardURL,
+           let info = JiraBoardContextInfo.parse(from: boardURL),
+           (boardJiraSessionActive || info.looksLikeJiraURL) {
+            if !preferences.jira.enabled
+                || preferences.jira.normalizedBaseURL == nil
+                || !hasJiraSecret()
+                || (preferences.jira.authMode == .webSession
+                    && preferences.jira.normalizedBaseURL?.host?.lowercased() == info.baseURL.host?.lowercased()) {
+                return JiraBoardWebSessionConnector(evaluator: evaluator, fallbackSettings: preferences.jira)
+            }
+        }
+        if preferences.jira.enabled && preferences.jira.normalizedBaseURL != nil {
+            if hasJiraSecret() {
+                return hooks.makeJiraConnector(preferences.jira, keychain)
+            }
+            if let evaluator = boardWebEvaluator, evaluator.currentBoardURL != nil {
+                return JiraBoardWebSessionConnector(evaluator: evaluator, fallbackSettings: preferences.jira)
+            }
+            return hooks.makeJiraConnector(preferences.jira, keychain)
+        }
+        if let evaluator = boardWebEvaluator, evaluator.currentBoardURL != nil {
+            return JiraBoardWebSessionConnector(evaluator: evaluator, fallbackSettings: preferences.jira)
+        }
+        throw JiraConnectorError.badRequest(L("Sign in to Jira on the Assistant Board or in Tasks → Sync Settings first."))
+    }
+
+    public func adoptJiraSessionFromBoardIfAvailable(_ evaluator: any JiraBoardWebEvaluating) async {
+        boardWebEvaluator = evaluator
+        guard let url = evaluator.currentBoardURL,
+              let info = JiraBoardContextInfo.parse(from: url),
+              info.looksLikeJiraURL else {
+            boardJiraSessionActive = false
+            return
+        }
+
+        let webConnector = JiraBoardWebSessionConnector(evaluator: evaluator, fallbackSettings: preferences.jira)
+        guard let me = try? await webConnector.verifyMyself() else {
+            boardJiraSessionActive = false
+            return
+        }
+        boardJiraSessionActive = true
+        currentJiraUser = me
+
+        var adoptSettings = preferences.jira
+        adoptSettings.baseURL = info.baseURL.absoluteString
+        let cookies = await evaluator.cookiesForBoard(matching: info.baseURL)
+        let cookieHeader = cookies
+            .map { "\($0.name)=\($0.value)" }
+            .joined(separator: "; ")
+        if !cookieHeader.isEmpty {
+            saveJiraSecret(cookieHeader, kind: .jiraSessionCookies, settings: adoptSettings)
+        }
+
+        let sameHost = preferences.jira.normalizedBaseURL?.host?.lowercased() == info.baseURL.host?.lowercased()
+        if !preferences.jira.enabled || preferences.jira.normalizedBaseURL == nil {
+            var updated = preferences
+            updated.jira.enabled = true
+            updated.jira.baseURL = info.baseURL.absoluteString
+            updated.jira.authMode = .webSession
+            if updated.jira.cleanProjectKey.isEmpty, let proj = info.projectKey, !proj.isEmpty {
+                updated.jira.projectKey = proj
+            }
+            if updated.jira.usernameOrEmail.isEmpty,
+               let hint = (me.emailAddress?.cleanedNilIfEmpty ?? me.username?.cleanedNilIfEmpty) {
+                updated.jira.usernameOrEmail = hint
+            }
+            await savePreferences(updated)
+        } else if sameHost,
+                  preferences.jira.cleanProjectKey.isEmpty,
+                  let proj = info.projectKey,
+                  !proj.isEmpty {
+            var updated = preferences
+            updated.jira.projectKey = proj
+            await savePreferences(updated)
+        }
+
+        if assignableJiraUsers.isEmpty,
+           let boardIssues = try? await webConnector.fetchActiveBoardIssues(maxResults: 40) {
+            var usersByID: [String: JiraUserContact] = [me.identifier.lowercased(): me]
+            for issue in boardIssues {
+                if let assignee = issue.assigneeContact {
+                    usersByID[assignee.identifier.lowercased()] = assignee
+                }
+                if let reporter = issue.reporterContact {
+                    usersByID[reporter.identifier.lowercased()] = reporter
+                }
+            }
+            let collected = Array(usersByID.values)
+            if !collected.isEmpty {
+                assignableJiraUsers = collected
+            }
+        }
+    }
+
     public func searchJiraUsers(
         query: String,
         projectKey: String? = nil,
         maxResults: Int = 15
     ) async throws -> [JiraUserContact] {
-        guard preferences.jira.enabled else {
-            throw JiraConnectorError.badRequest(L("Jira integration is not enabled."))
-        }
-        let connector = jiraConnectorForTesting ?? hooks.makeJiraConnector(preferences.jira, keychain)
+        let connector = try activeJiraConnector()
         let project = projectKey?.cleanedNilIfEmpty ?? preferences.jira.cleanProjectKey.cleanedNilIfEmpty
-        return try await connector.searchUsers(query: query, projectKey: project, maxResults: maxResults)
+        var collected = (try? await connector.searchUsers(query: query, projectKey: project, maxResults: maxResults)) ?? []
+
+        // Augment with active board assignees/reporters and current user so corporate DC/Cloud instances
+        // that restrict /user/search still return teammates visible on the open board.
+        var boardIssues: [JiraRemoteIssue] = []
+        if let webConnector = connector as? JiraBoardWebSessionConnector {
+            boardIssues = (try? await webConnector.fetchActiveBoardIssues(maxResults: 60)) ?? []
+        } else if let evaluator = boardWebEvaluator, evaluator.currentBoardURL != nil {
+            let webConnector = JiraBoardWebSessionConnector(evaluator: evaluator, fallbackSettings: preferences.jira)
+            boardIssues = (try? await webConnector.fetchActiveBoardIssues(maxResults: 60)) ?? []
+        }
+
+        if !boardIssues.isEmpty {
+            var extras: [JiraUserContact] = []
+            if let me = currentJiraUser { extras.append(me) }
+            for issue in boardIssues {
+                if let assignee = issue.assigneeContact { extras.append(assignee) }
+                if let reporter = issue.reporterContact { extras.append(reporter) }
+            }
+            let needle = query.trimmingCharacters(in: .whitespacesAndNewlines)
+            let stripped = AssistantPeopleDirectory.strippedMeetingDisplayName(needle)
+            let searchNeedle = stripped.isEmpty ? needle : stripped
+            let matchedExtras = extras.filter { user in
+                guard !searchNeedle.isEmpty else { return true }
+                return JiraContactMatcher.matchScore(
+                    name: searchNeedle,
+                    candidateNames: [user.displayName, user.username ?? "", user.identifier],
+                    candidateEmail: user.emailAddress,
+                    candidateUsername: user.username
+                ) >= 0.45
+            }
+            var seen = Set(collected.map { $0.identifier.lowercased() })
+            for user in matchedExtras where seen.insert(user.identifier.lowercased()).inserted {
+                collected.append(user)
+            }
+        }
+
+        if collected.isEmpty,
+           let direct = try? await connector.searchUsers(query: query, projectKey: project, maxResults: maxResults) {
+            collected = direct
+        }
+        return Array(collected.prefix(max(1, maxResults)))
     }
 
     public func resolveJiraAssignee(
@@ -866,7 +1017,7 @@ public final class WorkspaceTaskSyncController: ObservableObject {
 
         let project = defaultProjectKey.cleanedNilIfEmpty ?? preferences.jira.cleanProjectKey.cleanedNilIfEmpty
         var liveCandidates: [JiraUserContact] = []
-        if preferences.jira.enabled {
+        if (try? activeJiraConnector()) != nil {
             liveCandidates = (try? await searchJiraUsers(query: query, projectKey: project, maxResults: 8)) ?? []
         }
 
@@ -899,18 +1050,173 @@ public final class WorkspaceTaskSyncController: ObservableObject {
     }
 
     public func searchJiraIssues(jql: String, maxResults: Int = 20) async throws -> [JiraRemoteIssue] {
-        guard preferences.jira.enabled else {
-            throw JiraConnectorError.badRequest(L("Jira integration is not enabled."))
-        }
-        let connector = jiraConnectorForTesting ?? hooks.makeJiraConnector(preferences.jira, keychain)
+        let connector = try activeJiraConnector()
         return try await connector.searchIssues(jql: jql, maxResults: maxResults)
     }
 
     public func commentOnJiraIssue(key: String, comment: String) async throws {
-        guard preferences.jira.enabled else {
-            throw JiraConnectorError.badRequest(L("Jira integration is not enabled."))
-        }
-        let connector = jiraConnectorForTesting ?? hooks.makeJiraConnector(preferences.jira, keychain)
+        let connector = try activeJiraConnector()
         try await connector.addIssueComment(key: key, comment: comment)
+        await boardWebEvaluator?.refreshBoardAfterJiraMutation(highlightIssueKey: key)
+    }
+
+    public func fetchBoardUsersAndIssues(maxResults: Int = 50) async throws -> (users: [JiraUserContact], issues: [JiraRemoteIssue]) {
+        let connector = try activeJiraConnector()
+        let issues: [JiraRemoteIssue]
+        if let webConnector = connector as? JiraBoardWebSessionConnector {
+            issues = try await webConnector.fetchActiveBoardIssues(maxResults: maxResults)
+        } else if let evaluator = boardWebEvaluator, evaluator.currentBoardURL != nil {
+            let webConnector = JiraBoardWebSessionConnector(evaluator: evaluator, fallbackSettings: preferences.jira)
+            issues = try await webConnector.fetchActiveBoardIssues(maxResults: maxResults)
+        } else {
+            let project = preferences.jira.cleanProjectKey
+            let jql = project.isEmpty
+                ? "updated >= -30d ORDER BY updated DESC"
+                : "project = \"\(Self.escapedJQLString(project))\" ORDER BY updated DESC"
+            issues = try await connector.searchIssues(jql: jql, maxResults: maxResults)
+        }
+
+        var usersByID: [String: JiraUserContact] = [:]
+        var orderedIDs: [String] = []
+        func appendUser(_ user: JiraUserContact?) {
+            guard let user else { return }
+            let key = user.identifier.lowercased()
+            if usersByID[key] == nil {
+                orderedIDs.append(key)
+            }
+            usersByID[key] = user
+        }
+        appendUser(currentJiraUser)
+        for issue in issues {
+            appendUser(issue.assigneeContact)
+            appendUser(issue.reporterContact)
+        }
+        return (orderedIDs.compactMap { usersByID[$0] }, issues)
+    }
+
+    public func copyJiraUserFromIssue(
+        issueKey: String? = nil,
+        searchQuery: String? = nil,
+        role: String = "assignee"
+    ) async throws -> (user: JiraUserContact, issueKey: String) {
+        let connector = try activeJiraConnector()
+        let cleanRole = role.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+
+        let resolvedIssue: JiraRemoteIssue
+        if let rawKey = issueKey?.trimmingCharacters(in: .whitespacesAndNewlines), !rawKey.isEmpty {
+            resolvedIssue = try await connector.fetchIssueDetails(key: rawKey)
+        } else {
+            let (_, boardIssues) = try await fetchBoardUsersAndIssues(maxResults: 60)
+            let needle = searchQuery?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if !needle.isEmpty,
+               let boardMatch = boardIssues.first(where: { issue in
+                   issue.key.localizedCaseInsensitiveContains(needle)
+                       || issue.summary.localizedCaseInsensitiveContains(needle)
+                       || (issue.assigneeName?.localizedCaseInsensitiveContains(needle) == true)
+               }) {
+                resolvedIssue = try await connector.fetchIssueDetails(key: boardMatch.key)
+            } else if !needle.isEmpty {
+                let escaped = Self.escapedJQLString(needle)
+                let searched = try await connector.searchIssues(
+                    jql: "text ~ \"\(escaped)\" ORDER BY updated DESC",
+                    maxResults: 10
+                )
+                guard let first = searched.first else {
+                    throw JiraConnectorError.notFound(L("No Jira issue matched %@.", needle))
+                }
+                resolvedIssue = try await connector.fetchIssueDetails(key: first.key)
+            } else {
+                let resolvedMe: JiraUserContact?
+                if let current = currentJiraUser {
+                    resolvedMe = current
+                } else {
+                    resolvedMe = try? await connector.verifyMyself()
+                }
+                if let me = resolvedMe,
+                   let mineOnBoard = boardIssues.first(where: { issue in
+                       guard let assignee = issue.assigneeContact else { return false }
+                       return assignee.identifier.caseInsensitiveCompare(me.identifier) == .orderedSame
+                           || (assignee.username != nil && assignee.username == me.username)
+                   }) {
+                    resolvedIssue = try await connector.fetchIssueDetails(key: mineOnBoard.key)
+                } else if let firstBoardIssue = boardIssues.first(where: { $0.assigneeContact != nil }) {
+                    resolvedIssue = try await connector.fetchIssueDetails(key: firstBoardIssue.key)
+                } else {
+                    throw JiraConnectorError.badRequest(L("Specify a Jira issue key or search text to copy a user from."))
+                }
+            }
+        }
+
+        let picked = cleanRole == "reporter"
+            ? (resolvedIssue.reporterContact ?? resolvedIssue.assigneeContact)
+            : (resolvedIssue.assigneeContact ?? resolvedIssue.reporterContact)
+        guard var user = picked else {
+            throw JiraConnectorError.badRequest(L("Issue %@ has no assignee or reporter set.", resolvedIssue.key))
+        }
+        if user.emailAddress == nil || (user.accountId == nil && user.username == nil),
+           let enriched = (try? await connector.searchUsers(query: user.identifier, projectKey: nil, maxResults: 3))?.first(where: {
+               $0.identifier.caseInsensitiveCompare(user.identifier) == .orderedSame
+                   || ($0.username != nil && $0.username == user.username)
+                   || ($0.accountId != nil && $0.accountId == user.accountId)
+           }) {
+            user = enriched
+        }
+        return (user, resolvedIssue.key)
+    }
+
+    public func transitionJiraIssue(
+        key: String,
+        targetStatus: String,
+        comment: String? = nil
+    ) async throws -> JiraRemoteIssue {
+        let connector = try activeJiraConnector()
+        let updated = try await connector.transitionIssue(key: key, targetStatusText: targetStatus, comment: comment)
+        await boardWebEvaluator?.refreshBoardAfterJiraMutation(highlightIssueKey: updated.key)
+        return updated
+    }
+
+    public func assignJiraIssue(
+        key: String,
+        assignee: JiraUserContact?
+    ) async throws -> JiraRemoteIssue {
+        let connector = try activeJiraConnector()
+        let updated = try await connector.assignIssue(key: key, assignee: assignee)
+        await boardWebEvaluator?.refreshBoardAfterJiraMutation(highlightIssueKey: updated.key)
+        return updated
+    }
+
+    public func createJiraIssueDirect(
+        summary: String,
+        description: String = "",
+        projectKey: String? = nil,
+        issueKind: TaskIssueKind = .task,
+        assignee: JiraUserContact? = nil,
+        priority: TaskPriorityLevel? = nil,
+        parentEpicKey: String? = nil
+    ) async throws -> JiraRemoteIssue {
+        let connector = try activeJiraConnector()
+        let boardContextProject: String? = {
+            guard let url = boardWebEvaluator?.currentBoardURL else { return nil }
+            return JiraBoardContextInfo.parse(from: url)?.projectKey
+        }()
+        let resolvedProject = projectKey?.cleanedNilIfEmpty
+            ?? preferences.jira.cleanProjectKey.cleanedNilIfEmpty
+            ?? boardContextProject
+        guard let resolvedProject, !resolvedProject.isEmpty else {
+            throw JiraConnectorError.badRequest(L("Jira project key is required."))
+        }
+        let payload = JiraIssueWritePayload(
+            projectKey: resolvedProject,
+            issueType: preferences.jira.defaultIssueType.cleanedNilIfEmpty ?? "Task",
+            issueKind: issueKind,
+            parentEpicKey: parentEpicKey,
+            summary: summary,
+            description: description,
+            priority: priority,
+            assignee: assignee
+        )
+        let created = try await connector.createIssue(payload)
+        await boardWebEvaluator?.refreshBoardAfterJiraMutation(highlightIssueKey: created.key)
+        return created
     }
 }

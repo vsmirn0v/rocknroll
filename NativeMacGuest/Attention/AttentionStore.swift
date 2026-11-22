@@ -415,6 +415,10 @@ struct AttentionDecisionRecord: Codable, Equatable, Sendable {
         didSet { defaults.set(autonomousMeetingVoiceEnabled, forKey: Self.autonomousVoiceKey) }
     }
     static let autonomousVoiceKey = "assistant.autonomous.voiceEnabled"
+    @Published var lastBoardURL: String {
+        didSet { defaults.set(lastBoardURL, forKey: Self.lastBoardURLKey) }
+    }
+    static let lastBoardURLKey = "assistant.board.lastURL"
     @Published private(set) var keyedRealtimeProviders: Set<RealtimeProviderKind> = []
     /// Output-device UIDs the person marked with "This is a headphone".
     @Published private(set) var headphoneUIDs: Set<String>
@@ -578,6 +582,7 @@ struct AttentionDecisionRecord: Codable, Equatable, Sendable {
         realtimeVoiceRole = defaults.string(forKey: YandexRealtimePreferences.voiceRoleKey) ?? ""
         selectedSkillIDs = defaults.stringArray(forKey: Self.selectedSkillsKey) ?? []
         autonomousMeetingVoiceEnabled = defaults.object(forKey: Self.autonomousVoiceKey) as? Bool ?? false
+        lastBoardURL = defaults.string(forKey: Self.lastBoardURLKey) ?? ""
         headphoneUIDs = Set(defaults.stringArray(forKey: Self.headphoneUIDsKey) ?? [])
         provider = defaults.data(forKey: Self.providerKey).flatMap { try? JSONDecoder().decode(AttentionProvider.self, from: $0) }
             ?? AttentionProvider.defaults[.openAI]!

@@ -409,9 +409,11 @@ public enum DefaultAssistantSkills {
 
             ## How to Run a Standup
             1. If a Jira board URL is configured in Team Context or requested by the user, open it in the Assistant Board window and start sharing it into the active meeting (`rocknroll_control_board` with `open_url` then `share_to_meeting`).
-            2. Inspect visible tickets (`inspect`) and filter/scroll smoothly as each team member speaks (`filter`, `scroll`, `highlight`).
-            3. Invite each teammate sequentially (yesterday, today, blockers), keeping spoken replies concise (1–3 sentences) when answering by voice in a meeting.
-            4. Check `People.md` (`rocknroll_manage_people` `lookup`) to resolve spoken or meeting display names into Jira usernames/account IDs — never put an unmapped meeting name directly into JQL. If a person's Jira handle is missing, run `rocknroll_jira_action` (`operation: "search_users"`), ask the speaker to confirm the candidate or share their Jira username/email, save it with `rocknroll_manage_people` (`upsert`, passing the meeting display name in `aliases`), and then run the Jira lookup or update.
+            2. Inspect visible tickets (`inspect`) and visible people on the board (`rocknroll_jira_action` `board_users`).
+            3. Before asking a teammate for their status update while the board is open/shared, **visibly select their board filter** (`rocknroll_control_board` with `command: "select_person_filter"`, `query: "<person name>"`) so the screen focuses on their tasks. When moving to general team overview, call `clear_filters`.
+            4. Invite each teammate sequentially (yesterday, today, blockers), keeping spoken replies concise (1–3 sentences) when answering by voice in a meeting.
+            5. When status changes or comments are agreed during the call, execute them live (`rocknroll_control_board` `move_issue` or `rocknroll_jira_action` `transition` / `assign` / `comment` / `create`) so the card moves visibly on the board.
+            6. Check `People.md` (`rocknroll_manage_people` `lookup`) to resolve spoken or meeting display names into Jira usernames/account IDs — never put an unmapped meeting name directly into JQL. If a person's Jira handle is missing, run `rocknroll_jira_action` (`search_users` or `board_users`, or `copy_user_from_issue` if they ask to copy from an assigned card), ask the speaker to confirm the matching candidate BEFORE saving `People.md`, and then run the Jira action.
 
             ## Authorization & Task Changes
             - Only execute task creation, updates, reassignments, or Jira changes when instructed by an **approved speaker** (the local app owner is always approved) or directly confirmed in chat/voice by the owner.
@@ -437,8 +439,8 @@ public enum DefaultAssistantSkills {
             ## Core Responsibilities
             1. When asked to create, complete, edit, assign, or reassign a task:
                - Search existing tasks first (`rocknroll_list_tasks` or `rocknroll_search`) to avoid duplicates and obtain the current `task_id` and `expected_revision` when updating.
-               - Resolve assignee names through `People.md` (`rocknroll_manage_people` with `lookup`) so meeting display names map cleanly to Jira usernames/account IDs. If not mapped in `People.md`, search Jira users (`rocknroll_jira_action` with `operation: "search_users"`) and ask participants to confirm a candidate or provide their Jira username/email before saving to `People.md` (`upsert`).
-               - Use `rocknroll_create_task` for new items and `rocknroll_update_task` for status/owner/title/due-date changes or Jira sync.
+               - Resolve assignee names through `People.md` (`rocknroll_manage_people` with `lookup`) so meeting display names map cleanly to Jira usernames/account IDs. If not mapped in `People.md`: if the user asks to copy it from a task on the board, call `rocknroll_jira_action` (`operation: "copy_user_from_issue"`); otherwise search Jira users (`rocknroll_jira_action` `search_users` or `board_users`) and ask participants to confirm a candidate BEFORE saving to `People.md` (`upsert`).
+               - For direct Jira board actions (creating an issue, moving columns/status, assigning, or commenting), call `rocknroll_jira_action` (`create`, `transition`, `assign`, `comment`), and use `rocknroll_create_task` / `rocknroll_update_task` for local meeting tasks.
             2. When a person's Jira handle, email, or nickname/alias is mentioned during a conversation, offer or save the mapping via `rocknroll_manage_people` (`upsert`) so future assignments work automatically.
             3. Keep meeting summaries accurate: after significant task changes inside a meeting, reflect decisions or updated owners via `rocknroll_update_meeting_artifacts`.
             4. If the user asks to book a follow-up working session for a task or blocker, schedule it with `rocknroll_schedule_meeting`.

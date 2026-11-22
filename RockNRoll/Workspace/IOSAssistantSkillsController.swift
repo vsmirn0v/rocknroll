@@ -16,16 +16,32 @@ final class IOSAssistantSkillsController: ObservableObject {
     @Published var storageError: String?
 
     @Published var realtimeProvider: RealtimeProviderKind {
-        didSet { preferences.set(realtimeProvider.rawValue, forKey: Keys.realtimeProvider) }
+        didSet {
+            guard oldValue != realtimeProvider else { return }
+            preferences.set(realtimeProvider.rawValue, forKey: Keys.realtimeProvider)
+            notifyLocalCloudSyncableChange()
+        }
     }
     @Published var realtimeModel: String {
-        didSet { preferences.set(realtimeModel, forKey: Keys.realtimeModel) }
+        didSet {
+            guard oldValue != realtimeModel else { return }
+            preferences.set(realtimeModel, forKey: Keys.realtimeModel)
+            notifyLocalCloudSyncableChange()
+        }
     }
     @Published var realtimeVoice: String {
-        didSet { preferences.set(realtimeVoice, forKey: Keys.realtimeVoice) }
+        didSet {
+            guard oldValue != realtimeVoice else { return }
+            preferences.set(realtimeVoice, forKey: Keys.realtimeVoice)
+            notifyLocalCloudSyncableChange()
+        }
     }
     @Published var realtimeEndpoint: String {
-        didSet { preferences.set(realtimeEndpoint, forKey: Keys.realtimeEndpoint) }
+        didSet {
+            guard oldValue != realtimeEndpoint else { return }
+            preferences.set(realtimeEndpoint, forKey: Keys.realtimeEndpoint)
+            notifyLocalCloudSyncableChange()
+        }
     }
     @Published var realtimeFolderID: String {
         didSet {
@@ -38,18 +54,40 @@ final class IOSAssistantSkillsController: ObservableObject {
                     userInfo: ["isStandard": preferences === UserDefaults.standard]
                 )
             }
+            notifyLocalCloudSyncableChange()
         }
     }
     @Published var realtimeVoiceRole: String {
-        didSet { preferences.set(realtimeVoiceRole, forKey: YandexRealtimePreferences.voiceRoleKey) }
+        didSet {
+            guard oldValue != realtimeVoiceRole else { return }
+            preferences.set(realtimeVoiceRole, forKey: YandexRealtimePreferences.voiceRoleKey)
+            notifyLocalCloudSyncableChange()
+        }
     }
     @Published var selectedSkillIDs: [String] {
-        didSet { preferences.set(selectedSkillIDs, forKey: Keys.selectedSkillIDs) }
+        didSet {
+            guard oldValue != selectedSkillIDs else { return }
+            preferences.set(selectedSkillIDs, forKey: Keys.selectedSkillIDs)
+            notifyLocalCloudSyncableChange()
+        }
     }
     @Published var autonomousMeetingVoiceEnabled: Bool {
-        didSet { preferences.set(autonomousMeetingVoiceEnabled, forKey: Keys.autonomousMeetingVoice) }
+        didSet {
+            guard oldValue != autonomousMeetingVoiceEnabled else { return }
+            preferences.set(autonomousMeetingVoiceEnabled, forKey: Keys.autonomousMeetingVoice)
+            notifyLocalCloudSyncableChange()
+        }
+    }
+    @Published var lastBoardURL: String {
+        didSet {
+            guard oldValue != lastBoardURL else { return }
+            preferences.set(lastBoardURL, forKey: Keys.lastBoardURL)
+            notifyLocalCloudSyncableChange()
+        }
     }
     @Published private(set) var keyedRealtimeProviders: Set<RealtimeProviderKind> = []
+
+    var onLocalCloudSyncableChange: (() -> Void)?
 
     private enum Keys {
         static let vaultBookmark = "ios.assistant.obsidianVaultBookmark.v1"
@@ -59,6 +97,7 @@ final class IOSAssistantSkillsController: ObservableObject {
         static let realtimeEndpoint = "ios.assistant.realtime.endpoint.v1"
         static let selectedSkillIDs = "ios.assistant.selectedSkillIDs.v1"
         static let autonomousMeetingVoice = "ios.assistant.autonomousMeetingVoice.v1"
+        static let lastBoardURL = "ios.assistant.lastBoardURL.v1"
     }
 
     private weak var workspace: IOSWorkspaceCoordinator?
@@ -69,6 +108,7 @@ final class IOSAssistantSkillsController: ObservableObject {
     private var watchedVaultURL: URL?
     private var hasLoadedOnce = false
     private var suppressCredentialBroadcast = false
+    private var isApplyingRemoteCloudSync = false
     private var credentialObserver: NSObjectProtocol?
 
     init(
@@ -91,6 +131,7 @@ final class IOSAssistantSkillsController: ObservableObject {
         self.realtimeVoiceRole = preferences.string(forKey: YandexRealtimePreferences.voiceRoleKey) ?? ""
         self.selectedSkillIDs = preferences.stringArray(forKey: Keys.selectedSkillIDs) ?? ["scrum-master"]
         self.autonomousMeetingVoiceEnabled = preferences.object(forKey: Keys.autonomousMeetingVoice) as? Bool ?? false
+        self.lastBoardURL = preferences.string(forKey: Keys.lastBoardURL) ?? ""
 
         refreshRealtimeKeyIndicators()
         refresh()
@@ -187,6 +228,7 @@ final class IOSAssistantSkillsController: ObservableObject {
         storageError = nil
         refresh()
         startWatcher()
+        notifyLocalCloudSyncableChange()
     }
 
     func clearObsidianFolder() {
@@ -194,6 +236,7 @@ final class IOSAssistantSkillsController: ObservableObject {
         storageError = nil
         refresh()
         startWatcher()
+        notifyLocalCloudSyncableChange()
     }
 
     func refresh() {
@@ -232,7 +275,9 @@ final class IOSAssistantSkillsController: ObservableObject {
 
         let watcher = AssistantSkillFolderWatcher(rootURL: watchRoot) { [weak self] in
             Task { @MainActor [weak self] in
-                self?.refresh()
+                guard let self else { return }
+                self.refresh()
+                self.notifyLocalCloudSyncableChange()
             }
         }
         watcher.start()
@@ -250,12 +295,18 @@ final class IOSAssistantSkillsController: ObservableObject {
 
     // MARK: - Skills, Core Prompts & People CRUD
 
+    private func notifyLocalCloudSyncableChange() {
+        guard !isApplyingRemoteCloudSync else { return }
+        onLocalCloudSyncableChange?()
+    }
+
     @discardableResult
     func saveSkill(_ skill: AssistantSkill) throws -> AssistantSkill {
         let saved = try withRepository { repo, _ in
             try repo.saveSkill(skill)
         }
         refresh()
+        notifyLocalCloudSyncableChange()
         return saved
     }
 
@@ -265,6 +316,7 @@ final class IOSAssistantSkillsController: ObservableObject {
         }
         selectedSkillIDs.removeAll { $0 == id }
         refresh()
+        notifyLocalCloudSyncableChange()
     }
 
     func restoreDefaultSkill(id: String? = nil) throws {
@@ -276,6 +328,7 @@ final class IOSAssistantSkillsController: ObservableObject {
             }
         }
         refresh()
+        notifyLocalCloudSyncableChange()
     }
 
     @discardableResult
@@ -284,6 +337,7 @@ final class IOSAssistantSkillsController: ObservableObject {
             try repo.savePrompt(kind, content: content)
         }
         refresh()
+        notifyLocalCloudSyncableChange()
         return saved
     }
 
@@ -293,6 +347,7 @@ final class IOSAssistantSkillsController: ObservableObject {
             try repo.restoreDefaultPrompt(kind)
         }
         refresh()
+        notifyLocalCloudSyncableChange()
         return restored
     }
 
@@ -311,21 +366,8 @@ final class IOSAssistantSkillsController: ObservableObject {
             try repo.upsertPerson(entry, allowPrivilegeChange: allowPrivilegeChange)
         }
         refresh()
-        let handle = entry.jiraAccountID ?? entry.jiraUsername
-        if let handle, !handle.isEmpty, let workspace {
-            let appPerson = entry.toAppContactPerson()
-            let jiraUser = JiraUserContact(
-                identifier: handle,
-                username: entry.jiraUsername ?? handle,
-                accountId: entry.jiraAccountID,
-                displayName: entry.displayName,
-                emailAddress: entry.email,
-                isServerOrDC: entry.jiraAccountID == nil
-            )
-            Task { @MainActor in
-                await workspace.taskSync.setManualContactMapping(appContact: appPerson, jiraUser: jiraUser)
-            }
-        }
+        mirrorJiraMappingIfConfirmed(entry)
+        notifyLocalCloudSyncableChange()
         return updated
     }
 
@@ -334,6 +376,10 @@ final class IOSAssistantSkillsController: ObservableObject {
             try repo.savePeople(directory)
         }
         refresh()
+        for entry in directory.entries {
+            mirrorJiraMappingIfConfirmed(entry)
+        }
+        notifyLocalCloudSyncableChange()
     }
 
     @discardableResult
@@ -342,6 +388,7 @@ final class IOSAssistantSkillsController: ObservableObject {
             try repo.removePerson(id: id)
         }
         refresh()
+        notifyLocalCloudSyncableChange()
         return updated
     }
 
@@ -350,6 +397,102 @@ final class IOSAssistantSkillsController: ObservableObject {
             try repo.saveTeamContext(doc)
         }
         refresh()
+        notifyLocalCloudSyncableChange()
+    }
+
+    private func mirrorJiraMappingIfConfirmed(_ entry: AssistantPersonEntry) {
+        let handle = entry.jiraAccountID ?? entry.jiraUsername
+        guard let handle, !handle.isEmpty, let workspace else { return }
+        let appPerson = entry.toAppContactPerson()
+        if let existing = workspace.taskSync.preferences.contactMappings.first(where: { $0.appContactKey == appPerson.key }),
+           existing.isConfirmedByUser,
+           existing.jiraIdentifier == handle {
+            return
+        }
+        let jiraUser = JiraUserContact(
+            identifier: handle,
+            username: entry.jiraUsername ?? handle,
+            accountId: entry.jiraAccountID,
+            displayName: entry.displayName,
+            emailAddress: entry.email,
+            isServerOrDC: entry.jiraAccountID == nil
+        )
+        Task { @MainActor in
+            await workspace.taskSync.setManualContactMapping(appContact: appPerson, jiraUser: jiraUser)
+        }
+    }
+
+    func currentCloudSyncInput() -> AssistantCloudSync.LocalSnapshotInput {
+        if !hasLoadedOnce {
+            refresh()
+        }
+        return AssistantCloudSync.LocalSnapshotInput(
+            people: people,
+            teamContext: teamContext,
+            skills: skills,
+            prompts: prompts,
+            preferences: LocalAssistantPortablePreferences(
+                selectedSkillIDs: selectedSkillIDs,
+                autonomousMeetingVoiceEnabled: autonomousMeetingVoiceEnabled,
+                realtimeProvider: realtimeProvider.rawValue,
+                realtimeModel: realtimeModel,
+                realtimeVoice: realtimeVoice,
+                realtimeEndpoint: realtimeEndpoint,
+                realtimeFolderID: realtimeFolderID,
+                realtimeVoiceRole: realtimeVoiceRole,
+                lastBoardURL: lastBoardURL
+            )
+        )
+    }
+
+    @discardableResult
+    func applyRemoteCloudSync(
+        settings: [String: SyncedMeetingContextSettings],
+        previousBaseline: AssistantLocalSyncBaseline?
+    ) -> AssistantLocalSyncBaseline? {
+        guard let plan = AssistantCloudSync.planRemoteApplication(
+            from: settings,
+            currentInput: currentCloudSyncInput(),
+            previousBaseline: previousBaseline
+        ) else {
+            return previousBaseline
+        }
+        guard plan.hasAnyChange else {
+            return plan.updatedBaseline
+        }
+        isApplyingRemoteCloudSync = true
+        defer { isApplyingRemoteCloudSync = false }
+
+        do {
+            try withRepository { repo, _ in
+                try AssistantCloudSync.applyRepositoryChanges(from: plan, to: repo)
+            }
+        } catch {
+            storageError = error.localizedDescription
+        }
+
+        if let prefs = plan.updatedPreferences {
+            if selectedSkillIDs != prefs.selectedSkillIDs { selectedSkillIDs = prefs.selectedSkillIDs }
+            if autonomousMeetingVoiceEnabled != prefs.autonomousMeetingVoiceEnabled {
+                autonomousMeetingVoiceEnabled = prefs.autonomousMeetingVoiceEnabled
+            }
+            let nextProvider = RealtimeProviderKind(rawValue: prefs.realtimeProvider) ?? .disabled
+            if realtimeProvider != nextProvider { realtimeProvider = nextProvider }
+            if realtimeModel != prefs.realtimeModel { realtimeModel = prefs.realtimeModel }
+            if realtimeVoice != prefs.realtimeVoice { realtimeVoice = prefs.realtimeVoice }
+            if realtimeEndpoint != prefs.realtimeEndpoint { realtimeEndpoint = prefs.realtimeEndpoint }
+            if realtimeFolderID != prefs.realtimeFolderID { realtimeFolderID = prefs.realtimeFolderID }
+            if realtimeVoiceRole != prefs.realtimeVoiceRole { realtimeVoiceRole = prefs.realtimeVoiceRole }
+            if lastBoardURL != prefs.lastBoardURL { lastBoardURL = prefs.lastBoardURL }
+        }
+
+        refresh()
+        if let updatedPeople = plan.updatedPeople {
+            for entry in updatedPeople.entries {
+                mirrorJiraMappingIfConfirmed(entry)
+            }
+        }
+        return plan.updatedBaseline
     }
 
     func searchKnowledge(query: String, limit: Int = 8) -> [AssistantKnowledgeSearchHit] {
@@ -670,5 +813,67 @@ final class IOSAssistantSkillsController: ObservableObject {
     func commentOnJiraIssue(key: String, comment: String) async throws {
         guard let workspace else { return }
         try await workspace.taskSync.commentOnJiraIssue(key: key, comment: comment)
+    }
+
+    var isJiraConnected: Bool {
+        guard let workspace else { return false }
+        return (try? workspace.taskSync.activeJiraConnector()) != nil
+    }
+
+    func fetchJiraBoardUsersAndIssues(maxResults: Int = 50) async throws -> (users: [JiraUserContact], issues: [JiraRemoteIssue]) {
+        guard let workspace else { return ([], []) }
+        return try await workspace.taskSync.fetchBoardUsersAndIssues(maxResults: maxResults)
+    }
+
+    func copyJiraUserFromIssue(
+        issueKey: String?,
+        searchQuery: String?,
+        role: String = "assignee"
+    ) async throws -> (user: JiraUserContact, issueKey: String) {
+        guard let workspace else {
+            throw JiraConnectorError.badRequest(L("Workspace is unavailable."))
+        }
+        return try await workspace.taskSync.copyJiraUserFromIssue(
+            issueKey: issueKey,
+            searchQuery: searchQuery,
+            role: role
+        )
+    }
+
+    func transitionJiraIssue(key: String, status: String, comment: String? = nil) async throws -> JiraRemoteIssue {
+        guard let workspace else {
+            throw JiraConnectorError.badRequest(L("Workspace is unavailable."))
+        }
+        return try await workspace.taskSync.transitionJiraIssue(key: key, targetStatus: status, comment: comment)
+    }
+
+    func assignJiraIssue(key: String, assignee: JiraUserContact?) async throws -> JiraRemoteIssue {
+        guard let workspace else {
+            throw JiraConnectorError.badRequest(L("Workspace is unavailable."))
+        }
+        return try await workspace.taskSync.assignJiraIssue(key: key, assignee: assignee)
+    }
+
+    func createJiraIssueDirect(
+        summary: String,
+        description: String = "",
+        projectKey: String? = nil,
+        issueKind: TaskIssueKind = .task,
+        assignee: JiraUserContact? = nil,
+        priority: TaskPriorityLevel? = nil,
+        parentEpicKey: String? = nil
+    ) async throws -> JiraRemoteIssue {
+        guard let workspace else {
+            throw JiraConnectorError.badRequest(L("Workspace is unavailable."))
+        }
+        return try await workspace.taskSync.createJiraIssueDirect(
+            summary: summary,
+            description: description,
+            projectKey: projectKey,
+            issueKind: issueKind,
+            assignee: assignee,
+            priority: priority,
+            parentEpicKey: parentEpicKey
+        )
     }
 }

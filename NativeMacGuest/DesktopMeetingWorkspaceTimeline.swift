@@ -1,4 +1,5 @@
 import AppKit
+import ConferenceCore
 import SwiftUI
 
 /// Keep follow mode stable across layout and programmatic scroll changes; only
@@ -107,6 +108,17 @@ extension MeetingWorkspaceEvent {
     var displayAuthor: String {
         if kind == .assistantReply { return isPrivate ? L("Assistant") : L("You · via assistant") }
         if kind == .privateGuidance { return L("Your private guidance") }
+        if source == "assistantVoice" || AssistantSpeechLedger.isAssistantSpeaker(author, role: nil) {
+            return L("Rock Assistant")
+        }
+        if kind == .transcript && (source == "own" || source == "localOwn") {
+            return AssistantSpeechLedger.displayAuthor(
+                speaker: author,
+                isOwn: true,
+                speakerRole: AssistantSpeechLedger.speakerRoleUser,
+                youLabel: L("You")
+            )
+        }
         return author ?? (kind == .transcript ? L("Unknown speaker") : L("Conversation"))
     }
 
@@ -162,7 +174,10 @@ extension MeetingWorkspaceEvent {
         case .assistantReply: isPrivate ? L("Private text · not sent") : L("Delivery unknown")
         case .privateGuidance: L("Private")
         case .chat: L("Meeting chat")
-        case .transcript: source == "local" ? L("On-device transcript") : L("Service transcript")
+        case .transcript:
+            source == "assistantVoice"
+                ? L("Assistant reply")
+                : ((source == "local" || source == "localOwn") ? L("On-device transcript") : L("Service transcript"))
         case .captureGap: L("Speech capture gap")
         case .action: L("Workspace activity")
         }

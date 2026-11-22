@@ -277,13 +277,15 @@ enum AssistantSkillToolRegistrar {
         attention: AttentionCoordinator,
         allowComments: Bool
     ) {
-        let allowedOps = allowComments ? ["search", "search_users", "comment"] : ["search", "search_users"]
+        let allowedOps = allowComments
+            ? ["search", "search_users", "board_users", "copy_user_from_issue", "comment", "transition", "assign", "create"]
+            : ["search", "search_users", "board_users"]
         registry.register(AgentSkillClosureTool(
             descriptor: .init(
                 name: "rocknroll_jira_action",
                 description: allowComments
-                    ? "Search Jira issues with JQL/text/assignee, search Jira users to bind to People.md, or post a comment directly on an existing Jira issue."
-                    : "Search Jira issues read-only using JQL/text/assignee, or search Jira users to match with People.md.",
+                    ? "Search Jira issues/board users, copy a Jira user from an issue on the board, create/assign/transition issues, or post a comment."
+                    : "Search Jira issues read-only using JQL/text/assignee, or inspect board/Jira users to match with People.md.",
                 arguments: [
                     .init(name: "operation", type: .string, required: true, allowedValues: allowedOps),
                     .init(name: "jql", type: .string, required: false),
@@ -292,6 +294,18 @@ enum AssistantSkillToolRegistrar {
                     .init(name: "max_results", type: .integer, required: false),
                     .init(name: "issue_key", type: .string, required: false),
                     .init(name: "comment", type: .string, required: false),
+                    .init(name: "status", type: .string, required: false),
+                    .init(name: "role", type: .string, required: false, allowedValues: ["assignee", "reporter"]),
+                    .init(name: "save_to_people_name", type: .string, required: false),
+                    .init(name: "aliases", type: .array, required: false),
+                    .init(name: "summary", type: .string, required: false),
+                    .init(name: "description", type: .string, required: false),
+                    .init(name: "project_key", type: .string, required: false),
+                    .init(name: "issue_kind", type: .string, required: false, allowedValues: ["task", "story", "bug", "epic"]),
+                    .init(name: "priority", type: .string, required: false, allowedValues: ["critical", "high", "medium", "low"]),
+                    .init(name: "parent_epic_key", type: .string, required: false),
+                    .init(name: "jira_username", type: .string, required: false),
+                    .init(name: "jira_account_id", type: .string, required: false),
                 ]
             )
         ) { call, args in
@@ -327,6 +341,202 @@ enum AssistantSkillToolRegistrar {
                     toolName: call.name,
                     json: .object(("users", .array(rows))),
                     summary: L("Found %ld Jira users.", rows.count)
+                )
+            case "board_users":
+                let maxResults = max(1, min(args["max_results"]?.intValue ?? 40, 60))
+                let (users, issues) = try await attention.taskSync.fetchBoardUsersAndIssues(maxResults: maxResults)
+                return .init(
+                    callID: call.id,
+                    toolName: call.name,
+                    json: .object(
+                        ("users", .array(users.map { AssistantJSON.make(WorkspaceTaskSyncController.jiraUserPayload($0)) })),
+                        ("issues", .array(issues.map { AssistantJSON.make(WorkspaceTaskSyncController.jiraIssuePayload($0)) }))
+                    ),
+                    summary: L("Found %ld users across %ld board issues.", users.count, issues.count)
+                )
+            case "copy_user_from_issue":
+                guard allowComments else {
+                    return .error(call, L("Copying Jira users requires an approved speaker."))
+                }
+                let (copiedUser, sourceIssueKey) = try await attention.taskSync.copyJiraUserFromIssue(
+                    issueKey: args["issue_key"]?.stringValue,
+                    searchQuery: args["query"]?.stringValue,
+                    role: args["role"]?.stringValue ?? "assignee"
+                )
+                var savedToPeople = false
+                if let targetName = args["save_to_people_name"]?.stringValue?.trimmed, !targetName.isEmpty {
+                    let people = await attention.loadPeopleDirectory()
+                    let existing = people.resolvePerson(matching: targetName)
+                    let extraAliases = args["aliases"]?.arrayValue?.compactMap(\.stringValue) ?? []
+                    var mergedAliases = (existing?.aliases ?? []) + extraAliases
+                    if existing?.displayName.caseInsensitiveCompare(targetName) != .orderedSame {
+                        mergedAliases.append(targetName)
+                    }
+                    let entry = AssistantPersonEntry(
+                        id: existing?.id,
+                        displayName: existing?.displayName ?? targetName,
+                        aliases: AssistantPersonEntry.deduped(mergedAliases),
+                        jiraUsername: copiedUser.username ?? (copiedUser.isServerOrDC ? copiedUser.identifier : existing?.jiraUsername),
+                        jiraAccountID: copiedUser.accountId ?? (!copiedUser.isServerOrDC ? copiedUser.identifier : existing?.jiraAccountID),
+                        email: copiedUser.emailAddress ?? existing?.email,
+                        role: existing?.role,
+                        approvedVoiceCommander: existing?.approvedVoiceCommander ?? false,
+                        notes: existing?.notes
+                    )
+                    _ = try await attention.upsertPersonMapping(entry, allowPrivilegeChange: false)
+                    savedToPeople = true
+                }
+                return .init(
+                    callID: call.id,
+                    toolName: call.name,
+                    json: .object(
+                        ("issue_key", .string(sourceIssueKey)),
+                        ("copied_user", AssistantJSON.make(WorkspaceTaskSyncController.jiraUserPayload(copiedUser))),
+                        ("saved_to_people", .bool(savedToPeople))
+                    ),
+                    summary: L("Copied Jira user %@ from %@.", copiedUser.displayName, sourceIssueKey)
+                )
+            case "transition":
+                guard allowComments else {
+                    return .error(call, L("Jira status changes require an approved speaker."))
+                }
+                guard let key = args["issue_key"]?.stringValue?.trimmed, !key.isEmpty,
+                      let status = args["status"]?.stringValue?.trimmed, !status.isEmpty else {
+                    throw AssistantAgentError.missingArgument(call.name, "issue_key, status")
+                }
+                let updated = try await attention.taskSync.transitionJiraIssue(
+                    key: key,
+                    targetStatus: status,
+                    comment: args["comment"]?.stringValue
+                )
+                return .init(
+                    callID: call.id,
+                    toolName: call.name,
+                    json: .object(("transitioned", .bool(true)), ("issue", AssistantJSON.make(WorkspaceTaskSyncController.jiraIssuePayload(updated)))),
+                    summary: L("Moved %@ to %@.", updated.key, updated.statusName)
+                )
+            case "assign":
+                guard allowComments else {
+                    return .error(call, L("Jira assignment requires an approved speaker."))
+                }
+                guard let key = args["issue_key"]?.stringValue?.trimmed, !key.isEmpty else {
+                    throw AssistantAgentError.missingArgument(call.name, "issue_key")
+                }
+                let assigneeContact: JiraUserContact?
+                if let accountID = args["jira_account_id"]?.stringValue?.trimmed, !accountID.isEmpty {
+                    assigneeContact = JiraUserContact(
+                        identifier: accountID,
+                        username: args["jira_username"]?.stringValue?.trimmed,
+                        accountId: accountID,
+                        displayName: args["assignee"]?.stringValue?.trimmed ?? accountID,
+                        isServerOrDC: false
+                    )
+                } else if let username = args["jira_username"]?.stringValue?.trimmed, !username.isEmpty {
+                    assigneeContact = JiraUserContact(
+                        identifier: username,
+                        username: username,
+                        accountId: nil,
+                        displayName: args["assignee"]?.stringValue?.trimmed ?? username,
+                        isServerOrDC: true
+                    )
+                } else if let rawAssignee = args["assignee"]?.stringValue?.trimmed, !rawAssignee.isEmpty {
+                    let people = await attention.loadPeopleDirectory()
+                    let team = await attention.loadTeamContext()
+                    switch await attention.taskSync.resolveJiraAssignee(
+                        rawAssignee,
+                        people: people,
+                        defaultProjectKey: team.defaultJiraProjectKey
+                    ) {
+                    case .resolved(let handle, let person):
+                        let isDC = await MainActor.run { !attention.taskSync.preferences.jira.isCloudHost }
+                        assigneeContact = JiraUserContact(
+                            identifier: handle,
+                            username: person?.jiraUsername ?? handle,
+                            accountId: person?.jiraAccountID,
+                            displayName: person?.displayName ?? rawAssignee,
+                            isServerOrDC: person?.jiraAccountID == nil && isDC
+                        )
+                    case .unresolved(let unresolvedQuery, let candidates):
+                        let payload = WorkspaceTaskSyncController.unresolvedJiraAssigneePayload(
+                            query: unresolvedQuery,
+                            candidates: candidates
+                        )
+                        return .init(
+                            callID: call.id,
+                            toolName: call.name,
+                            json: AssistantJSON.make(payload),
+                            summary: L("Need user confirmation to match Jira user for “%@”.", unresolvedQuery)
+                        )
+                    }
+                } else {
+                    assigneeContact = nil
+                }
+                let updated = try await attention.taskSync.assignJiraIssue(key: key, assignee: assigneeContact)
+                return .init(
+                    callID: call.id,
+                    toolName: call.name,
+                    json: .object(("assigned", .bool(true)), ("issue", AssistantJSON.make(WorkspaceTaskSyncController.jiraIssuePayload(updated)))),
+                    summary: L("Assigned %@.", updated.key)
+                )
+            case "create":
+                guard allowComments else {
+                    return .error(call, L("Creating Jira issues requires an approved speaker."))
+                }
+                guard let summary = (args["summary"]?.stringValue ?? args["query"]?.stringValue)?.trimmed,
+                      !summary.isEmpty else {
+                    throw AssistantAgentError.missingArgument(call.name, "summary")
+                }
+                var assigneeContact: JiraUserContact?
+                if let rawAssignee = args["assignee"]?.stringValue?.trimmed, !rawAssignee.isEmpty {
+                    let people = await attention.loadPeopleDirectory()
+                    let team = await attention.loadTeamContext()
+                    switch await attention.taskSync.resolveJiraAssignee(
+                        rawAssignee,
+                        people: people,
+                        defaultProjectKey: team.defaultJiraProjectKey
+                    ) {
+                    case .resolved(let handle, let person):
+                        let isDC = await MainActor.run { !attention.taskSync.preferences.jira.isCloudHost }
+                        assigneeContact = JiraUserContact(
+                            identifier: handle,
+                            username: person?.jiraUsername ?? handle,
+                            accountId: person?.jiraAccountID,
+                            displayName: person?.displayName ?? rawAssignee,
+                            isServerOrDC: person?.jiraAccountID == nil && isDC
+                        )
+                    case .unresolved(let unresolvedQuery, let candidates):
+                        let payload = WorkspaceTaskSyncController.unresolvedJiraAssigneePayload(
+                            query: unresolvedQuery,
+                            candidates: candidates
+                        )
+                        return .init(
+                            callID: call.id,
+                            toolName: call.name,
+                            json: AssistantJSON.make(payload),
+                            summary: L("Need user confirmation to match Jira user for “%@”.", unresolvedQuery)
+                        )
+                    }
+                }
+                let team = await attention.loadTeamContext()
+                let explicitProject = args["project_key"]?.stringValue?.trimmed ?? ""
+                let teamProject = team.defaultJiraProjectKey.trimmed
+                let projectKey = explicitProject.isEmpty ? (teamProject.isEmpty ? nil : teamProject) : explicitProject
+                let kind = args["issue_kind"]?.stringValue.flatMap(TaskIssueKind.init(rawValue:)) ?? .task
+                let priority = args["priority"]?.stringValue.flatMap(TaskPriorityLevel.init(rawValue:))
+                let created = try await attention.taskSync.createJiraIssueDirect(
+                    summary: summary,
+                    description: args["description"]?.stringValue ?? "",
+                    projectKey: projectKey,
+                    issueKind: kind,
+                    assignee: assigneeContact,
+                    priority: priority,
+                    parentEpicKey: args["parent_epic_key"]?.stringValue
+                )
+                return .init(
+                    callID: call.id,
+                    toolName: call.name,
+                    json: .object(("created", .bool(true)), ("issue", AssistantJSON.make(WorkspaceTaskSyncController.jiraIssuePayload(created)))),
+                    summary: L("Created Jira issue %@.", created.key)
                 )
             case "search":
                 let team = await attention.loadTeamContext()
@@ -438,6 +648,7 @@ enum AssistantSkillToolRegistrar {
                     .init(name: "email", type: .string, required: false),
                     .init(name: "role", type: .string, required: false),
                     .init(name: "approved_voice_commander", type: .boolean, required: false),
+                    .init(name: "force_without_jira", type: .boolean, required: false),
                     .init(name: "aliases", type: .array, required: false),
                     .init(name: "notes", type: .string, required: false),
                 ]
@@ -452,13 +663,46 @@ enum AssistantSkillToolRegistrar {
                     ?? args["aliases"]?.stringValue.map {
                         $0.split(separator: ",").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
                     } ?? []
+                let jiraUser = args["jira_username"]?.stringValue?.trimmed
+                let jiraAccount = args["jira_account_id"]?.stringValue?.trimmed
+                let forceWithoutJira = args["force_without_jira"]?.boolValue ?? false
+                let directory = await attention.loadPeopleDirectory()
+                let existingMatch = directory.resolvePerson(matching: name)
+                let hasExistingHandle = !((existingMatch?.jiraAccountID ?? existingMatch?.jiraUsername ?? "").isEmpty)
+                let hasNewHandle = !(jiraUser ?? "").isEmpty || !(jiraAccount ?? "").isEmpty
+                let jiraConnected = await MainActor.run { (try? attention.taskSync.activeJiraConnector()) != nil }
+
+                if !hasNewHandle && !hasExistingHandle && !forceWithoutJira && jiraConnected {
+                    let team = await attention.loadTeamContext()
+                    let candidates = (try? await attention.taskSync.searchJiraUsers(
+                        query: name,
+                        projectKey: team.defaultJiraProjectKey.trimmed.isEmpty ? nil : team.defaultJiraProjectKey.trimmed,
+                        maxResults: 8
+                    )) ?? []
+                    let candidateRows = candidates.map { AssistantJSON.make(WorkspaceTaskSyncController.jiraUserPayload($0)) }
+                    return .init(
+                        callID: call.id,
+                        toolName: call.name,
+                        json: .object(
+                            ("saved", .bool(false)),
+                            ("needs_user_confirmation", .bool(true)),
+                            ("display_name", .string(name)),
+                            ("jira_user_candidates", .array(candidateRows)),
+                            ("instruction", .string(candidates.isEmpty
+                                ? "No Jira user matched automatically. Ask the user for their Jira username/email or copy it from a board task via copy_user_from_issue. Only pass force_without_jira=true if they have no Jira account."
+                                : "Ask the user which of these Jira candidates matches \(name), then call upsert with jira_username/jira_account_id."))
+                        ),
+                        summary: L("Confirm Jira user for %@ before saving People.md.", name)
+                    )
+                }
+
                 let explicitApproved = args["approved_voice_commander"]?.boolValue
                 let allowPrivilegeChange = allowPrivilegedActions && (explicitApproved != nil)
                 let entry = AssistantPersonEntry(
                     displayName: name,
                     aliases: rawAliases,
-                    jiraUsername: args["jira_username"]?.stringValue,
-                    jiraAccountID: args["jira_account_id"]?.stringValue,
+                    jiraUsername: jiraUser,
+                    jiraAccountID: jiraAccount,
                     email: args["email"]?.stringValue,
                     role: args["role"]?.stringValue,
                     approvedVoiceCommander: allowPrivilegeChange ? (explicitApproved ?? false) : false,
@@ -471,7 +715,12 @@ enum AssistantSkillToolRegistrar {
                 return .init(
                     callID: call.id,
                     toolName: call.name,
-                    json: .object(["saved": .bool(true), "count": .int(updated.entries.count), "id": .string(entry.id)]),
+                    json: .object(
+                        ("saved", .bool(true)),
+                        ("count", .int(updated.entries.count)),
+                        ("id", .string(entry.id)),
+                        ("jira_bound", .bool(hasNewHandle || hasExistingHandle))
+                    ),
                     summary: L("Saved team mapping for %@ in People.md.", entry.displayName)
                 )
             } else {
@@ -806,12 +1055,15 @@ enum AssistantSkillToolRegistrar {
                 description: "Open, inspect, capture a visual snapshot, filter, scroll, click (CSS/text or normalized canvas coordinates), highlight, or share the in-app Jira/Board browser window into an active meeting.",
                 arguments: [
                     .init(name: "command", type: .string, required: true,
-                          allowedValues: ["open_url", "share_to_meeting", "stop_share", "scroll", "filter", "click", "click_at", "highlight", "inspect", "snapshot"]),
+                          allowedValues: ["open_url", "share_to_meeting", "stop_share", "scroll", "filter", "select_person_filter", "clear_filters", "click", "click_at", "highlight", "inspect", "snapshot", "move_issue"]),
                     .init(name: "url", type: .string, required: false),
                     .init(name: "meeting_id", type: .string, required: false, description: "Active session UUID; defaults to selected meeting."),
                     .init(name: "query", type: .string, required: false),
                     .init(name: "selector", type: .string, required: false),
                     .init(name: "text", type: .string, required: false),
+                    .init(name: "issue_key", type: .string, required: false),
+                    .init(name: "status", type: .string, required: false),
+                    .init(name: "comment", type: .string, required: false),
                     .init(name: "delta_y", type: .integer, required: false),
                     .init(name: "x", type: .number, required: false, description: "Horizontal coordinate for click_at (normalized 0.0...1.0 unless normalized=false)."),
                     .init(name: "y", type: .number, required: false, description: "Vertical coordinate for click_at (normalized 0.0...1.0 unless normalized=false)."),
@@ -868,6 +1120,30 @@ enum AssistantSkillToolRegistrar {
             case "filter":
                 let msg = try await board.filter(query: args["query"]?.stringValue ?? args["text"]?.stringValue ?? "")
                 return .init(callID: call.id, toolName: call.name, json: .object(["message": .string(msg)]), summary: msg)
+            case "select_person_filter":
+                let people = await attention.loadPeopleDirectory()
+                let query = args["query"]?.stringValue ?? args["text"]?.stringValue ?? ""
+                let msg = try await board.selectPersonFilter(query: query, people: people)
+                return .init(callID: call.id, toolName: call.name, json: .object(["message": .string(msg)]), summary: msg)
+            case "clear_filters":
+                let msg = try await board.clearFilters()
+                return .init(callID: call.id, toolName: call.name, json: .object(["message": .string(msg)]), summary: msg)
+            case "move_issue":
+                guard let key = args["issue_key"]?.stringValue?.trimmed, !key.isEmpty,
+                      let status = (args["status"]?.stringValue ?? args["text"]?.stringValue)?.trimmed, !status.isEmpty else {
+                    throw AssistantAgentError.missingArgument(call.name, "issue_key, status")
+                }
+                let updated = try await attention.taskSync.transitionJiraIssue(
+                    key: key,
+                    targetStatus: status,
+                    comment: args["comment"]?.stringValue
+                )
+                return .init(
+                    callID: call.id,
+                    toolName: call.name,
+                    json: .object(("moved", .bool(true)), ("issue", AssistantJSON.make(WorkspaceTaskSyncController.jiraIssuePayload(updated)))),
+                    summary: L("Moved %@ to %@.", updated.key, updated.statusName)
+                )
             case "click":
                 let msg = try await board.click(selector: args["selector"]?.stringValue, text: args["text"]?.stringValue)
                 return .init(callID: call.id, toolName: call.name, json: .object(["message": .string(msg)]), summary: msg)

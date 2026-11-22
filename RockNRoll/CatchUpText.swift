@@ -15,9 +15,15 @@ enum CatchUpText {
     }
 
     private static func describe(_ segment: TranscriptSegment) -> String {
-        let speaker = segment.speaker?.isEmpty == false ? segment.speaker! : L("Participant")
+        let speaker = AssistantSpeechLedger.displayAuthor(
+            speaker: segment.speaker,
+            isOwn: segment.isOwn == true,
+            speakerRole: segment.speakerRole,
+            youLabel: L("You")
+        )
+        let resolvedSpeaker = speaker.isEmpty ? L("Participant") : speaker
         let time = segment.spokenAt.map { "[\(clock($0))] " } ?? ""
-        return "\(time)\(speaker): \(segment.text)"
+        return "\(time)\(resolvedSpeaker): \(segment.text)"
     }
 
     private static func clock(_ date: Date) -> String {

@@ -324,6 +324,9 @@ final class AutonomousMeetingFacilitator: ObservableObject {
         var matchedLine = unseen.first { _ in false }
         var matchedCommand = ""
         for line in unseen.reversed() {
+            if line.id.hasPrefix("assistant:") || AssistantSpeechLedger.isAssistantSpeaker(line.participantName, role: nil) {
+                continue
+            }
             let text = line.text.trimmed
             guard !text.isEmpty else { continue }
             if Self.isLikelySelfEcho(candidate: text, lastSpoken: lastSpoken, isLocal: line.isOwn, withinEchoWindow: inEchoWindow) {
@@ -797,11 +800,18 @@ final class AutonomousMeetingFacilitator: ObservableObject {
             if !model.ownsMicrophone, let arbiter = model.microphoneArbiter {
                 _ = await arbiter(model)
             }
+            let utteranceID = UUID().uuidString
+            let startedAt = Date()
+            if !fallbackText.isEmpty {
+                model.recordAssistantSpokenUtterance(id: utteranceID, text: fallbackText, startedAt: startedAt, endedAt: nil)
+            }
             do {
                 try await attention.deliverVoice(model, buffer)
+                model.assistantSpeechLedger.endUtterance(id: utteranceID, endedAt: Date())
                 lastStatusBySession[model.sessionID] = L("Spoken into “%@”.", model.title)
                 return
             } catch {
+                model.assistantSpeechLedger.endUtterance(id: utteranceID, endedAt: Date())
                 // Fall through to local preview playback if WebRTC send fails.
             }
         }

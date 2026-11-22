@@ -1,4 +1,5 @@
 import Combine
+import ConferenceCore
 import Foundation
 
 struct MeetingWorkspaceSession: Codable, Equatable, Identifiable {
@@ -416,12 +417,17 @@ struct MeetingWorkspaceSession: Codable, Equatable, Identifiable {
     func exportSyncedEvents(sessionID: UUID, deviceID: String) -> [SyncedTranscriptEvent] {
         let events = session(id: sessionID)?.events ?? []
         return events.compactMap { event -> SyncedTranscriptEvent? in
+            let isAssistant = event.source == "assistantVoice"
+                || AssistantSpeechLedger.isAssistantSpeaker(event.author, role: nil)
+            let isServerTranscript = event.source == "server"
+                || event.source == "service"
+                || (event.source == "own" && event.id.hasPrefix("transcript:guest:"))
             let kind: String
             let tier: Int
             switch event.kind {
             case .transcript:
                 kind = "transcript"
-                tier = event.source == "server" ? 3 : 2
+                tier = (isServerTranscript || isAssistant) ? 3 : 2
             case .chat:
                 kind = "chat"
                 tier = 3
@@ -435,15 +441,21 @@ struct MeetingWorkspaceSession: Codable, Equatable, Identifiable {
                 return nil
             }
             let text = event.text ?? ""
+            let isOwn = !isAssistant && (event.source == "own"
+                || (event.author?.isEmpty == false && event.isPrivate == false && event.source == "localOwn"))
+            let role = isAssistant
+                ? AssistantSpeechLedger.speakerRoleAssistant
+                : (isOwn ? AssistantSpeechLedger.speakerRoleUser : AssistantSpeechLedger.speakerRoleParticipant)
             return SyncedTranscriptEvent(
                 id: event.id,
-                providerMessageID: event.source == "server" || event.kind == .chat ? event.id : nil,
+                providerMessageID: (isServerTranscript || event.kind == .chat) ? event.id : nil,
                 kind: kind,
                 sourceTier: tier,
                 occurredAt: event.occurredAt,
                 endedAt: event.endedAt,
-                speaker: event.author,
-                isOwn: event.source == "own" || event.author?.isEmpty == false && event.isPrivate == false && event.source == "localOwn",
+                speaker: isAssistant ? AssistantSpeechLedger.canonicalSpeakerName : event.author,
+                isOwn: isOwn,
+                speakerRole: role,
                 text: text,
                 revisions: event.revisions.map {
                     SyncedTranscriptRevision(text: $0.text, author: $0.author, observedAt: $0.observedAt)
@@ -501,12 +513,17 @@ struct MeetingWorkspaceSession: Codable, Equatable, Identifiable {
                     toStore.append(updated)
                 }
             } else {
+                let isAssistant = AssistantSpeechLedger.isAssistantSpeaker(item.speaker, role: item.speakerRole)
+                let resolvedSource = isAssistant
+                    ? "assistantVoice"
+                    : (item.isOwn ? "own" : (item.providerMessageID != nil ? "server" : "remoteSynced"))
+                let resolvedAuthor = isAssistant ? AssistantSpeechLedger.canonicalSpeakerName : item.speaker
                 var created = MeetingWorkspaceEvent(
                     id: item.id,
                     kind: kind,
                     occurredAt: item.occurredAt,
-                    source: item.providerMessageID != nil ? "server" : "remoteSynced",
-                    author: item.speaker,
+                    source: resolvedSource,
+                    author: resolvedAuthor,
                     text: item.text
                 )
                 created.endedAt = item.endedAt

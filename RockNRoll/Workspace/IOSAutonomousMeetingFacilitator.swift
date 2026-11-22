@@ -342,6 +342,9 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
         var matchedEvent: SyncedTranscriptEvent?
         var matchedCommand = ""
         for ev in unseen.reversed() {
+            if AssistantSpeechLedger.isAssistantSpeaker(ev.speaker, role: ev.speakerRole) {
+                continue
+            }
             let clean = ev.text.trimmingCharacters(in: .whitespacesAndNewlines)
             if AssistantWakePhraseMatcher.isLikelySelfEcho(
                 candidate: clean,
@@ -847,20 +850,44 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
                     ?? ((args["aliases"] as? String).map {
                         $0.split(separator: ",").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
                     } ?? [])
+                let jiraUser = (args["jira_username"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+                let jiraAccount = (args["jira_account_id"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+                let forceWithoutJira = (args["force_without_jira"] as? Bool) ?? false
+                let existingMatch = skills.people.resolvePerson(matching: display)
+                let hasExistingHandle = !((existingMatch?.jiraAccountID ?? existingMatch?.jiraUsername ?? "").isEmpty)
+                let hasNewHandle = !(jiraUser ?? "").isEmpty || !(jiraAccount ?? "").isEmpty
+
+                if !hasNewHandle && !hasExistingHandle && !forceWithoutJira && skills.isJiraConnected {
+                    let candidates = (try? await skills.searchJiraUsers(query: display, maxResults: 8)) ?? []
+                    return jsonString([
+                        "saved": false,
+                        "needs_user_confirmation": true,
+                        "display_name": display,
+                        "jira_user_candidates": candidates.map(WorkspaceTaskSyncController.jiraUserPayload),
+                        "instruction": candidates.isEmpty
+                            ? "No Jira user matched automatically. Ask the user for their Jira username/email or offer to copy it from a task on the board via rocknroll_jira_action(operation='copy_user_from_issue'). Only pass force_without_jira=true if they do not have a Jira account."
+                            : "Ask the user which of these Jira candidates matches \(display), then call upsert with jira_username/jira_account_id."
+                    ])
+                }
+
                 let explicitApproved = args["approved_voice_commander"] as? Bool
                 let allowPrivilegeChange = allowWrites && (explicitApproved != nil)
                 let entry = AssistantPersonEntry(
                     displayName: display,
                     aliases: rawAliases,
-                    jiraUsername: args["jira_username"] as? String,
-                    jiraAccountID: args["jira_account_id"] as? String,
+                    jiraUsername: jiraUser,
+                    jiraAccountID: jiraAccount,
                     email: args["email"] as? String,
                     role: args["role"] as? String,
                     approvedVoiceCommander: allowPrivilegeChange ? (explicitApproved ?? false) : false,
                     notes: args["notes"] as? String
                 )
                 let updated = try? skills.upsertPerson(entry, allowPrivilegeChange: allowPrivilegeChange)
-                return jsonString(["saved": updated != nil, "display_name": display])
+                return jsonString([
+                    "saved": updated != nil,
+                    "display_name": display,
+                    "jira_bound": hasNewHandle || hasExistingHandle
+                ])
             } else if op == "remove" {
                 guard allowWrites else { return "{\"error\":\"Approved speaker required\"}" }
                 let id = (args["id"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1012,6 +1039,178 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
                     return jsonString(["error": error.localizedDescription])
                 }
             }
+            if op == "board_users" {
+                let maxResults = max(1, min((args["max_results"] as? Int) ?? 40, 60))
+                do {
+                    let (users, issues) = try await skills.fetchJiraBoardUsersAndIssues(maxResults: maxResults)
+                    return jsonString([
+                        "users": users.map(WorkspaceTaskSyncController.jiraUserPayload),
+                        "issues": issues.map(WorkspaceTaskSyncController.jiraIssuePayload)
+                    ])
+                } catch {
+                    return jsonString(["error": error.localizedDescription])
+                }
+            }
+            if op == "copy_user_from_issue" {
+                let issueKey = args["issue_key"] as? String
+                let searchQuery = (args["query"] as? String) ?? (args["text"] as? String)
+                let role = (args["role"] as? String) ?? "assignee"
+                do {
+                    let (copiedUser, sourceIssueKey) = try await skills.copyJiraUserFromIssue(
+                        issueKey: issueKey,
+                        searchQuery: searchQuery,
+                        role: role
+                    )
+                    var savedToPeople = false
+                    if let targetName = (args["save_to_people_name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                       !targetName.isEmpty, allowWrites {
+                        let extraAliases = (args["aliases"] as? [String]) ?? []
+                        let existing = skills.people.resolvePerson(matching: targetName)
+                        var mergedAliases = (existing?.aliases ?? []) + extraAliases
+                        if existing?.displayName.caseInsensitiveCompare(targetName) != .orderedSame {
+                            mergedAliases.append(targetName)
+                        }
+                        let entry = AssistantPersonEntry(
+                            id: existing?.id,
+                            displayName: existing?.displayName ?? targetName,
+                            aliases: AssistantPersonEntry.deduped(mergedAliases),
+                            jiraUsername: copiedUser.username ?? (copiedUser.isServerOrDC ? copiedUser.identifier : existing?.jiraUsername),
+                            jiraAccountID: copiedUser.accountId ?? (!copiedUser.isServerOrDC ? copiedUser.identifier : existing?.jiraAccountID),
+                            email: copiedUser.emailAddress ?? existing?.email,
+                            role: existing?.role,
+                            approvedVoiceCommander: existing?.approvedVoiceCommander ?? false,
+                            notes: existing?.notes
+                        )
+                        savedToPeople = (try? skills.upsertPerson(entry, allowPrivilegeChange: false)) != nil
+                    }
+                    return jsonString([
+                        "issue_key": sourceIssueKey,
+                        "copied_user": WorkspaceTaskSyncController.jiraUserPayload(copiedUser),
+                        "saved_to_people": savedToPeople
+                    ])
+                } catch {
+                    return jsonString(["error": error.localizedDescription])
+                }
+            }
+            if op == "transition" {
+                guard allowWrites else { return "{\"error\":\"Approved speaker required\"}" }
+                guard let key = (args["issue_key"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !key.isEmpty,
+                      let status = ((args["status"] as? String) ?? (args["text"] as? String))?.trimmingCharacters(in: .whitespacesAndNewlines),
+                      !status.isEmpty else {
+                    return "{\"error\":\"issue_key and status required\"}"
+                }
+                do {
+                    let updated = try await skills.transitionJiraIssue(key: key, status: status, comment: args["comment"] as? String)
+                    return jsonString([
+                        "transitioned": true,
+                        "issue": WorkspaceTaskSyncController.jiraIssuePayload(updated)
+                    ])
+                } catch {
+                    return jsonString(["error": error.localizedDescription])
+                }
+            }
+            if op == "assign" {
+                guard allowWrites else { return "{\"error\":\"Approved speaker required\"}" }
+                guard let key = (args["issue_key"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !key.isEmpty else {
+                    return "{\"error\":\"issue_key required\"}"
+                }
+                do {
+                    let assigneeContact: JiraUserContact?
+                    if let explicitAccount = (args["jira_account_id"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !explicitAccount.isEmpty {
+                        assigneeContact = JiraUserContact(
+                            identifier: explicitAccount,
+                            username: args["jira_username"] as? String,
+                            accountId: explicitAccount,
+                            displayName: (args["assignee"] as? String) ?? explicitAccount,
+                            isServerOrDC: false
+                        )
+                    } else if let explicitUser = (args["jira_username"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !explicitUser.isEmpty {
+                        assigneeContact = JiraUserContact(
+                            identifier: explicitUser,
+                            username: explicitUser,
+                            accountId: nil,
+                            displayName: (args["assignee"] as? String) ?? explicitUser,
+                            isServerOrDC: true
+                        )
+                    } else if let rawAssignee = (args["assignee"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !rawAssignee.isEmpty {
+                        guard let resolution = await skills.resolveJiraAssignee(rawAssignee) else {
+                            return "{\"error\":\"Workspace unavailable\"}"
+                        }
+                        switch resolution {
+                        case .resolved(let handle, let person):
+                            let isDC = !(workspace?.taskSync.preferences.jira.isCloudHost ?? false)
+                            assigneeContact = JiraUserContact(
+                                identifier: handle,
+                                username: person?.jiraUsername ?? handle,
+                                accountId: person?.jiraAccountID,
+                                displayName: person?.displayName ?? rawAssignee,
+                                isServerOrDC: person?.jiraAccountID == nil && isDC
+                            )
+                        case .unresolved(let unresolvedQuery, let candidates):
+                            return jsonString(WorkspaceTaskSyncController.unresolvedJiraAssigneePayload(
+                                query: unresolvedQuery,
+                                candidates: candidates
+                            ))
+                        }
+                    } else {
+                        assigneeContact = nil
+                    }
+                    let updated = try await skills.assignJiraIssue(key: key, assignee: assigneeContact)
+                    return jsonString([
+                        "assigned": true,
+                        "issue": WorkspaceTaskSyncController.jiraIssuePayload(updated)
+                    ])
+                } catch {
+                    return jsonString(["error": error.localizedDescription])
+                }
+            }
+            if op == "create" {
+                guard allowWrites else { return "{\"error\":\"Approved speaker required\"}" }
+                guard let summary = ((args["summary"] as? String) ?? (args["query"] as? String) ?? (args["text"] as? String))?.trimmingCharacters(in: .whitespacesAndNewlines),
+                      !summary.isEmpty else {
+                    return "{\"error\":\"summary required\"}"
+                }
+                do {
+                    var assigneeContact: JiraUserContact?
+                    if let rawAssignee = (args["assignee"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !rawAssignee.isEmpty {
+                        if let resolution = await skills.resolveJiraAssignee(rawAssignee) {
+                            switch resolution {
+                            case .resolved(let handle, let person):
+                                let isDC = !(workspace?.taskSync.preferences.jira.isCloudHost ?? false)
+                                assigneeContact = JiraUserContact(
+                                    identifier: handle,
+                                    username: person?.jiraUsername ?? handle,
+                                    accountId: person?.jiraAccountID,
+                                    displayName: person?.displayName ?? rawAssignee,
+                                    isServerOrDC: person?.jiraAccountID == nil && isDC
+                                )
+                            case .unresolved(let unresolvedQuery, let candidates):
+                                return jsonString(WorkspaceTaskSyncController.unresolvedJiraAssigneePayload(
+                                    query: unresolvedQuery,
+                                    candidates: candidates
+                                ))
+                            }
+                        }
+                    }
+                    let kind = (args["issue_kind"] as? String).flatMap(TaskIssueKind.init(rawValue:)) ?? .task
+                    let priority = (args["priority"] as? String).flatMap(TaskPriorityLevel.init(rawValue:))
+                    let created = try await skills.createJiraIssueDirect(
+                        summary: summary,
+                        description: (args["description"] as? String) ?? "",
+                        projectKey: args["project_key"] as? String,
+                        issueKind: kind,
+                        assignee: assigneeContact,
+                        priority: priority,
+                        parentEpicKey: args["parent_epic_key"] as? String
+                    )
+                    return jsonString([
+                        "created": true,
+                        "issue": WorkspaceTaskSyncController.jiraIssuePayload(created)
+                    ])
+                } catch {
+                    return jsonString(["error": error.localizedDescription])
+                }
+            }
             do {
                 var resolvedAssigneeID: String?
                 if let rawAssignee = (args["assignee"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -1091,6 +1290,27 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
                     return jsonString(["sharing": false, "message": L("Stopped sharing the Assistant Board.")])
                 case "filter":
                     return jsonString(["message": try await board.filter(query: (args["query"] as? String) ?? (args["text"] as? String) ?? "")])
+                case "select_person_filter":
+                    let q = ((args["query"] as? String) ?? (args["text"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                    return jsonString(["message": try await board.selectPersonFilter(query: q, people: skills.people)])
+                case "clear_filters":
+                    return jsonString(["message": try await board.clearFilters()])
+                case "move_issue":
+                    guard allowWrites else { return "{\"error\":\"Approved speaker required\"}" }
+                    guard let key = (args["issue_key"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !key.isEmpty,
+                          let status = ((args["status"] as? String) ?? (args["text"] as? String))?.trimmingCharacters(in: .whitespacesAndNewlines),
+                          !status.isEmpty else {
+                        return "{\"error\":\"issue_key and status required\"}"
+                    }
+                    let updated = try await skills.transitionJiraIssue(
+                        key: key,
+                        status: status,
+                        comment: args["comment"] as? String
+                    )
+                    return jsonString([
+                        "moved": true,
+                        "issue": WorkspaceTaskSyncController.jiraIssuePayload(updated)
+                    ])
                 case "scroll":
                     return jsonString(["message": try await board.scroll(deltaY: (args["delta_y"] as? Int) ?? 450)])
                 case "click":
@@ -1277,7 +1497,17 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
 
         if let bridge = resolveBridge(controllerID) {
             if let speakBuffer = bridge.speakAudioBuffer {
+                let utteranceID = UUID().uuidString
+                let startedAt = Date()
+                if !fallbackText.isEmpty {
+                    bridge.recordAssistantSpeech(utteranceID, fallbackText, startedAt, nil)
+                }
                 do {
+                    defer {
+                        if !fallbackText.isEmpty {
+                            bridge.recordAssistantSpeech(utteranceID, fallbackText, startedAt, Date())
+                        }
+                    }
                     try await speakBuffer(buffer)
                     lastStatusBySession[controllerID] = L("Spoken into “%@”.", bridge.title)
                     return
@@ -1561,7 +1791,8 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
                         "email": ["type": "string"],
                         "role": ["type": "string"],
                         "notes": ["type": "string"],
-                        "approved_voice_commander": ["type": "boolean"]
+                        "approved_voice_commander": ["type": "boolean"],
+                        "force_without_jira": ["type": "boolean"]
                     ],
                     "required": ["operation"]
                 ]
@@ -1602,17 +1833,29 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
         if allows(.jira) {
             tools.append(.init(
                 name: "rocknroll_jira_action",
-                description: "Search Jira issues, search Jira users/assignees for People.md binding, or add a comment to a Jira issue.",
+                description: "Search Jira issues/board users, copy a Jira user from a board issue, create/assign/transition issues, or add a comment.",
                 parametersJSONSchema: [
                     "type": "object",
                     "properties": [
-                        "operation": ["type": "string", "enum": ["search", "search_users", "comment"]],
+                        "operation": ["type": "string", "enum": ["search", "search_users", "board_users", "copy_user_from_issue", "comment", "transition", "assign", "create"]],
                         "jql": ["type": "string"],
                         "query": ["type": "string"],
                         "assignee": ["type": "string"],
                         "max_results": ["type": "integer"],
                         "issue_key": ["type": "string"],
-                        "comment": ["type": "string"]
+                        "comment": ["type": "string"],
+                        "status": ["type": "string"],
+                        "role": ["type": "string", "enum": ["assignee", "reporter"]],
+                        "save_to_people_name": ["type": "string"],
+                        "aliases": ["type": "array", "items": ["type": "string"]],
+                        "summary": ["type": "string"],
+                        "description": ["type": "string"],
+                        "project_key": ["type": "string"],
+                        "issue_kind": ["type": "string", "enum": ["task", "story", "bug", "epic"]],
+                        "priority": ["type": "string", "enum": ["critical", "high", "medium", "low"]],
+                        "parent_epic_key": ["type": "string"],
+                        "jira_username": ["type": "string"],
+                        "jira_account_id": ["type": "string"]
                     ],
                     "required": ["operation"]
                 ]
@@ -1664,16 +1907,19 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
         if allows(.boardShare) {
             tools.append(.init(
                 name: "rocknroll_control_board",
-                description: "Control the in-app desktop-sized (1440x810) Assistant Board browser and stream it directly to an active meeting like a desktop screen share (open_url, share_to_meeting, stop_share, filter, scroll, click, click_at, highlight, inspect, snapshot).",
+                description: "Control the in-app desktop-sized (1440x810) Assistant Board browser, select person filters during standups, move Jira cards, and stream it directly to an active meeting.",
                 parametersJSONSchema: [
                     "type": "object",
                     "properties": [
-                        "command": ["type": "string", "enum": ["open_url", "share_to_meeting", "stop_share", "filter", "scroll", "click", "click_at", "highlight", "inspect", "snapshot"]],
+                        "command": ["type": "string", "enum": ["open_url", "share_to_meeting", "stop_share", "filter", "select_person_filter", "clear_filters", "scroll", "click", "click_at", "highlight", "inspect", "snapshot", "move_issue"]],
                         "url": ["type": "string"],
                         "meeting_id": ["type": "string"],
                         "query": ["type": "string"],
                         "text": ["type": "string"],
                         "selector": ["type": "string"],
+                        "issue_key": ["type": "string"],
+                        "status": ["type": "string"],
+                        "comment": ["type": "string"],
                         "delta_y": ["type": "integer"],
                         "x": ["type": "number"],
                         "y": ["type": "number"],

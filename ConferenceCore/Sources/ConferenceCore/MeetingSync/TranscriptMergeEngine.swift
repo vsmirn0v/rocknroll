@@ -113,13 +113,17 @@ public enum TranscriptMergeEngine {
                 if event.occurredAt.timeIntervalSince(existing.occurredAt) > 4.0 {
                     break
                 }
-                guard existing.deviceID != event.deviceID || existing.id == event.id else { continue }
+                let existingIsAssistant = AssistantSpeechLedger.isAssistantSpeaker(existing.speaker, role: existing.speakerRole)
+                let eventIsAssistant = AssistantSpeechLedger.isAssistantSpeaker(event.speaker, role: event.speakerRole)
+                guard existingIsAssistant == eventIsAssistant else { continue }
+                let sameDeviceOwnVsServer = (existing.deviceID == event.deviceID) && existing.isOwn && event.isOwn && (existing.sourceTier != event.sourceTier)
+                guard existing.deviceID != event.deviceID || existing.id == event.id || sameDeviceOwnVsServer else { continue }
                 if existing.id == event.id {
                     matchedIndex = idx
                     break
                 }
                 let cached = transcriptCache[idx]
-                if !cached.speaker.isEmpty && !eventSpeaker.isEmpty && cached.speaker != eventSpeaker {
+                if !sameDeviceOwnVsServer, !cached.speaker.isEmpty && !eventSpeaker.isEmpty && cached.speaker != eventSpeaker {
                     continue
                 }
                 if eventTokenSet == nil {
@@ -210,6 +214,7 @@ public enum TranscriptMergeEngine {
             (lhs.sourceTier, lhs.revisions.count, lhs.text.count, lhs.deviceID)
         var winner = preferRHS ? rhs : lhs
         winner.isBookmarked = lhs.isBookmarked || rhs.isBookmarked
+        winner.speakerRole = winner.speakerRole ?? (preferRHS ? lhs.speakerRole : rhs.speakerRole)
         var seenRevisions = Set(winner.revisions.map { "\($0.observedAt.syncMilliseconds)|\($0.text)" })
         for revision in (lhs.revisions + rhs.revisions) {
             let key = "\(revision.observedAt.syncMilliseconds)|\(revision.text)"
@@ -233,6 +238,7 @@ public enum TranscriptMergeEngine {
             (lhs.sourceTier, lhs.text.count, lhs.deviceID)
         var winner = preferRHS ? rhs : lhs
         winner.isBookmarked = lhs.isBookmarked || rhs.isBookmarked
+        winner.speakerRole = winner.speakerRole ?? (preferRHS ? lhs.speakerRole : rhs.speakerRole)
         winner.occurredAt = min(lhs.occurredAt, rhs.occurredAt)
         return winner
     }

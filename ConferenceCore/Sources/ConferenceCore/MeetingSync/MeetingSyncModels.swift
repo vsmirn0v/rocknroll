@@ -789,6 +789,7 @@ public struct SyncedTranscriptEvent: Codable, Equatable, Identifiable, Sendable 
     public var endedAt: Date?
     public var speaker: String?
     public var isOwn: Bool
+    public var speakerRole: String?
     public var text: String
     public var revisions: [SyncedTranscriptRevision]
     public var isBookmarked: Bool
@@ -803,6 +804,7 @@ public struct SyncedTranscriptEvent: Codable, Equatable, Identifiable, Sendable 
         endedAt: Date? = nil,
         speaker: String? = nil,
         isOwn: Bool = false,
+        speakerRole: String? = nil,
         text: String,
         revisions: [SyncedTranscriptRevision] = [],
         isBookmarked: Bool = false,
@@ -816,6 +818,7 @@ public struct SyncedTranscriptEvent: Codable, Equatable, Identifiable, Sendable 
         self.endedAt = endedAt
         self.speaker = speaker
         self.isOwn = isOwn
+        self.speakerRole = speakerRole
         self.text = text
         self.revisions = revisions
         self.isBookmarked = isBookmarked
@@ -880,6 +883,7 @@ public struct SyncedTranscriptChunk: Codable, Equatable, Identifiable, Sendable 
                     }
                     var combined = newer
                     combined.isBookmarked = existing.isBookmarked || event.isBookmarked
+                    combined.speakerRole = combined.speakerRole ?? existing.speakerRole ?? event.speakerRole
                     byID[event.id] = combined
                 } else {
                     byID[event.id] = event
@@ -1191,7 +1195,9 @@ public struct SyncedMeetingContextSettings: Codable, Equatable, Identifiable, Se
         result.attentionMode = mergeOptional(attentionMode, other.attentionMode)
         result.urgency = mergeOptional(urgency, other.urgency)
         result.suggestReplies = mergeOptional(suggestReplies, other.suggestReplies)
-        result.about = mergeOptional(about, other.about)
+        result.about = AssistantCloudSync.isAssistantScopeKey(scopeKey)
+            ? AssistantCloudSync.mergeAboutValue(scopeKey: scopeKey, lhs: about, rhs: other.about)
+            : mergeOptional(about, other.about)
         result.matters = mergeOptional(matters, other.matters)
         result.never = mergeOptional(never, other.never)
         result.people = mergeOptional(people, other.people)

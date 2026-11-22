@@ -10,7 +10,7 @@ trap 'rm -rf -- "$build_dir"' EXIT
 core_dir="${NATIVE_GUEST_CORE_BUILD_DIR:-$repo_dir/.build/native-guest/library-core}"
 swift build --package-path "$repo_dir/ConferenceCore" --scratch-path "$core_dir" --product ConferenceCore
 core_products="$(swift build --package-path "$repo_dir/ConferenceCore" --scratch-path "$core_dir" --show-bin-path)"
-sources=("$repo_dir/ConferenceCore/Sources/ConferenceCore/Localization.swift" "$repo_dir/MeetingEngine/Sources/MeetingEngine/Providers/Guest/AdditionalRootTrust.swift" "$repo_dir/MeetingEngine/Sources/MeetingEngine/Providers/Guest/VendorEndpointResolver.swift" "$repo_dir/MeetingEngine/Sources/MeetingEngine/Providers/Guest/GuestSiteLinkAdapter.swift")
+sources=("$repo_dir/ConferenceCore/Sources/ConferenceCore/Localization.swift" "$repo_dir/MeetingEngine/Sources/MeetingEngine/Auth/SiteClientIdentityRegistry.swift" "$repo_dir/MeetingEngine/Sources/MeetingEngine/Auth/SiteTLSDelegate.swift" "$repo_dir/MeetingEngine/Sources/MeetingEngine/Providers/Guest/AdditionalRootTrust.swift" "$repo_dir/MeetingEngine/Sources/MeetingEngine/Providers/Guest/VendorEndpointResolver.swift" "$repo_dir/MeetingEngine/Sources/MeetingEngine/Providers/Guest/GuestSiteLinkAdapter.swift")
 for name in RoomHistoryStore RoomSyncCoordinator CloudRoomTransport AppleCalendarReader CalendarMeetingStore CalendarInvitationContext CalendarReminderRepository CalendarReminderCoordinator CalendarReminderNotifications ReminderProfileCloud MeetingContinuationCloud MeetingContinuationCoordinator MeetingSetupCoordinator HomeMeetingCard; do
     sources+=("$repo_dir/RockNRoll/$name.swift")
 done

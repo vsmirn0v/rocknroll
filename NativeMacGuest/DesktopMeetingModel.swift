@@ -165,10 +165,15 @@ import UniformTypeIdentifiers
     @Published private(set) var localTranscript: [GuestMeetingMessage] = [] {
         didSet { cachedMergedTranscript = nil }
     }
+    let assistantSpeechLedger = AssistantSpeechLedger()
+    @Published private(set) var assistantTranscript: [GuestMeetingMessage] = [] {
+        didSet { cachedMergedTranscript = nil }
+    }
     private var cachedMergedTranscript: [GuestMeetingMessage]?
     /// This meeting only: the person paused transcription on this Mac.
     @Published var localTranscriptionPaused = false { didSet { updateLocalTranscription() } }
     private var localTranscriber: MeetingTranscriber?
+    private var localMicSupplementOnly = false
     private var localTranscriptionGeneration = UUID()
     private var participationAudioSources: [String: ParticipationRemoteAudioBinding] = [:]
     private var participationLocalTranscript: [ParticipationLocalTranscriptLine] = []
@@ -177,7 +182,7 @@ import UniformTypeIdentifiers
         #if DEBUG
         if localParticipationTranscribingForTesting { return true }
         #endif
-        return localTranscriber != nil
+        return localTranscriber != nil && !localMicSupplementOnly
     }
     /// The calendar series this meeting was joined from, for its Attention instructions.
     var calendarSeriesID: String?
@@ -261,17 +266,22 @@ import UniformTypeIdentifiers
     func updateLocalTranscription() {
         engine.setTranscriptionRequested(localTranscriptionAllowed)
         let serviceTranscriptReadable = guestFeatures.transcriptionStatus == .active && guestFeatures.permissions.canViewTranscript
-        let wanted = !closed && connected && localTranscriptionAllowed && !localTranscriptionPaused && !serviceTranscriptReadable
+        let fullWanted = !closed && connected && localTranscriptionAllowed && !localTranscriptionPaused && !serviceTranscriptReadable
+        let micSupplementWanted = !closed && connected && serviceTranscriptReadable && listenStore.enabled && listenStore.includesMicrophone && !localTranscriptionPaused
+        let wanted = fullWanted || micSupplementWanted
+        let nextMicSupplementOnly = !fullWanted && micSupplementWanted
         if wanted, localTranscriber == nil, let model = listenStore.recognizerModel(), let vad = listenStore.vadURL {
             LocalSpeechRecognizer.shared.acquire(model)   // loads before the first utterance
             let generation = UUID()
             localTranscriptionGeneration = generation
+            localMicSupplementOnly = nextMicSupplementOnly
             let transcriber = MeetingTranscriber(model: model, vadModel: vad, onDropped: { [weak self] start, end, reason in
                 guard let self else { return }
                 self.workspaceJournal?.recordGap(sessionID: self.workspaceSessionID, reason: reason.rawValue, from: start, until: end)
             }) { [weak self] line in
                 self?.receiveLocalLine(line, generation: generation)
             }
+            transcriber.setLocalMicrophoneOnly(localMicSupplementOnly)
             localTranscriber = transcriber
             syncRealtimeAudioTap()
             engine.setTranscriptionAudioHandler { [weak self, weak transcriber] sources in
@@ -286,11 +296,12 @@ import UniformTypeIdentifiers
             Task { _ = await engine.setTranscriptionOutput(true) }
             probeLog("local-transcription-start", ["model": listenStore.selectedID, "soundOn": snapshot.playoutOn,
                 "microphone": listenStore.includesMicrophone, "service": kind.rawValue,
-                "reason": serverTranscriptHidden ? "serverTranscriptHidden" : "serviceTranscriptOff"])
+                "reason": localMicSupplementOnly ? "localMicSupplement" : (serverTranscriptHidden ? "serverTranscriptHidden" : "serviceTranscriptOff")])
             observeParticipation()
             objectWillChange.send()
         } else if !wanted, let transcriber = localTranscriber {
             localTranscriber = nil
+            localMicSupplementOnly = false
             transcriber.setPCM16AudioHandler(nil)
             let generation = localTranscriptionGeneration
             let names = Dictionary(participants.map { ($0.id, $0.name) }, uniquingKeysWith: { first, _ in first })
@@ -319,7 +330,12 @@ import UniformTypeIdentifiers
             if !closed { let engine = engine; Task { _ = await engine.setTranscriptionOutput(false) } }
             if !closed { observeTranscript(); observeParticipation() }
             objectWillChange.send()
-        } else if wanted, localTranscriber != nil {
+        } else if wanted, let transcriber = localTranscriber {
+            if localMicSupplementOnly != nextMicSupplementOnly {
+                localMicSupplementOnly = nextMicSupplementOnly
+                transcriber.setLocalMicrophoneOnly(localMicSupplementOnly)
+                objectWillChange.send()
+            }
             updateLocalMicrophoneCapture()
         }
         updateWorkspaceCoverage()
@@ -342,17 +358,17 @@ import UniformTypeIdentifiers
 
     private func receiveLocalLine(_ line: MeetingTranscriber.Line, live: Bool = true, archivedAuthor: String? = nil) {
         let observedAt = Date()
-        func capture(_ message: GuestMeetingMessage) {
+        func capture(_ message: GuestMeetingMessage, source: String) {
             observeWorkspace([
                 .init(id: "transcript:local:" + message.id, kind: .transcript, occurredAt: line.start,
-                    observedAt: observedAt, source: "local", author: message.participantName, text: line.text)
+                    observedAt: observedAt, source: source, author: message.participantName, text: line.text)
             ])
         }
         if line.trackID == MeetingTranscriber.localTrackID {
             let own = participants.first { $0.isLocal }?.id ?? line.trackID
             let message = GuestMeetingMessage(id: line.id, participantID: own, participantName: displayName,
                 text: line.text, sentAt: line.start, isOwn: true, receivedAt: line.end)
-            capture(message)
+            capture(message, source: "localOwn")
             guard live, !closed else { return }
             localTranscript.append(message)
             if localTranscript.count > 1000 { localTranscript.removeFirst(localTranscript.count - 1000) }
@@ -365,7 +381,7 @@ import UniformTypeIdentifiers
         let name = archivedAuthor ?? participants.first { $0.id == identity }?.name ?? L("Participant")
         let message = GuestMeetingMessage(id: line.id, participantID: identity ?? line.trackID, participantName: name,
             text: line.text, sentAt: line.start, isOwn: false, receivedAt: line.end)
-        capture(message)
+        capture(message, source: "local")
         guard live, !closed else { return }
         localTranscript.append(message)
         if localTranscript.count > 1000 { localTranscript.removeFirst(localTranscript.count - 1000) }
@@ -386,9 +402,110 @@ import UniformTypeIdentifiers
                          archivedAuthor: archivedLocalAttribution[generation]?[line.trackID])
     }
 
+    func recordAssistantSpokenUtterance(
+        id: String = UUID().uuidString,
+        text: String,
+        startedAt: Date = Date(),
+        endedAt: Date? = nil
+    ) {
+        let clean = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty else { return }
+        if let endedAt {
+            assistantSpeechLedger.recordCompletedUtterance(id: id, text: clean, startedAt: startedAt, endedAt: endedAt)
+        } else {
+            assistantSpeechLedger.beginUtterance(id: id, text: clean, startedAt: startedAt)
+        }
+        let messageID = "assistant:" + id
+        let msg = GuestMeetingMessage(
+            id: messageID,
+            participantID: "rock-assistant",
+            participantName: AssistantSpeechLedger.canonicalSpeakerName,
+            text: clean,
+            sentAt: startedAt,
+            isOwn: false,
+            receivedAt: endedAt ?? startedAt
+        )
+        if let idx = assistantTranscript.firstIndex(where: { $0.id == messageID }) {
+            assistantTranscript[idx] = msg
+        } else {
+            assistantTranscript.append(msg)
+            if assistantTranscript.count > 400 {
+                assistantTranscript.removeFirst(assistantTranscript.count - 400)
+            }
+        }
+        observeWorkspace([
+            .init(
+                id: "transcript:assistant:" + id,
+                kind: .transcript,
+                occurredAt: startedAt,
+                observedAt: Date(),
+                source: "assistantVoice",
+                author: AssistantSpeechLedger.canonicalSpeakerName,
+                text: clean
+            )
+        ])
+        observeTranscript()
+    }
+
+    private func separatedServiceMessages(_ messages: [GuestMeetingMessage]) -> [GuestMeetingMessage] {
+        guard !assistantSpeechLedger.snapshotUtterances().isEmpty else { return messages }
+        var out: [GuestMeetingMessage] = []
+        out.reserveCapacity(messages.count)
+        for message in messages {
+            guard message.isOwn else {
+                out.append(message)
+                continue
+            }
+            let occurredAt = Self.spokenAt(message)
+            func appendAssistantIfMissing(_ assistantText: String, id: String) {
+                let cleanAssistant = assistantText.trimmed
+                guard !cleanAssistant.isEmpty else { return }
+                let alreadyRecorded = assistantTranscript.contains { existing in
+                    guard let existingAt = Self.spokenAt(existing), let msgAt = occurredAt else {
+                        return existing.text == cleanAssistant
+                    }
+                    return abs(existingAt.timeIntervalSince(msgAt)) <= 25.0 &&
+                        AssistantWakePhraseMatcher.isLikelySelfEcho(
+                            candidate: message.text,
+                            lastSpoken: existing.text,
+                            isLocal: true,
+                            withinEchoWindow: true
+                        )
+                }
+                guard !alreadyRecorded else { return }
+                out.append(GuestMeetingMessage(
+                    id: id,
+                    participantID: "rock-assistant",
+                    participantName: AssistantSpeechLedger.canonicalSpeakerName,
+                    text: cleanAssistant,
+                    sentAt: message.sentAt,
+                    isOwn: false,
+                    delivery: message.delivery,
+                    receivedAt: message.receivedAt,
+                    locallyAcknowledged: message.locallyAcknowledged
+                ))
+            }
+            switch assistantSpeechLedger.classifyOwnServerSegment(text: message.text, occurredAt: occurredAt) {
+            case .pureUser(let cleanUser):
+                var updated = message
+                updated.text = cleanUser
+                out.append(updated)
+            case .mixed(let cleanUser, let assistantText):
+                var updated = message
+                updated.text = cleanUser
+                out.append(updated)
+                appendAssistantIfMissing(assistantText, id: message.id + ":assistant")
+            case .pureAssistant(let assistantText):
+                appendAssistantIfMissing(assistantText, id: message.id)
+            }
+        }
+        return out
+    }
+
     private func captureGuestMessages(_ messages: [GuestMeetingMessage], transcript: Bool) {
         let now = Date()
-        let captured = messages.map { message -> MeetingWorkspaceEvent in
+        let effectiveMessages = transcript ? separatedServiceMessages(messages) : messages
+        let captured = effectiveMessages.map { message -> MeetingWorkspaceEvent in
             let occurredAt = transcript ? Self.spokenAt(message) : (message.sentAt ?? message.receivedAt)
             let authoredTime = message.sentAt != nil && message.sentAt == occurredAt
             let delivery: MeetingWorkspaceEvent.Status = switch message.delivery {
@@ -396,14 +513,17 @@ import UniformTypeIdentifiers
             case .sent: message.locallyAcknowledged ? .accepted : .sent
             case .failed: .failed
             }
+            let transcriptSource = message.participantID == "rock-assistant"
+                ? "assistantVoice"
+                : (message.isOwn ? "own" : "service")
             return .init(id: (transcript ? "transcript:guest:" : "chat:guest:") + message.id,
                 kind: transcript ? .transcript : .chat, occurredAt: occurredAt ?? now, observedAt: now,
-                source: transcript ? "service" : "guest", author: message.participantName,
+                source: transcript ? transcriptSource : "guest", author: message.participantName,
                 text: message.text, status: transcript ? nil : delivery, timeIsObserved: !authoredTime)
         }
         observeWorkspace(captured)
         if !transcript {
-            for (message, event) in zip(messages, captured) where message.isOwn {
+            for (message, event) in zip(effectiveMessages, captured) where message.isOwn {
                 guard let status = event.status else { continue }
                 workspaceJournal?.observeApprovedChat(sessionID: workspaceSessionID, chatID: event.id, status: status)
             }
@@ -540,8 +660,20 @@ import UniformTypeIdentifiers
     /// Service and local text form one timeline for Live text and Catch up.
     var onTranscriptChanged: (() -> Void)?
     private func observeTranscript() {
-        catchUp.observe(messages: transcript.map { TranscriptSegment(id: $0.id, speaker: $0.participantName, text: $0.text, spokenAt: Self.spokenAt($0)) },
-            canView: guestFeatures.permissions.canViewTranscript || !localTranscript.isEmpty || transcribingLocally,
+        catchUp.observe(messages: transcript.map {
+            let role = $0.participantID == "rock-assistant"
+                ? AssistantSpeechLedger.speakerRoleAssistant
+                : ($0.isOwn ? AssistantSpeechLedger.speakerRoleUser : AssistantSpeechLedger.speakerRoleParticipant)
+            return TranscriptSegment(
+                id: $0.id,
+                speaker: $0.participantName,
+                text: $0.text,
+                spokenAt: Self.spokenAt($0),
+                isOwn: $0.isOwn,
+                speakerRole: role
+            )
+        },
+            canView: guestFeatures.permissions.canViewTranscript || !localTranscript.isEmpty || !assistantTranscript.isEmpty || transcribingLocally,
             enabled: guestFeatures.transcriptionStatus == .active || transcribingLocally)
         onTranscriptChanged?()
     }
@@ -1286,9 +1418,29 @@ import UniformTypeIdentifiers
     }
     var canReact: Bool { connected && guestFeatures.permissions.canSendReaction }
     var transcript: [GuestMeetingMessage] {
-        guard !localTranscript.isEmpty else { return guestFeatures.transcript }
+        let ledgerNonEmpty = !assistantSpeechLedger.snapshotUtterances().isEmpty
+        guard !localTranscript.isEmpty || !assistantTranscript.isEmpty || ledgerNonEmpty else {
+            return guestFeatures.transcript
+        }
         if let cachedMergedTranscript { return cachedMergedTranscript }
-        let merged = (guestFeatures.transcript + localTranscript)
+        let separatedService = separatedServiceMessages(guestFeatures.transcript)
+        let ownServerMessages = separatedService.filter(\.isOwn)
+        let dedupedLocal = localTranscript.filter { localMsg in
+            guard localMsg.isOwn, !ownServerMessages.isEmpty else { return true }
+            let localAt = Self.spokenAt(localMsg)
+            return !ownServerMessages.contains { srv in
+                if let localAt, let srvAt = Self.spokenAt(srv), abs(localAt.timeIntervalSince(srvAt)) > 6.0 {
+                    return false
+                }
+                return AssistantWakePhraseMatcher.isLikelySelfEcho(
+                    candidate: localMsg.text,
+                    lastSpoken: srv.text,
+                    isLocal: true,
+                    withinEchoWindow: true
+                )
+            }
+        }
+        let merged = (separatedService + assistantTranscript + dedupedLocal)
             .map { ($0, Self.spokenAt($0) ?? .distantPast) }
             .sorted { $0.1 < $1.1 }
             .map(\.0)
