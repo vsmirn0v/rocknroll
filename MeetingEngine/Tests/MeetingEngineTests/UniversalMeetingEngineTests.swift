@@ -1,4 +1,5 @@
 import ConferenceCore
+import LiveKit
 import XCTest
 @testable import MeetingEngine
 
@@ -66,5 +67,85 @@ final class UniversalMeetingEngineTests: XCTestCase {
         XCTAssertEqual(external.lobbyModeratorPresent, false)
         external.phase = .connected
         XCTAssertEqual(external.phase, .connected)
+    }
+
+    func testRockReconnectSubscriptionLifecycle() async throws {
+        XCTAssertTrue(RockAdapter.appliesSubscriptions(when: .connected))
+        XCTAssertFalse(RockAdapter.appliesSubscriptions(when: .connecting))
+        XCTAssertFalse(RockAdapter.appliesSubscriptions(when: .reconnecting))
+        XCTAssertFalse(RockAdapter.appliesSubscriptions(when: .disconnecting))
+        XCTAssertFalse(RockAdapter.appliesSubscriptions(when: .disconnected))
+
+        let lock = NSLock()
+        var capturedEvents: [[String: Any]] = []
+        setProbeLogSink { line in
+            guard let data = line.data(using: .utf8),
+                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+            lock.lock()
+            capturedEvents.append(object)
+            lock.unlock()
+        }
+        let adapter = RockAdapter(sharedAudio: nil)
+        let room = Room()
+        adapter.installRoomForTesting(room)
+        defer {
+            setProbeLogSink(nil)
+            adapter.installRoomForTesting(nil)
+        }
+        func events(named name: String) -> [[String: Any]] {
+            lock.lock(); defer { lock.unlock() }
+            return capturedEvents.filter { ($0["event"] as? String) == name }
+        }
+
+        let dummyKey = ObjectIdentifier(room)
+        let dummyDemand = NativeRockTrackDemand(subscribed: true, ready: false, primary: false)
+        let sampleError = NSError(domain: "RockReconnectTest", code: 1)
+        adapter.primeSubscriptionStateForTesting(failure: sampleError, cachedDemandKey: dummyKey, demand: dummyDemand)
+
+        adapter.handleConnectionStateChange(.reconnecting, from: .connected, in: room)
+        XCTAssertEqual(adapter.snapshot.phase, .reconnecting)
+        XCTAssertFalse(adapter.chat.canSend)
+        XCTAssertNotNil(adapter.reconnectStartedAt)
+        XCTAssertFalse(adapter.hasCachedDemandsForTesting)
+        XCTAssertNil(adapter.subscriptionFailureForTesting)
+        XCTAssertEqual(events(named: "rock-reconnect-start").count, 1)
+
+        try await adapter.setVideoDemand(.init(visibleParticipantIDs: ["person-1"], focusedParticipantID: "person-1", receivesCameras: false))
+        XCTAssertFalse(adapter.hasCachedDemandsForTesting)
+        XCTAssertNil(adapter.subscriptionFailureForTesting)
+
+        adapter.primeSubscriptionStateForTesting(failure: sampleError, cachedDemandKey: dummyKey, demand: dummyDemand)
+        adapter.handleConnectionStateChange(.connecting, from: .reconnecting, in: room)
+        XCTAssertEqual(adapter.snapshot.phase, .connecting)
+        XCTAssertNotNil(adapter.reconnectStartedAt)
+
+        adapter.handleConnectionStateChange(.connected, from: .connecting, in: room)
+        XCTAssertNil(adapter.reconnectStartedAt)
+        XCTAssertEqual(adapter.snapshot.phase, .connected)
+        XCTAssertTrue(adapter.chat.canSend)
+        XCTAssertFalse(adapter.hasCachedDemandsForTesting)
+        XCTAssertNil(adapter.subscriptionFailureForTesting)
+        let completed = events(named: "rock-reconnect-complete")
+        XCTAssertEqual(completed.count, 1)
+        XCTAssertNotNil(completed.last?["elapsedMs"] as? Int)
+
+        adapter.handleConnectionStateChange(.reconnecting, from: .connected, in: room)
+        adapter.handleConnectionStateChange(.disconnected, from: .reconnecting, in: room)
+        XCTAssertNil(adapter.reconnectStartedAt)
+        XCTAssertEqual(adapter.snapshot.phase, .failed)
+        let failed = events(named: "rock-reconnect-failed")
+        XCTAssertEqual(failed.count, 1)
+        XCTAssertNotNil(failed.last?["elapsedMs"] as? Int)
+
+        adapter.handleConnectionStateChange(.reconnecting, from: .connected, in: room)
+        XCTAssertNotNil(adapter.reconnectStartedAt)
+        let failedBeforeLeave = events(named: "rock-reconnect-failed").count
+        let completeBeforeLeave = events(named: "rock-reconnect-complete").count
+        _ = await adapter.leave()
+        XCTAssertNil(adapter.reconnectStartedAt)
+        XCTAssertFalse(adapter.hasCachedDemandsForTesting)
+        XCTAssertNil(adapter.subscriptionFailureForTesting)
+        XCTAssertEqual(events(named: "rock-reconnect-failed").count, failedBeforeLeave)
+        XCTAssertEqual(events(named: "rock-reconnect-complete").count, completeBeforeLeave)
     }
 }

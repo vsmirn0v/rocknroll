@@ -1,5 +1,8 @@
 #!/bin/bash
 set -euo pipefail
+if [[ -z "${DEVELOPER_DIR:-}" && "$(xcode-select -p 2>/dev/null || true)" == "/Library/Developer/CommandLineTools" && -d "/Applications/Xcode.app/Contents/Developer" ]]; then
+    export DEVELOPER_DIR="/Applications/Xcode.app/Contents/Developer"
+fi
 suite="$1"
 shift
 source_dir="$(cd -- "$(dirname -- "$0")/.." && pwd)"
@@ -107,6 +110,18 @@ public func setProbeLogSink(_ value: ((String) -> Void)?) {
 PYSHIM
 sources+=(
     "$build_dir/ConferenceCoreShims.swift"
+    "$repo_dir/MeetingEngine/Sources/MeetingEngine/Core/MeetingEngineExports.swift"
+    "$repo_dir/MeetingEngine/Sources/MeetingEngine/Providers/Guest/AdditionalRootTrust.swift"
+    "$repo_dir/MeetingEngine/Sources/MeetingEngine/Auth/SiteClientIdentityRegistry.swift"
+    "$repo_dir/MeetingEngine/Sources/MeetingEngine/Auth/SiteTLSDelegate.swift"
+    "$repo_dir/MeetingEngine/Sources/MeetingEngine/Auth/SiteAccountStore.swift"
+    "$repo_dir/MeetingEngine/Sources/MeetingEngine/Auth/SiteAuthCoordinator.swift"
+    "$repo_dir/MeetingEngine/Sources/MeetingEngine/Auth/MeetingRoomCreator.swift"
+    "$repo_dir/MeetingEngine/Sources/MeetingEngine/Media/H264InputColorSignalling.swift"
+    "$repo_dir/MeetingEngine/Sources/MeetingEngine/Media/H264ColorSignalling.swift"
+    "$repo_dir/MeetingEngine/Sources/MeetingEngine/Media/NativeH264ColorEncoder.swift"
+    "$repo_dir/MeetingEngine/Sources/MeetingEngine/Providers/Telemost/TelemostBootstrap.swift"
+    "$repo_dir/MeetingEngine/Sources/MeetingEngine/Providers/TrueConf/TrueConfBootstrap.swift"
     "$repo_dir/MeetingEngine/Sources/MeetingEngine/Audio/MeetingAudioSource.swift"
     "$repo_dir/MeetingEngine/Sources/MeetingEngine/Audio/NativeDesktopExternalEngine.swift"
     "$repo_dir/MeetingEngine/Sources/MeetingEngine/Audio/SharedAudioEngine.swift"
@@ -154,14 +169,11 @@ case "$suite" in
             "$repo_dir/MeetingEngine/Sources/MeetingEngine/Core/MeetingWorkspaceEvent.swift"
             "$repo_dir/MeetingEngine/Sources/MeetingEngine/Features/ChatStore.swift"
             "$repo_dir/MeetingEngine/Sources/MeetingEngine/Features/ReactionHistoryStore.swift"
-            "$repo_dir/MeetingEngine/Sources/MeetingEngine/Providers/Telemost/TelemostBootstrap.swift"
             "$repo_dir/MeetingEngine/Sources/MeetingEngine/Providers/Telemost/TelemostTransport.swift"
             "$repo_dir/MeetingEngine/Sources/MeetingEngine/Providers/Telemost/TelemostChat.swift"
             "$repo_dir/MeetingEngine/Sources/MeetingEngine/Providers/Telemost/TelemostChatWire.swift"
-            "$repo_dir/MeetingEngine/Sources/MeetingEngine/Providers/TrueConf/TrueConfBootstrap.swift"
             "$repo_dir/MeetingEngine/Sources/MeetingEngine/Providers/TrueConf/TrueConfTransport.swift"
             "$repo_dir/MeetingEngine/Sources/MeetingEngine/Providers/TrueConf/TrueConfRoster.swift"
-            "$repo_dir/MeetingEngine/Sources/MeetingEngine/Providers/Guest/AdditionalRootTrust.swift"
             "$source_dir/Tests/ExternalEngineProtocolTests.swift"
         )
         ;;
@@ -174,8 +186,6 @@ case "$suite" in
             "$repo_dir/MeetingEngine/Sources/MeetingEngine/Audio/NativeDesktopRTCPeer.swift"
             "$repo_dir/MeetingEngine/Sources/MeetingEngine/Media/PresenterCompositor.swift"
             "$repo_dir/MeetingEngine/Sources/MeetingEngine/Media/PresenterCanvasEdit.swift"
-            "$repo_dir/MeetingEngine/Sources/MeetingEngine/Media/H264InputColorSignalling.swift"
-            "$repo_dir/MeetingEngine/Sources/MeetingEngine/Media/H264ColorSignalling.swift"
             "$source_dir/DesktopShareCapture.swift"
             "$source_dir/DesktopPresenterSession.swift"
             "$repo_dir/MeetingEngine/Sources/MeetingEngine/Media/DesktopPresenterRelay.swift"
@@ -193,8 +203,6 @@ case "$suite" in
         sources+=(
             "$repo_dir/MeetingEngine/Sources/MeetingEngine/Audio/NativeDesktopRTCPeer.swift"
             "$repo_dir/MeetingEngine/Sources/MeetingEngine/Media/PresenterCompositor.swift"
-            "$repo_dir/MeetingEngine/Sources/MeetingEngine/Media/H264InputColorSignalling.swift"
-            "$repo_dir/MeetingEngine/Sources/MeetingEngine/Media/H264ColorSignalling.swift"
             "$source_dir/DesktopShareCapture.swift"
             "$source_dir/Tests/NativeDesktopShareCaptureTests.swift"
         )

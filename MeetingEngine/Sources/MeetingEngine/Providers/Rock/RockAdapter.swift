@@ -194,7 +194,10 @@ import LiveKitWebRTC
     private let playbackGainQueue = DispatchQueue(label: "rock.remote-audio.gain")
     private let subscriptions = MediaConfigurationCoordinator<ObjectIdentifier, NativeRockTrackDemand>()
     private var subscriptionFailure: Error?
-    private var lastAppliedDemands: [String: NativeRockTrackDemand]?
+    private var lastAppliedDemands: [ObjectIdentifier: NativeRockTrackDemand]?
+    /// System uptime when LiveKit entered `.reconnecting`, so a completed or failed
+    /// attempt records how long remote media was down.
+    private(set) var reconnectStartedAt: TimeInterval?
     private var lastEmittedSnapshot: NativeDesktopExternalSnapshot?
     private var lastEmittedSessionSnapshot: MeetingSessionSnapshot?
     private var visibleParticipantIDs: Set<String>?
@@ -222,6 +225,14 @@ import LiveKitWebRTC
     var roomForTesting: Room? { room }
     #endif
 
+    var hasCachedDemandsForTesting: Bool { lastAppliedDemands != nil }
+    var subscriptionFailureForTesting: Error? { subscriptionFailure }
+    func installRoomForTesting(_ room: Room?) { self.room = room }
+    func primeSubscriptionStateForTesting(failure: Error?, cachedDemandKey: ObjectIdentifier, demand: NativeRockTrackDemand) {
+        subscriptionFailure = failure
+        lastAppliedDemands = [cachedDemandKey: demand]
+    }
+
     init(service: JamService = JamService(), chat: ChatStore? = nil, collectStatistics: Bool = false,
          sharedAudio: SharedAudioEngine? = nil) {
         self.service = service
@@ -230,7 +241,9 @@ import LiveKitWebRTC
         self.sharedAudio = sharedAudio
         super.init()
         subscriptions.onError = { [weak self] error in
-            guard let self else { return }
+            guard let self, let room = self.room,
+                  Self.appliesSubscriptions(when: room.connectionState),
+                  self.snapshot.phase == .connected else { return }
             self.subscriptionFailure = error
             self.snapshot.lastError = error.localizedDescription
             self.emit()
@@ -349,6 +362,8 @@ import LiveKitWebRTC
         cameraIntent = false
         authorizedTalkEpoch = nil
         registeredSenderTrackIDs = []
+        reconnectStartedAt = nil
+        resetSubscriptions()
         self.invitation = target.invitationURL; displayName = name; playoutIntent = !quiet
         if resetChat { chat.clear(); audioProfile = .saved }
         snapshot = .init(phase: .connecting, playoutOn: !quiet)
@@ -398,6 +413,8 @@ import LiveKitWebRTC
             refresh(room)
         } catch {
             if revision == token {
+                reconnectStartedAt = nil
+                resetSubscriptions()
                 audioPreparation?.cancel(); _ = try? await audioPreparation?.value; audioPreparation = nil
                 let failedRoom = room; room = nil
                 await failedRoom?.disconnect()
@@ -416,6 +433,8 @@ import LiveKitWebRTC
         microphoneIntent = false
         cameraIntent = false
         authorizedTalkEpoch = nil
+        reconnectStartedAt = nil
+        resetSubscriptions()
         voicePlayback?.cancel()
         attachment?.suppress()
         chatServiceImpl.cancelApprovedOutputs()
@@ -716,12 +735,8 @@ import LiveKitWebRTC
     func setTranscriptionRequested(_ requested: Bool) {
         guard transcriptionRequested != requested else { return }
         transcriptionRequested = requested
-        guard let room, room.connectionState == .connected else { return }
-        let token = revision
-        Task { @MainActor [weak self] in
-            guard let self, revision == token, self.room === room else { return }
-            try? await subscribe(room); refresh(room)
-        }
+        guard let room, Self.appliesSubscriptions(when: room.connectionState) else { return }
+        refresh(room)
     }
 
     func setTranscriptionOutput(_ keep: Bool) async -> Bool {
@@ -887,7 +902,8 @@ import LiveKitWebRTC
         for participant in room.remoteParticipants.values {
             for publication in participant.audioTracks {
                 guard let track = publication.track as? RemoteAudioTrack else { continue }
-                sources.append(.liveKit(track, id: publication.sid.stringValue, identity: identifier(participant)))
+                let streamID = "\(publication.sid.stringValue)#\(UInt(bitPattern: ObjectIdentifier(track)))"
+                sources.append(.liveKit(track, id: streamID, identity: identifier(participant)))
             }
         }
         let ids = sources.map(\.id).sorted()
@@ -948,7 +964,8 @@ import LiveKitWebRTC
         focusedParticipantID = demand.focusedParticipantID
         receivesCameras = demand.receivesCameras
         guard let room else { return }
-        refresh(room)
+        refresh(room, reconcileSubscriptions: false)
+        guard Self.appliesSubscriptions(when: room.connectionState) else { return }
         try await subscribe(room)
     }
 
@@ -1073,8 +1090,8 @@ import LiveKitWebRTC
         voicePlayback?.cancel()
         chatServiceImpl.cancelApprovedOutputs()
         revision = UUID(); snapshot.phase = .leaving; emit()
-        subscriptions.reset(); subscriptionFailure = nil
-        lastAppliedDemands = nil
+        reconnectStartedAt = nil
+        resetSubscriptions()
         audioPreparation?.cancel(); _ = try? await audioPreparation?.value; audioPreparation = nil
         let room = room; self.room = nil
         if transcriptionSourceIDs?.isEmpty == false { transcriptionSourceIDs = []; transcriptionHandler?([]) }
@@ -1144,40 +1161,93 @@ import LiveKitWebRTC
         participant.identity?.stringValue ?? participant.sid?.stringValue ?? "local"
     }
 
-    private func subscribe(_ room: Room, values precomputedValues: [String: NativeRockTrackDemand]? = nil) async throws {
-        let token = revision
-        let values = precomputedValues ?? demands(in: room)
-        var allPublications: [RemoteTrackPublication] = []
+    private func resetSubscriptions() {
+        subscriptions.reset()
+        subscriptionFailure = nil
+        lastAppliedDemands = nil
+    }
+
+    private func remotePublications(in room: Room) -> [RemoteTrackPublication] {
+        var publications: [RemoteTrackPublication] = []
         for participant in room.remoteParticipants.values {
             for publication in participant.trackPublications.values {
                 if let remote = publication as? RemoteTrackPublication {
-                    allPublications.append(remote)
+                    publications.append(remote)
                 }
             }
         }
-        let requests = allPublications.compactMap { remote
-            -> MediaConfigurationCoordinator<ObjectIdentifier, NativeRockTrackDemand>.Request? in
-            guard let demand = values[remote.sid.stringValue] else { return nil }
-            return .init(key: ObjectIdentifier(remote), value: demand) { [weak self] requested in
-                guard let self, self.revision == token, self.room === room else { throw CancellationError() }
-                try await remote.set(subscribed: requested.subscribed)
-                guard self.revision == token, self.room === room else { throw CancellationError() }
-                guard requested.subscribed, requested.ready, remote.kind == .video,
-                      self.demands(in: room)[remote.sid.stringValue] == requested else { return }
-                try await remote.set(enabled: true)
-                try await remote.set(videoQuality: requested.primary ? .high : .low)
-                try await remote.set(preferredFPS: requested.preferredFPS)
+        return publications
+    }
+
+    private func publicationDemands(
+        in room: Room,
+        values precomputedValues: [String: NativeRockTrackDemand]? = nil
+    ) -> [ObjectIdentifier: NativeRockTrackDemand] {
+        let values = precomputedValues ?? demands(in: room)
+        var result: [ObjectIdentifier: NativeRockTrackDemand] = [:]
+        for remote in remotePublications(in: room) {
+            if let demand = values[remote.sid.stringValue] {
+                result[ObjectIdentifier(remote)] = demand
             }
         }
+        return result
+    }
+
+    private func subscribe(_ room: Room) async throws {
+        guard Self.appliesSubscriptions(when: room.connectionState) else { return }
+        let token = revision
+        let publications = remotePublications(in: room)
+        let values = demands(in: room)
+        var targetDemands: [ObjectIdentifier: NativeRockTrackDemand] = [:]
+        let requests = publications.compactMap { remote
+            -> MediaConfigurationCoordinator<ObjectIdentifier, NativeRockTrackDemand>.Request? in
+            guard let demand = values[remote.sid.stringValue] else { return nil }
+            let key = ObjectIdentifier(remote)
+            targetDemands[key] = demand
+            return .init(key: key, value: demand) { [weak self] requested in
+                guard let self, self.revision == token, self.room === room else { throw CancellationError() }
+                guard Self.appliesSubscriptions(when: room.connectionState) else {
+                    self.resetSubscriptions()
+                    throw CancellationError()
+                }
+                do {
+                    try await remote.set(subscribed: requested.subscribed)
+                    guard self.revision == token, self.room === room else { throw CancellationError() }
+                    guard Self.appliesSubscriptions(when: room.connectionState) else {
+                        self.resetSubscriptions()
+                        throw CancellationError()
+                    }
+                    guard requested.subscribed, requested.ready, remote.kind == .video,
+                          self.demands(in: room)[remote.sid.stringValue] == requested else { return }
+                    try await remote.set(enabled: true)
+                    try await remote.set(videoQuality: requested.primary ? .high : .low)
+                    try await remote.set(preferredFPS: requested.preferredFPS)
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    guard self.revision == token, self.room === room else { throw CancellationError() }
+                    guard Self.appliesSubscriptions(when: room.connectionState) else {
+                        self.resetSubscriptions()
+                        throw CancellationError()
+                    }
+                    throw error
+                }
+            }
+        }
+        lastAppliedDemands = targetDemands
         subscriptions.update(requests)
         await subscriptions.waitForReconciliation()
-        guard revision == token, self.room === room else { return }
-        let current = demands(in: room)
-        for remote in allPublications {
-            if current[remote.sid.stringValue].map({ subscriptions.didFail(ObjectIdentifier(remote), value: $0) }) == true {
+        guard revision == token, self.room === room,
+              Self.appliesSubscriptions(when: room.connectionState) else { return }
+        let current = publicationDemands(in: room)
+        lastAppliedDemands = current
+        for remote in publications {
+            let key = ObjectIdentifier(remote)
+            if current[key].map({ subscriptions.didFail(key, value: $0) }) == true {
                 throw subscriptionFailure ?? NativeDesktopRockError.staleOperation
             }
         }
+        subscriptionFailure = nil
     }
 
     private func demands(in room: Room) -> [String: NativeRockTrackDemand] {
@@ -1199,7 +1269,7 @@ import LiveKitWebRTC
             focused: focusedParticipantID, playout: playoutIntent || transcriptionRequested, cameras: receivesCameras)
     }
 
-    private func refresh(_ room: Room) {
+    private func refresh(_ room: Room, reconcileSubscriptions: Bool = true) {
         guard self.room === room,
               let factory = self.factory ?? (SharedPeerConnectionFactory.resolveFactory as? LKRTCPeerConnectionFactory) else { return }
         let connected = room.connectionState == .connected
@@ -1256,13 +1326,15 @@ import LiveKitWebRTC
             onVideo?(videos)
         }
         emit()
-        if demanded != lastAppliedDemands || subscriptionFailure != nil {
-            lastAppliedDemands = demanded
+        guard reconcileSubscriptions, Self.appliesSubscriptions(when: room.connectionState) else { return }
+        let currentDemands = publicationDemands(in: room, values: demanded)
+        if currentDemands != lastAppliedDemands {
+            lastAppliedDemands = currentDemands
             Task { [weak self] in
-                do { try await self?.subscribe(room, values: demanded) }
+                do { try await self?.subscribe(room) }
                 catch {
-                    guard let self, self.room === room else { return }
-                    self.lastAppliedDemands = nil
+                    guard let self, self.room === room,
+                          Self.appliesSubscriptions(when: room.connectionState) else { return }
                     self.snapshot.lastError = error.localizedDescription
                     self.emit()
                 }
@@ -1344,35 +1416,88 @@ import LiveKitWebRTC
         }
     }
     nonisolated private func changed(_ room: Room) { Task { @MainActor [weak self] in self?.refresh(room) } }
+    private func reconnectElapsedMs(since started: TimeInterval) -> Int {
+        Int((ProcessInfo.processInfo.systemUptime - started) * 1000)
+    }
+
+    private func failReconnectIfNeeded() {
+        guard let started = reconnectStartedAt else { return }
+        probeLog("rock-reconnect-failed", ["elapsedMs": reconnectElapsedMs(since: started)])
+        reconnectStartedAt = nil
+    }
+
+    /// Remote audio and video are subscribed only while the room is connected.
+    /// The coordinator allows three tries. A reconnect usually lasts longer than
+    /// that, and spending them while the socket is down leaves the same demand
+    /// unsubscribed after LiveKit returns.
+    static func appliesSubscriptions(when connection: ConnectionState) -> Bool {
+        connection == .connected
+    }
+
+    @MainActor func handleConnectionStateChange(_ state: ConnectionState, from oldState: ConnectionState, in room: Room) {
+        guard self.room === room else { return }
+        switch state {
+        case .connected:
+            let wasReconnecting = reconnectStartedAt != nil || oldState == .reconnecting
+            if let started = reconnectStartedAt {
+                probeLog("rock-reconnect-complete", ["elapsedMs": reconnectElapsedMs(since: started)])
+                reconnectStartedAt = nil
+            }
+            if wasReconnecting {
+                // The outage may have failed applies that were already in flight.
+                // Forget them and subscribe again now that the room can accept it.
+                resetSubscriptions()
+            }
+            snapshot.phase = .connected; snapshot.lastError = nil; chat.canSend = true
+            reconcileLocalAudioPublication(in: room, reason: wasReconnecting ? "reconnect" : "connected")
+            if wasReconnecting {
+                Task { @MainActor [weak self, weak room] in
+                    guard let self, let room, self.room === room,
+                          Self.appliesSubscriptions(when: room.connectionState) else { return }
+                    await self.applyVolume(room)
+                }
+            }
+        case .connecting:
+            snapshot.phase = .connecting; chat.canSend = false; microphoneDiagnosticsGeneration = UUID()
+        case .reconnecting:
+            snapshot.phase = .reconnecting; chat.canSend = false; microphoneDiagnosticsGeneration = UUID()
+            if reconnectStartedAt == nil {
+                reconnectStartedAt = ProcessInfo.processInfo.systemUptime
+                probeLog("rock-reconnect-start", [:])
+            }
+            // Cancel applies that would otherwise count as failed tries.
+            resetSubscriptions()
+            attachment?.suppress()
+        case .disconnecting:
+            failReconnectIfNeeded()
+            snapshot.phase = .leaving; chat.canSend = false; microphoneDiagnosticsGeneration = UUID()
+            resetSubscriptions()
+            attachment?.suppress()
+        case .disconnected:
+            failReconnectIfNeeded()
+            snapshot.phase = .failed; chat.canSend = false; microphoneDiagnosticsGeneration = UUID()
+            resetSubscriptions()
+            attachment?.suppress()
+        @unknown default: break
+        }
+        refresh(room)
+        emit()
+    }
+
     nonisolated func room(_ room: Room, didUpdateConnectionState state: ConnectionState, from oldState: ConnectionState) {
         Task { @MainActor [weak self] in
-            guard let self, self.room === room else { return }
-            switch state {
-            case .connected:
-                snapshot.phase = .connected; snapshot.lastError = nil; chat.canSend = true
-                reconcileLocalAudioPublication(in: room, reason: oldState == .reconnecting ? "reconnect" : "connected")
-            case .connecting:
-                snapshot.phase = .connecting; chat.canSend = false; microphoneDiagnosticsGeneration = UUID()
-            case .reconnecting:
-                snapshot.phase = .reconnecting; chat.canSend = false; subscriptions.reset(); lastAppliedDemands = nil; microphoneDiagnosticsGeneration = UUID()
-                attachment?.suppress()
-            case .disconnecting:
-                snapshot.phase = .leaving; chat.canSend = false; microphoneDiagnosticsGeneration = UUID()
-                attachment?.suppress()
-            case .disconnected:
-                snapshot.phase = .failed; chat.canSend = false; lastAppliedDemands = nil; microphoneDiagnosticsGeneration = UUID()
-                attachment?.suppress()
-            @unknown default: break
-            }
-            refresh(room)
+            self?.handleConnectionStateChange(state, from: oldState, in: room)
         }
     }
     nonisolated func room(_ room: Room, didDisconnectWithError error: LiveKitError?) {
         Task { @MainActor [weak self] in
             guard let self, self.room === room else { return }
+            failReconnectIfNeeded()
+            resetSubscriptions()
             attachment?.suppress()
             snapshot.lastError = error?.localizedDescription; snapshot.phase = .failed; chat.canSend = false
             refresh(room)
+            emit()
         }
     }
     nonisolated func room(_ room: Room, participant: RemoteParticipant?, didReceiveData data: Data,

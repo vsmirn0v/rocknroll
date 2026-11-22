@@ -111,6 +111,92 @@ private final class RockFrameSink: NSObject, LiveKit.VideoRenderer, @unchecked S
         await coordinator.waitForReconciliation()
         try expect(attempts == 3 && coordinator.didFail("video", value: shown), "Failed SDK configuration has a bounded retry budget and readback")
         coordinator.reset()
+        var restored = 0
+        coordinator.update([.init(key: "video", value: shown) { _ in restored += 1 }])
+        await coordinator.waitForReconciliation()
+        try expect(restored == 1 && coordinator.isApplied("video", value: shown) && !coordinator.didFail("video", value: shown),
+            "Resetting when the room reconnects clears tries spent while the socket was down")
+    }
+    @MainActor static func reconnectSubscriptionPolicy() async throws {
+        try expect(RockAdapter.appliesSubscriptions(when: .connected), "A restored room reapplies remote audio and video")
+        try expect(!RockAdapter.appliesSubscriptions(when: .connecting) &&
+            !RockAdapter.appliesSubscriptions(when: .reconnecting) &&
+            !RockAdapter.appliesSubscriptions(when: .disconnecting) &&
+            !RockAdapter.appliesSubscriptions(when: .disconnected),
+            "Subscriptions stay idle until the room is connected again")
+
+        let lock = NSLock()
+        var capturedEvents: [[String: Any]] = []
+        setProbeLogSink { line in
+            guard let data = line.data(using: .utf8),
+                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+            lock.lock()
+            capturedEvents.append(object)
+            lock.unlock()
+        }
+        let adapter = RockAdapter(sharedAudio: nil)
+        let room = Room()
+        adapter.installRoomForTesting(room)
+        defer {
+            setProbeLogSink(nil)
+            adapter.installRoomForTesting(nil)
+        }
+        func events(named name: String) -> [[String: Any]] {
+            lock.lock(); defer { lock.unlock() }
+            return capturedEvents.filter { ($0["event"] as? String) == name }
+        }
+
+        let dummyKey = ObjectIdentifier(room)
+        let dummyDemand = NativeRockTrackDemand(subscribed: true, ready: false, primary: false)
+        adapter.primeSubscriptionStateForTesting(
+            failure: RockTestError.assertion("transient"),
+            cachedDemandKey: dummyKey,
+            demand: dummyDemand
+        )
+
+        adapter.handleConnectionStateChange(.reconnecting, from: .connected, in: room)
+        try expect(adapter.snapshot.phase == .reconnecting && !adapter.chat.canSend &&
+            adapter.reconnectStartedAt != nil && !adapter.hasCachedDemandsForTesting &&
+            adapter.subscriptionFailureForTesting == nil && events(named: "rock-reconnect-start").count == 1,
+            "Entering reconnect records start, clears cached demands/failures, and blocks chat")
+
+        try await adapter.setVideoDemand(.init(visibleParticipantIDs: ["person-1"], focusedParticipantID: "person-1", receivesCameras: false))
+        try expect(!adapter.hasCachedDemandsForTesting && adapter.subscriptionFailureForTesting == nil,
+            "Changing video demand while reconnecting does not populate demand cache or fail subscriptions")
+
+        adapter.primeSubscriptionStateForTesting(
+            failure: RockTestError.assertion("stale"),
+            cachedDemandKey: dummyKey,
+            demand: dummyDemand
+        )
+        adapter.handleConnectionStateChange(.connecting, from: .reconnecting, in: room)
+        try expect(adapter.snapshot.phase == .connecting && adapter.reconnectStartedAt != nil,
+            "Multi-hop reconnect through .connecting preserves reconnectStartedAt")
+        adapter.handleConnectionStateChange(.connected, from: .connecting, in: room)
+        let completed = events(named: "rock-reconnect-complete")
+        try expect(adapter.reconnectStartedAt == nil && adapter.snapshot.phase == .connected &&
+            adapter.chat.canSend && !adapter.hasCachedDemandsForTesting &&
+            adapter.subscriptionFailureForTesting == nil &&
+            completed.count == 1 && (completed.last?["elapsedMs"] as? Int) != nil,
+            "Completing reconnect resets subscription state, restores chat, and logs elapsedMs")
+
+        adapter.handleConnectionStateChange(.reconnecting, from: .connected, in: room)
+        adapter.handleConnectionStateChange(.disconnected, from: .reconnecting, in: room)
+        let failed = events(named: "rock-reconnect-failed")
+        try expect(adapter.reconnectStartedAt == nil && adapter.snapshot.phase == .failed &&
+            failed.count == 1 && (failed.last?["elapsedMs"] as? Int) != nil,
+            "Disconnecting during reconnect logs rock-reconnect-failed with elapsedMs and clears reconnectStartedAt")
+
+        adapter.handleConnectionStateChange(.reconnecting, from: .connected, in: room)
+        try expect(adapter.reconnectStartedAt != nil, "Second reconnect records start uptime")
+        let failedBeforeLeave = events(named: "rock-reconnect-failed").count
+        let completeBeforeLeave = events(named: "rock-reconnect-complete").count
+        _ = await adapter.leave()
+        try expect(adapter.reconnectStartedAt == nil && !adapter.hasCachedDemandsForTesting &&
+            adapter.subscriptionFailureForTesting == nil &&
+            events(named: "rock-reconnect-failed").count == failedBeforeLeave &&
+            events(named: "rock-reconnect-complete").count == completeBeforeLeave,
+            "Leaving while reconnecting clears reconnectStartedAt silently without leaking into later sessions")
     }
     @MainActor static func nativeAspectScreenBridge() async throws {
         let factory = LKRTCPeerConnectionFactory(encoderFactory: LKRTCDefaultVideoEncoderFactory(), decoderFactory: LKRTCDefaultVideoDecoderFactory())
@@ -181,7 +267,7 @@ private final class RockFrameSink: NSObject, LiveKit.VideoRenderer, @unchecked S
     }
     @MainActor static func main() async {
         do {
-            try demandPolicy(); try capturePolicies(); try await latestDemand(); try await nativeAspectScreenBridge(); try await sharedAudioOwnership()
+            try demandPolicy(); try capturePolicies(); try await reconnectSubscriptionPolicy(); try await latestDemand(); try await nativeAspectScreenBridge(); try await sharedAudioOwnership()
             let configuration = URLSessionConfiguration.ephemeral
             configuration.protocolClasses = [AdmissionResponse.self]
             let engine = RockAdapter(service: JamService(session: URLSession(configuration: configuration)))
