@@ -820,37 +820,99 @@ final class IOSVoiceStore: ObservableObject {
         let clean = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !clean.isEmpty else { throw IOSVoiceSynthesisError.empty }
         let fallbackVoiceID = systemVoiceIdentifier.isEmpty ? nil : systemVoiceIdentifier
+        let engineName: String
+        let providerName: String
+        switch assistantAuditionVoice {
+        case .voxPreset:
+            engineName = "voxPreset"
+            providerName = "local"
+        case .clonedVoice:
+            engineName = "clonedVoice"
+            providerName = "local"
+        case .personalVoice:
+            engineName = "personalVoice"
+            providerName = "apple"
+        case .systemVoice:
+            engineName = "systemVoice"
+            providerName = "apple"
+        case .yandexLiveTTS:
+            engineName = "yandexLiveTTS"
+            providerName = "yandex"
+        }
+        AppDiagnostics.log("voice-synthesis-start", [
+            "engine": engineName,
+            "provider": providerName
+        ])
+        let startedAt = ProcessInfo.processInfo.systemUptime
+
+        func logReady(_ buffer: AVAudioPCMBuffer, engine: String) -> AVAudioPCMBuffer {
+            let elapsedMs = Int(((ProcessInfo.processInfo.systemUptime - startedAt) * 1000).rounded())
+            AppDiagnostics.log("voice-synthesis-ready", [
+                "engine": engine,
+                "ms": elapsedMs,
+                "frames": Int(buffer.frameLength),
+                "sampleRate": Int(buffer.format.sampleRate)
+            ])
+            return buffer
+        }
+
+        func fallbackToSystem(from sourceEngine: String, error: Error) async throws -> AVAudioPCMBuffer {
+            let ns = error as NSError
+            AppDiagnostics.log("voice-synthesis-error", [
+                "engine": sourceEngine,
+                "errorType": String(describing: type(of: error)),
+                "errorCode": ns.code
+            ])
+            AppDiagnostics.log("voice-synthesis-fallback", [
+                "from": sourceEngine,
+                "to": "systemVoice",
+                "reason": String(describing: type(of: error))
+            ])
+            let buf = try await IOSVoiceSynthesis.system(clean, voiceIdentifier: fallbackVoiceID)
+            return logReady(buf, engine: "systemVoice")
+        }
+
         switch assistantAuditionVoice {
         case .voxPreset(let preset):
             do {
-                return try await IOSVoxCPM2Store.shared.speakPreset(clean, preset: preset)
+                return logReady(try await IOSVoxCPM2Store.shared.speakPreset(clean, preset: preset), engine: engineName)
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
-                return try await IOSVoiceSynthesis.system(clean, voiceIdentifier: fallbackVoiceID)
+                return try await fallbackToSystem(from: engineName, error: error)
             }
         case .clonedVoice:
             do {
-                return try await IOSVoxCPM2Store.shared.speakClonedForAssistant(clean)
+                return logReady(try await IOSVoxCPM2Store.shared.speakClonedForAssistant(clean), engine: engineName)
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
-                return try await IOSVoiceSynthesis.system(clean, voiceIdentifier: fallbackVoiceID)
+                return try await fallbackToSystem(from: engineName, error: error)
             }
         case .personalVoice:
             do {
-                return try await IOSVoiceSynthesis.personal(clean)
+                return logReady(try await IOSVoiceSynthesis.personal(clean), engine: engineName)
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
-                return try await IOSVoiceSynthesis.system(clean, voiceIdentifier: fallbackVoiceID)
+                return try await fallbackToSystem(from: engineName, error: error)
             }
         case .systemVoice(let identifier):
             let resolvedID = identifier.isEmpty ? fallbackVoiceID : identifier
-            return try await IOSVoiceSynthesis.system(clean, voiceIdentifier: resolvedID)
+            do {
+                return logReady(try await IOSVoiceSynthesis.system(clean, voiceIdentifier: resolvedID), engine: engineName)
+            } catch {
+                let ns = error as NSError
+                AppDiagnostics.log("voice-synthesis-error", [
+                    "engine": engineName,
+                    "errorType": String(describing: type(of: error)),
+                    "errorCode": ns.code
+                ])
+                throw error
+            }
         case .yandexLiveTTS(let voice):
             do {
-                return try await IOSVoiceSynthesis.yandexLiveTTS(
+                let buf = try await IOSVoiceSynthesis.yandexLiveTTS(
                     clean,
                     apiKey: yandexAPIKey(),
                     folderID: yandexFolderID,
@@ -861,46 +923,72 @@ final class IOSVoiceStore: ObservableObject {
                     approvedEndpoint: approvedYandexEndpoint,
                     customTransport: customYandexTransportFactory?()
                 )
+                return logReady(buf, engine: engineName)
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
-                return try await IOSVoiceSynthesis.system(clean, voiceIdentifier: fallbackVoiceID)
+                return try await fallbackToSystem(from: engineName, error: error)
             }
         }
     }
 
     func synthesize(_ text: String, session: URLSession = .shared) async throws -> AVAudioPCMBuffer {
-        switch engine {
-        case .system:
-            return try await IOSVoiceSynthesis.system(
-                text,
-                voiceIdentifier: systemVoiceIdentifier.isEmpty ? nil : systemVoiceIdentifier
-            )
-        case .personal:
-            return try await IOSVoiceSynthesis.personal(text)
-        case .voxCPM2:
-            return try await IOSVoxCPM2Store.shared.speak(text)
-        case .rapidMLX:
-            return try await IOSVoiceSynthesis.rapidMLX(
-                text,
-                baseURL: rapidMLXBaseURL,
-                approvedEndpoint: approvedRapidMLXEndpoint,
-                model: rapidMLXModel,
-                description: rapidMLXDescription,
-                session: session
-            )
-        case .yandexLiveTTS:
-            return try await IOSVoiceSynthesis.yandexLiveTTS(
-                text,
-                apiKey: yandexAPIKey(),
-                folderID: yandexFolderID,
-                model: yandexModel,
-                voice: yandexVoice,
-                role: yandexRole,
-                endpointOverride: yandexEndpoint,
-                approvedEndpoint: approvedYandexEndpoint,
-                customTransport: customYandexTransportFactory?()
-            )
+        let providerName = engine == .yandexLiveTTS ? "yandex" : (engine == .rapidMLX ? "rapidMLX" : (engine == .voxCPM2 ? "local" : "apple"))
+        AppDiagnostics.log("voice-synthesis-start", [
+            "engine": engine.rawValue,
+            "provider": providerName
+        ])
+        let startedAt = ProcessInfo.processInfo.systemUptime
+        do {
+            let buffer: AVAudioPCMBuffer
+            switch engine {
+            case .system:
+                buffer = try await IOSVoiceSynthesis.system(
+                    text,
+                    voiceIdentifier: systemVoiceIdentifier.isEmpty ? nil : systemVoiceIdentifier
+                )
+            case .personal:
+                buffer = try await IOSVoiceSynthesis.personal(text)
+            case .voxCPM2:
+                buffer = try await IOSVoxCPM2Store.shared.speak(text)
+            case .rapidMLX:
+                buffer = try await IOSVoiceSynthesis.rapidMLX(
+                    text,
+                    baseURL: rapidMLXBaseURL,
+                    approvedEndpoint: approvedRapidMLXEndpoint,
+                    model: rapidMLXModel,
+                    description: rapidMLXDescription,
+                    session: session
+                )
+            case .yandexLiveTTS:
+                buffer = try await IOSVoiceSynthesis.yandexLiveTTS(
+                    text,
+                    apiKey: yandexAPIKey(),
+                    folderID: yandexFolderID,
+                    model: yandexModel,
+                    voice: yandexVoice,
+                    role: yandexRole,
+                    endpointOverride: yandexEndpoint,
+                    approvedEndpoint: approvedYandexEndpoint,
+                    customTransport: customYandexTransportFactory?()
+                )
+            }
+            let elapsedMs = Int(((ProcessInfo.processInfo.systemUptime - startedAt) * 1000).rounded())
+            AppDiagnostics.log("voice-synthesis-ready", [
+                "engine": engine.rawValue,
+                "ms": elapsedMs,
+                "frames": Int(buffer.frameLength),
+                "sampleRate": Int(buffer.format.sampleRate)
+            ])
+            return buffer
+        } catch {
+            let ns = error as NSError
+            AppDiagnostics.log("voice-synthesis-error", [
+                "engine": engine.rawValue,
+                "errorType": String(describing: type(of: error)),
+                "errorCode": ns.code
+            ])
+            throw error
         }
     }
 

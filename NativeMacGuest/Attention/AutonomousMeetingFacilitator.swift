@@ -149,10 +149,19 @@ final class AutonomousMeetingFacilitator: ObservableObject {
         return attention?.store.selectedSkillIDs.first ?? "scrum-master"
     }
 
-    func enable(for model: NativeDesktopMeetingModel, skillID: String? = nil, suppressAutoGreet: Bool = false) {
+    func enable(
+        for model: NativeDesktopMeetingModel,
+        skillID: String? = nil,
+        suppressAutoGreet: Bool = false,
+        trigger: String = "manual"
+    ) {
         manuallyDisabledSessions.remove(model.sessionID)
         var chosen = resolveSkillID(explicitSkillID: skillID, meetingTitle: model.title)
         activeSessionSkills[model.sessionID] = chosen
+        probeLog("assistant-facilitator-enable", [
+            "skill": chosen,
+            "trigger": trigger
+        ])
         // Skip pre-existing lines at activation time so Rock responds to new spoken instructions.
         let initialIDs = model.transcript.map(\.id)
         processedLineIDsBySession[model.sessionID] = Set(initialIDs)
@@ -181,7 +190,10 @@ final class AutonomousMeetingFacilitator: ObservableObject {
 
     func disable(for sessionID: UUID) {
         manuallyDisabledSessions.insert(sessionID)
-        activeSessionSkills.removeValue(forKey: sessionID)
+        let removedSkill = activeSessionSkills.removeValue(forKey: sessionID)
+        if let removedSkill {
+            probeLog("assistant-facilitator-disable", ["skill": removedSkill])
+        }
         processedLineIDsBySession.removeValue(forKey: sessionID)
         processedLineOrderBySession.removeValue(forKey: sessionID)
         pendingTranscriptObservationSessions.remove(sessionID)
@@ -237,17 +249,24 @@ final class AutonomousMeetingFacilitator: ObservableObject {
     func processTick(models: [NativeDesktopMeetingModel]) {
         refreshSkillsCacheIfNeeded()
 
-        // 1. Attach queued skills to newly connected meetings (voice join / MCP join).
+        // 1. Attach queued skills (voice/MCP join), then per-meeting/series setting,
+        // then optional global voice-activation fallback (default off).
         for model in models where !model.isClosed && model.connected && activeSessionSkills[model.sessionID] == nil {
             if let queued = pendingSkillByTitleOrURL.removeValue(forKey: model.invitation.absoluteString.lowercased())
                 ?? pendingSkillByTitleOrURL.removeValue(forKey: model.title.trimmed.lowercased()) {
-                enable(for: model, skillID: queued)
-            } else if attention?.store.autonomousMeetingVoiceEnabled == true,
-                      !manuallyDisabledSessions.contains(model.sessionID),
-                      let matched = cachedSkills.first(where: {
-                          $0.enabled && $0.voiceActivation && $0.matches(meetingTitle: model.title, commandText: "")
-                      }) {
-                enable(for: model, skillID: matched.id)
+                enable(for: model, skillID: queued, trigger: "pending")
+            } else if !manuallyDisabledSessions.contains(model.sessionID) {
+                let seriesIDs = [model.participationCalendar?.externalSeriesID, model.calendarSeriesID]
+                    .compactMap { $0 }
+                if let configuredSkillID = attention?.store.autoFacilitatorSkillID(room: model.invitation, seriesIDs: seriesIDs),
+                   let configuredSkill = cachedSkills.first(where: { $0.id == configuredSkillID && $0.enabled }) {
+                    enable(for: model, skillID: configuredSkill.id, trigger: "meeting-setting")
+                } else if attention?.store.autonomousMeetingVoiceEnabled == true,
+                          let matched = cachedSkills.first(where: {
+                              $0.enabled && $0.voiceActivation && $0.matches(meetingTitle: model.title, commandText: "")
+                          }) {
+                    enable(for: model, skillID: matched.id, trigger: "auto-title")
+                }
             }
         }
 
@@ -370,6 +389,11 @@ final class AutonomousMeetingFacilitator: ObservableObject {
             rtState.transcriptBuffer = ""
             let prefixedPrompt = "[\(speakerName) (approved=\(allowWrites)) in “\(model.title)”]: \(commandText)"
             if await rtState.router.sendText(prefixedPrompt) {
+                probeLog("assistant-facilitator-turn", [
+                    "skill": skillID,
+                    "route": "realtime",
+                    "allowWrites": allowWrites
+                ])
                 lastStatusBySession[model.sessionID] = L("Realtime model handling request…")
                 rtState.turnTimeoutTask?.cancel()
                 let sid = model.sessionID
@@ -444,6 +468,11 @@ final class AutonomousMeetingFacilitator: ObservableObject {
             (allowWrites
                 ? "(Approved speaker. Answer concisely for voice playback in 1-3 sentences after running any needed tools.)"
                 : "(Read-only guest speaker. Do not create/update tasks, schedule meetings, or control the board unless an approved member confirms. Answer concisely for voice playback.)")
+        probeLog("assistant-facilitator-turn", [
+            "skill": skillID,
+            "route": "llm",
+            "allowWrites": allowWrites
+        ])
         let outcome = await runtime.submit(framedPrompt, environment: environment)
 
         let spokenText: String?
@@ -532,6 +561,12 @@ final class AutonomousMeetingFacilitator: ObservableObject {
         let state = SessionRealtimeState(activeSkillID: skillID, outputSampleRate: Double(config.outputSampleRate))
         state.gate.setApprovedSpeakersOnly(skill?.approvedSpeakersOnly ?? true)
         realtimeSessions[model.sessionID] = state
+        probeLog("assistant-facilitator-realtime", [
+            "provider": kind.rawValue,
+            "state": "connecting",
+            "inputSampleRate": targetInputRate,
+            "outputSampleRate": Int(config.outputSampleRate)
+        ])
         let sessionID = model.sessionID
         await state.router.start(
             config: config,
@@ -613,17 +648,28 @@ final class AutonomousMeetingFacilitator: ObservableObject {
             allowPrivilegedActions: allowWrites,
             allowedToolGroups: allowedGroups
         )
-        return await AssistantSkillToolRegistrar.executeToolCallJSON(
+        let result = await AssistantSkillToolRegistrar.executeToolCallJSON(
             registry: registry,
             name: name,
             argumentsJSON: argumentsJSON
         )
+        let command = (try? JSONSerialization.jsonObject(with: Data(argumentsJSON.utf8)) as? [String: Any])?["command"] as? String ?? ""
+        probeLog("assistant-facilitator-tool", [
+            "tool": name,
+            "command": command,
+            "ok": !result.contains("\"error\"")
+        ])
+        return result
     }
 
     private func handleRealtimeEvent(_ event: RealtimeVoiceEvent, state: SessionRealtimeState, model: NativeDesktopMeetingModel?) async {
         switch event {
         case .connected:
             state.connected = true
+            probeLog("assistant-facilitator-realtime", [
+                "state": "connected",
+                "outputSampleRate": Int(state.outputSampleRate)
+            ])
             syncRealtimeActiveFlag()
         case .audioPCM16(let pcm, let sampleRate):
             if sampleRate > 0 {
@@ -659,6 +705,10 @@ final class AutonomousMeetingFacilitator: ObservableObject {
                 lastStatusBySession[sessionID] = L("Realtime fallback active (%@)", msg)
             }
             state.connected = false
+            probeLog("assistant-facilitator-realtime", [
+                "state": "error",
+                "outputSampleRate": Int(state.outputSampleRate)
+            ])
             syncRealtimeActiveFlag()
         case .disconnected:
             state.turnTimeoutTask?.cancel()
@@ -667,6 +717,10 @@ final class AutonomousMeetingFacilitator: ObservableObject {
                 busySessions.remove(sessionID)
             }
             state.connected = false
+            probeLog("assistant-facilitator-realtime", [
+                "state": "disconnected",
+                "outputSampleRate": Int(state.outputSampleRate)
+            ])
             syncRealtimeActiveFlag()
         default:
             break

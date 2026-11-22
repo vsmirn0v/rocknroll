@@ -90,7 +90,7 @@ final class IOSAssistantSkillsController: ObservableObject {
         self.realtimeFolderID = preferences.string(forKey: YandexRealtimePreferences.folderIDKey) ?? ""
         self.realtimeVoiceRole = preferences.string(forKey: YandexRealtimePreferences.voiceRoleKey) ?? ""
         self.selectedSkillIDs = preferences.stringArray(forKey: Keys.selectedSkillIDs) ?? ["scrum-master"]
-        self.autonomousMeetingVoiceEnabled = preferences.object(forKey: Keys.autonomousMeetingVoice) as? Bool ?? true
+        self.autonomousMeetingVoiceEnabled = preferences.object(forKey: Keys.autonomousMeetingVoice) as? Bool ?? false
 
         refreshRealtimeKeyIndicators()
         refresh()

@@ -99,6 +99,8 @@ final class MacWorkspaceSyncCoordinator: ObservableObject {
         var matters: String?
         var never: String?
         var people: [String]?
+        var autoJoin: Bool?
+        var autoFacilitatorSkillID: String?
         var guidanceTexts: [String]
     }
 
@@ -1234,6 +1236,8 @@ final class MacWorkspaceSyncCoordinator: ObservableObject {
                     matters: preset?.matters,
                     never: preset?.never,
                     people: preset?.people,
+                    autoJoin: preset?.autoJoin,
+                    autoFacilitatorSkillID: preset?.autoFacilitatorSkillID,
                     guidanceTexts: guidanceTexts(.calendarSeries(seriesID))
                 )
             } else if scopeKey.hasPrefix("room:") {
@@ -1250,6 +1254,8 @@ final class MacWorkspaceSyncCoordinator: ObservableObject {
                     matters: preset?.matters,
                     never: preset?.never,
                     people: preset?.people,
+                    autoJoin: preset?.autoJoin,
+                    autoFacilitatorSkillID: preset?.autoFacilitatorSkillID,
                     guidanceTexts: guidanceTexts(.room(room))
                 )
             }
@@ -1263,6 +1269,10 @@ final class MacWorkspaceSyncCoordinator: ObservableObject {
             func syncScalar<V: Equatable>(_ val: V, old: SyncValue<V>?) -> SyncValue<V> {
                 if let old, old.value == val { return old }
                 return SyncValue(val, version: replica.workspaceDoc.nextVersion())
+            }
+            func syncNullable<V: Equatable>(_ val: V?, old: SyncValue<V?>?) -> SyncValue<V?>? {
+                if val == nil && old == nil { return nil }
+                return syncScalar(val, old: old)
             }
             func syncOpt(_ val: String?, old: SyncValue<String>?) -> SyncValue<String>? {
                 if let val { return syncScalar(val, old: old) }
@@ -1303,6 +1313,8 @@ final class MacWorkspaceSyncCoordinator: ObservableObject {
                 never: syncOpt(fp.never, old: existing?.never),
                 people: syncOptArray(fp.people, old: existing?.people),
                 defaultReminderOverride: existing?.defaultReminderOverride,
+                autoJoin: syncNullable(fp.autoJoin, old: existing?.autoJoin),
+                autoFacilitatorSkillID: syncNullable(fp.autoFacilitatorSkillID, old: existing?.autoFacilitatorSkillID),
                 guidanceRules: updatedRules
             )
             replica.workspaceDoc.upsertContextSettings(synced)
@@ -1545,6 +1557,7 @@ final class MacWorkspaceSyncCoordinator: ObservableObject {
         if sawHandoverChange {
             onJiraHandoverPacketsChanged?()
         }
+        calendar?.refreshAutoJoinSchedule()
     }
 
     private func applyPresetFields(
@@ -1559,7 +1572,9 @@ final class MacWorkspaceSyncCoordinator: ObservableObject {
             !(settings.never?.value ?? "").isEmpty ||
             !(settings.people?.value ?? []).isEmpty ||
             settings.attentionMode?.value != nil ||
-            settings.suggestReplies?.value != nil
+            settings.suggestReplies?.value != nil ||
+            settings.autoJoin?.value != nil ||
+            (settings.autoFacilitatorSkillID?.value.map { !$0.isEmpty } ?? false)
         guard hasPresetData else { return }
 
         var preset = existing ?? MeetingPreset(title: settings.title.value, bindings: [binding])
@@ -1576,6 +1591,13 @@ final class MacWorkspaceSyncCoordinator: ObservableObject {
         }
         if let repliesBox = settings.suggestReplies {
             preset.suggestReplies = repliesBox.value
+        }
+        if let autoJoinBox = settings.autoJoin {
+            preset.autoJoin = autoJoinBox.value
+        }
+        if let skillBox = settings.autoFacilitatorSkillID {
+            let trimmed = skillBox.value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            preset.autoFacilitatorSkillID = trimmed.isEmpty ? nil : trimmed
         }
         if case .room = binding, let trBox = settings.sameRoomTransition {
             preset.sameRoomTransition = trBox.value.flatMap(SameRoomMeetingTransitionMode.init(rawValue:))

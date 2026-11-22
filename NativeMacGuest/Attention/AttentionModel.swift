@@ -100,6 +100,10 @@ struct MeetingPreset: Codable, Identifiable, Equatable, Sendable {
     var replyEdits: [ReplyEdit]?
     /// Optional per-room override when back-to-back scheduled meetings share this room.
     var sameRoomTransition: SameRoomMeetingTransitionMode? = nil
+    /// Optional per-meeting/series override for automatic calendar joining (`nil` = inherit default).
+    var autoJoin: Bool? = nil
+    /// Optional role assistant skill slug (e.g. `"scrum-master"`) to auto-engage on join (`nil` = Off).
+    var autoFacilitatorSkillID: String? = nil
     static let replyEditLimit = 10
     static let promptReplyEditLimit = 5
 

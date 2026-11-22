@@ -4114,3 +4114,9 @@
 "Starting Share…" = "正在开始共享…";
 "You can tap Done to return to the call — the 1440×810 desktop board keeps streaming." = "您可以轻点“完成”返回通话——1440×810 桌面看板将继续推流。";
 "Stop Sharing Board" = "停止共享看板";
+"Joining & Role Assistant" = "自动入会与角色助手";
+"Always auto-join" = "始终自动加入";
+"Never auto-join" = "从不自动加入";
+"Auto-engage role assistant" = "自动启用角色助手";
+"Keep this Off on shared team calls so multiple assistants do not talk over each other." = "在多人共享的团队会议中请保持关闭，以免多名成员的助手互相干扰。";
+"Meeting settings…" = "会议设置…";

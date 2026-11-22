@@ -4114,3 +4114,9 @@
 "Starting Share…" = "Memulai Berbagi…";
 "You can tap Done to return to the call — the 1440×810 desktop board keeps streaming." = "Anda dapat mengetuk Selesai untuk kembali ke panggilan — papan desktop 1440×810 tetap ditayangkan.";
 "Stop Sharing Board" = "Hentikan Berbagi Papan";
+"Joining & Role Assistant" = "Bergabung & Asisten Peran";
+"Always auto-join" = "Selalu bergabung otomatis";
+"Never auto-join" = "Jangan pernah bergabung otomatis";
+"Auto-engage role assistant" = "Aktifkan asisten peran otomatis";
+"Keep this Off on shared team calls so multiple assistants do not talk over each other." = "Biarkan nonaktif pada panggilan tim bersama agar beberapa asisten tidak saling bertabrakan.";
+"Meeting settings…" = "Pengaturan rapat…";

@@ -651,6 +651,15 @@ struct NativeDesktopHomeView: View {
             Button(L("Join")) { library.open(item) }.buttonStyle(.bordered)
         }.padding(16).background(.quaternary.opacity(0.3), in: RoundedRectangle(cornerRadius: 14))
             .contextMenu {
+                if let url = item.invitation {
+                    Button(L("Meeting settings…")) {
+                        workspace.attention.editingPreset = .init(
+                            invitation: url,
+                            seriesID: item.seriesID,
+                            title: item.title
+                        )
+                    }
+                }
                 Button(L("Choose another room")) { library.calendar.choosingMeeting = item }
                 Button(L("Reminders…")) { library.calendar.reminders.editing = library.calendar.reminders.occurrence(for: item) }
             }

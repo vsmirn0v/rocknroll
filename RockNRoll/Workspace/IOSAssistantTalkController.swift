@@ -171,11 +171,21 @@ import FoundationModels
         defer { working = false }
 
         if let deterministic = await handleDeterministicCommandIfMatched(clean, source: source) {
+            AppDiagnostics.log("assistant-talk-turn", [
+                "source": String(describing: source),
+                "route": "deterministic",
+                "provider": skills?.realtimeProvider.rawValue ?? "none"
+            ])
             recordAnswer(deterministic, source: source)
             return
         }
 
         if let override = llmResponderOverride {
+            AppDiagnostics.log("assistant-talk-turn", [
+                "source": String(describing: source),
+                "route": "override",
+                "provider": skills?.realtimeProvider.rawValue ?? "none"
+            ])
             do {
                 let answer = try await override(clean)
                 recordAnswer(answer, source: source)
@@ -186,9 +196,19 @@ import FoundationModels
         }
 
         if source.isVoice, await runVoiceRealtimeTurnIfConfigured(clean, source: source) {
+            AppDiagnostics.log("assistant-talk-turn", [
+                "source": String(describing: source),
+                "route": "realtime",
+                "provider": skills?.realtimeProvider.rawValue ?? "none"
+            ])
             return
         }
 
+        AppDiagnostics.log("assistant-talk-turn", [
+            "source": String(describing: source),
+            "route": "ai",
+            "provider": skills?.realtimeProvider.rawValue ?? "none"
+        ])
         let answer = await answerWithWorkspaceOrAI(clean)
         recordAnswer(answer, source: source)
     }
@@ -749,6 +769,7 @@ import FoundationModels
         }
 
         let usesWarmRouter = customRealtimeTransportFactory == nil
+        var warmReused = false
         let router: RealtimeVoiceRouter
         if usesWarmRouter {
             warmRealtimeIdleTask?.cancel()
@@ -757,6 +778,7 @@ import FoundationModels
             if let existing = warmRealtimeRouter,
                warmRealtimeConfigKey == configKey,
                await existing.isRealtimeConnected {
+                warmReused = true
                 router = existing
             } else {
                 if let existing = warmRealtimeRouter {
@@ -797,6 +819,11 @@ import FoundationModels
         }
 
         guard await router.isRealtimeConnected, await router.sendText(input) else {
+            AppDiagnostics.log("assistant-talk-realtime", [
+                "provider": kind.rawValue,
+                "state": "connectOrSendFailed",
+                "warmReused": warmReused
+            ])
             if usesWarmRouter {
                 invalidateWarmRealtimeRouter()
             } else {
@@ -805,6 +832,11 @@ import FoundationModels
             if state.streamToken != nil { stopAudition() }
             return false
         }
+        AppDiagnostics.log("assistant-talk-realtime", [
+            "provider": kind.rawValue,
+            "state": "connected",
+            "warmReused": warmReused
+        ])
 
         if !state.finished && !state.failed && !Task.isCancelled {
             let timeoutTask = Task { @MainActor in

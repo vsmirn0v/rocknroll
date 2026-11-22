@@ -99,13 +99,15 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
         let gate = AudioTapGate()
         var connected = false
         var audioChunks: [Data] = []
+        let provider: RealtimeProviderKind
         var outputSampleRate: Double = 24_000
         var transcriptBuffer = ""
         var activeSkillID: String
         var turnTimeoutTask: Task<Void, Never>?
 
-        init(activeSkillID: String, outputSampleRate: Double = 24_000) {
+        init(activeSkillID: String, provider: RealtimeProviderKind = .disabled, outputSampleRate: Double = 24_000) {
             self.activeSkillID = activeSkillID
+            self.provider = provider
             self.outputSampleRate = outputSampleRate
         }
     }
@@ -161,10 +163,14 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
         return skills?.selectedSkillIDs.first ?? "scrum-master"
     }
 
-    func enable(controllerID: UUID, title: String, skillID: String? = nil) {
+    func enable(controllerID: UUID, title: String, skillID: String? = nil, trigger: String = "manual") {
         manuallyDisabledSessions.remove(controllerID)
         let chosen = resolveSkillID(explicitSkillID: skillID, meetingTitle: title)
         activeSessionSkills[controllerID] = chosen
+        AppDiagnostics.log("assistant-facilitator-enable", [
+            "skill": chosen,
+            "trigger": trigger
+        ])
         let recentIDs = (recentEventsBySession[controllerID] ?? []).map(\.id)
         seenEventIDsBySession[controllerID] = Set(recentIDs)
         seenEventOrderBySession[controllerID] = recentIDs
@@ -196,7 +202,10 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
 
     func disable(controllerID: UUID) {
         manuallyDisabledSessions.insert(controllerID)
-        activeSessionSkills.removeValue(forKey: controllerID)
+        let removedSkill = activeSessionSkills.removeValue(forKey: controllerID)
+        if let removedSkill {
+            AppDiagnostics.log("assistant-facilitator-disable", ["skill": removedSkill])
+        }
         seenEventIDsBySession.removeValue(forKey: controllerID)
         seenEventOrderBySession.removeValue(forKey: controllerID)
         recentEventsBySession.removeValue(forKey: controllerID)
@@ -370,13 +379,20 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
         let titleKey = title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if let queued = (!urlKey.isEmpty ? pendingSkillByTitleOrURL.removeValue(forKey: urlKey) : nil)
             ?? (!titleKey.isEmpty ? pendingSkillByTitleOrURL.removeValue(forKey: titleKey) : nil) {
-            enable(controllerID: controllerID, title: title, skillID: queued)
-        } else if skills?.autonomousMeetingVoiceEnabled == true,
-                  !manuallyDisabledSessions.contains(controllerID),
-                  let matched = skills?.skills.first(where: {
-                      $0.enabled && $0.voiceActivation && $0.matches(meetingTitle: title, commandText: "")
-                  }) {
-            enable(controllerID: controllerID, title: title, skillID: matched.id)
+            enable(controllerID: controllerID, title: title, skillID: queued, trigger: "pending")
+        } else if !manuallyDisabledSessions.contains(controllerID) {
+            let bridge = resolveBridge(controllerID)
+            let seriesIDs = [bridge?.calendarSeriesKey, bridge?.localCalendarSeriesKey].compactMap { $0 }
+            let roomKeys = [roomURLString, bridge?.roomKey].compactMap { $0 }.filter { !$0.isEmpty }
+            if let configuredSkillID = workspace?.autoFacilitatorSkillID(seriesIDs: seriesIDs, roomKeys: roomKeys),
+               let configuredSkill = skills?.skills.first(where: { $0.id == configuredSkillID && $0.enabled }) {
+                enable(controllerID: controllerID, title: title, skillID: configuredSkill.id, trigger: "meeting-setting")
+            } else if skills?.autonomousMeetingVoiceEnabled == true,
+                      let matched = skills?.skills.first(where: {
+                          $0.enabled && $0.voiceActivation && $0.matches(meetingTitle: title, commandText: "")
+                      }) {
+                enable(controllerID: controllerID, title: title, skillID: matched.id, trigger: "auto-title")
+            }
         }
     }
 
@@ -430,6 +446,11 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
             rtState.transcriptBuffer = ""
             let prefixedPrompt = "[\(speakerName) (approved=\(allowWrites)) in “\(title)”]: \(commandText)"
             if await rtState.router.sendText(prefixedPrompt) {
+                AppDiagnostics.log("assistant-facilitator-turn", [
+                    "skill": skillID,
+                    "route": "realtime",
+                    "allowWrites": allowWrites
+                ])
                 lastStatusBySession[controllerID] = L("Realtime model handling request…")
                 rtState.turnTimeoutTask?.cancel()
                 rtState.turnTimeoutTask = Task { @MainActor [weak self, weak rtState] in
@@ -486,6 +507,11 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
                defaultBoardURL: skills.teamContext.defaultJiraBoardURL,
                targetID: controllerID
            ) {
+            AppDiagnostics.log("assistant-facilitator-turn", [
+                "skill": skillID,
+                "route": "deterministic-board",
+                "allowWrites": allowWrites
+            ])
             return boardReply
         }
 
@@ -497,6 +523,11 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
                 title: extractedTask.title,
                 owner: extractedTask.owner ?? speakerName
             ) {
+                AppDiagnostics.log("assistant-facilitator-turn", [
+                    "skill": skillID,
+                    "route": "deterministic-task",
+                    "allowWrites": allowWrites
+                ])
                 return created.resolvedOwner.isEmpty
                     ? L("Created task “%@”.", created.resolvedTitle)
                     : L("Created task “%@” for %@.", created.resolvedTitle, created.resolvedOwner)
@@ -556,9 +587,19 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
             }
            ),
            !answer.isEmpty {
+            AppDiagnostics.log("assistant-facilitator-turn", [
+                "skill": skillID,
+                "route": "llm",
+                "allowWrites": allowWrites
+            ])
             return answer
         }
 
+        AppDiagnostics.log("assistant-facilitator-turn", [
+            "skill": skillID,
+            "route": "fallback",
+            "allowWrites": allowWrites
+        ])
         if !knowledgeHits.isEmpty {
             return knowledgeHits
         }
@@ -603,9 +644,19 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
             voiceRole: skills.realtimeVoiceRole
         )
 
-        let state = SessionRealtimeState(activeSkillID: skillID, outputSampleRate: Double(config.outputSampleRate))
+        let state = SessionRealtimeState(
+            activeSkillID: skillID,
+            provider: kind,
+            outputSampleRate: Double(config.outputSampleRate)
+        )
         state.gate.setApprovedSpeakersOnly(skill?.approvedSpeakersOnly ?? true)
         realtimeSessions[controllerID] = state
+        AppDiagnostics.log("assistant-facilitator-realtime", [
+            "provider": kind.rawValue,
+            "state": "connecting",
+            "inputSampleRate": targetInputRate,
+            "outputSampleRate": Int(config.outputSampleRate)
+        ])
         await state.router.start(
             config: config,
             customTransport: customRealtimeTransportFactory?(),
@@ -688,11 +739,45 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
         directTalkJoinHandler: ((String, String?) async -> String)? = nil,
         joinableTargetsProvider: (() -> [JoinableMeetingCandidate])? = nil
     ) async -> String {
+        let args = (try? JSONSerialization.jsonObject(with: Data(argumentsJSON.utf8)) as? [String: Any]) ?? [:]
+        let command = (args["command"] as? String) ?? (args["operation"] as? String) ?? ""
+        let result = await executeSharedToolCore(
+            name: name,
+            args: args,
+            sessionID: sessionID,
+            controllerID: controllerID,
+            allowWrites: allowWrites,
+            allowedGroups: allowedGroups,
+            skills: skills,
+            workspace: workspace,
+            board: board,
+            directTalkJoinHandler: directTalkJoinHandler,
+            joinableTargetsProvider: joinableTargetsProvider
+        )
+        AppDiagnostics.log("assistant-facilitator-tool", [
+            "tool": name,
+            "command": command,
+            "ok": !result.contains("\"error\"")
+        ])
+        return result
+    }
+
+    private static func executeSharedToolCore(
+        name: String,
+        args: [String: Any],
+        sessionID: UUID?,
+        controllerID: UUID?,
+        allowWrites: Bool,
+        allowedGroups: Set<AssistantSkillToolGroup>?,
+        skills: IOSAssistantSkillsController,
+        workspace: IOSWorkspaceCoordinator?,
+        board: IOSAssistantBoardController?,
+        directTalkJoinHandler: ((String, String?) async -> String)?,
+        joinableTargetsProvider: (() -> [JoinableMeetingCandidate])?
+    ) async -> String {
         func allows(_ group: AssistantSkillToolGroup) -> Bool {
             allowedGroups?.contains(group) ?? true
         }
-
-        let args = (try? JSONSerialization.jsonObject(with: Data(argumentsJSON.utf8)) as? [String: Any]) ?? [:]
 
         switch name {
         case "rocknroll_search_knowledge":
@@ -968,6 +1053,12 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
         switch event {
         case .connected:
             state.connected = true
+            AppDiagnostics.log("assistant-facilitator-realtime", [
+                "provider": state.provider.rawValue,
+                "state": "connected",
+                "inputSampleRate": state.provider.defaultInputSampleRate,
+                "outputSampleRate": Int(state.outputSampleRate)
+            ])
             syncRealtimeActiveFlag()
         case .audioPCM16(let pcm, let sampleRate):
             if sampleRate > 0 {
@@ -1004,12 +1095,24 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
             busySessions.remove(controllerID)
             lastStatusBySession[controllerID] = L("Realtime fallback active (%@)", msg)
             state.connected = false
+            AppDiagnostics.log("assistant-facilitator-realtime", [
+                "provider": state.provider.rawValue,
+                "state": "error",
+                "inputSampleRate": state.provider.defaultInputSampleRate,
+                "outputSampleRate": Int(state.outputSampleRate)
+            ])
             syncRealtimeActiveFlag()
         case .disconnected:
             state.turnTimeoutTask?.cancel()
             state.turnTimeoutTask = nil
             busySessions.remove(controllerID)
             state.connected = false
+            AppDiagnostics.log("assistant-facilitator-realtime", [
+                "provider": state.provider.rawValue,
+                "state": "disconnected",
+                "inputSampleRate": state.provider.defaultInputSampleRate,
+                "outputSampleRate": Int(state.outputSampleRate)
+            ])
             syncRealtimeActiveFlag()
         default:
             break

@@ -432,11 +432,27 @@ final class IOSScreenShareCapture {
         await stop()
         let attempt = UUID()
         generation = attempt
+        let mode = broadcast ? "broadcast" : "native"
+        AppDiagnostics.log("screen-share-capture-start", [
+            "mode": mode,
+            "codec": codec.lowercased(),
+            "width": Int(profile.width),
+            "height": Int(profile.height)
+        ])
         let created = makeSender(attempt: attempt, profile: profile, codec: codec)
         sender = created
         do {
             try await created.start(broadcast: broadcast)
         } catch {
+            let ns = error as NSError
+            AppDiagnostics.log("screen-share-capture-error", [
+                "mode": mode,
+                "codec": codec.lowercased(),
+                "errorType": String(describing: type(of: error)),
+                "errorDomain": ns.domain,
+                "errorCode": ns.code,
+                "cancelled": error is CancellationError
+            ])
             if generation == attempt {
                 await stop()
             }
@@ -452,6 +468,12 @@ final class IOSScreenShareCapture {
         await stop()
         let attempt = UUID()
         generation = attempt
+        AppDiagnostics.log("screen-share-capture-start", [
+            "mode": "composed",
+            "codec": codec.lowercased(),
+            "width": Int(profile.width),
+            "height": Int(profile.height)
+        ])
         let created = makeSender(attempt: attempt, profile: profile, codec: codec)
         sender = created
         do {
@@ -461,6 +483,15 @@ final class IOSScreenShareCapture {
                 created.send(initialSample)
             }
         } catch {
+            let ns = error as NSError
+            AppDiagnostics.log("screen-share-capture-error", [
+                "mode": "composed",
+                "codec": codec.lowercased(),
+                "errorType": String(describing: type(of: error)),
+                "errorDomain": ns.domain,
+                "errorCode": ns.code,
+                "cancelled": error is CancellationError
+            ])
             if generation == attempt {
                 await stop()
             }
@@ -487,6 +518,13 @@ final class IOSScreenShareCapture {
         let wasSharing = isSharing
         isSharing = false
         let shouldStopBroadcast = currentSender?.isBroadcast == true
+        if wasSharing || currentSender != nil {
+            let stopMode = currentSender?.composed == true ? "composed" : (shouldStopBroadcast ? "broadcast" : "native")
+            AppDiagnostics.log("screen-share-capture-stop", [
+                "mode": stopMode,
+                "wasSharing": wasSharing
+            ])
+        }
 
         if let session {
             if session.supportsScreenSharePublication {
@@ -571,6 +609,12 @@ final class IOSScreenShareCapture {
                             return
                         }
                         self.isSharing = true
+                        let readyMode = activeSender.composed ? "composed" : (activeSender.isBroadcast ? "broadcast" : "native")
+                        AppDiagnostics.log("screen-share-capture-ready", [
+                            "mode": readyMode,
+                            "codec": codec.lowercased(),
+                            "supportsPublication": session.supportsScreenSharePublication
+                        ])
                         self.onSharingChanged?(true)
                         self.publishWaiters.removeValue(forKey: attempt)?.resume()
                     } catch is CancellationError {
@@ -581,6 +625,16 @@ final class IOSScreenShareCapture {
                             self.publishWaiters.removeValue(forKey: attempt)?.resume(throwing: CancellationError())
                             return
                         }
+                        let ns = error as NSError
+                        let errMode = activeSender.composed ? "composed" : (activeSender.isBroadcast ? "broadcast" : "native")
+                        AppDiagnostics.log("screen-share-capture-error", [
+                            "mode": errMode,
+                            "codec": codec.lowercased(),
+                            "errorType": String(describing: type(of: error)),
+                            "errorDomain": ns.domain,
+                            "errorCode": ns.code,
+                            "cancelled": false
+                        ])
                         self.publishWaiters.removeValue(forKey: attempt)?.resume(throwing: error)
                         self.onError?(error)
                         self.onExternalEnd?()

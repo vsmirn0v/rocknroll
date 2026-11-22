@@ -19,7 +19,7 @@ private final class BoardDirtyScriptHandlerProxy: NSObject, WKScriptMessageHandl
 /// Sandbox-safe Computer Use controller for sharing and interacting with Jira or
 /// project boards inside an in-app WKWebView window without Accessibility permissions.
 @MainActor
-final class AssistantBoardWindowController: NSObject, ObservableObject, WKNavigationDelegate, NSWindowDelegate {
+final class AssistantBoardWindowController: NSObject, ObservableObject, WKNavigationDelegate, WKUIDelegate, NSWindowDelegate {
     @Published private(set) var currentURL: URL?
     @Published private(set) var pageTitle: String = L("Assistant Board")
     @Published private(set) var isLoading = false
@@ -95,6 +95,9 @@ final class AssistantBoardWindowController: NSObject, ObservableObject, WKNaviga
         isLoading = true
         refreshNavigationUI()
         refreshBanner()
+        probeLog("board-open-start", [
+            "scheme": url.scheme?.lowercased() ?? "unknown"
+        ])
         webView.load(URLRequest(url: url))
         try? await waitForLoadFinish(timeoutSeconds: 8)
         let title = webView.title?.trimmed.isEmpty == false ? (webView.title ?? url.host ?? url.absoluteString) : url.absoluteString
@@ -103,6 +106,9 @@ final class AssistantBoardWindowController: NSObject, ObservableObject, WKNaviga
             lastActionSummary = err
             return err
         }
+        probeLog("board-open-ready", [
+            "timedOutWhileLoading": isLoading
+        ])
         lastActionSummary = L("Opened %@", title)
         return L("Opened %@ (%@).", title, url.absoluteString)
     }
@@ -117,9 +123,17 @@ final class AssistantBoardWindowController: NSObject, ObservableObject, WKNaviga
             await activeModel.stopSharing()
             stopSharing(notifyModel: false)
         }
+        probeLog("board-share-start", [
+            "hasLoadedBoard": currentURL != nil,
+            "isLoading": isLoading
+        ])
         guard model.startBoardSharing() else {
+            probeLog("board-share-error", ["reason": "share-already-active-or-not-ready"])
             throw NativeDesktopError.unavailable(L("Stop the active screen share before sharing the Assistant Board."))
         }
+        probeLog("board-share-ready", [
+            "viewport": "desktop"
+        ])
         frameTask?.cancel()
         sharedMeetingModel = model
         sharingMeetingID = model.sessionID
@@ -167,6 +181,7 @@ final class AssistantBoardWindowController: NSObject, ObservableObject, WKNaviga
     }
 
     func stopSharing(notifyModel: Bool) {
+        let wasSharing = sharingMeetingID != nil || frameTask != nil
         frameTask?.cancel()
         frameTask = nil
         if let model = sharedMeetingModel {
@@ -178,6 +193,9 @@ final class AssistantBoardWindowController: NSObject, ObservableObject, WKNaviga
         sharedMeetingModel = nil
         sharingMeetingID = nil
         sharingMeetingTitle = nil
+        if wasSharing {
+            probeLog("board-share-stop", ["notifyModel": notifyModel])
+        }
         refreshBanner()
         lastActionSummary = L("Stopped sharing board")
     }
@@ -525,6 +543,7 @@ final class AssistantBoardWindowController: NSObject, ObservableObject, WKNaviga
         let web = WKWebView(frame: .zero, configuration: config)
         web.translatesAutoresizingMaskIntoConstraints = false
         web.navigationDelegate = self
+        web.uiDelegate = self
 
         root.addSubview(toolbarStack)
         root.addSubview(web)
@@ -747,6 +766,11 @@ final class AssistantBoardWindowController: NSObject, ObservableObject, WKNaviga
         let nsError = error as NSError
         if !(nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorCancelled) {
             loadError = error.localizedDescription
+            probeLog("board-open-error", [
+                "stage": "navigation",
+                "errorDomain": nsError.domain,
+                "errorCode": nsError.code
+            ])
         }
         refreshNavigationUI()
         refreshBanner()
@@ -758,10 +782,35 @@ final class AssistantBoardWindowController: NSObject, ObservableObject, WKNaviga
         let nsError = error as NSError
         if !(nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorCancelled) {
             loadError = error.localizedDescription
+            probeLog("board-open-error", [
+                "stage": "provisional",
+                "errorDomain": nsError.domain,
+                "errorCode": nsError.code
+            ])
         }
         refreshNavigationUI()
         refreshBanner()
         finishPendingNavigation()
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        didReceive challenge: URLAuthenticationChallenge,
+        completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
+    ) {
+        SiteTLSDelegate.shared.handleChallenge(challenge, completionHandler: completionHandler)
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        createWebViewWith configuration: WKWebViewConfiguration,
+        for navigationAction: WKNavigationAction,
+        windowFeatures: WKWindowFeatures
+    ) -> WKWebView? {
+        if navigationAction.targetFrame?.isMainFrame != true {
+            webView.load(navigationAction.request)
+        }
+        return nil
     }
 
     func windowWillClose(_ notification: Notification) {

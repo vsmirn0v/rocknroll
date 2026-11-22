@@ -98,7 +98,7 @@ struct IOSWorkspaceHubView: View {
                     tabDetailContent
                         .navigationTitle(selectedTab.title)
                 } else if let selectedID = selectedSessionID ?? visibleHistory.first?.id {
-                    IOSMeetingDetailView(workspace: workspace, sync: sync, sessionID: selectedID)
+                    IOSMeetingDetailView(workspace: workspace, sync: sync, sessionID: selectedID, skills: skills)
                 } else {
                     ContentUnavailableView(
                         L("No Meetings Yet"),

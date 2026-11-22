@@ -1126,6 +1126,8 @@ public struct SyncedMeetingContextSettings: Codable, Equatable, Identifiable, Se
     public var never: SyncValue<String>?
     public var people: SyncValue<[String]>?
     public var defaultReminderOverride: SyncValue<ReminderOverride?>?
+    public var autoJoin: SyncValue<Bool?>?
+    public var autoFacilitatorSkillID: SyncValue<String?>?
     public var guidanceRules: [UUID: SyncValue<SyncedGuidanceRule>]
 
     public init(
@@ -1141,6 +1143,8 @@ public struct SyncedMeetingContextSettings: Codable, Equatable, Identifiable, Se
         never: SyncValue<String>? = nil,
         people: SyncValue<[String]>? = nil,
         defaultReminderOverride: SyncValue<ReminderOverride?>? = nil,
+        autoJoin: SyncValue<Bool?>? = nil,
+        autoFacilitatorSkillID: SyncValue<String?>? = nil,
         guidanceRules: [UUID: SyncValue<SyncedGuidanceRule>] = [:]
     ) {
         self.scopeKey = scopeKey
@@ -1155,6 +1159,8 @@ public struct SyncedMeetingContextSettings: Codable, Equatable, Identifiable, Se
         self.never = never
         self.people = people
         self.defaultReminderOverride = defaultReminderOverride
+        self.autoJoin = autoJoin
+        self.autoFacilitatorSkillID = autoFacilitatorSkillID
         self.guidanceRules = guidanceRules
     }
 
@@ -1169,7 +1175,9 @@ public struct SyncedMeetingContextSettings: Codable, Equatable, Identifiable, Se
             matters?.version.counter,
             never?.version.counter,
             people?.version.counter,
-            defaultReminderOverride?.version.counter
+            defaultReminderOverride?.version.counter,
+            autoJoin?.version.counter,
+            autoFacilitatorSkillID?.version.counter
         ]
         let ruleMax = guidanceRules.values.map(\.version.counter).max() ?? 0
         return max(scalars.compactMap { $0 }.max() ?? 0, ruleMax)
@@ -1188,6 +1196,8 @@ public struct SyncedMeetingContextSettings: Codable, Equatable, Identifiable, Se
         result.never = mergeOptional(never, other.never)
         result.people = mergeOptional(people, other.people)
         result.defaultReminderOverride = mergeOptional(defaultReminderOverride, other.defaultReminderOverride)
+        result.autoJoin = mergeOptional(autoJoin, other.autoJoin)
+        result.autoFacilitatorSkillID = mergeOptional(autoFacilitatorSkillID, other.autoFacilitatorSkillID)
         var rules = guidanceRules
         for (ruleID, value) in other.guidanceRules {
             rules[ruleID] = rules[ruleID]?.merging(value) ?? value

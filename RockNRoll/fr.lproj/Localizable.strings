@@ -4114,3 +4114,9 @@
 "Starting Share…" = "Démarrage…";
 "You can tap Done to return to the call — the 1440×810 desktop board keeps streaming." = "Vous pouvez toucher OK pour revenir à l'appel — le tableau bureau 1440×810 continue d'être diffusé.";
 "Stop Sharing Board" = "Arrêter le partage du tableau";
+"Joining & Role Assistant" = "Connexion et assistant de rôle";
+"Always auto-join" = "Toujours rejoindre automatiquement";
+"Never auto-join" = "Ne jamais rejoindre automatiquement";
+"Auto-engage role assistant" = "Activer automatiquement l’assistant de rôle";
+"Keep this Off on shared team calls so multiple assistants do not talk over each other." = "Laissez cette option désactivée lors des appels d’équipe partagés afin que plusieurs assistants ne parlent pas en même temps.";
+"Meeting settings…" = "Paramètres de la réunion…";

@@ -32,7 +32,7 @@ private final class IOSBoardDirtyScriptHandlerProxy: NSObject, WKScriptMessageHa
 /// Sandbox-safe in-app WebView controller for inspecting, filtering, clicking,
 /// and streaming desktop-sized Jira or project boards directly into an active iOS meeting.
 @MainActor
-final class IOSAssistantBoardController: NSObject, ObservableObject, WKNavigationDelegate {
+final class IOSAssistantBoardController: NSObject, ObservableObject, WKNavigationDelegate, WKUIDelegate {
     static let desktopViewportSize = CGSize(width: 1440, height: 810)
     static let sharedOutputSize = CGSize(width: 1920, height: 1080)
     static let desktopUserAgent =
@@ -110,6 +110,7 @@ final class IOSAssistantBoardController: NSObject, ObservableObject, WKNavigatio
         let view = WKWebView(frame: CGRect(origin: .zero, size: Self.desktopViewportSize), configuration: config)
         view.customUserAgent = Self.desktopUserAgent
         view.navigationDelegate = self
+        view.uiDelegate = self
         view.scrollView.contentInsetAdjustmentBehavior = .never
         view.isOpaque = true
         view.backgroundColor = .white
@@ -222,9 +223,18 @@ final class IOSAssistantBoardController: NSObject, ObservableObject, WKNavigatio
         isLoading = true
         ensureWebViewHostedForRendering(force: true)
         markBoardDirty()
+        AppDiagnostics.log("board-open-start", [
+            "presentSheet": presentSheet,
+            "isLocal": ["localhost", "127.0.0.1", "::1"].contains(url.host?.lowercased() ?? "")
+        ])
         webView.load(URLRequest(url: url))
         await waitForLoadFinish(timeoutSeconds: 8)
         ensureWebViewHostedForRendering()
+        AppDiagnostics.log("board-open-finish", [
+            "hasError": loadError != nil,
+            "viewportW": Int(webView.bounds.width),
+            "viewportH": Int(webView.bounds.height)
+        ])
         if let loadError {
             lastActionSummary = loadError
             throw MeetingSessionError.unavailable(loadError)
@@ -240,6 +250,13 @@ final class IOSAssistantBoardController: NSObject, ObservableObject, WKNavigatio
     @discardableResult
     func startSharing(targetID: UUID? = nil, urlOverride: String? = nil) async throws -> String {
         guard let target = resolveShareTarget?(targetID), target.canShareBoard else {
+            AppDiagnostics.log("board-share-error", [
+                "stage": "resolveTarget",
+                "errorType": "unavailable",
+                "errorDomain": "RockNRoll.Board",
+                "errorCode": 1,
+                "cancelled": false
+            ])
             throw MeetingSessionError.unavailable(L("Connect to a meeting before sharing the Assistant Board."))
         }
         let explicitURL = urlOverride?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -252,6 +269,11 @@ final class IOSAssistantBoardController: NSObject, ObservableObject, WKNavigatio
         guard !isStartingShare else {
             throw MeetingSessionError.unavailable(L("Starting Assistant Board share…"))
         }
+
+        AppDiagnostics.log("board-share-begin", [
+            "hasCurrentURL": currentURL != nil,
+            "sheetOpen": isPresented
+        ])
 
         isStartingShare = true
         ensureWebViewHostedForRendering(force: true)
@@ -271,119 +293,136 @@ final class IOSAssistantBoardController: NSObject, ObservableObject, WKNavigatio
         shareAttemptGeneration &+= 1
         let attempt = shareAttemptGeneration
 
-        if !explicitURL.isEmpty {
-            _ = try await open(urlString: explicitURL, presentSheet: isPresented)
-        } else if currentURL == nil {
-            let draftSeed = urlDraft.trimmingCharacters(in: .whitespacesAndNewlines)
-            let defaultSeed = defaultBoardURLProvider?().trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            let seed = !draftSeed.isEmpty ? draftSeed : defaultSeed
-            guard !seed.isEmpty else {
-                throw MeetingSessionError.unavailable(L("Enter a Jira board URL or set a Default Jira Board URL in Skills → Team Context first."))
-            }
-            _ = try await open(urlString: seed, presentSheet: isPresented)
-        }
-
-        guard shareAttemptGeneration == attempt else { throw CancellationError() }
-        guard target.canShareBoard else {
-            throw MeetingSessionError.unavailable(L("Connect to a meeting before sharing the Assistant Board."))
-        }
-
-        var initialPixels: CVPixelBuffer?
-        var capturedInitial = false
-        for _ in 0..<3 {
-            guard shareAttemptGeneration == attempt else { throw CancellationError() }
-            if let captured = await captureBoardPixelBuffer() {
-                initialPixels = captured
-                capturedInitial = true
-                break
-            }
-            try? await Task.sleep(for: .milliseconds(80))
-        }
-        guard shareAttemptGeneration == attempt else { throw CancellationError() }
-        if initialPixels == nil {
-            initialPixels = await Self.renderPixelBufferOnQueue(cgImage: nil)
-        }
-        guard shareAttemptGeneration == attempt else { throw CancellationError() }
-        guard target.canShareBoard else {
-            throw MeetingSessionError.unavailable(L("Connect to a meeting before sharing the Assistant Board."))
-        }
-        guard let firstBuffer = initialPixels,
-              let initialSample = Self.makeSampleBuffer(from: firstBuffer) else {
-            throw MeetingSessionError.unavailable(L("Could not capture the Assistant Board frame."))
-        }
-
-        try await target.startBoardSharing(initialSample: initialSample)
-        guard shareAttemptGeneration == attempt, target.canShareBoard else {
-            await target.stopBoardSharing()
-            throw CancellationError()
-        }
-
-        sharedTarget = target
-        sharingSessionID = target.id
-        sharingMeetingTitle = target.title
-        target.onExternalBoardShareStopped = { [weak self] in
-            self?.stopSharing(notifyTarget: false)
-        }
-
-        let sessionID = target.id
-        markBoardDirty()
-        let initialGeneration = capturedInitial ? dirtyGeneration : 0
-        lastCapturedGeneration = initialGeneration
-
-        frameTask?.cancel()
-        frameTask = Task { @MainActor [weak self] in
-            guard let self else { return }
-            var cachedBuffer: CVPixelBuffer? = capturedInitial ? firstBuffer : nil
-            var lastPushUptime = ProcessInfo.processInfo.systemUptime
-            var lastFreshSnapshotUptime = capturedInitial ? lastPushUptime : 0
-
-            while !Task.isCancelled {
-                guard let currentTarget = self.sharedTarget,
-                      currentTarget.id == sessionID,
-                      currentTarget.canShareBoard else {
-                    self.stopSharing(notifyTarget: false)
-                    return
+        do {
+            if !explicitURL.isEmpty {
+                _ = try await open(urlString: explicitURL, presentSheet: isPresented)
+            } else if currentURL == nil {
+                let draftSeed = urlDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+                let defaultSeed = defaultBoardURLProvider?().trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                let seed = !draftSeed.isEmpty ? draftSeed : defaultSeed
+                guard !seed.isEmpty else {
+                    throw MeetingSessionError.unavailable(L("Enter a Jira board URL or set a Default Jira Board URL in Skills → Team Context first."))
                 }
+                _ = try await open(urlString: seed, presentSheet: isPresented)
+            }
 
-                let uptime = ProcessInfo.processInfo.systemUptime
-                let isDirty = self.isLoading
-                    || self.dirtyGeneration != self.lastCapturedGeneration
-                    || (uptime - self.lastDirtyUptime) <= 1.2
-                let needsFreshRefresh = isDirty
-                    || cachedBuffer == nil
-                    || (uptime - lastFreshSnapshotUptime) >= 3.0
+            guard shareAttemptGeneration == attempt else { throw CancellationError() }
+            guard target.canShareBoard else {
+                throw MeetingSessionError.unavailable(L("Connect to a meeting before sharing the Assistant Board."))
+            }
 
-                if needsFreshRefresh {
-                    let targetGen = self.dirtyGeneration
-                    let fresh = await self.captureBoardPixelBuffer()
-                    guard !Task.isCancelled,
-                          self.sharedTarget === currentTarget,
-                          self.sharingSessionID == sessionID,
+            var initialPixels: CVPixelBuffer?
+            var capturedInitial = false
+            for _ in 0..<3 {
+                guard shareAttemptGeneration == attempt else { throw CancellationError() }
+                if let captured = await captureBoardPixelBuffer() {
+                    initialPixels = captured
+                    capturedInitial = true
+                    break
+                }
+                try? await Task.sleep(for: .milliseconds(80))
+            }
+            guard shareAttemptGeneration == attempt else { throw CancellationError() }
+            if initialPixels == nil {
+                initialPixels = await Self.renderPixelBufferOnQueue(cgImage: nil)
+            }
+            guard shareAttemptGeneration == attempt else { throw CancellationError() }
+            guard target.canShareBoard else {
+                throw MeetingSessionError.unavailable(L("Connect to a meeting before sharing the Assistant Board."))
+            }
+            guard let firstBuffer = initialPixels,
+                  let initialSample = Self.makeSampleBuffer(from: firstBuffer) else {
+                throw MeetingSessionError.unavailable(L("Could not capture the Assistant Board frame."))
+            }
+
+            try await target.startBoardSharing(initialSample: initialSample)
+            guard shareAttemptGeneration == attempt, target.canShareBoard else {
+                await target.stopBoardSharing()
+                throw CancellationError()
+            }
+
+            sharedTarget = target
+            sharingSessionID = target.id
+            sharingMeetingTitle = target.title
+            target.onExternalBoardShareStopped = { [weak self] in
+                self?.stopSharing(notifyTarget: false)
+            }
+
+            let sessionID = target.id
+            markBoardDirty()
+            let initialGeneration = capturedInitial ? dirtyGeneration : 0
+            lastCapturedGeneration = initialGeneration
+
+            frameTask?.cancel()
+            frameTask = Task { @MainActor [weak self] in
+                guard let self else { return }
+                var cachedBuffer: CVPixelBuffer? = capturedInitial ? firstBuffer : nil
+                var lastPushUptime = ProcessInfo.processInfo.systemUptime
+                var lastFreshSnapshotUptime = capturedInitial ? lastPushUptime : 0
+
+                while !Task.isCancelled {
+                    guard let currentTarget = self.sharedTarget,
+                          currentTarget.id == sessionID,
                           currentTarget.canShareBoard else {
+                        self.stopSharing(notifyTarget: false)
                         return
                     }
-                    if let fresh,
-                       let sample = Self.makeSampleBuffer(from: fresh) {
-                        cachedBuffer = fresh
-                        self.lastCapturedGeneration = targetGen
-                        lastFreshSnapshotUptime = ProcessInfo.processInfo.systemUptime
-                        lastPushUptime = lastFreshSnapshotUptime
+
+                    let uptime = ProcessInfo.processInfo.systemUptime
+                    let isDirty = self.isLoading
+                        || self.dirtyGeneration != self.lastCapturedGeneration
+                        || (uptime - self.lastDirtyUptime) <= 1.2
+                    let needsFreshRefresh = isDirty
+                        || cachedBuffer == nil
+                        || (uptime - lastFreshSnapshotUptime) >= 3.0
+
+                    if needsFreshRefresh {
+                        let targetGen = self.dirtyGeneration
+                        let fresh = await self.captureBoardPixelBuffer()
+                        guard !Task.isCancelled,
+                              self.sharedTarget === currentTarget,
+                              self.sharingSessionID == sessionID,
+                              currentTarget.canShareBoard else {
+                            return
+                        }
+                        if let fresh,
+                           let sample = Self.makeSampleBuffer(from: fresh) {
+                            cachedBuffer = fresh
+                            self.lastCapturedGeneration = targetGen
+                            lastFreshSnapshotUptime = ProcessInfo.processInfo.systemUptime
+                            lastPushUptime = lastFreshSnapshotUptime
+                            currentTarget.pushBoardShareFrame(sample)
+                        }
+                    } else if (uptime - lastPushUptime) >= 1.0,
+                              let cachedBuffer,
+                              let sample = Self.makeSampleBuffer(from: cachedBuffer) {
+                        lastPushUptime = uptime
                         currentTarget.pushBoardShareFrame(sample)
                     }
-                } else if (uptime - lastPushUptime) >= 1.0,
-                          let cachedBuffer,
-                          let sample = Self.makeSampleBuffer(from: cachedBuffer) {
-                    lastPushUptime = uptime
-                    currentTarget.pushBoardShareFrame(sample)
+
+                    try? await Task.sleep(for: .milliseconds(isDirty ? 160 : 350))
                 }
-
-                try? await Task.sleep(for: .milliseconds(isDirty ? 160 : 350))
             }
-        }
 
-        ensureWebViewHostedForRendering()
-        lastActionSummary = L("Sharing desktop board to %@", target.title)
-        return L("Sharing Assistant Board as Desktop (16:9) to “%@”.", target.title)
+            ensureWebViewHostedForRendering()
+            AppDiagnostics.log("board-share-active", [
+                "capturedInitial": capturedInitial,
+                "outputW": Int(Self.sharedOutputSize.width),
+                "outputH": Int(Self.sharedOutputSize.height)
+            ])
+            lastActionSummary = L("Sharing desktop board to %@", target.title)
+            return L("Sharing Assistant Board as Desktop (16:9) to “%@”.", target.title)
+        } catch {
+            let ns = error as NSError
+            AppDiagnostics.log("board-share-error", [
+                "stage": "startSharing",
+                "errorType": String(describing: type(of: error)),
+                "errorDomain": ns.domain,
+                "errorCode": ns.code,
+                "cancelled": error is CancellationError
+            ])
+            throw error
+        }
     }
 
     func stopSharing(notifyTarget: Bool = true) {
@@ -403,6 +442,11 @@ final class IOSAssistantBoardController: NSObject, ObservableObject, WKNavigatio
         }
         ensureWebViewHostedForRendering()
         if wasSharing {
+            AppDiagnostics.log("board-share-stop", [
+                "notifyTarget": notifyTarget,
+                "wasSharing": wasSharing,
+                "reason": notifyTarget ? "userOrTool" : "external"
+            ])
             lastActionSummary = L("Stopped sharing board")
         }
     }
@@ -832,8 +876,14 @@ final class IOSAssistantBoardController: NSObject, ObservableObject, WKNavigatio
         isLoading = false
         canGoBack = webView.canGoBack
         canGoForward = webView.canGoForward
-        if (error as NSError).code != NSURLErrorCancelled {
+        let ns = error as NSError
+        if ns.code != NSURLErrorCancelled {
             loadError = error.localizedDescription
+            AppDiagnostics.log("board-open-error", [
+                "stage": "navigation",
+                "errorDomain": ns.domain,
+                "errorCode": ns.code
+            ])
         }
         finishPendingNavigation()
         ensureWebViewHostedForRendering()
@@ -843,11 +893,37 @@ final class IOSAssistantBoardController: NSObject, ObservableObject, WKNavigatio
         isLoading = false
         canGoBack = webView.canGoBack
         canGoForward = webView.canGoForward
-        if (error as NSError).code != NSURLErrorCancelled {
+        let ns = error as NSError
+        if ns.code != NSURLErrorCancelled {
             loadError = error.localizedDescription
+            AppDiagnostics.log("board-open-error", [
+                "stage": "provisional",
+                "errorDomain": ns.domain,
+                "errorCode": ns.code
+            ])
         }
         finishPendingNavigation()
         ensureWebViewHostedForRendering()
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        didReceive challenge: URLAuthenticationChallenge,
+        completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
+    ) {
+        SiteTLSDelegate.shared.handleChallenge(challenge, completionHandler: completionHandler)
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        createWebViewWith configuration: WKWebViewConfiguration,
+        for navigationAction: WKNavigationAction,
+        windowFeatures: WKWindowFeatures
+    ) -> WKWebView? {
+        if navigationAction.targetFrame?.isMainFrame != true {
+            webView.load(navigationAction.request)
+        }
+        return nil
     }
 
     // MARK: - Helpers

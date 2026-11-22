@@ -195,6 +195,16 @@ import UserNotifications
             joinTasks[id]?.cancel()
         }
         library.canAutomaticallyJoin = { [weak self] in self?.meetings.isEmpty == true && self?.preparing == false && self?.mayAdmitMeeting() == true }
+        library.calendar.automaticJoinOverride = { [weak self] meeting in
+            guard let self else { return nil }
+            let seriesIDs = [meeting.externalSeriesID, meeting.seriesID].compactMap { $0 }
+            return self.attention.store.autoJoinOverride(room: meeting.invitation, seriesIDs: seriesIDs)
+        }
+        self.attention.store.$presets.dropFirst().sink { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.library.calendar.refreshAutoJoinSchedule()
+            }
+        }.store(in: &subscriptions)
         library.continuation.onSnapshot = { [weak self] in self?.continuationSnapshot() }
         library.continuation.onJoinTarget = { [weak self] jam, quiet in
             guard let self, !preparing, meetings.isEmpty, mayAdmitMeeting() else { return nil }

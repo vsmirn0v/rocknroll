@@ -948,4 +948,41 @@ final class MeetingWorkspaceSyncTests: XCTestCase {
             XCTAssertEqual(error as? CloudZoneError, .generationChanged)
         }
     }
+
+    func testSyncedMeetingContextSettingsAutoJoinAndFacilitatorSkillRoundTripAndMerge() throws {
+        let v1 = SyncVersion(counter: 1, device: "mac-1")
+        let v2 = SyncVersion(counter: 2, device: "ios-1")
+        let initial = SyncedMeetingContextSettings(
+            scopeKey: "series:cto-daily",
+            scopeKind: .calendarSeries,
+            title: SyncValue("CTO Daily", version: v1),
+            autoJoin: SyncValue(true, version: v1),
+            autoFacilitatorSkillID: SyncValue(nil, version: v1)
+        )
+        let encoded = try JSONEncoder().encode(initial)
+        let decoded = try JSONDecoder().decode(SyncedMeetingContextSettings.self, from: encoded)
+        XCTAssertEqual(decoded, initial)
+        XCTAssertEqual(decoded.autoJoin?.value, true)
+        XCTAssertNil(decoded.autoFacilitatorSkillID?.value ?? nil)
+
+        let remote = SyncedMeetingContextSettings(
+            scopeKey: "series:cto-daily",
+            scopeKind: .calendarSeries,
+            title: SyncValue("CTO Daily", version: v1),
+            autoJoin: SyncValue(false, version: v2),
+            autoFacilitatorSkillID: SyncValue("scrum-master", version: v2)
+        )
+        let merged = decoded.merging(remote)
+        XCTAssertEqual(merged.autoJoin?.value, false)
+        XCTAssertEqual(merged.autoFacilitatorSkillID?.value, "scrum-master")
+        XCTAssertEqual(merged.maximumCounter, 2)
+
+        // Legacy payloads missing autoJoin/autoFacilitatorSkillID still decode cleanly as nil.
+        let legacyJSON = """
+        {"scopeKey":"room:standup","scopeKind":"room","title":{"value":"Standup","version":{"counter":1,"device":"mac-1"}},"guidanceRules":[]}
+        """
+        let legacy = try JSONDecoder().decode(SyncedMeetingContextSettings.self, from: Data(legacyJSON.utf8))
+        XCTAssertNil(legacy.autoJoin)
+        XCTAssertNil(legacy.autoFacilitatorSkillID)
+    }
 }

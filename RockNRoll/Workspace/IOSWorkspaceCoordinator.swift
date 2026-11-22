@@ -274,7 +274,10 @@ final class IOSWorkspaceCoordinator: ObservableObject {
             if tasks != snapshot.tasks { tasks = snapshot.tasks }
             if taskProfile != snapshot.taskProfile { taskProfile = snapshot.taskProfile }
             if taskArchiveDates != snapshot.taskArchiveDates { taskArchiveDates = snapshot.taskArchiveDates }
-            if contextSettings != snapshot.contextSettings { contextSettings = snapshot.contextSettings }
+            if contextSettings != snapshot.contextSettings {
+                contextSettings = snapshot.contextSettings
+                calendar?.refreshAutoJoinSchedule()
+            }
             if let json = snapshot.contextSettings[TaskSyncPreferences.syncScopeKey]?.about?.value,
                let remotePrefs = TaskSyncPreferences.decodeSyncJSON(json) {
                 taskSync.updatePreferencesFromRemoteSync(remotePrefs)
@@ -1282,6 +1285,47 @@ final class IOSWorkspaceCoordinator: ObservableObject {
         contextSettings[scopeKey] ?? replica.workspaceDoc.contextSettings[scopeKey]
     }
 
+    func autoJoinOverride(seriesIDs: [String], roomKeys: [String]) -> Bool? {
+        for sid in seriesIDs {
+            let trimmed = sid.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+            if let value = settings(for: "series:" + trimmed)?.autoJoin?.value {
+                return value
+            }
+        }
+        for key in roomKeys {
+            let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+            if let value = settings(for: "room:" + trimmed)?.autoJoin?.value {
+                return value
+            }
+        }
+        return nil
+    }
+
+    func autoFacilitatorSkillID(seriesIDs: [String], roomKeys: [String]) -> String? {
+        func sanitized(_ raw: String?) -> String? {
+            guard let raw else { return nil }
+            let slug = AssistantSkill.sanitizedSlug(from: raw)
+            return slug.isEmpty ? nil : slug
+        }
+        for sid in seriesIDs {
+            let trimmed = sid.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+            if let slug = sanitized(settings(for: "series:" + trimmed)?.autoFacilitatorSkillID?.value) {
+                return slug
+            }
+        }
+        for key in roomKeys {
+            let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+            if let slug = sanitized(settings(for: "room:" + trimmed)?.autoFacilitatorSkillID?.value) {
+                return slug
+            }
+        }
+        return nil
+    }
+
     func saveDefaultTransitionMode(_ mode: IOSSameRoomTransitionMode) async {
         let current = settings(for: "all")
         await saveContextSettings(
@@ -1304,12 +1348,20 @@ final class IOSWorkspaceCoordinator: ObservableObject {
         about: String?,
         matters: String?,
         never: String?,
-        people: [String]?
+        people: [String]?,
+        autoJoin: Bool? = nil,
+        updateAutoJoin: Bool = false,
+        autoFacilitatorSkillID: String? = nil,
+        updateAutoFacilitatorSkillID: Bool = false
     ) async {
         let existing = replica.workspaceDoc.contextSettings[scopeKey]
         func scalar<V: Equatable>(_ value: V, _ prev: SyncValue<V>?) -> SyncValue<V> {
             if let prev, prev.value == value { return prev }
             return SyncValue(value, version: replica.workspaceDoc.nextVersion())
+        }
+        func nullableScalar<V: Equatable>(_ value: V?, _ prev: SyncValue<V?>?) -> SyncValue<V?>? {
+            if value == nil && prev == nil { return nil }
+            return scalar(value, prev)
         }
         func opt(_ value: String?, _ prev: SyncValue<String>?) -> SyncValue<String>? {
             if let value { return scalar(value, prev) }
@@ -1321,6 +1373,14 @@ final class IOSWorkspaceCoordinator: ObservableObject {
             guard prev != nil else { return nil }
             return scalar([], prev)
         }
+        let nextAutoJoin = updateAutoJoin ? nullableScalar(autoJoin, existing?.autoJoin) : existing?.autoJoin
+        let sanitizedSkill = autoFacilitatorSkillID.flatMap { raw -> String? in
+            let slug = AssistantSkill.sanitizedSlug(from: raw)
+            return slug.isEmpty ? nil : slug
+        }
+        let nextAutoSkill = updateAutoFacilitatorSkillID
+            ? nullableScalar(sanitizedSkill, existing?.autoFacilitatorSkillID)
+            : existing?.autoFacilitatorSkillID
         let updated = SyncedMeetingContextSettings(
             scopeKey: scopeKey,
             scopeKind: scopeKind,
@@ -1334,6 +1394,8 @@ final class IOSWorkspaceCoordinator: ObservableObject {
             never: opt(never, existing?.never),
             people: optArray(people, existing?.people),
             defaultReminderOverride: existing?.defaultReminderOverride,
+            autoJoin: nextAutoJoin,
+            autoFacilitatorSkillID: nextAutoSkill,
             guidanceRules: existing?.guidanceRules ?? [:]
         )
         replica.workspaceDoc.upsertContextSettings(updated)
@@ -1367,6 +1429,8 @@ final class IOSWorkspaceCoordinator: ObservableObject {
             never: existing?.never,
             people: existing?.people,
             defaultReminderOverride: existing?.defaultReminderOverride,
+            autoJoin: existing?.autoJoin,
+            autoFacilitatorSkillID: existing?.autoFacilitatorSkillID,
             guidanceRules: existing?.guidanceRules ?? [:]
         )
         replica.workspaceDoc.upsertContextSettings(updated)

@@ -53,6 +53,7 @@ final class CalendarMeetingStore: ObservableObject {
     var invitationNormalizer: (URL) -> URL? = { (try? JoinTarget.parse($0.absoluteString))?.invitationURL }
     var knownEngine: (URL) -> MeetingEngineKind? = { _ in nil }
     var canAutomaticallyJoin: (CalendarMeeting) -> Bool = { _ in false }
+    var automaticJoinOverride: ((CalendarMeeting) -> Bool?)?
     var onAutomaticJoin: (CalendarMeeting) -> Void = { _ in }
     var onScheduledJoin: (CalendarMeeting) -> Void = { _ in }
     var onScheduledActivity: (Date?) -> Void = { _ in }
@@ -186,8 +187,39 @@ final class CalendarMeetingStore: ObservableObject {
         }
     }
     var scheduledJoiningEnabled: Bool {
-        isMac && enabled && automaticJoinMode == .scheduled &&
+        isMac && enabled && (automaticJoinMode == .scheduled || hasPerMeetingAutoJoinCandidate) &&
             (automaticJoinPausedUntil.map { $0 <= clock() } ?? true)
+    }
+
+    private func allowsAutomaticJoin(_ meeting: CalendarMeeting, scheduled: Bool) -> Bool {
+        if let override = automaticJoinOverride?(meeting) {
+            return override
+        }
+        return scheduled ? automaticJoinMode == .scheduled : automaticJoinMode == .whenOpening
+    }
+
+    private var hasPerMeetingAutoJoinCandidate: Bool {
+        guard let override = automaticJoinOverride else { return false }
+        let current = clock()
+        return meetings.contains {
+            !$0.allDay && !$0.tentative && $0.hasResolvedInvitation && $0.end > current &&
+                override($0) == true
+        }
+    }
+
+    func refreshAutoJoinSchedule() {
+        if let active = joiningMeeting {
+            let scheduled = scheduledJoiningEnabled && schedulingAvailable &&
+                automaticCandidate(at: clock(), scheduled: true)?.id == active.id
+            let opening = automaticJoinAllowed(scheduled: false) && allowsAutomaticJoin(active, scheduled: false)
+            if !scheduled && !opening {
+                cancelAutomaticJoin()
+            }
+        }
+        scheduleBoundary()
+        if scheduledJoiningEnabled && schedulingAvailable {
+            considerAutomaticJoin()
+        }
     }
     func setScheduledUIBlocked(_ blocked: Bool) {
         guard isMac, scheduledUIBlocked != blocked else { return }
@@ -223,12 +255,12 @@ final class CalendarMeetingStore: ObservableObject {
     func foregrounded(allowAutomaticJoin: Bool) {
         foreground = true; automaticEntry = allowAutomaticJoin
         reminders.foregrounded()
-        if automaticJoinMode == .scheduled, joiningMeeting != nil { return }
+        if (automaticJoinMode == .scheduled || hasPerMeetingAutoJoinCandidate), joiningMeeting != nil { return }
         refresh()
     }
     func backgrounded() {
         foreground = false; automaticEntry = false
-        if automaticJoinMode == .scheduled && schedulingAvailable {
+        if (automaticJoinMode == .scheduled || hasPerMeetingAutoJoinCandidate) && schedulingAvailable {
             if joiningMeeting == nil { scheduleBoundary() }
             return
         }
@@ -593,9 +625,18 @@ final class CalendarMeetingStore: ObservableObject {
     }
     private func considerAutomaticJoin() {
         defer { automaticEntry = false }
-        let scheduled = automaticJoinMode == .scheduled
-        guard scheduled ? automaticJoinAllowed(scheduled: true) : foreground && automaticEntry && automaticJoin,
-              let meeting = automaticCandidate(at: now, scheduled: scheduled),
+        let selection: (meeting: CalendarMeeting, scheduled: Bool)? = {
+            if automaticJoinAllowed(scheduled: true),
+               let scheduledMeeting = automaticCandidate(at: now, scheduled: true) {
+                return (scheduledMeeting, true)
+            }
+            if foreground && automaticEntry && automaticJoinAllowed(scheduled: false),
+               let openingMeeting = automaticCandidate(at: now, scheduled: false) {
+                return (openingMeeting, false)
+            }
+            return nil
+        }()
+        guard let (meeting, scheduled) = selection,
               canAutomaticallyJoin(meeting) else { return }
         joiningMeeting = meeting; countdown = 5
         if scheduled { onScheduledActivity(meeting.start.addingTimeInterval(15)) }
@@ -617,13 +658,18 @@ final class CalendarMeetingStore: ObservableObject {
         }
     }
     private func automaticJoinAllowed(scheduled: Bool) -> Bool {
-        scheduled ? scheduledJoiningEnabled && schedulingAvailable && schedulingIsAvailable() && !scheduledUIBlocked && !showingMacSettings && reminders.editing == nil : foreground && automaticJoinMode == .whenOpening
+        if scheduled {
+            return scheduledJoiningEnabled && schedulingAvailable && schedulingIsAvailable() &&
+                !scheduledUIBlocked && !showingMacSettings && reminders.editing == nil
+        }
+        return foreground && (automaticJoinMode == .whenOpening || hasPerMeetingAutoJoinCandidate)
     }
     func scheduledTransportAdmission(for meeting: CalendarMeeting) -> () -> Bool {
         let revision = admissionRevision
         return { [weak self] in
             guard let self else { return false }
             return self.admissionRevision == revision && self.automaticJoinAllowed(scheduled: true) &&
+                self.allowsAutomaticJoin(meeting, scheduled: true) &&
                 self.meetings.first(where: { $0.id == meeting.id }) == meeting && meeting.start >= self.armedAfter &&
                 (0...15).contains(self.clock().timeIntervalSince(meeting.start)) && !self.reminders.skipped(meeting) &&
                 self.meetings.filter { !$0.allDay && !$0.tentative && $0.start <= self.clock() && $0.end > self.clock() }.count == 1
@@ -639,20 +685,25 @@ final class CalendarMeetingStore: ObservableObject {
         guard automaticJoinAllowed(scheduled: true) else { return nil }
         return meetings.first { $0.hasResolvedInvitation && !$0.allDay && !$0.tentative &&
             $0.start >= armedAfter && (-10...30).contains($0.start.timeIntervalSince(clock())) &&
-            !state.suppressed.keys.contains($0.id) && !reminders.skipped($0) }
+            !state.suppressed.keys.contains($0.id) && !reminders.skipped($0) &&
+            allowsAutomaticJoin($0, scheduled: true) }
     }
     private func automaticCandidate(at date: Date, scheduled: Bool) -> CalendarMeeting? {
-        if !scheduled { return CalendarAutoJoinPolicy.candidate(in: meetings, at: date, suppressed: Set(state.suppressed.keys)) }
+        if !scheduled {
+            guard let candidate = CalendarAutoJoinPolicy.candidate(in: meetings, at: date, suppressed: Set(state.suppressed.keys)),
+                  allowsAutomaticJoin(candidate, scheduled: false) else { return nil }
+            return candidate
+        }
         let overlapping = meetings.filter { !$0.allDay && !$0.tentative && $0.start <= date && $0.end > date }
         guard overlapping.count == 1, let meeting = overlapping.first,
               meeting.hasResolvedInvitation, meeting.start >= armedAfter,
               date.timeIntervalSince(meeting.start) <= 10, !state.suppressed.keys.contains(meeting.id),
-              !reminders.skipped(meeting) else { return nil }
+              !reminders.skipped(meeting), allowsAutomaticJoin(meeting, scheduled: true) else { return nil }
         return meeting
     }
     private func scheduleBoundary() {
         boundaryTask?.cancel()
-        let scheduled = isMac && enabled && automaticJoinMode == .scheduled && schedulingAvailable
+        let scheduled = isMac && enabled && (automaticJoinMode == .scheduled || hasPerMeetingAutoJoinCandidate) && schedulingAvailable
         guard foreground || scheduled else { finishScheduledTransportPreparation(); return }
         let current = clock()
         var dates = meetings.flatMap { [$0.start.addingTimeInterval(-900),

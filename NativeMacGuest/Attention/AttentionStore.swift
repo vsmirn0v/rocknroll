@@ -577,7 +577,7 @@ struct AttentionDecisionRecord: Codable, Equatable, Sendable {
         realtimeFolderID = defaults.string(forKey: YandexRealtimePreferences.folderIDKey) ?? ""
         realtimeVoiceRole = defaults.string(forKey: YandexRealtimePreferences.voiceRoleKey) ?? ""
         selectedSkillIDs = defaults.stringArray(forKey: Self.selectedSkillsKey) ?? []
-        autonomousMeetingVoiceEnabled = defaults.object(forKey: Self.autonomousVoiceKey) as? Bool ?? true
+        autonomousMeetingVoiceEnabled = defaults.object(forKey: Self.autonomousVoiceKey) as? Bool ?? false
         headphoneUIDs = Set(defaults.stringArray(forKey: Self.headphoneUIDsKey) ?? [])
         provider = defaults.data(forKey: Self.providerKey).flatMap { try? JSONDecoder().decode(AttentionProvider.self, from: $0) }
             ?? AttentionProvider.defaults[.openAI]!
@@ -946,6 +946,43 @@ struct AttentionDecisionRecord: Codable, Equatable, Sendable {
             created.sameRoomTransition = mode
             save(created)
         }
+    }
+
+    func autoJoinOverride(room: URL?, latest: URL? = nil, seriesIDs: [String] = []) -> Bool? {
+        for sid in seriesIDs where !sid.trimmed.isEmpty {
+            if let match = presets.first(where: { $0.bindings.contains(.calendarSeries(sid)) }),
+               let value = match.autoJoin {
+                return value
+            }
+        }
+        let rooms = [room, latest].compactMap { $0?.absoluteString }.filter { !$0.isEmpty }
+        if !rooms.isEmpty,
+           let match = presets.first(where: { $0.bindings.contains { if case .room(let key) = $0 { rooms.contains(key) } else { false } } }),
+           let value = match.autoJoin {
+            return value
+        }
+        return nil
+    }
+
+    func autoFacilitatorSkillID(room: URL?, latest: URL? = nil, seriesIDs: [String] = []) -> String? {
+        func sanitized(_ raw: String?) -> String? {
+            guard let raw else { return nil }
+            let slug = AssistantSkill.sanitizedSlug(from: raw)
+            return slug.isEmpty ? nil : slug
+        }
+        for sid in seriesIDs where !sid.trimmed.isEmpty {
+            if let match = presets.first(where: { $0.bindings.contains(.calendarSeries(sid)) }),
+               let value = sanitized(match.autoFacilitatorSkillID) {
+                return value
+            }
+        }
+        let rooms = [room, latest].compactMap { $0?.absoluteString }.filter { !$0.isEmpty }
+        if !rooms.isEmpty,
+           let match = presets.first(where: { $0.bindings.contains { if case .room(let key) = $0 { rooms.contains(key) } else { false } } }),
+           let value = sanitized(match.autoFacilitatorSkillID) {
+            return value
+        }
+        return nil
     }
     func record(_ example: PresetExample, in preset: MeetingPreset) {
         var updated = self.preset(id: preset.id) ?? preset

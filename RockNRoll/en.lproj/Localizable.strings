@@ -4342,3 +4342,9 @@
 "Starting Share…" = "Starting Share…";
 "You can tap Done to return to the call — the 1440×810 desktop board keeps streaming." = "You can tap Done to return to the call — the 1440×810 desktop board keeps streaming.";
 "Stop Sharing Board" = "Stop Sharing Board";
+"Joining & Role Assistant" = "Joining & Role Assistant";
+"Always auto-join" = "Always auto-join";
+"Never auto-join" = "Never auto-join";
+"Auto-engage role assistant" = "Auto-engage role assistant";
+"Keep this Off on shared team calls so multiple assistants do not talk over each other." = "Keep this Off on shared team calls so multiple assistants do not talk over each other.";
+"Meeting settings…" = "Meeting settings…";

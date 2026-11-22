@@ -24,6 +24,7 @@ struct IOSMeetingDetailView: View {
     @ObservedObject var workspace: IOSWorkspaceCoordinator
     @ObservedObject var sync: RoomSyncCoordinator
     let sessionID: UUID
+    var skills: IOSAssistantSkillsController? = nil
 
     @State private var linkedRecordID: UUID?
     @State private var tab: IOSMeetingDetailTab = .summary
@@ -53,6 +54,9 @@ struct IOSMeetingDetailView: View {
 
     @State private var transitionChoice: IOSSameRoomTransitionMode?
     @State private var useSeriesScope = false
+    @State private var autoJoinChoice: Bool?
+    @State private var autoFacilitatorSkillID: String?
+    @State private var availableSkills: [AssistantSkill] = []
     @State private var aboutDraft = ""
     @State private var mattersDraft = ""
     @State private var neverDraft = ""
@@ -77,8 +81,19 @@ struct IOSMeetingDetailView: View {
         workspace.tasks.filter { $0.sessionID == sessionID }
     }
 
+    private var preferredSeriesID: String? {
+        let local = session?.calendarSeriesID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let external = session?.externalSeriesID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !local.isEmpty, workspace.settings(for: "series:" + local) != nil,
+           external.isEmpty || workspace.settings(for: "series:" + external) == nil {
+            return local
+        }
+        if !external.isEmpty { return external }
+        return local.isEmpty ? nil : local
+    }
+
     private var contextScopeKey: String {
-        if useSeriesScope, let series = session?.calendarSeriesID, !series.isEmpty {
+        if useSeriesScope, let series = preferredSeriesID, !series.isEmpty {
             return "series:" + series
         }
         if let room = session?.invitation?.absoluteString ?? session?.roomIdentity, !room.isEmpty {
@@ -143,7 +158,7 @@ struct IOSMeetingDetailView: View {
         .scrollDismissesKeyboard(.interactively)
         .navigationTitle(session?.title ?? L("Meeting"))
         .navigationDestination(item: $linkedRecordID) { id in
-            IOSMeetingDetailView(workspace: workspace, sync: sync, sessionID: id)
+            IOSMeetingDetailView(workspace: workspace, sync: sync, sessionID: id, skills: skills)
         }
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
@@ -628,11 +643,41 @@ struct IOSMeetingDetailView: View {
             .filter { !$0.deleted } ?? []
 
         return Form {
-            if let series = session?.calendarSeriesID, !series.isEmpty {
+            if let series = preferredSeriesID, !series.isEmpty {
                 Section {
                     Toggle(L("Apply to entire calendar series"), isOn: $useSeriesScope)
                         .onChange(of: useSeriesScope) { _, _ in loadContextFields() }
                 }
+            }
+
+            Section {
+                Picker(L("Automatic joining"), selection: $autoJoinChoice) {
+                    Text(L("Use default")).tag(Bool?.none)
+                    Text(L("Always auto-join")).tag(Bool?.some(true))
+                    Text(L("Never auto-join")).tag(Bool?.some(false))
+                }
+                .onChange(of: autoJoinChoice) { _, _ in
+                    guard !isLoadingContext else { return }
+                    saveCurrentContextSettings()
+                }
+                Picker(L("Auto-engage role assistant"), selection: $autoFacilitatorSkillID) {
+                    Text(L("Off")).tag(String?.none)
+                    ForEach(availableSkills) { skill in
+                        Text(skill.name).tag(String?.some(skill.id))
+                    }
+                    if let saved = autoFacilitatorSkillID, !saved.isEmpty,
+                       !availableSkills.contains(where: { $0.id == saved }) {
+                        Text(saved).tag(String?.some(saved))
+                    }
+                }
+                .onChange(of: autoFacilitatorSkillID) { _, _ in
+                    guard !isLoadingContext else { return }
+                    saveCurrentContextSettings()
+                }
+            } header: {
+                Text(L("Joining & Role Assistant"))
+            } footer: {
+                Text(L("Keep this Off on shared team calls so multiple assistants do not talk over each other."))
             }
 
             Section(L("Back-to-back in this meeting")) {
@@ -714,7 +759,11 @@ struct IOSMeetingDetailView: View {
                 about: aboutDraft,
                 matters: mattersDraft,
                 never: neverDraft,
-                people: people
+                people: people,
+                autoJoin: autoJoinChoice,
+                updateAutoJoin: true,
+                autoFacilitatorSkillID: autoFacilitatorSkillID,
+                updateAutoFacilitatorSkillID: true
             )
             settingsSaved = true
             try? await Task.sleep(for: .seconds(2))
@@ -726,7 +775,8 @@ struct IOSMeetingDetailView: View {
 
     private func loadInitialState() {
         noteText = workspace.noteDraft(for: sessionID)
-        useSeriesScope = (session?.calendarSeriesID?.isEmpty == false)
+        useSeriesScope = (preferredSeriesID?.isEmpty == false)
+        availableSkills = (skills?.skills ?? DefaultAssistantSkills.all).filter(\.enabled)
         loadContextFields()
         if previewNotes { refreshNotePreviewIfNeeded() }
     }
@@ -742,6 +792,9 @@ struct IOSMeetingDetailView: View {
         isLoadingContext = true
         defer { isLoadingContext = false }
         let settings = workspace.settings(for: contextScopeKey)
+        autoJoinChoice = settings?.autoJoin?.value
+        let rawSkill = settings?.autoFacilitatorSkillID?.value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        autoFacilitatorSkillID = rawSkill.isEmpty ? nil : rawSkill
         transitionChoice = settings?.sameRoomTransition?.value.flatMap(IOSSameRoomTransitionMode.init(rawValue:))
         aboutDraft = settings?.about?.value ?? ""
         mattersDraft = settings?.matters?.value ?? ""

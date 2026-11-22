@@ -4114,3 +4114,9 @@
 "Starting Share…" = "साझा करना शुरू…";
 "You can tap Done to return to the call — the 1440×810 desktop board keeps streaming." = "कॉल पर लौटने के लिए आप 'हो गया' पर टैप कर सकते हैं — 1440×810 डेस्कटॉप बोर्ड स्ट्रीम होता रहेगा।";
 "Stop Sharing Board" = "बोर्ड साझा करना रोकें";
+"Joining & Role Assistant" = "जॉइनिंग और रोल असिस्टेंट";
+"Always auto-join" = "हमेशा अपने-आप जुड़ें";
+"Never auto-join" = "कभी अपने-आप न जुड़ें";
+"Auto-engage role assistant" = "रोल असिस्टेंट अपने-आप चालू करें";
+"Keep this Off on shared team calls so multiple assistants do not talk over each other." = "साझा टीम कॉल में इसे बंद रखें ताकि एक साथ कई असिस्टेंट आपस में न टकराएँ।";
+"Meeting settings…" = "मीटिंग सेटिंग्स…";

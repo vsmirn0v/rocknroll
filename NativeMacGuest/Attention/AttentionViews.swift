@@ -340,18 +340,22 @@ struct MeetingPresetEditor: View {
     @State private var people: String
     @State private var appliesToSeries: Bool
     @State private var sameRoomTransition: SameRoomMeetingTransitionMode?
+    @State private var availableSkills: [AssistantSkill]
     @State private var tuning: ThresholdTuner.Result?
     @State private var tuneMessage: String?
 
     init(store: AttentionStore, target: AttentionCoordinator.PresetTarget) {
         self.store = store; self.target = target
         let existing = store.preset(room: target.invitation, latest: target.latest, series: target.seriesID)
-            ?? MeetingPreset(title: target.title, bindings: [.room(target.invitation.absoluteString)])
-        _preset = State(initialValue: existing)
-        _people = State(initialValue: existing.people.joined(separator: ", "))
-        _appliesToSeries = State(initialValue: target.seriesID.map { existing.bindings.contains(.calendarSeries($0)) } ?? false)
+        let resolved = existing ?? MeetingPreset(title: target.title, bindings: [.room(target.invitation.absoluteString)])
+        _preset = State(initialValue: resolved)
+        _people = State(initialValue: resolved.people.joined(separator: ", "))
+        _appliesToSeries = State(initialValue: target.seriesID.map { id in
+            existing.map { $0.bindings.contains(.calendarSeries(id)) } ?? true
+        } ?? false)
         _sameRoomTransition = State(initialValue: store.savedSameRoomTransition(
             room: target.invitation, latest: target.latest, series: target.seriesID))
+        _availableSkills = State(initialValue: store.localSkillRepository().listSkills().filter(\.enabled))
     }
 
     var body: some View {
@@ -361,6 +365,26 @@ struct MeetingPresetEditor: View {
                 Text(L("The judge reads these with the meeting's last three minutes. They stay on this Mac and are sent only to your judge provider.")).font(.caption).foregroundStyle(.secondary)
             }.padding([.horizontal, .top], 20)
             Form {
+                Section(L("Joining & Role Assistant")) {
+                    Picker(L("Automatic joining"), selection: $preset.autoJoin) {
+                        Text(L("Use default")).tag(Bool?.none)
+                        Text(L("Always auto-join")).tag(Bool?.some(true))
+                        Text(L("Never auto-join")).tag(Bool?.some(false))
+                    }
+                    Picker(L("Auto-engage role assistant"), selection: $preset.autoFacilitatorSkillID) {
+                        Text(L("Off")).tag(String?.none)
+                        ForEach(availableSkills) { skill in
+                            Text(skill.name).tag(String?.some(skill.id))
+                        }
+                        if let saved = preset.autoFacilitatorSkillID, !saved.isEmpty,
+                           !availableSkills.contains(where: { $0.id == saved }) {
+                            Text(saved).tag(String?.some(saved))
+                        }
+                    }
+                    Text(L("Keep this Off on shared team calls so multiple assistants do not talk over each other."))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
                 Section {
                     field(L("What this meeting is about"), text: $preset.about, prompt: L("Weekly infrastructure sync. Anna leads."))
                     field(L("What matters to me"), text: $preset.matters, prompt: L("DNS cut-over, certificates, decisions that need my sign-off."))

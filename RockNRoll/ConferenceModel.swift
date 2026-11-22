@@ -460,6 +460,12 @@ final class ConferenceModel: ObservableObject {
         guestWebsiteOrigin = preferences.string(forKey: "guestWebsiteOrigin") ?? ""
 
         self.calendar.configureInvitationContext(history: self.history, preferences: preferences)
+        self.calendar.automaticJoinOverride = { [weak self] meeting in
+            guard let self else { return nil }
+            let seriesIDs = [meeting.externalSeriesID, meeting.seriesID].compactMap { $0 }
+            let roomKeys = [meeting.invitation?.absoluteString].compactMap { $0 }
+            return self.workspace.autoJoinOverride(seriesIDs: seriesIDs, roomKeys: roomKeys)
+        }
         self.calendar.canAutomaticallyJoin = { [weak self] meeting in
             guard let self else { return false }
             return !self.setup.blocksAutomaticJoin && !self.isJoining && !self.isInConference && !self.isLeaving &&
@@ -947,13 +953,15 @@ final class ConferenceModel: ObservableObject {
         let matchedCalendar = calendar.meetings.first { meeting in
             meeting.invitation.map { $0 == controller.invitationURL } ?? false
         }
-        let seriesKey = matchedCalendar?.externalSeriesID
-            ?? workspace.sessions.first(where: { $0.id == controller.workspaceSessionID })?.externalSeriesID
+        let session = workspace.sessions.first(where: { $0.id == controller.workspaceSessionID })
+        let seriesKey = matchedCalendar?.externalSeriesID ?? session?.externalSeriesID
+        let localSeriesKey = matchedCalendar?.seriesID ?? session?.calendarSeriesID
         return IOSAssistantSessionBridge(
             controllerID: controller.id,
             title: controller.title,
             roomKey: controller.invitationURL.absoluteString,
             calendarSeriesKey: seriesKey,
+            localCalendarSeriesKey: localSeriesKey,
             localDisplayName: controller.displayName,
             participantNames: controller.participantDisplayNames,
             canSendChat: controller.canSendAssistantChat,

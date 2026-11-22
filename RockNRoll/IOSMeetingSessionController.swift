@@ -689,9 +689,33 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
         guard canShareBoard, let screenShare else {
             throw MeetingSessionError.unavailable(L("Screen sharing is unavailable in this call state."))
         }
-        let codec = session.capabilities.supportsScreenShareVP9 ? "vp9" : "h264"
-        let profile = GuestVideoProfile(width: 1920, height: 1080, fps: 15, maximumBitrate: 2_000_000)
-        try await screenShare.startComposed(initialSample: initialSample, profile: profile, codec: codec)
+        let codec = "h264"
+        let profile = GuestVideoProfile(width: 1920, height: 1080, fps: 15, maximumBitrate: 1_500_000)
+        AppDiagnostics.log("board-share-start", [
+            "provider": kind.rawValue,
+            "codec": codec,
+            "width": Int(profile.width),
+            "height": Int(profile.height),
+            "fps": Int(profile.fps)
+        ])
+        do {
+            try await screenShare.startComposed(initialSample: initialSample, profile: profile, codec: codec)
+            AppDiagnostics.log("board-share-ready", [
+                "provider": kind.rawValue,
+                "codec": codec
+            ])
+        } catch {
+            let ns = error as NSError
+            AppDiagnostics.log("board-share-error", [
+                "provider": kind.rawValue,
+                "codec": codec,
+                "errorType": String(describing: type(of: error)),
+                "errorDomain": ns.domain,
+                "errorCode": ns.code,
+                "cancelled": error is CancellationError
+            ])
+            throw error
+        }
     }
 
     func pushBoardShareFrame(_ sample: CMSampleBuffer) {
@@ -701,12 +725,22 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
 
     func stopBoardSharing() async {
         onExternalBoardShareStopped = nil
+        AppDiagnostics.log("board-share-stop", [
+            "provider": kind.rawValue,
+            "reason": "controllerStop"
+        ])
         await stopScreenSharing(retirePresenter: false)
     }
 
     private func notifyExternalBoardShareStopped() {
         let callback = onExternalBoardShareStopped
         onExternalBoardShareStopped = nil
+        if callback != nil {
+            AppDiagnostics.log("board-share-stop", [
+                "provider": kind.rawValue,
+                "reason": "externalStop"
+            ])
+        }
         callback?()
     }
 

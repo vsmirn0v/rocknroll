@@ -1145,6 +1145,63 @@ final class IOSAssistantTalkTests: XCTestCase {
         try? FileManager.default.removeItem(at: tempRoot)
     }
 
+    func testIOSAutonomousFacilitatorDefaultsOffForManualDailyJoin() throws {
+        let suite = SuiteBox()
+        let tempRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ios-daily-default-off-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempRoot) }
+
+        let skills = IOSAssistantSkillsController(
+            workspace: nil,
+            preferences: suite.defaults,
+            keychain: WorkspaceAPIKeychain(service: "dev.vsmirn0v.ios.dailyoff.\(UUID().uuidString)"),
+            customRootURL: tempRoot
+        )
+        defer { skills.stopWatcher() }
+        XCTAssertFalse(skills.autonomousMeetingVoiceEnabled)
+
+        let manualID = UUID()
+        let queuedID = UUID()
+        let bridgeFor: (UUID) -> IOSAssistantSessionBridge = { id in
+            IOSAssistantSessionBridge(
+                controllerID: id,
+                title: "CTO Daily",
+                roomKey: "https://meet.example.com/cto-daily-\(id.uuidString)",
+                localDisplayName: "Vitalii",
+                participantNames: [],
+                canSendChat: true,
+                isMicUnmuted: false,
+                isForeground: true,
+                ensureTranscription: {},
+                sendChat: { _ in },
+                speakVoice: { _ in }
+            )
+        }
+
+        let facilitator = IOSAutonomousMeetingFacilitator(
+            skills: skills,
+            workspace: nil,
+            board: nil,
+            resolveBridge: { bridgeFor($0) }
+        )
+
+        // Manual join to "CTO Daily" with default settings must NOT auto-engage scrum-master.
+        facilitator.sessionConnected(controllerID: manualID)
+        facilitator.sessionTitleUpdated(controllerID: manualID, title: "CTO Daily")
+        XCTAssertNil(facilitator.activeSessionSkills[manualID])
+
+        // Queued voice-join skill MUST still attach when the meeting connects.
+        facilitator.queuePendingSkill("scrum-master", title: "CTO Daily", invitation: URL(string: "https://meet.example.com/cto-daily-\(queuedID.uuidString)"))
+        facilitator.sessionConnected(controllerID: queuedID)
+        XCTAssertEqual(facilitator.activeSessionSkills[queuedID], "scrum-master")
+
+        // Enabling autonomous facilitator restores title-based matching for new meetings.
+        let optInID = UUID()
+        skills.autonomousMeetingVoiceEnabled = true
+        facilitator.sessionConnected(controllerID: optInID)
+        XCTAssertEqual(facilitator.activeSessionSkills[optInID], "scrum-master")
+    }
+
     func testIOSYandexRealtimeTurnExecutesToolAndPassesFolderIDAndSampleRates() async throws {
         let suite = SuiteBox()
         let tempRoot = FileManager.default.temporaryDirectory
@@ -1212,5 +1269,132 @@ final class IOSAssistantTalkTests: XCTestCase {
 
         await store.close()
         try? FileManager.default.removeItem(at: tempRoot)
+    }
+
+    func testIOSPerMeetingAutoFacilitatorSettingEngagesOnlyForConfiguredMeetingWhenGlobalOff() async throws {
+        let suite = SuiteBox()
+        let tempRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ios-per-meeting-fac-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempRoot) }
+        let (workspace, store) = try await makeTestWorkspace(
+            tempRoot: tempRoot.appendingPathComponent("ws", isDirectory: true),
+            prefs: suite.defaults
+        )
+
+        let skills = IOSAssistantSkillsController(
+            workspace: workspace,
+            preferences: suite.defaults,
+            keychain: WorkspaceAPIKeychain(service: "dev.vsmirn0v.ios.permeeting.\(UUID().uuidString)"),
+            customRootURL: tempRoot.appendingPathComponent("skills", isDirectory: true)
+        )
+        defer { skills.stopWatcher() }
+        XCTAssertFalse(skills.autonomousMeetingVoiceEnabled)
+
+        // Configure per-series auto-join + Scrum Master on one daily, plus a room-level override vs series override.
+        await workspace.saveContextSettings(
+            scopeKey: "series:cto-daily-ext",
+            scopeKind: .calendarSeries,
+            title: "CTO Daily",
+            sameRoomTransition: nil,
+            about: nil,
+            matters: nil,
+            never: nil,
+            people: nil,
+            autoJoin: true,
+            updateAutoJoin: true,
+            autoFacilitatorSkillID: "scrum-master",
+            updateAutoFacilitatorSkillID: true
+        )
+        await workspace.saveContextSettings(
+            scopeKey: "room:https://meet.example.com/shared-room",
+            scopeKind: .room,
+            title: "Shared Room",
+            sameRoomTransition: nil,
+            about: nil,
+            matters: nil,
+            never: nil,
+            people: nil,
+            autoJoin: false,
+            updateAutoJoin: true,
+            autoFacilitatorSkillID: nil,
+            updateAutoFacilitatorSkillID: true
+        )
+
+        XCTAssertEqual(
+            workspace.autoJoinOverride(
+                seriesIDs: ["cto-daily-ext"],
+                roomKeys: ["https://meet.example.com/shared-room"]
+            ),
+            true,
+            "Calendar series setting must override room setting for auto-join"
+        )
+        XCTAssertEqual(
+            workspace.autoJoinOverride(
+                seriesIDs: ["other-series"],
+                roomKeys: ["https://meet.example.com/shared-room"]
+            ),
+            false
+        )
+        XCTAssertNil(
+            workspace.autoJoinOverride(
+                seriesIDs: ["other-series"],
+                roomKeys: ["https://meet.example.com/unconfigured"]
+            )
+        )
+
+        let ctoDailyID = UUID()
+        let otherDailyID = UUID()
+        let bridges: [UUID: IOSAssistantSessionBridge] = [
+            ctoDailyID: IOSAssistantSessionBridge(
+                controllerID: ctoDailyID,
+                title: "CTO Daily",
+                roomKey: "https://meet.example.com/shared-room",
+                calendarSeriesKey: "cto-daily-ext",
+                localDisplayName: "Vitalii",
+                participantNames: [],
+                canSendChat: true,
+                isMicUnmuted: false,
+                isForeground: true,
+                ensureTranscription: {},
+                sendChat: { _ in },
+                speakVoice: { _ in }
+            ),
+            otherDailyID: IOSAssistantSessionBridge(
+                controllerID: otherDailyID,
+                title: "Team Daily",
+                roomKey: "https://meet.example.com/other-room",
+                calendarSeriesKey: "other-series",
+                localDisplayName: "Vitalii",
+                participantNames: [],
+                canSendChat: true,
+                isMicUnmuted: false,
+                isForeground: true,
+                ensureTranscription: {},
+                sendChat: { _ in },
+                speakVoice: { _ in }
+            ),
+        ]
+        let facilitator = IOSAutonomousMeetingFacilitator(
+            skills: skills,
+            workspace: workspace,
+            board: nil,
+            resolveBridge: { bridges[$0] }
+        )
+
+        // Unconfigured meeting ("Team Daily") must NOT auto-engage scrum-master.
+        facilitator.sessionConnected(controllerID: otherDailyID)
+        facilitator.sessionTitleUpdated(controllerID: otherDailyID, title: "Team Daily")
+        XCTAssertNil(facilitator.activeSessionSkills[otherDailyID])
+
+        // Opted-in series ("CTO Daily") MUST auto-engage scrum-master even when global autonomousMeetingVoiceEnabled is false.
+        facilitator.sessionConnected(controllerID: ctoDailyID)
+        XCTAssertEqual(facilitator.activeSessionSkills[ctoDailyID], "scrum-master")
+
+        // Stopping manually must keep it disabled on later title updates in the same session.
+        facilitator.disable(controllerID: ctoDailyID)
+        facilitator.sessionTitleUpdated(controllerID: ctoDailyID, title: "CTO Daily")
+        XCTAssertNil(facilitator.activeSessionSkills[ctoDailyID])
+
+        await store.close()
     }
 }

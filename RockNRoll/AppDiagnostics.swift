@@ -47,6 +47,7 @@ enum AppDiagnostics {
             "guest-voice-reply-failed", "guest-audio-reception", "audio-device-route", "audio-engine-lifecycle",
             "ice-state", "peer-transport-state", "ice-selected-route", "ice-incoming-demand",
             "ice-timeout", "ice-failed-checklist", "ice-tcp-relay-fallback", "ice-relay-media-verified",
+            "screen-codec-registration", "screen-share-start", "screen-share-stage", "screen-share-failed",
             "session-control-failure", "session-recovery"
         ]) { NativeDiagnosticsLog.shared.append($0) }
         NativeDiagnosticReports.shared.onSaved = { log("diagnostic-reports-saved", ["count": $0]) }

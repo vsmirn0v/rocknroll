@@ -685,4 +685,48 @@ final class MacCalendarSchedulingTests: XCTestCase {
         f.store.finishScheduledTransportPreparation()
         XCTAssertNil(deadline)
     }
+
+    func testPerMeetingAutoJoinOverrideOptInAndOptOutAcrossScheduledAndOpeningModes() async throws {
+        // 1. Mac global automaticJoinMode == .off, but one recurring meeting is opted in -> scheduled auto-join fires ONLY for it.
+        let mac = fixture(offset: 60, interval: .milliseconds(2), isMac: true); defer { mac.store.setEnabled(false) }
+        var scheduledJoined: [String] = []
+        mac.store.onScheduledJoin = { scheduledJoined.append($0.id) }
+        let optedInID = "daily-opted-in"
+        let defaultID = "other-meeting"
+        let optedIn = meeting(clock: mac.clock, offset: 60, id: optedInID)
+        let other = meeting(clock: mac.clock, offset: 3600, id: defaultID)
+        await mac.reader.setEvents([optedIn, other], delay: .zero)
+        mac.store.automaticJoinOverride = { $0.id == optedInID ? true : nil }
+        mac.store.setAutomaticJoinMode(.off)
+        mac.store.setSchedulingAvailable(true)
+        try await ready(mac.store)
+        XCTAssertTrue(mac.store.scheduledJoiningEnabled)
+
+        mac.clock.now.addTimeInterval(60)
+        mac.store.refresh(); try await ready(mac.store)
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual(scheduledJoined, [optedInID])
+
+        // 2. Mac global .scheduled, but meeting has explicit false ("Never auto-join") -> does not auto-join.
+        let macOptOut = fixture(offset: 60, interval: .milliseconds(2), isMac: true); defer { macOptOut.store.setEnabled(false) }
+        var optOutJoined = 0
+        macOptOut.store.onScheduledJoin = { _ in optOutJoined += 1 }
+        macOptOut.store.automaticJoinOverride = { _ in false }
+        try await arm(macOptOut)
+        macOptOut.clock.now.addTimeInterval(60); macOptOut.store.refresh(); try await ready(macOptOut.store)
+        try await Task.sleep(for: .milliseconds(40))
+        XCTAssertNil(macOptOut.store.countdown)
+        XCTAssertEqual(optOutJoined, 0)
+
+        // 3. iOS global .off + per-meeting true -> foregrounding triggers opening auto-join for opted-in meeting only.
+        let ios = fixture(offset: 60, interval: .milliseconds(2), isMac: false); defer { ios.store.setEnabled(false) }
+        var iosJoined: [String] = []
+        ios.store.onAutomaticJoin = { iosJoined.append($0.id) }
+        ios.store.automaticJoinOverride = { $0.id == "event" ? true : nil }
+        ios.store.setAutomaticJoin(false)
+        ios.store.foregrounded(allowAutomaticJoin: true)
+        try await ready(ios.store)
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual(iosJoined, ["event"])
+    }
 }

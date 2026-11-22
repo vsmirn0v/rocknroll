@@ -4341,3 +4341,9 @@
 "Starting Share…" = "Запуск показа…";
 "You can tap Done to return to the call — the 1440×810 desktop board keeps streaming." = "Нажмите «Готово», чтобы вернуться к звонку — десктопная доска 1440×810 продолжит транслироваться.";
 "Stop Sharing Board" = "Остановить показ доски";
+"Joining & Role Assistant" = "Подключение и ролевой ассистент";
+"Always auto-join" = "Всегда подключаться автоматически";
+"Never auto-join" = "Никогда не подключаться автоматически";
+"Auto-engage role assistant" = "Авто-включение ролевого ассистента";
+"Keep this Off on shared team calls so multiple assistants do not talk over each other." = "Оставьте выключенным для общих командных созвонов, чтобы ассистенты участников не мешали друг другу.";
+"Meeting settings…" = "Настройки встречи…";

@@ -2038,12 +2038,23 @@ extension NativeGuestEngine {
         }
         screenStarting = true; screenIntent = true
         let generation = screenGeneration
+        var stage = "permission"
+        let lowerCodec = codec.lowercased()
+        probeLog("screen-share-start", [
+            "codec": lowerCodec,
+            "width": profile.width,
+            "height": profile.height,
+            "fps": profile.fps,
+            "bitrate": profile.maximumBitrate
+        ])
         defer { screenStarting = false }
         do {
             try requireScreenPermission(generation: generation)
+            stage = "prepare"
             let cid = UUID().uuidString.lowercased()
             let track = try await publisher.prepareScreenVideo(cid: cid, profile: profile)
             guard let source = publisher.screenSource else { throw GuestEngineError.malformed }
+            stage = "capture"
             let capture = captureFactory(source); screenCapture = capture
             let info = try await capture.start()
             try requireScreenPermission(generation: generation)
@@ -2051,23 +2062,37 @@ extension NativeGuestEngine {
             let actual = GuestVideoProfile(width: info.width, height: info.height, fps: profile.fps,
                                            maximumBitrate: profile.maximumBitrate)
             publisher.updateScreenProfile(actual)
+            stage = "register"
             let infoTrack = try await register(["cid": cid, "type": "VIDEO", "source": "SCREEN_SHARE", "muted": true,
                 "width": actual.width, "height": actual.height, "layers": [actual.layer],
-                "simulcastCodecs": [["codec": codec.lowercased(), "cid": cid]]], kind: "screen")
-            probeLog("screen-codec-registration", ["requested": codec.lowercased(), "source": infoTrack["source"] as? String ?? "absent",
+                "simulcastCodecs": [["codec": lowerCodec, "cid": cid]]], kind: "screen")
+            probeLog("screen-codec-registration", ["requested": lowerCodec, "source": infoTrack["source"] as? String ?? "absent",
                 "codecs": (infoTrack["codecs"] as? [[String: Any]] ?? []).compactMap { $0["mimeType"] as? String }])
+            probeLog("screen-share-stage", ["stage": "registered", "codec": lowerCodec])
             try requireScreenPermission(generation: generation)
             guard infoTrack["source"] as? String == "SCREEN_SHARE", let sid = infoTrack["sid"] as? String else {
                 throw GuestEngineError.malformed
             }
             published["screen"] = sid
+            stage = "attach"
             try await publisher.attachScreenVideo(track, codec: codec)
+            stage = "negotiate"
             try await negotiatePublisher()
+            probeLog("screen-share-stage", ["stage": "negotiated", "codec": lowerCodec])
             try requireScreenPermission(generation: generation)
+            stage = "unmute"
             try await setScreenServerMuted(false, generation: generation)
+            probeLog("screen-share-stage", ["stage": "unmuted", "codec": lowerCodec])
             try requireScreenPermission(generation: generation)
             meetingFeatures.setScreenSharing(true); emitMeetingChange()
         } catch {
+            probeLog("screen-share-failed", [
+                "stage": stage,
+                "codec": lowerCodec,
+                "causeType": String(describing: type(of: error)),
+                "causeCode": (error as NSError).code,
+                "cancelled": error is CancellationError
+            ])
             setScreenShareIntent(false)
             try? await finishScreenShare()
             throw error

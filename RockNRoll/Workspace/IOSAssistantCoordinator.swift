@@ -186,6 +186,7 @@ struct IOSAssistantSessionBridge {
     var title: String
     var roomKey: String
     var calendarSeriesKey: String?
+    var localCalendarSeriesKey: String? = nil
     var localDisplayName: String
     var participantNames: [String]
     var canSendChat: Bool

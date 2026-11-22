@@ -979,6 +979,43 @@ import XCTest
         XCTAssertFalse(store.draftsAllowed)
     }
 
+    func testMacAutonomousFacilitatorDefaultsOffAndPerMeetingSeriesOverridesRoom() {
+        let store = store()
+        XCTAssertFalse(store.autonomousMeetingVoiceEnabled,
+                       "Auto-engaging voice assistants must default off so team calls do not collide")
+
+        let roomURL = URL(string: "https://meet.example.test/team-room")!
+        var roomPreset = MeetingPreset(title: "Team Room", bindings: [.room(roomURL.absoluteString)])
+        roomPreset.autoJoin = false
+        roomPreset.autoFacilitatorSkillID = nil
+        store.save(roomPreset)
+
+        var seriesPreset = MeetingPreset(title: "CTO Daily", bindings: [.calendarSeries("series-cto-daily")])
+        seriesPreset.autoJoin = true
+        seriesPreset.autoFacilitatorSkillID = "scrum-master"
+        store.save(seriesPreset)
+
+        XCTAssertEqual(
+            store.autoJoinOverride(room: roomURL, seriesIDs: ["series-cto-daily"]),
+            true,
+            "Series auto-join override takes precedence over room setting"
+        )
+        XCTAssertEqual(
+            store.autoJoinOverride(room: roomURL, seriesIDs: ["other-series"]),
+            false
+        )
+        XCTAssertNil(
+            store.autoJoinOverride(room: URL(string: "https://meet.example.test/unconfigured")!, seriesIDs: ["other-series"])
+        )
+        XCTAssertEqual(
+            store.autoFacilitatorSkillID(room: roomURL, seriesIDs: ["series-cto-daily"]),
+            "scrum-master"
+        )
+        XCTAssertNil(
+            store.autoFacilitatorSkillID(room: roomURL, seriesIDs: ["other-series"])
+        )
+    }
+
     /// The app's own client against Rapid-MLX on this Mac, when it is running.
     func testLiveRapidMLXJudgesARussianMeeting() async throws {
         let provider = try XCTUnwrap(AttentionProvider.defaults[.rapidMLX])
