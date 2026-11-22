@@ -1486,11 +1486,15 @@ final class MacWorkspaceSyncCoordinator: ObservableObject {
     func ingestLocalAssistantStateIntoDocument() async -> Bool {
         guard let assistantSyncInputProvider else { return false }
         let input = await assistantSyncInputProvider()
+        var workspaceDoc = replica.workspaceDoc
+        var baseline = replica.lastExportedAssistantBaseline
         let changed = AssistantCloudSync.exportLocalState(
             input,
-            into: &replica.workspaceDoc,
-            baseline: &replica.lastExportedAssistantBaseline
+            into: &workspaceDoc,
+            baseline: &baseline
         )
+        replica.workspaceDoc = workspaceDoc
+        replica.lastExportedAssistantBaseline = baseline
         if !changed.isEmpty {
             persistReplica()
         }

@@ -307,11 +307,15 @@ final class IOSWorkspaceCoordinator: ObservableObject {
 
     private func ingestLocalAssistantStateIntoDocument() async {
         guard let input = assistantSyncInputProvider?() else { return }
+        var workspaceDoc = replica.workspaceDoc
+        var baseline = replica.lastExportedAssistantBaseline
         let changedKeys = AssistantCloudSync.exportLocalState(
             input,
-            into: &replica.workspaceDoc,
-            baseline: &replica.lastExportedAssistantBaseline
+            into: &workspaceDoc,
+            baseline: &baseline
         )
+        replica.workspaceDoc = workspaceDoc
+        replica.lastExportedAssistantBaseline = baseline
         guard !changedKeys.isEmpty else { return }
         for key in changedKeys {
             if let entry = replica.workspaceDoc.contextSettings[key] {
