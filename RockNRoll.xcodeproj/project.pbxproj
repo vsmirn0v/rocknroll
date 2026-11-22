@@ -196,6 +196,7 @@
 		964484C8436C0EA4F90E16BD /* AudioCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4C049BADA8D8CC43635B8F59 /* AudioCoordinator.swift */; };
 		96B5CFAF419EA78413E529BE /* SampleBufferFrameDelivery.swift in Sources */ = {isa = PBXBuildFile; fileRef = EAD93F37E38E73613C0647D1 /* SampleBufferFrameDelivery.swift */; };
 		96E45477868AE00B30673F3A /* MeetingEngine in Frameworks */ = {isa = PBXBuildFile; productRef = A1C78439F0A617086C483C49 /* MeetingEngine */; };
+		984AC9AAF7FFC2D0E0FD944A /* IOSVoxCPM2ResilienceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8706BC3799939D614C2972DD /* IOSVoxCPM2ResilienceTests.swift */; };
 		98A8EC0B35ED58AD2EE9A4C8 /* NativeFocusCompanionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0355F0836C7386E8FEA1B407 /* NativeFocusCompanionTests.swift */; };
 		98CD9CB2AEB2F788DC8CB4AE /* ParticipantPanelViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = F426462734DBEBAED52073DA /* ParticipantPanelViewController.swift */; };
 		98D74C992824212B89CFCCE3 /* MeetingGalleryFixture.swift in Sources */ = {isa = PBXBuildFile; fileRef = BE6E9EDF239CB05382785B3A /* MeetingGalleryFixture.swift */; };
@@ -571,6 +572,7 @@
 		8495CBB24498D4A7F4AAC199 /* IOSPersonalTasksTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IOSPersonalTasksTests.swift; sourceTree = "<group>"; };
 		8673A1476A9A30C9EE82E814 /* FloatingVideoController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FloatingVideoController.swift; sourceTree = "<group>"; };
 		86A4407E202F9667E3FAD11D /* OutgoingMediaExperimentTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OutgoingMediaExperimentTests.swift; sourceTree = "<group>"; };
+		8706BC3799939D614C2972DD /* IOSVoxCPM2ResilienceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IOSVoxCPM2ResilienceTests.swift; sourceTree = "<group>"; };
 		882E2BE18A7D5330F7FF6663 /* ActiveSpeaker.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ActiveSpeaker.swift; sourceTree = "<group>"; };
 		882F17399F3AE2A5FFD61BCD /* de */ = {isa = PBXFileReference; lastKnownFileType = text.plist.strings; name = de; path = de.lproj/InfoPlist.strings; sourceTree = "<group>"; };
 		89C04A164F37F1A963CFA1B7 /* NativeVideoPixelBufferTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeVideoPixelBufferTests.swift; sourceTree = "<group>"; };
@@ -1130,6 +1132,7 @@
 				0F09328762DCF8EB21F20ADC /* IOSLocalTranscriptionAndVoiceTests.swift */,
 				51E69EB969FD513C7C9B24DB /* IOSMultiMeetingTests.swift */,
 				8495CBB24498D4A7F4AAC199 /* IOSPersonalTasksTests.swift */,
+				8706BC3799939D614C2972DD /* IOSVoxCPM2ResilienceTests.swift */,
 				2B85B36EC73686DEFC3D9B6C /* IOSWorkspaceAudioCoordinatorTests.swift */,
 				C5691273D94C8770D950071A /* IOSWorkspaceSyncTests.swift */,
 				C9ECBC97504D70EFB9B2E28C /* JamServiceTests.swift */,
@@ -1771,6 +1774,7 @@
 				BD77F6D1988D2285626E2A8C /* IOSLocalTranscriptionAndVoiceTests.swift in Sources */,
 				5D7D0FC0980D60BB15992594 /* IOSMultiMeetingTests.swift in Sources */,
 				B2230DA501A8EDA607C74043 /* IOSPersonalTasksTests.swift in Sources */,
+				984AC9AAF7FFC2D0E0FD944A /* IOSVoxCPM2ResilienceTests.swift in Sources */,
 				AD2B0F55365B191CD81A34EE /* IOSWorkspaceAudioCoordinatorTests.swift in Sources */,
 				DB9855AA9726026F68345AE1 /* IOSWorkspaceSyncTests.swift in Sources */,
 				8F43AA9F0044B87E68E3646E /* JamServiceTests.swift in Sources */,

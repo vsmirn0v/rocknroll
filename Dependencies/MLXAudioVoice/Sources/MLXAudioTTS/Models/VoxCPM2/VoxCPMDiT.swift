@@ -161,23 +161,41 @@ class VoxUnifiedCFM: Module {
         super.init()
     }
 
+    static func swaySchedule(nTimesteps: Int) -> [Float] {
+        guard nTimesteps > 0 else { return [1.0, 0.0] }
+        return (0 ... nTimesteps).map { i in
+            let u: Float
+            if i == 0 {
+                u = 1.0
+            } else if i == nTimesteps {
+                u = 0.0
+            } else {
+                u = 1.0 - Float(i) / Float(nTimesteps)
+            }
+            return 2.0 * u + cosf(Float.pi / 2.0 * u) - 1.0
+        }
+    }
+
     func solveEuler(
         _ x: MLXArray,
-        tSpan: MLXArray,
+        tSpan: [Float],
         mu: MLXArray,
         cond: MLXArray,
         cfgValue: Float = 1.0,
-        useCfgZeroStar: Bool = true
-    ) -> MLXArray {
-        var t = tSpan[0].item(Float.self)
-        var dt = tSpan[0].item(Float.self) - tSpan[1].item(Float.self)
+        useCfgZeroStar: Bool = true,
+        checkAbort: (() throws -> Void)? = nil
+    ) throws -> MLXArray {
+        guard tSpan.count >= 2 else { return x }
+        var t = tSpan[0]
+        var dt = tSpan[0] - tSpan[1]
 
         var currentX = x
 
-        let nSteps = tSpan.dim(0)
+        let nSteps = tSpan.count
         let zeroInitSteps = max(1, Int(Float(nSteps) * 0.04))
 
         for step in 1 ..< nSteps {
+            try checkAbort?()
             let dphiDt: MLXArray
 
             if useCfgZeroStar && step <= zeroInitSteps {
@@ -228,7 +246,7 @@ class VoxUnifiedCFM: Module {
             t = t - dt
 
             if step < nSteps - 1 {
-                dt = t - tSpan[step + 1].item(Float.self)
+                dt = t - tSpan[step + 1]
             }
         }
 
@@ -241,18 +259,17 @@ class VoxUnifiedCFM: Module {
         patchSize: Int,
         cond: MLXArray,
         temperature: Float = 1.0,
-        cfgValue: Float = 1.0
-    ) -> MLXArray {
+        cfgValue: Float = 1.0,
+        checkAbort: (() throws -> Void)? = nil
+    ) throws -> MLXArray {
         let B = mu.dim(0)
         let T = patchSize
 
         let z = MLXRandom.normal([B, inChannels, T]).asType(mu.dtype) * temperature
 
-        var tSpan = MLX.linspace(Float(1), Float(0), count: nTimesteps + 1)
-        // Sway scheduling: t + cos(pi/2 * t) - 1 + t = 2t + cos(pi/2 * t) - 1
-        let sway = MLX.cos(MLXArray(Float.pi / 2) * tSpan) - 1 + tSpan
-        tSpan = tSpan + sway
+        // Sway scheduling computed in Swift to avoid GPU scalar syncs on every Euler step.
+        let tSpan = Self.swaySchedule(nTimesteps: nTimesteps)
 
-        return solveEuler(z, tSpan: tSpan, mu: mu, cond: cond, cfgValue: cfgValue)
+        return try solveEuler(z, tSpan: tSpan, mu: mu, cond: cond, cfgValue: cfgValue, checkAbort: checkAbort)
     }
 }

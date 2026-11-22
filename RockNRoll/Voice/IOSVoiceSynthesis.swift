@@ -718,9 +718,14 @@ final class IOSVoiceStore: ObservableObject {
     @Published private var approvedYandexEndpoint: String?
     private let preferences: UserDefaults
     private let keychain: WorkspaceAPIKeychain
+    private let voxStoreOverride: IOSVoxCPM2Store?
     private var suppressCredentialBroadcast = false
     private var credentialObserver: NSObjectProtocol?
     var customYandexTransportFactory: (@Sendable () -> any RealtimeVoiceTransport)?
+
+    private var resolvedVoxStore: IOSVoxCPM2Store {
+        voxStoreOverride ?? .shared
+    }
 
     var rapidMLXEndpoint: URL? { IOSVoiceSynthesis.rapidMLXEndpoint(for: rapidMLXBaseURL) }
 
@@ -768,9 +773,14 @@ final class IOSVoiceStore: ObservableObject {
         return saved
     }
 
-    init(preferences: UserDefaults = .standard, keychain: WorkspaceAPIKeychain = WorkspaceAPIKeychain()) {
+    init(
+        preferences: UserDefaults = .standard,
+        keychain: WorkspaceAPIKeychain = WorkspaceAPIKeychain(),
+        voxStore: IOSVoxCPM2Store? = nil
+    ) {
         self.preferences = preferences
         self.keychain = keychain
+        self.voxStoreOverride = voxStore
         self.engine = preferences.string(forKey: Keys.engine).flatMap(IOSVoiceEngine.init(rawValue:)) ?? .system
         self.systemVoiceIdentifier = preferences.string(forKey: Keys.systemVoiceID) ?? ""
         self.approvedRapidMLXEndpoint = preferences.string(forKey: Keys.approvedRapidMLXEndpoint)
@@ -875,7 +885,7 @@ final class IOSVoiceStore: ObservableObject {
         switch assistantAuditionVoice {
         case .voxPreset(let preset):
             do {
-                return logReady(try await IOSVoxCPM2Store.shared.speakPreset(clean, preset: preset), engine: engineName)
+                return logReady(try await resolvedVoxStore.speakPreset(clean, preset: preset), engine: engineName)
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
@@ -883,7 +893,7 @@ final class IOSVoiceStore: ObservableObject {
             }
         case .clonedVoice:
             do {
-                return logReady(try await IOSVoxCPM2Store.shared.speakClonedForAssistant(clean), engine: engineName)
+                return logReady(try await resolvedVoxStore.speakClonedForAssistant(clean), engine: engineName)
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
@@ -950,7 +960,7 @@ final class IOSVoiceStore: ObservableObject {
             case .personal:
                 buffer = try await IOSVoiceSynthesis.personal(text)
             case .voxCPM2:
-                buffer = try await IOSVoxCPM2Store.shared.speak(text)
+                buffer = try await resolvedVoxStore.speak(text)
             case .rapidMLX:
                 buffer = try await IOSVoiceSynthesis.rapidMLX(
                     text,

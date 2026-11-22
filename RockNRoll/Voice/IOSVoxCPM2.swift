@@ -465,82 +465,245 @@ final class IOSVoiceSampleRecorder: ObservableObject {
     }
 }
 
-/// Manages in-process MLX GPU lifecycle for `VoxCPM2Model` with strict cache caps and idle/memory-pressure unloading.
+/// Thread-safe foreground state gate polled from background MLX GPU loops to avoid iOS Metal background-execution aborts.
+final class IOSVoxForegroundGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var active: Bool
+
+    init(isActive: Bool = true) {
+        self.active = isActive
+    }
+
+    var isActive: Bool {
+        lock.withLock { active }
+    }
+
+    func setActive(_ value: Bool) {
+        lock.withLock { active = value }
+    }
+}
+
+/// Maps MLX/Metal and VoxCPM2 runtime errors into privacy-safe allowlisted diagnostic reason codes.
+enum IOSVoxCPM2ErrorClassifier {
+    static func reasonCode(for error: Error) -> String {
+        let text = "\(error.localizedDescription)\n\(String(describing: error))".lowercased()
+        if text.contains("backgroundexecutionnotpermitted")
+            || text.contains("insufficient permission")
+            || text.contains("no longer active")
+            || text.contains("not active for on-device gpu") {
+            return "background"
+        }
+        if text.contains("outofmemory")
+            || text.contains("insufficient memory")
+            || text.contains("unable to allocate")
+            || text.contains("resource limit") {
+            return "metal-oom"
+        }
+        if text.contains("timeout") {
+            return "metal-timeout"
+        }
+        if text.contains("command buffer execution failed") || text.contains("[metal]") {
+            return "metal-command-buffer"
+        }
+        if text.contains("[eval]") || text.contains("[async_eval]") || text.contains("mlx error:") {
+            return "mlx-eval"
+        }
+        if text.contains("exceed") || text.contains("no generation space") {
+            return "context-limit"
+        }
+        return "other"
+    }
+}
+
+/// FIFO cancellation-safe gate serializing GPU access across async suspension points.
+actor IOSVoxSerialGate {
+    private var busy = false
+    private var waiters: [(id: UUID, continuation: CheckedContinuation<Void, Error>)] = []
+
+    var isBusy: Bool { busy }
+
+    func withExclusiveAccess<T: Sendable>(_ operation: @Sendable () async throws -> T) async throws -> T {
+        try await acquire()
+        defer { release() }
+        try Task.checkCancellation()
+        return try await operation()
+    }
+
+    func tryIfIdle<T: Sendable>(_ operation: @Sendable () async throws -> T) async rethrows -> T? {
+        guard !busy else { return nil }
+        busy = true
+        defer { release() }
+        return try await operation()
+    }
+
+    private func acquire() async throws {
+        try Task.checkCancellation()
+        if !busy {
+            busy = true
+            return
+        }
+        let id = UUID()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                if Task.isCancelled {
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
+                if !busy {
+                    busy = true
+                    continuation.resume()
+                    return
+                }
+                waiters.append((id: id, continuation: continuation))
+            }
+        } onCancel: {
+            Task { await self.cancelWaiter(id: id) }
+        }
+    }
+
+    private func cancelWaiter(id: UUID) {
+        guard let index = waiters.firstIndex(where: { $0.id == id }) else { return }
+        let waiter = waiters.remove(at: index)
+        waiter.continuation.resume(throwing: CancellationError())
+    }
+
+    private func release() {
+        if !waiters.isEmpty {
+            let next = waiters.removeFirst()
+            next.continuation.resume()
+        } else {
+            busy = false
+        }
+    }
+}
+
+/// Manages in-process MLX GPU lifecycle for `VoxCPM2Model` with strict cache caps, serialization, and idle/memory-pressure unloading.
 private actor IOSVoxCPM2Runtime {
     private var loadedDirectory: URL?
     private var loadedModel: VoxCPM2Model?
     private var loadedTokenizer: IOSVoxTokenizer?
-    private var activeOperations = 0
+    private let gate = IOSVoxSerialGate()
     private var idleUnloadTask: Task<Void, Never>?
 
-    func encodeVoice(samples16k: [Float], transcript: String, mode: VoxVoice.Mode, in directory: URL) async throws -> VoxVoice {
+    func encodeVoice(
+        samples16k: [Float],
+        transcript: String,
+        mode: VoxVoice.Mode,
+        in directory: URL,
+        shouldContinue: @escaping @Sendable () -> Bool = { true }
+    ) async throws -> VoxVoice {
 #if targetEnvironment(simulator)
         throw IOSVoiceSynthesisError.voxUnsupportedDevice(IOSVoxCPM2Store.sharedUnsupportedMessage)
 #else
-        activeOperations += 1
-        idleUnloadTask?.cancel()
-        defer {
-            activeOperations -= 1
-            VoxCPM2Model.clearMemoryCache()
-            scheduleIdleUnload()
-        }
-
-        let (model, _) = try await ensureLoaded(directory: directory)
-        let encoded = try model.encodeVoicePromptLatents(
-            samples16k: samples16k,
-            includeReference: mode != .continuation,
-            includeContinuation: mode != .clone
-        )
-        return VoxVoice(
-            mode: mode,
-            transcript: transcript,
-            reference: encoded.reference,
-            continuation: encoded.continuation,
-            patches: encoded.patches
-        )
-#endif
-    }
-
-    func synthesize(text: String, voice: VoxVoice?, in directory: URL) async throws -> [Float] {
-#if targetEnvironment(simulator)
-        throw IOSVoiceSynthesisError.voxUnsupportedDevice(IOSVoxCPM2Store.sharedUnsupportedMessage)
-#else
-        activeOperations += 1
-        idleUnloadTask?.cancel()
-        defer {
-            activeOperations -= 1
-            VoxCPM2Model.clearMemoryCache()
-            scheduleIdleUnload()
-        }
-
-        let (model, tokenizer) = try await ensureLoaded(directory: directory)
-        let clean = text.split(whereSeparator: \.isWhitespace).joined(separator: " ")
-        guard !clean.isEmpty else { throw IOSVoiceSynthesisError.empty }
-
-        if let voice {
-            guard voice.revision == VoxVoice.revision else {
-                throw IOSVoiceSynthesisError.voxRuntimeFailed("Saved voice revision differs from model.")
+        return try await gate.withExclusiveAccess {
+            guard shouldContinue() else {
+                throw IOSVoiceSynthesisError.voxRuntimeFailed("App is not active for on-device GPU speech synthesis.")
             }
-            let prefix = voice.continuation != nil ? voice.transcript : ""
-            let ids = tokenizer.encode(prefix + clean)
-            return try await model.synthesizeSavedVoiceSamples(
-                text: clean,
-                transcript: voice.transcript,
-                patches: voice.patches,
-                reference: voice.reference,
-                continuation: voice.continuation,
-                tokenIDs: ids,
-                maxTokens: 256
-            )
-        } else {
-            let ids = tokenizer.encode(clean)
-            return try await model.synthesizeZeroShotSamples(text: clean, tokenIDs: ids, maxTokens: 256)
+            await self.cancelIdleUnload()
+            do {
+                let (model, _) = try await self.ensureLoaded(directory: directory)
+                let encoded = try model.encodeVoicePromptLatents(
+                    samples16k: samples16k,
+                    includeReference: mode != .continuation,
+                    includeContinuation: mode != .clone,
+                    shouldContinue: shouldContinue
+                )
+                VoxCPM2Model.clearMemoryCache()
+                await self.scheduleIdleUnload()
+                return VoxVoice(
+                    mode: mode,
+                    transcript: transcript,
+                    reference: encoded.reference,
+                    continuation: encoded.continuation,
+                    patches: encoded.patches
+                )
+            } catch {
+                await self.handleFailure(error)
+                throw error
+            }
         }
 #endif
     }
 
-    func unloadIfIdle() {
-        guard activeOperations == 0 else { return }
+    func synthesize(
+        text: String,
+        voice: VoxVoice?,
+        in directory: URL,
+        shouldContinue: @escaping @Sendable () -> Bool = { true }
+    ) async throws -> [Float] {
+#if targetEnvironment(simulator)
+        throw IOSVoiceSynthesisError.voxUnsupportedDevice(IOSVoxCPM2Store.sharedUnsupportedMessage)
+#else
+        return try await gate.withExclusiveAccess {
+            guard shouldContinue() else {
+                throw IOSVoiceSynthesisError.voxRuntimeFailed("App is not active for on-device GPU speech synthesis.")
+            }
+            let clean = text.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+            guard !clean.isEmpty else { throw IOSVoiceSynthesisError.empty }
+
+            await self.cancelIdleUnload()
+            do {
+                let (model, tokenizer) = try await self.ensureLoaded(directory: directory)
+                let samples: [Float]
+                if let voice {
+                    guard voice.revision == VoxVoice.revision else {
+                        throw IOSVoiceSynthesisError.voxRuntimeFailed("Saved voice revision differs from model.")
+                    }
+                    let prefix = voice.continuation != nil ? voice.transcript : ""
+                    let ids = tokenizer.encode(prefix + clean)
+                    samples = try await model.synthesizeSavedVoiceSamples(
+                        text: clean,
+                        transcript: voice.transcript,
+                        patches: voice.patches,
+                        reference: voice.reference,
+                        continuation: voice.continuation,
+                        tokenIDs: ids,
+                        maxTokens: 256,
+                        shouldContinue: shouldContinue
+                    )
+                } else {
+                    let ids = tokenizer.encode(clean)
+                    samples = try await model.synthesizeZeroShotSamples(
+                        text: clean,
+                        tokenIDs: ids,
+                        maxTokens: 256,
+                        shouldContinue: shouldContinue
+                    )
+                }
+                VoxCPM2Model.clearMemoryCache()
+                await self.scheduleIdleUnload()
+                return samples
+            } catch {
+                await self.handleFailure(error)
+                throw error
+            }
+        }
+#endif
+    }
+
+    func unloadIfIdle() async {
+        await gate.tryIfIdle {
+            await self.performUnload()
+        }
+    }
+
+    private func cancelIdleUnload() {
+        idleUnloadTask?.cancel()
+        idleUnloadTask = nil
+    }
+
+    private func handleFailure(_ error: Error) {
+        if !(error is CancellationError) && (error as? IOSVoiceSynthesisError) != .empty {
+            performUnload()
+        } else {
+            #if !targetEnvironment(simulator)
+            VoxCPM2Model.clearMemoryCache()
+            #endif
+            scheduleIdleUnload()
+        }
+    }
+
+    private func performUnload() {
         let hadModel = loadedModel != nil
         idleUnloadTask?.cancel()
         idleUnloadTask = nil
@@ -653,22 +816,32 @@ final class IOSVoxCPM2Store: ObservableObject {
     private let downloader: IOSListenModelStore.FileDownloader
     private let hardwareSupportedProvider: () -> Bool
     private let freeDiskBytesProvider: (URL) -> Int64?
+    private let foregroundActiveProvider: (@Sendable () -> Bool)?
+    private let synthesizeOverride: (@Sendable (String, VoxVoice?, URL, @escaping @Sendable () -> Bool) async throws -> [Float])?
     private let runtime = IOSVoxCPM2Runtime()
+    private let foregroundGate: IOSVoxForegroundGate
     private var downloadTask: Task<Void, Never>?
+    private var activeWorkCount = 0
     private var memoryObserver: NSObjectProtocol?
+    private var lifecycleObservers: [NSObjectProtocol] = []
 
     init(
         modelsDirectory: URL? = nil,
         preferences: UserDefaults = .standard,
         downloader: IOSListenModelStore.FileDownloader? = nil,
         hardwareSupportedProvider: (() -> Bool)? = nil,
-        freeDiskBytesProvider: ((URL) -> Int64?)? = nil
+        freeDiskBytesProvider: ((URL) -> Int64?)? = nil,
+        foregroundActiveProvider: (@Sendable () -> Bool)? = nil,
+        synthesizeOverride: (@Sendable (String, VoxVoice?, URL, @escaping @Sendable () -> Bool) async throws -> [Float])? = nil
     ) {
         self.modelsDirectory = modelsDirectory ?? IOSListenModelStore.defaultModelsDirectory
         self.preferences = preferences
         self.downloader = downloader ?? IOSListenModelStore.streamDownload
         self.hardwareSupportedProvider = hardwareSupportedProvider ?? { Self.isDeviceSupportedByHardware }
         self.freeDiskBytesProvider = freeDiskBytesProvider ?? Self.defaultFreeDiskBytes
+        self.foregroundActiveProvider = foregroundActiveProvider
+        self.synthesizeOverride = synthesizeOverride
+        self.foregroundGate = IOSVoxForegroundGate(isActive: UIApplication.shared.applicationState == .active)
 
         if preferences.object(forKey: Keys.useClonedVoice) != nil {
             self.useClonedVoice = preferences.bool(forKey: Keys.useClonedVoice)
@@ -678,20 +851,41 @@ final class IOSVoxCPM2Store: ObservableObject {
 
         loadStoredVoice()
         refreshInstallState()
-        self.memoryObserver = NotificationCenter.default.addObserver(
+        let center = NotificationCenter.default
+        let runtime = self.runtime
+        let gate = self.foregroundGate
+        self.memoryObserver = center.addObserver(
             forName: UIApplication.didReceiveMemoryWarningNotification,
             object: nil,
             queue: .main
-        ) { [weak self] _ in
-            guard let self else { return }
-            Task { await self.runtime.unloadIfIdle() }
+        ) { _ in
+            Task { await runtime.unloadIfIdle() }
         }
+        self.lifecycleObservers = [
+            center.addObserver(forName: UIApplication.willResignActiveNotification, object: nil, queue: nil) { _ in
+                gate.setActive(false)
+            },
+            center.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: nil) { _ in
+                gate.setActive(false)
+                Task { await runtime.unloadIfIdle() }
+            },
+            center.addObserver(forName: UIApplication.didBecomeActiveNotification, object: nil, queue: nil) { _ in
+                gate.setActive(true)
+            }
+        ]
     }
 
     deinit {
         if let memoryObserver {
             NotificationCenter.default.removeObserver(memoryObserver)
         }
+        for observer in lifecycleObservers {
+            NotificationCenter.default.removeObserver(observer)
+        }
+    }
+
+    private var currentForegroundCheck: @Sendable () -> Bool {
+        foregroundActiveProvider ?? { [foregroundGate] in foregroundGate.isActive }
     }
 
     static func hasAllFilesInstalled(in directory: URL) -> Bool {
@@ -763,19 +957,45 @@ final class IOSVoxCPM2Store: ObservableObject {
         guard !cleanTranscript.isEmpty else {
             throw IOSVoiceSynthesisError.voxTranscriptMissing
         }
+        let shouldContinue = currentForegroundCheck
+        guard shouldContinue() else {
+            AppDiagnostics.log("voxcpm2-synthesis-skipped", ["reason": "background", "stage": "enroll"])
+            throw IOSVoiceSynthesisError.voxRuntimeFailed("App is not active for on-device GPU speech synthesis.")
+        }
 
+        activeWorkCount += 1
         isWorking = true
-        defer { isWorking = false }
+        defer {
+            activeWorkCount = max(0, activeWorkCount - 1)
+            isWorking = activeWorkCount > 0
+        }
 
-        let (samples, seconds) = try await Task.detached(priority: .userInitiated) { () throws -> ([Float], Double) in
-            let rate = IOSVoiceSampleAudio.encodeSampleRate
-            let raw = try IOSVoiceSampleAudio.monoSamples(from: audioURL, rate: Double(rate))
-            return try IOSVoiceSampleAudio.prepareEnrollmentSamples(raw, rate: rate)
-        }.value
+        do {
+            let (samples, seconds) = try await Task.detached(priority: .userInitiated) { () throws -> ([Float], Double) in
+                let rate = IOSVoiceSampleAudio.encodeSampleRate
+                let raw = try IOSVoiceSampleAudio.monoSamples(from: audioURL, rate: Double(rate))
+                return try IOSVoiceSampleAudio.prepareEnrollmentSamples(raw, rate: rate)
+            }.value
 
-        let voice = try await runtime.encodeVoice(samples16k: samples, transcript: cleanTranscript, mode: mode, in: modelDirectory)
-        let saved = StoredClonedVoice(voice: voice, recordedAt: Date(), seconds: seconds)
-        try persistVoice(saved)
+            let voice = try await runtime.encodeVoice(
+                samples16k: samples,
+                transcript: cleanTranscript,
+                mode: mode,
+                in: modelDirectory,
+                shouldContinue: shouldContinue
+            )
+            let saved = StoredClonedVoice(voice: voice, recordedAt: Date(), seconds: seconds)
+            try persistVoice(saved)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            AppDiagnostics.log("voxcpm2-synthesis-failed", [
+                "reason": IOSVoxCPM2ErrorClassifier.reasonCode(for: error),
+                "stage": "enroll",
+                "foreground": shouldContinue()
+            ])
+            throw error
+        }
     }
 
     func persistVoice(_ value: StoredClonedVoice) throws {
@@ -805,20 +1025,8 @@ final class IOSVoxCPM2Store: ObservableObject {
             throw IOSVoiceSynthesisError.voxVoiceNotRecorded
         }
 
-        isWorking = true
-        defer { isWorking = false }
-
         let activeVoice = useClonedVoice ? storedVoice?.voice : nil
-        do {
-            let samples = try await runtime.synthesize(text: clean, voice: activeVoice, in: modelDirectory)
-            return try IOSVoiceSampleAudio.buffer(samples, rate: Double(IOSVoiceSampleAudio.outputSampleRate))
-        } catch let error as IOSVoiceSynthesisError {
-            throw error
-        } catch is CancellationError {
-            throw CancellationError()
-        } catch {
-            throw IOSVoiceSynthesisError.voxRuntimeFailed(error.localizedDescription)
-        }
+        return try await synthesizeAudioBuffer(text: clean, voice: activeVoice, stage: "speak")
     }
 
     func speakPreset(_ text: String, preset: AssistantVoxVoicePreset) async throws -> AVAudioPCMBuffer {
@@ -833,19 +1041,7 @@ final class IOSVoxCPM2Store: ObservableObject {
         let prompt = preset.formattedPrompt(for: clean)
         guard !prompt.isEmpty else { throw IOSVoiceSynthesisError.empty }
 
-        isWorking = true
-        defer { isWorking = false }
-
-        do {
-            let samples = try await runtime.synthesize(text: prompt, voice: nil, in: modelDirectory)
-            return try IOSVoiceSampleAudio.buffer(samples, rate: Double(IOSVoiceSampleAudio.outputSampleRate))
-        } catch let error as IOSVoiceSynthesisError {
-            throw error
-        } catch is CancellationError {
-            throw CancellationError()
-        } catch {
-            throw IOSVoiceSynthesisError.voxRuntimeFailed(error.localizedDescription)
-        }
+        return try await synthesizeAudioBuffer(text: prompt, voice: nil, stage: "preset")
     }
 
     func speakClonedForAssistant(_ text: String) async throws -> AVAudioPCMBuffer {
@@ -861,17 +1057,51 @@ final class IOSVoxCPM2Store: ObservableObject {
             throw IOSVoiceSynthesisError.voxVoiceNotRecorded
         }
 
+        return try await synthesizeAudioBuffer(text: clean, voice: voice, stage: "cloned")
+    }
+
+    private func synthesizeAudioBuffer(text: String, voice: VoxVoice?, stage: String) async throws -> AVAudioPCMBuffer {
+        let shouldContinue = currentForegroundCheck
+        guard shouldContinue() else {
+            AppDiagnostics.log("voxcpm2-synthesis-skipped", ["reason": "background", "stage": stage])
+            throw IOSVoiceSynthesisError.voxRuntimeFailed("App is not active for on-device GPU speech synthesis.")
+        }
+
+        activeWorkCount += 1
         isWorking = true
-        defer { isWorking = false }
+        defer {
+            activeWorkCount = max(0, activeWorkCount - 1)
+            isWorking = activeWorkCount > 0
+        }
 
         do {
-            let samples = try await runtime.synthesize(text: clean, voice: voice, in: modelDirectory)
+            let samples: [Float]
+            if let synthesizeOverride {
+                samples = try await synthesizeOverride(text, voice, modelDirectory, shouldContinue)
+            } else {
+                samples = try await runtime.synthesize(
+                    text: text,
+                    voice: voice,
+                    in: modelDirectory,
+                    shouldContinue: shouldContinue
+                )
+            }
             return try IOSVoiceSampleAudio.buffer(samples, rate: Double(IOSVoiceSampleAudio.outputSampleRate))
         } catch let error as IOSVoiceSynthesisError {
+            AppDiagnostics.log("voxcpm2-synthesis-failed", [
+                "reason": IOSVoxCPM2ErrorClassifier.reasonCode(for: error),
+                "stage": stage,
+                "foreground": shouldContinue()
+            ])
             throw error
         } catch is CancellationError {
             throw CancellationError()
         } catch {
+            AppDiagnostics.log("voxcpm2-synthesis-failed", [
+                "reason": IOSVoxCPM2ErrorClassifier.reasonCode(for: error),
+                "stage": stage,
+                "foreground": shouldContinue()
+            ])
             throw IOSVoiceSynthesisError.voxRuntimeFailed(error.localizedDescription)
         }
     }
