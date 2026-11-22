@@ -18,6 +18,8 @@ private enum ActiveHomeSheet: Identifiable {
     case assistantMode(UUID)
     case devices
     case renameRoom(RecentRoom)
+    case createRoom(URL?)
+    case signInSite(URL?)
 
     var id: String {
         switch self {
@@ -28,6 +30,8 @@ private enum ActiveHomeSheet: Identifiable {
         case .assistantMode(let id): "assistantMode.\(id.uuidString)"
         case .devices: "devices"
         case .renameRoom(let room): "rename.\(room.id)"
+        case .createRoom(let url): "createRoom.\(url?.absoluteString ?? "default")"
+        case .signInSite(let url): "signInSite.\(url?.absoluteString ?? "default")"
         }
     }
 
@@ -76,6 +80,15 @@ struct JoinView: View {
 
     private var favorites: [RecentRoom] { history.rooms.filter(\.isStarred) }
     private var recent: [RecentRoom] { history.rooms.filter { !$0.isStarred } }
+    private var suggestedSiteOrigins: [URL] {
+        var origins = JoinDestination.guestInvitations(in: history.rooms).compactMap {
+            SiteOrigin.canonicalOrigin(for: $0)
+        }
+        if let custom = SiteOrigin.normalize(model.guestWebsiteOrigin) {
+            origins.insert(custom, at: 0)
+        }
+        return origins
+    }
 
     private func homeFold(in window: GeometryProxy) -> CallFold? {
         if #available(iOS 27.1, *) {
@@ -162,7 +175,10 @@ struct JoinView: View {
                 .accessibilityIdentifier("home.ask")
                 .accessibilityLabel(L("Ask Rock"))
             }
-            ToolbarItem(placement: .topBarTrailing) {
+            ToolbarItemGroup(placement: .topBarTrailing) {
+                Button { activeSheet = .createRoom(nil) } label: { Image(systemName: "plus") }
+                    .accessibilityIdentifier("home.create-room")
+                    .accessibilityLabel(L("New room"))
                 Button { activeSheet = .settings } label: { Image(systemName: "gearshape") }
                     .accessibilityLabel(L("Settings"))
             }
@@ -283,6 +299,8 @@ struct JoinView: View {
                     if case .settings = activeSheet { calendar.cancelAutomaticJoin(suppress: true) }
                     else if case .agenda = activeSheet { calendar.cancelAutomaticJoin(suppress: true) }
                     else if case .devices = activeSheet { calendar.cancelAutomaticJoin(suppress: true) }
+                    else if case .createRoom = activeSheet { calendar.cancelAutomaticJoin(suppress: true) }
+                    else if case .signInSite = activeSheet { calendar.cancelAutomaticJoin(suppress: true) }
                 }
                 if oldID == "settings" && newID != "settings" {
                     if let generation = setupAfterSettings {
@@ -542,6 +560,19 @@ struct JoinView: View {
             if model.status != L("Enter a jam link to begin.") {
                 Text(model.status).font(.footnote).foregroundStyle(model.statusIsError ? .red : .secondary)
             }
+            if let authOrigin = model.pendingAuthChallengeOrigin {
+                Button {
+                    activeSheet = .signInSite(authOrigin)
+                } label: {
+                    Label(
+                        L("Sign in to %@…", authOrigin.host ?? authOrigin.absoluteString),
+                        systemImage: "person.crop.circle.badge.checkmark"
+                    )
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .accessibilityIdentifier("home.signin-prompt")
+            }
             if let media = model.mediaStatus { Text(media).font(.footnote).foregroundStyle(.red) }
             if model.isJoining || model.isInConference {
                 Button(L("Leave jam"), role: .destructive) { model.leave() }.frame(minHeight: 44)
@@ -626,6 +657,14 @@ struct JoinView: View {
         }
         if !catchUp.timeline.intervals.isEmpty && !model.isInConference {
             Section(L("Catch up")) { Button(L("Review missed section")) { activeSheet = .savedHistory } }
+        }
+        Section {
+            Button {
+                activeSheet = .createRoom(nil)
+            } label: {
+                Label(L("New room…"), systemImage: "plus.bubble")
+            }
+            .accessibilityIdentifier("home.secondary.create-room")
         }
         Section(L("Meetings & Tasks")) {
             Button {
@@ -874,6 +913,29 @@ struct JoinView: View {
                 }
             }
             .presentationDetents([.medium])
+        case .createRoom(let origin):
+            CreateRoomSheet(
+                initialOrigin: origin,
+                suggestedOrigins: suggestedSiteOrigins,
+                defaultDisplayName: model.displayName,
+                onJoinCreatedRoom: { created, saveFavorite in
+                    activeSheet = nil
+                    model.joinCreatedRoom(created, saveFavorite: saveFavorite)
+                },
+                onSaveFavoriteOnly: { created in
+                    model.saveCreatedRoomFavorite(created)
+                }
+            )
+        case .signInSite(let origin):
+            SiteSignInSheet(
+                initialOrigin: origin,
+                suggestedOrigins: suggestedSiteOrigins
+            ) { _ in
+                activeSheet = nil
+                if !model.invite.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    model.join()
+                }
+            }
         }
     }
 
@@ -943,6 +1005,7 @@ struct JoinView: View {
         setup.offerIfAppropriate(homeVisible && foreground && !homeInteracting && model.invite.isEmpty &&
             !calendar.reminders.hasOpenIntent && !calendar.reminders.presenting && !CalendarReminderBroker.shared.hasPendingIntent)
     }
+    @ViewBuilder
     private var websiteSettings: some View {
         Section(L("Compatible meeting website")) {
             TextField(L("HTTPS website address"), text: $model.guestWebsiteOrigin)
@@ -950,6 +1013,12 @@ struct JoinView: View {
             Text(L("Fallback for app links that omit their website. Links with an embedded host open directly."))
                 .font(.footnote).foregroundStyle(.secondary)
         }
+        SiteAccountsSettingsSections(
+            suggestedOrigins: suggestedSiteOrigins,
+            onCreateRoom: { origin in
+                activeSheet = .createRoom(origin)
+            }
+        )
     }
     @ViewBuilder private var phoneSettings: some View {
         Section {

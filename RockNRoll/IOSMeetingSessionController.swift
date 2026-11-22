@@ -50,6 +50,7 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
     @Published private(set) var callView: RockCallViewController?
     @Published private(set) var title: String
     @Published private(set) var phase: NativeDesktopMeetingPhase = .idle
+    private(set) var lastConnectFailure: Error?
     @Published private(set) var isForegroundVisible = false
     private var lastAssistantBadge: (mode: IOSMeetingAssistantMode, isPaused: Bool, alertCount: Int, facilitatorSkillName: String?) = (.off, false, 0, nil)
     private weak var presentedBoardController: UIViewController?
@@ -347,6 +348,7 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
         self.displayName = displayName
         self.quiet = quiet
         isMeetingSoundEnabled = !quiet
+        lastConnectFailure = nil
         joinStarted = true
 
         _ = prepareCallView()
@@ -391,6 +393,7 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
                 return
             } catch {
                 guard !self.leaving else { return }
+                self.lastConnectFailure = error
                 self.reportMediaStatus(error.localizedDescription)
                 await self.finish(event: .failed)
             }

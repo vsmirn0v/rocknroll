@@ -104,21 +104,22 @@ public typealias GuestPrepared = GuestPreparedRoom
 /// getRoomPreconnect, createConnectionService and createRoom (web-readable.js).
 public struct GuestBootstrap {
     private let session: URLSession
-    private let customSessionInjected: Bool
+    private let useBoundedHTTP: Bool
 
-    public init(session: URLSession? = nil) {
+    public init(session: URLSession? = nil, useBoundedHTTP: Bool? = nil) {
         if let session {
             self.session = session
-            self.customSessionInjected = true
+            self.useBoundedHTTP = useBoundedHTTP ?? false
         } else {
-            self.customSessionInjected = false
+            self.useBoundedHTTP = useBoundedHTTP ?? true
             let configuration = URLSessionConfiguration.ephemeral
             configuration.httpShouldSetCookies = false
             configuration.httpCookieStorage = nil
+            configuration.urlCredentialStorage = nil
             configuration.urlCache = nil
             configuration.timeoutIntervalForRequest = 15
             configuration.timeoutIntervalForResource = 30
-            self.session = URLSession(configuration: configuration)
+            self.session = URLSession(configuration: configuration, delegate: SiteTLSDelegate.shared, delegateQueue: nil)
         }
     }
 
@@ -132,16 +133,30 @@ public struct GuestBootstrap {
     /// The caller explicitly opts into creating a separate disposable meeting.
     public static func createDisposable(origin: URL) async throws -> GuestInvitation {
         let bootstrap = GuestBootstrap()
-        let server = try await bootstrap.discoverServer(origin: origin)
-        let result = try await bootstrap.json(url: server.appendingPathComponent("room/create-meeting"), body: [
-            "title": "Rock native guest prototype disposable", "roomType": "ANONYMOUS",
-            "guestEnabled": true, "lobbyEnabled": false
-        ], headers: ["X-Jazz-Token": ""])
+        return try await bootstrap.createRoom(
+            origin: origin,
+            title: "Rock native guest prototype disposable",
+            roomType: "ANONYMOUS",
+            guestEnabled: true,
+            lobbyEnabled: false,
+            headers: ["X-Jazz-Token": ""]
+        )
+    }
+
+    public func createRoom(origin: URL, title: String, roomType: String = "MEETING",
+                           guestEnabled: Bool = true, lobbyEnabled: Bool = false,
+                           headers: [String: String] = [:]) async throws -> GuestInvitation {
+        let server = try await discoverServer(origin: origin)
+        let result = try await json(url: server.appendingPathComponent("room/create-meeting"), body: [
+            "title": title, "roomType": roomType,
+            "guestEnabled": guestEnabled, "lobbyEnabled": lobbyEnabled
+        ], headers: headers)
         guard let rawURL = result["url"] as? String,
-              let roomID = result["roomId"] as? String,
-              let password = result["password"] as? String else { throw GuestBootstrapError.invalidPreconnect }
+              let roomID = result["roomId"] as? String else { throw GuestBootstrapError.invalidPreconnect }
+        let password = (result["password"] as? String) ?? ""
         let invitation = try GuestInvitation.parse(rawURL)
-        guard invitation.roomID == roomID, invitation.password == password else {
+        guard invitation.roomID == roomID,
+              password.isEmpty || invitation.password == password else {
             throw GuestBootstrapError.invalidPreconnect
         }
         return invitation
@@ -151,7 +166,8 @@ public struct GuestBootstrap {
     /// No join is performed; the returned payload is sent by the caller.
     public func prepare(_ invitation: GuestInvitation, participantName: String,
                         supportedFeatures: [String: Any] = [:],
-                        sessionID: String? = nil, jazzToken: String? = nil) async throws -> GuestPreparedRoom {
+                        sessionID: String? = nil, jazzToken: String? = nil,
+                        authHeaders: [String: String] = [:]) async throws -> GuestPreparedRoom {
         let serverURL = try await discoverServer(origin: invitation.origin)
         let endpoint = serverURL.appendingPathComponent("room")
             .appendingPathComponent(invitation.roomID).appendingPathComponent("preconnect")
@@ -164,7 +180,7 @@ public struct GuestBootstrap {
         ]
         let response = try await json(url: endpoint, body: [
             "password": invitation.password, "jazzNextMigration": migration
-        ])
+        ], headers: authHeaders)
         guard let rawConnector = response["connectorUrl"] as? String, !rawConnector.isEmpty else {
             throw GuestBootstrapError.unsupportedLegacyRoom
         }
@@ -218,10 +234,10 @@ public struct GuestBootstrap {
             request.httpBody = try JSONSerialization.data(withJSONObject: body)
         }
         let (data, response): (Data, URLResponse)
-        if customSessionInjected {
-            (data, response) = try await session.data(for: request)
-        } else {
+        if useBoundedHTTP {
             (data, response) = try await BoundedHTTP.load(request, session: session, maximumBytes: 1_048_576)
+        } else {
+            (data, response) = try await session.data(for: request)
         }
         guard let http = response as? HTTPURLResponse else { throw GuestBootstrapError.invalidPreconnect }
         guard (200..<300).contains(http.statusCode) else { throw GuestBootstrapError.httpStatus(http.statusCode) }

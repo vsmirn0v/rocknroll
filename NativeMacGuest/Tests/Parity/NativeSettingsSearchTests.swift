@@ -30,7 +30,9 @@ final class NativeSettingsSearchTests: XCTestCase {
             ("Delete Saved Voice…", "settings.voice-delete"),
             ("Add memory", "settings.memory-add"),
             ("Endpoint file", "settings.mcp-endpoint"),
-            ("In the background", "settings.attention-mode-background")
+            ("In the background", "settings.attention-mode-background"),
+            ("Site logins", "settings.site-accounts"),
+            ("mTLS", "settings.mtls-certificates")
         ]
         for (query, id) in cases {
             XCTAssertEqual(NativeSettingsSearchCatalog.search(query: query, availableTabs: Set(0...8)).first?.id, id, query)

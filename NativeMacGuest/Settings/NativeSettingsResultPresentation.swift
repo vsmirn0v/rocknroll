@@ -8,6 +8,8 @@ enum NativeSettingsResultPresentation {
         var result: [String: String] = [:]
         for id in ["settings.display-name", "settings.names", "settings.aliases", "settings.role"] { result[id] = "Your name or role used in meetings." }
         for id in ["settings.website"] { result[id] = "Website used for invitations with a room code." }
+        for id in ["settings.site-accounts"] { result[id] = "Manage saved website sign-ins, SSO sessions, and automatic relogin." }
+        for id in ["settings.mtls-certificates"] { result[id] = "Import or remove PKCS#12 client certificates used for mutual TLS authentication." }
         for id in ["settings.setup"] { result[id] = "Review your meeting setup choices." }
         for id in ["settings.relay"] { result[id] = "Choose the connection route for guest meetings." }
         for id in ["settings.mic-warm", "settings.mic-readiness"] { result[id] = "Prepare the microphone for use in meetings." }
@@ -73,7 +75,7 @@ enum NativeSettingsResultPresentation {
             return store?.mode(for: situation).title
         }
         switch entry.id {
-        case "settings.display-name", "settings.website", "settings.microphone", "settings.output", "settings.camera":
+        case "settings.display-name", "settings.website", "settings.site-accounts", "settings.mtls-certificates", "settings.microphone", "settings.output", "settings.camera":
             return L("Open to view")
         case "settings.names", "settings.aliases", "settings.role", "settings.reply-style":
             return store == nil ? nil : L("Open to view")

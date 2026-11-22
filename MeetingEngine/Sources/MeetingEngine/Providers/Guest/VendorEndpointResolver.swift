@@ -5,7 +5,7 @@ public enum VendorEndpointResolver {
     public static let calendarHostHints = ["jazz", "rock"]
     public static let calendarNativeSchemes: Set<String> = ["conferenceguest", "jcp", "jazz"]
     private static let session = URLSession(configuration: .ephemeral,
-                                            delegate: AdditionalRootTrust(), delegateQueue: nil)
+                                            delegate: SiteTLSDelegate.shared, delegateQueue: nil)
 
     public static func make() -> ConferenceEndpointResolver {
         return ConferenceEndpointResolver(serviceName: "jazz", session: session)
@@ -18,10 +18,14 @@ public enum VendorEndpointResolver {
         config.urlCredentialStorage = nil
         config.urlCache = nil
         config.timeoutIntervalForResource = 3
-        return URLSession(configuration: config, delegate: AdditionalRootTrust(), delegateQueue: nil)
+        return URLSession(configuration: config, delegate: SiteTLSDelegate.shared, delegateQueue: nil)
     }()
 
     public static func makeDetector() -> MeetingEngineDetector {
-        return MeetingEngineDetector(serviceName: "jazz", session: detectorSession)
+        return MeetingEngineDetector(
+            serviceName: "jazz",
+            session: detectorSession,
+            allowsAuthenticatedOrigin: { SiteClientIdentityRegistry.shared.hasActiveSession(for: $0) }
+        )
     }
 }

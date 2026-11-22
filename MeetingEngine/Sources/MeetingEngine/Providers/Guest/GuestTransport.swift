@@ -102,11 +102,12 @@ public enum GuestTransportError: Error, LocalizedError {
     }
 }
 
-private final class GuestSocketDelegate: NSObject, URLSessionWebSocketDelegate, @unchecked Sendable {
+private final class GuestSocketDelegate: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDelegate, @unchecked Sendable {
     let opened: () -> Void
     let ended: () -> Void
-    init(opened: @escaping () -> Void, ended: @escaping () -> Void) {
-        self.opened = opened; self.ended = ended
+    let tlsDelegate: (any URLSessionDelegate)?
+    init(opened: @escaping () -> Void, ended: @escaping () -> Void, tlsDelegate: (any URLSessionDelegate)?) {
+        self.opened = opened; self.ended = ended; self.tlsDelegate = tlsDelegate
     }
     func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask,
                     didOpenWithProtocol protocol: String?) { opened() }
@@ -114,6 +115,25 @@ private final class GuestSocketDelegate: NSObject, URLSessionWebSocketDelegate, 
                     didCloseWith closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) { ended() }
     func urlSession(_ session: URLSession, task: URLSessionTask,
                     didCompleteWithError error: Error?) { ended() }
+    func urlSession(_ session: URLSession,
+                    didReceive challenge: URLAuthenticationChallenge,
+                    completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
+        if let tlsDelegate, tlsDelegate.responds(to: #selector(URLSessionDelegate.urlSession(_:didReceive:completionHandler:))) {
+            tlsDelegate.urlSession?(session, didReceive: challenge, completionHandler: completionHandler)
+        } else {
+            completionHandler(.performDefaultHandling, nil)
+        }
+    }
+    func urlSession(_ session: URLSession, task: URLSessionTask,
+                    didReceive challenge: URLAuthenticationChallenge,
+                    completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
+        if let taskDelegate = tlsDelegate as? URLSessionTaskDelegate,
+           taskDelegate.responds(to: #selector(URLSessionTaskDelegate.urlSession(_:task:didReceive:completionHandler:))) {
+            taskDelegate.urlSession?(session, task: task, didReceive: challenge, completionHandler: completionHandler)
+        } else {
+            urlSession(session, didReceive: challenge, completionHandler: completionHandler)
+        }
+    }
 }
 
 /// One reader and writer preserve wire order. A stream exists before connect,
@@ -126,6 +146,8 @@ public actor GuestTransport {
     private let eventContinuation: AsyncStream<[String: Any]>.Continuation
     private let url: URL
     private let origin: URL?
+    private let tlsDelegate: (any URLSessionDelegate)?
+    private let additionalHeaders: [String: String]
     private let capacity: Int
     private let maximumFrameBytes: Int
     private var roomID: String
@@ -161,8 +183,11 @@ public actor GuestTransport {
     private var outgoing: [Frame] = []
 
     public init(url: URL, roomID: String, origin: URL? = nil,
+                tlsDelegate: (any URLSessionDelegate)? = nil,
+                additionalHeaders: [String: String] = [:],
                 queueCapacity: Int = 256, maximumFrameBytes: Int = 4_194_304) {
         self.url = url; self.roomID = roomID; self.origin = origin
+        self.tlsDelegate = tlsDelegate; self.additionalHeaders = additionalHeaders
         self.capacity = max(1, queueCapacity)
         self.maximumFrameBytes = max(1, maximumFrameBytes)
         var continuation: AsyncStream<[String: Any]>.Continuation!
@@ -179,18 +204,23 @@ public actor GuestTransport {
         guard timeout.isFinite, timeout > 0, timeout <= 300 else { throw GuestTransportError.timedOut }
         try Task.checkCancellation()
         state = .connecting
+        let resolvedTLS = tlsDelegate ?? SiteTLSDelegate(preferredOrigin: origin, lookup: SiteClientIdentityRegistry.shared)
         let delegate = GuestSocketDelegate(opened: { [weak self] in
             Task { await self?.didOpen() }
         }, ended: { [weak self] in
             Task { await self?.socketEnded() }
-        })
+        }, tlsDelegate: resolvedTLS)
         let configuration = URLSessionConfiguration.ephemeral
         configuration.httpShouldSetCookies = false
         configuration.httpCookieStorage = nil
+        configuration.urlCredentialStorage = nil
         configuration.timeoutIntervalForRequest = timeout
         session = URLSession(configuration: configuration, delegate: delegate, delegateQueue: nil)
         var request = URLRequest(url: url)
         if let origin { request.setValue(origin.absoluteString, forHTTPHeaderField: "Origin") }
+        for (name, value) in additionalHeaders {
+            request.setValue(value, forHTTPHeaderField: name)
+        }
         let task = session!.webSocketTask(with: request)
         task.maximumMessageSize = maximumFrameBytes
         socket = task

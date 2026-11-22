@@ -264,10 +264,63 @@ public final class NativeGuestEngine {
 
     func join(_ invitation: GuestInvitation, sessionID: String? = nil) async throws {
         LKRTCInitializeSSL()
-        let prepared = try await GuestBootstrap().prepare(invitation, participantName: label,
-            supportedFeatures: Self.supportedFeatures, sessionID: sessionID)
+        let tlsDelegate = SiteTLSDelegate(preferredOrigin: invitation.origin, lookup: SiteClientIdentityRegistry.shared)
+        let httpSession = SiteTLSDelegate.makeEphemeralSession(preferredOrigin: invitation.origin, lookup: SiteClientIdentityRegistry.shared)
+        defer { httpSession.finishTasksAndInvalidate() }
+        let bootstrap = GuestBootstrap(session: httpSession, useBoundedHTTP: true)
+        var creds = await SiteAuthCoordinator.shared.validCredentials(for: invitation.origin, engine: .guest)
+        let prepared: GuestPreparedRoom
+        do {
+            prepared = try await bootstrap.prepare(
+                invitation,
+                participantName: label,
+                supportedFeatures: Self.supportedFeatures,
+                sessionID: sessionID,
+                jazzToken: creds?.accessToken,
+                authHeaders: creds?.httpHeaders(for: invitation.origin, engine: .guest) ?? [:]
+            )
+        } catch GuestBootstrapError.httpStatus(let code) where (code == 401 || code == 403) && creds != nil {
+            let refreshed = await SiteAuthCoordinator.shared.validCredentials(for: invitation.origin, engine: .guest, forceRefresh: true)
+            if let refreshed, refreshed != creds {
+                creds = refreshed
+                do {
+                    prepared = try await bootstrap.prepare(
+                        invitation,
+                        participantName: label,
+                        supportedFeatures: Self.supportedFeatures,
+                        sessionID: sessionID,
+                        jazzToken: refreshed.accessToken,
+                        authHeaders: refreshed.httpHeaders(for: invitation.origin, engine: .guest)
+                    )
+                } catch GuestBootstrapError.httpStatus(let innerCode) where innerCode == 401 || innerCode == 403 {
+                    // Graceful fallback: stale corporate token must not block public guest links.
+                    creds = nil
+                    prepared = try await bootstrap.prepare(
+                        invitation,
+                        participantName: label,
+                        supportedFeatures: Self.supportedFeatures,
+                        sessionID: sessionID
+                    )
+                }
+            } else {
+                creds = nil
+                prepared = try await bootstrap.prepare(
+                    invitation,
+                    participantName: label,
+                    supportedFeatures: Self.supportedFeatures,
+                    sessionID: sessionID
+                )
+            }
+        }
         try checkActive()
-        let transport = GuestTransport(url: prepared.connectorURL, roomID: prepared.roomID, origin: invitation.origin)
+        let wsHeaders = creds?.httpHeaders(for: prepared.connectorURL, engine: .guest) ?? [:]
+        let transport = GuestTransport(
+            url: prepared.connectorURL,
+            roomID: prepared.roomID,
+            origin: invitation.origin,
+            tlsDelegate: tlsDelegate,
+            additionalHeaders: wsHeaders
+        )
         self.transport = transport
         // Peer creation awaits WebRTC; a leave during it closes what was made.
         let subscriber = try await makePeer(.subscriber)

@@ -39,6 +39,8 @@ enum NativeSettingsSearchCatalog {
     static let entries: [Entry] = [
         .init("display-name", "Display name", 0, "General"),
         .init("website", "Guest meeting website", 0, "General"),
+        .init("site-accounts", "Site logins & SSO", 0, "General"),
+        .init("mtls-certificates", "Client certificates (mTLS)", 0, "General"),
         .init("setup", "Review meeting setup…", 0, "General"),
         .init("relay", "Use TCP/TLS relay only", 0, "General"),
         .init("mic-warm", "Keep the microphone ready in every meeting (experimental)", 3, "Camera & sound"),

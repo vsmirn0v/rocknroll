@@ -35,7 +35,8 @@ public struct JamService {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
         configuration.urlCache = nil
-        self.session = session ?? URLSession(configuration: configuration)
+        configuration.urlCredentialStorage = nil
+        self.session = session ?? URLSession(configuration: configuration, delegate: SiteTLSDelegate.shared, delegateQueue: nil)
     }
 
     public func join(_ target: JamTarget, name: String) async throws -> JamCredentials {

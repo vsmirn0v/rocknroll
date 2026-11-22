@@ -22,6 +22,7 @@ public actor MeetingEngineDetector {
     private let timeout: TimeInterval
     private let lifetime: TimeInterval
     private let now: @Sendable () -> Date
+    private let allowsAuthenticatedOrigin: @Sendable (URL) -> Bool
     private struct Cached {
         let evidence: MeetingEngineDetection
         let expires: Date
@@ -29,10 +30,13 @@ public actor MeetingEngineDetector {
     private var cache: [URL: Cached] = [:]
 
     public init(serviceName: String, session: URLSession? = nil, timeout: TimeInterval = 3,
-                cacheLifetime: TimeInterval = 300, now: @escaping @Sendable () -> Date = { Date() }) {
+                cacheLifetime: TimeInterval = 300,
+                allowsAuthenticatedOrigin: @escaping @Sendable (URL) -> Bool = { _ in false },
+                now: @escaping @Sendable () -> Date = { Date() }) {
         self.serviceName = serviceName
         self.timeout = min(10, max(0.05, timeout))
         self.lifetime = max(0, cacheLifetime)
+        self.allowsAuthenticatedOrigin = allowsAuthenticatedOrigin
         self.now = now
         let config = URLSessionConfiguration.ephemeral
         config.httpShouldSetCookies = false
@@ -54,6 +58,7 @@ public actor MeetingEngineDetector {
         if let cached = cache[key], cached.expires > now() { return cached.evidence }
 
         let session = self.session, timeout = self.timeout, serviceName = self.serviceName
+        let allowAuthTrueConf = trueconf.map { allowsAuthenticatedOrigin($0.originURL) } ?? false
         // A task group rather than several `async let`s: multiple concurrent async let's
         // crash the Swift 6.3/6.4 runtime on macOS 26/27 ("freed pointer was not the
         // last allocation", swiftlang/swift#87481). The probes still run concurrently.
@@ -62,7 +67,8 @@ public actor MeetingEngineDetector {
                                                   session: session, timeout: timeout) }
             group.addTask { await Self.probeCommunity(community,
                                                       session: session, timeout: timeout) }
-            group.addTask { await Self.probeTrueConf(trueconf, session: session, timeout: timeout) }
+            group.addTask { await Self.probeTrueConf(trueconf, allowAuthenticated: allowAuthTrueConf,
+                                                     session: session, timeout: timeout) }
             var results: [MeetingEngineEvidence?] = []
             for await result in group { results.append(result) }
             return results
@@ -91,6 +97,13 @@ public actor MeetingEngineDetector {
         cache.removeValue(forKey: invitation)
     }
 
+    public func invalidateOrigin(_ origin: URL) {
+        let canonical = SiteOrigin.canonicalOrigin(for: origin) ?? origin
+        cache = cache.filter { key, _ in
+            SiteOrigin.canonicalOrigin(for: key) != canonical
+        }
+    }
+
     private static func probeGuest(_ target: JoinTarget, serviceName: String,
                                    session: URLSession, timeout: TimeInterval) async -> MeetingEngineEvidence? {
         var components = URLComponents(url: target.originURL, resolvingAgainstBaseURL: false)!
@@ -104,13 +117,13 @@ public actor MeetingEngineDetector {
         } catch { return nil }
     }
 
-    private static func probeTrueConf(_ target: TrueConfTarget?, session: URLSession,
-                                     timeout: TimeInterval) async -> MeetingEngineEvidence? {
+    private static func probeTrueConf(_ target: TrueConfTarget?, allowAuthenticated: Bool,
+                                      session: URLSession, timeout: TimeInterval) async -> MeetingEngineEvidence? {
         guard let target else { return nil }
         do {
             let (data, response) = try await load(target.descriptionURL, session: session,
                                                 timeout: timeout, maximumBytes: 65_536)
-            return response.statusCode == 200 && target.supportsBrowser(in: data) ? .trueconf : nil
+            return response.statusCode == 200 && target.supportsBrowser(in: data, allowAuthenticated: allowAuthenticated) ? .trueconf : nil
         } catch { return nil }
     }
 

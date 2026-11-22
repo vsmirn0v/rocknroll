@@ -19,11 +19,41 @@ public enum TrueConfError: LocalizedError, Equatable {
 public struct TrueConfBootstrap {
     public let login: String
     public let credential: String
+    public let credentialsType: Int
     public let socketURL: URL
-    public init(login: String, credential: String, socketURL: URL) {
-        self.login = login; self.credential = credential; self.socketURL = socketURL
+    public init(login: String, credential: String, credentialsType: Int = 3, socketURL: URL) {
+        self.login = login; self.credential = credential; self.credentialsType = credentialsType; self.socketURL = socketURL
     }
     public static func load(_ target: TrueConfTarget, name: String, session: URLSession) async throws -> Self {
+        try await load(target, name: name, session: session, credentials: nil, savedPassword: nil)
+    }
+    public static func load(_ target: TrueConfTarget, name: String, session: URLSession,
+                            credentials: ResolvedSiteCredentials?, savedPassword: String? = nil) async throws -> Self {
+        var socket = URLComponents(url: target.originURL, resolvingAgainstBaseURL: false)!
+        socket.scheme = "wss"; socket.path = "/websocket/"
+
+        if let credentials {
+            var url = URLComponents(url: target.originURL, resolvingAgainstBaseURL: false)!
+            url.path = "/api/v4/software/clients"
+            url.queryItems = [.init(name: "lang", value: "en"), .init(name: "call_id", value: target.roomID),
+                              .init(name: "case", value: "join_conference_button")]
+            var request = URLRequest(url: url.url!, timeoutInterval: 15)
+            request.setValue("application/json", forHTTPHeaderField: "Accept")
+            request.setValue("no-store", forHTTPHeaderField: "Cache-Control")
+            for (headerName, value) in credentials.httpHeaders(for: url.url!, engine: .trueconf) {
+                request.setValue(value, forHTTPHeaderField: headerName)
+            }
+            if let (data, response) = try? await BoundedHTTP.load(request, session: session, maximumBytes: 256_000),
+               response.statusCode == 200,
+               let decoded = try? decode(data, target: target) {
+                return decoded
+            }
+            if let username = credentials.account.username, !username.isEmpty,
+               let savedPassword, !savedPassword.isEmpty {
+                return .init(login: username, credential: savedPassword, credentialsType: 1, socketURL: socket.url!)
+            }
+        }
+
         var url = URLComponents(url: target.originURL, resolvingAgainstBaseURL: false)!
         url.path = "/api/v4/software/clients"
         url.queryItems = [.init(name: "lang", value: "en"), .init(name: "call_id", value: target.roomID),
@@ -31,6 +61,11 @@ public struct TrueConfBootstrap {
         var request = URLRequest(url: url.url!, timeoutInterval: 15)
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.setValue("no-store", forHTTPHeaderField: "Cache-Control")
+        if let credentials {
+            for (headerName, value) in credentials.httpHeaders(for: url.url!, engine: .trueconf) {
+                request.setValue(value, forHTTPHeaderField: headerName)
+            }
+        }
         let (data, response) = try await BoundedHTTP.load(request, session: session, maximumBytes: 256_000)
         guard response.statusCode == 200 else { throw TrueConfError.unavailable }
         return try decode(data, target: target)

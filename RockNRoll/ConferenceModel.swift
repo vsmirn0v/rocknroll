@@ -83,6 +83,7 @@ final class ConferenceModel: ObservableObject {
     @Published var showSwitchConfirmation = false
     @Published var siteSelection: LinkSiteSelection?
     @Published var engineSelection: MeetingEngineSelection?
+    @Published var pendingAuthChallengeOrigin: URL?
     @Published private var joinAwaitingName: JoinDestination?
     var isNameRequiredForJoin: Bool { joinAwaitingName != nil }
     var namePolicy: MeetingInputPolicy { joinAwaitingName?.inputPolicy ?? MeetingInputPolicy(maximumNameScalars: 80) }
@@ -504,6 +505,25 @@ final class ConferenceModel: ObservableObject {
                         controller: self.assistantBoard,
                         defaultBoardURL: self.assistantSkills.teamContext.defaultJiraBoardURL
                     )
+                }
+            }
+            .store(in: &assistantSubscriptions)
+
+        SiteAccountStore.shared.objectWillChange
+            .sink { [weak self] _ in
+                guard let self else { return }
+                let cachedOrigins = Array(self.endpointCache.keys)
+                let beforeOrigins = SiteAccountStore.shared.accounts.compactMap(\.originURL)
+                self.endpointCache.removeAll()
+                self.pendingAuthChallengeOrigin = nil
+                Task { @MainActor [weak self, detector] in
+                    let afterOrigins = SiteAccountStore.shared.accounts.compactMap(\.originURL)
+                    let defaultOrigin = self.flatMap { SiteOrigin.normalize($0.guestWebsiteOrigin) }
+                    let allOrigins = cachedOrigins + beforeOrigins + afterOrigins + (defaultOrigin.map { [$0] } ?? [])
+                    self?.endpointCache.removeAll()
+                    for origin in allOrigins {
+                        await detector.invalidateOrigin(origin)
+                    }
                 }
             }
             .store(in: &assistantSubscriptions)
@@ -1114,6 +1134,7 @@ final class ConferenceModel: ObservableObject {
 
     func join() {
         guard !isLeaving, joinTask == nil, phase != .joining || !nonLeavingSessions.isEmpty else { return }
+        pendingAuthChallengeOrigin = nil
         do {
             let target = try destination(for: invite)
             if !nonLeavingSessions.isEmpty || phase != .idle {
@@ -1237,6 +1258,7 @@ final class ConferenceModel: ObservableObject {
         }
         setup.suspendForMeeting()
         dismissEngineSelection()
+        pendingAuthChallengeOrigin = nil
         calendar.cancelAutomaticJoin(suppress: scheduledAdmission == nil, preservingActivity: scheduledAdmission != nil)
 
         #if DEBUG
@@ -1606,6 +1628,11 @@ final class ConferenceModel: ObservableObject {
                 }
                 companionAudioPaused = false
                 continuation.targetDidFail()
+                if !(error is CancellationError) {
+                    pendingAuthChallengeOrigin = SiteAuthError.challengeOrigin(from: error, attemptedURL: target.invitationURL)
+                } else {
+                    pendingAuthChallengeOrigin = nil
+                }
                 status = error is CancellationError ? L("Automatic joining was cancelled.") : error.localizedDescription
                 statusIsError = !(error is CancellationError)
             }
@@ -1776,7 +1803,14 @@ final class ConferenceModel: ObservableObject {
                     status = L("Removed from the jam.")
                     statusIsError = true
                 case .failed, .inactive:
-                    status = controller.phase == .idle ? L("Could not connect to the jam.") : L("Disconnected from the jam.")
+                    if event == .failed, let failure = controller.lastConnectFailure {
+                        pendingAuthChallengeOrigin = SiteAuthError.challengeOrigin(from: failure, attemptedURL: controller.invitationURL)
+                        status = pendingAuthChallengeOrigin != nil
+                            ? failure.localizedDescription
+                            : (controller.phase == .idle ? L("Could not connect to the jam.") : L("Disconnected from the jam."))
+                    } else {
+                        status = controller.phase == .idle ? L("Could not connect to the jam.") : L("Disconnected from the jam.")
+                    }
                     statusIsError = true
                 default:
                     break
@@ -1988,6 +2022,31 @@ final class ConferenceModel: ObservableObject {
     }
 
     func toggleStar(_ room: RecentRoom) { history.toggleStar(room.invitationURL) }
+
+    func saveCreatedRoomFavorite(_ created: CreatedMeetingRoom) {
+        let cleanTitle = created.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        history.saveFavorite(
+            url: created.invitationURL,
+            title: cleanTitle.isEmpty ? created.roomID : cleanTitle,
+            engine: created.engine
+        )
+    }
+
+    func joinCreatedRoom(_ created: CreatedMeetingRoom, saveFavorite: Bool) {
+        if saveFavorite {
+            saveCreatedRoomFavorite(created)
+        }
+        let cleanTitle = created.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let roomTitle = cleanTitle.isEmpty ? nil : cleanTitle
+        pendingAuthChallengeOrigin = nil
+        invite = created.invitationURL.absoluteString
+        rejoinEvidence = (created.invitationURL, created.engine)
+        if !nonLeavingSessions.isEmpty || phase != .idle {
+            receive(target: created.destination, autoJoin: true, title: roomTitle)
+        } else {
+            startJoin(created.destination, title: roomTitle, engineWasChosen: true)
+        }
+    }
 
     func joinCalendarMeeting(_ meeting: CalendarMeeting) {
         let occurrence = calendar.reminders.enabled

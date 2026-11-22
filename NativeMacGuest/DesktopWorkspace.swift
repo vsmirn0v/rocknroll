@@ -91,6 +91,7 @@ import UserNotifications
     @Published var settingsTab = 0
     @Published var assistantSettingsArea: NativeDesktopAssistantSettingsArea = .overview
     @Published var error: String?
+    @Published var pendingAuthChallenge: (origin: URL, retryURL: URL, title: String?)?
     /// An informational alert, such as a meeting the organizer ended.
     @Published var notice: (title: String, message: String)?
     /// A join is in flight (setting up or connecting), or every meeting is being left.
@@ -147,12 +148,13 @@ import UserNotifications
     static let sameRoomOverrunGrace: TimeInterval = 120
     private let reminderPresenter = NativeDesktopReminderPresenter()
     private var pendingScheduled: NativeDesktopScheduledJoin?
+    private let engineDetector: MeetingEngineDetector?
     private let detect: @MainActor (URL) async throws -> MeetingEngineDetection
     private let makeMeeting: @MainActor (JoinDestination, String, String?, Bool) -> NativeDesktopMeetingModel
     private let makeHandoffActivity: @MainActor (ActiveJam) -> NSUserActivity
 
     init(library: NativeDesktopLibrary? = nil,
-         detect: @escaping @MainActor (URL) async throws -> MeetingEngineDetection = { try await VendorEndpointResolver.makeDetector().detect($0) },
+         detect: (@MainActor (URL) async throws -> MeetingEngineDetection)? = nil,
          makeMeeting: (@MainActor (JoinDestination, String, String?, Bool) -> NativeDesktopMeetingModel)? = nil,
          makeHandoffActivity: @escaping @MainActor (ActiveJam) -> NSUserActivity = { NativeDesktopHandoff.activity(for: $0) },
          attention: AttentionCoordinator? = nil) {
@@ -163,7 +165,16 @@ import UserNotifications
             let cutoff = Date().addingTimeInterval(-900)
             return (library?.calendar.meetings ?? []).filter { $0.end > cutoff }
         }
-        self.library = library; self.detect = detect; self.makeHandoffActivity = makeHandoffActivity
+        self.library = library
+        if let detect {
+            self.engineDetector = nil
+            self.detect = detect
+        } else {
+            let detector = VendorEndpointResolver.makeDetector()
+            self.engineDetector = detector
+            self.detect = { try await detector.detect($0) }
+        }
+        self.makeHandoffActivity = makeHandoffActivity
         self.makeMeeting = makeMeeting ?? { NativeDesktopMeetingModel(destination: $0, name: $1, title: $2, quiet: $3) }
         super.init()
         Task { [weak self] in
@@ -377,6 +388,22 @@ import UserNotifications
         Task { @MainActor [weak self] in
             await self?.attention.handleRemoteJiraHandovers()
         }
+        SiteAccountStore.shared.objectWillChange
+            .sink { [weak self] _ in
+                guard let self else { return }
+                let beforeOrigins = SiteAccountStore.shared.accounts.compactMap(\.originURL)
+                self.pendingAuthChallenge = nil
+                guard let detector = self.engineDetector else { return }
+                Task { @MainActor [weak self, detector] in
+                    let afterOrigins = SiteAccountStore.shared.accounts.compactMap(\.originURL)
+                    let defaultOrigin = self.flatMap { SiteOrigin.normalize($0.library.guestWebsiteOrigin) }
+                    let allOrigins = beforeOrigins + afterOrigins + (defaultOrigin.map { [$0] } ?? [])
+                    for origin in allOrigins {
+                        await detector.invalidateOrigin(origin)
+                    }
+                }
+            }
+            .store(in: &subscriptions)
     }
 
     /// The meeting is in front of you: shown in a visible main window, its own
@@ -563,7 +590,7 @@ import UserNotifications
             error = L("You can be in up to %d meetings at once.", Self.meetingLimit); return
         }
         if scheduled == nil { library.setup.suspendForMeeting() }
-        error = nil; sessionID = UUID(); joinSettingUp = true
+        error = nil; pendingAuthChallenge = nil; sessionID = UUID(); joinSettingUp = true
         let joinID = UUID()
         if scheduled != nil { pendingScheduled = scheduled; scheduledJoinID = joinID }
         let token = joinGeneration, requestedSession = sessionID
@@ -722,7 +749,12 @@ import UserNotifications
                 library.calendar.reminders.activeConnectionsChanged()
                 synchronizeScheduledTransitions()
             } catch {
-                if token == joinGeneration, !(error is CancellationError) { self.error = error.localizedDescription }
+                if token == joinGeneration, !(error is CancellationError) {
+                    self.error = error.localizedDescription
+                    if let challengeOrigin = SiteAuthError.challengeOrigin(from: error, attemptedURL: url) {
+                        self.pendingAuthChallenge = (challengeOrigin, url, title)
+                    }
+                }
                 if token == joinGeneration, requestedSession == sessionID { library.continuation.targetDidFail() }
                 if let ownedModel, meetings.contains(where: { $0 === ownedModel }) {
                     _ = await leave(ownedModel)
@@ -736,6 +768,28 @@ import UserNotifications
             }
         }
     }
+
+    func saveCreatedRoomFavorite(_ created: CreatedMeetingRoom) {
+        let cleanTitle = created.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        library.history.saveFavorite(
+            url: created.invitationURL,
+            title: cleanTitle.isEmpty ? created.roomID : cleanTitle,
+            engine: created.engine
+        )
+    }
+
+    func joinCreatedRoom(_ created: CreatedMeetingRoom, saveFavorite: Bool) {
+        if saveFavorite {
+            saveCreatedRoomFavorite(created)
+        }
+        let cleanTitle = created.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let roomTitle = cleanTitle.isEmpty ? nil : cleanTitle
+        pendingAuthChallenge = nil
+        invitation = created.invitationURL.absoluteString
+        selection = .home
+        join(created.invitationURL, engine: created.engine, title: roomTitle)
+    }
+
     private func chooseEngine(for url: URL) throws -> JoinDestination {
         let kinds: [MeetingEngineKind] = [.guest, .telemost, .trueconf, .community]
         let picker = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 320, height: 30))

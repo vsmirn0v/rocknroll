@@ -52,6 +52,10 @@ struct NativeDesktopHomeView: View {
     @State private var bindingLink = ""
     @State private var bindingSeries = true
     @State private var showMultiJoinSheet = false
+    @State private var showingCreateRoom = false
+    @State private var createRoomOrigin: URL?
+    @State private var signInSheetOrigin: IdentifiableSiteOrigin?
+    @State private var retryAfterSignIn: (url: URL, title: String?)?
     @FocusState private var editingName: Bool
     #if NATIVE_DIRECT_UPDATES
     @FocusState private var homeHeadingFocused: Bool
@@ -60,7 +64,17 @@ struct NativeDesktopHomeView: View {
     #endif
     private var blocksScheduledJoining: Bool {
         editingName || addingFavorite || editRoom != nil || library.calendar.choosingMeeting != nil ||
-        library.calendar.reminders.editing != nil || library.setup.isPresented || showMultiJoinSheet
+        library.calendar.reminders.editing != nil || library.setup.isPresented || showMultiJoinSheet ||
+        showingCreateRoom || signInSheetOrigin != nil
+    }
+    private var suggestedSiteOrigins: [URL] {
+        var origins = JoinDestination.guestInvitations(in: library.history.rooms).compactMap {
+            SiteOrigin.canonicalOrigin(for: $0)
+        }
+        if let custom = SiteOrigin.normalize(library.guestWebsiteOrigin) {
+            origins.insert(custom, at: 0)
+        }
+        return origins
     }
     /// Discoveries apply immediately; only rows under the pointer or behind an
     /// open editor are held, so a card cannot move as it is clicked.
@@ -75,10 +89,14 @@ struct NativeDesktopHomeView: View {
         library.sync.nameChoice == nil
     }
     @ViewBuilder private var settingsView: some View {
+        let onCreateRoom: (URL) -> Void = { origin in
+            createRoomOrigin = origin
+            showingCreateRoom = true
+        }
         #if NATIVE_DIRECT_UPDATES
-        NativeDesktopSettingsView(library: library, meeting: workspace.meeting, tab: $workspace.settingsTab, assistantArea: $workspace.assistantSettingsArea, attention: workspace.attention, updates: workspace.updates, focusSupportOnEntry: $focusSupportOnEntry, mcpService: workspace.mcpService, obsidian: workspace.obsidian)
+        NativeDesktopSettingsView(library: library, meeting: workspace.meeting, tab: $workspace.settingsTab, assistantArea: $workspace.assistantSettingsArea, attention: workspace.attention, updates: workspace.updates, focusSupportOnEntry: $focusSupportOnEntry, mcpService: workspace.mcpService, obsidian: workspace.obsidian, suggestedOrigins: suggestedSiteOrigins, onCreateRoom: onCreateRoom)
         #else
-        NativeDesktopSettingsView(library: library, meeting: workspace.meeting, tab: $workspace.settingsTab, assistantArea: $workspace.assistantSettingsArea, attention: workspace.attention, mcpService: workspace.mcpService, obsidian: workspace.obsidian)
+        NativeDesktopSettingsView(library: library, meeting: workspace.meeting, tab: $workspace.settingsTab, assistantArea: $workspace.assistantSettingsArea, attention: workspace.attention, mcpService: workspace.mcpService, obsidian: workspace.obsidian, suggestedOrigins: suggestedSiteOrigins, onCreateRoom: onCreateRoom)
         #endif
     }
     private func favoriteSidebarRow(_ room: RecentRoom) -> some View {
@@ -272,8 +290,45 @@ struct NativeDesktopHomeView: View {
         .sheet(isPresented: $showMultiJoinSheet) {
             MultiMeetingRockJoinSheet(attention: workspace.attention, isPresented: $showMultiJoinSheet)
         }
+        .sheet(isPresented: $showingCreateRoom) {
+            CreateRoomSheet(
+                initialOrigin: createRoomOrigin,
+                suggestedOrigins: suggestedSiteOrigins,
+                defaultDisplayName: library.displayName,
+                onJoinCreatedRoom: { created, saveFavorite in
+                    showingCreateRoom = false
+                    workspace.joinCreatedRoom(created, saveFavorite: saveFavorite)
+                },
+                onSaveFavoriteOnly: { created in
+                    workspace.saveCreatedRoomFavorite(created)
+                }
+            )
+        }
+        .sheet(item: $signInSheetOrigin, onDismiss: { retryAfterSignIn = nil }) { target in
+            SiteSignInSheet(
+                initialOrigin: target.url,
+                suggestedOrigins: suggestedSiteOrigins
+            ) { _ in
+                let retry = retryAfterSignIn
+                retryAfterSignIn = nil
+                signInSheetOrigin = nil
+                if let retry {
+                    workspace.join(retry.url, title: retry.title)
+                }
+            }
+        }
         .alert(alertTitle, isPresented: alertShown) {
-            Button(L("OK")) { dismissAlert() }
+            if workspace.error != nil, let challenge = workspace.pendingAuthChallenge {
+                Button(L("Sign in to %@…", challenge.origin.host ?? challenge.origin.absoluteString)) {
+                    retryAfterSignIn = (challenge.retryURL, challenge.title)
+                    let target = IdentifiableSiteOrigin(challenge.origin)
+                    dismissAlert()
+                    signInSheetOrigin = target
+                }
+                Button(L("Cancel"), role: .cancel) { dismissAlert() }
+            } else {
+                Button(L("OK")) { dismissAlert() }
+            }
         } message: { Text(alertMessage) }
     }
     /// A meeting shown here puts its status and tools in the window toolbar, beside its title.
@@ -317,6 +372,8 @@ struct NativeDesktopHomeView: View {
                 Button { workspace.toggleWindow(meeting) } label: { Label(L("Open in New Window"), systemImage: "macwindow.on.rectangle") }
                     .help(L("Open in New Window"))
             } else if workspace.selectedMeeting == nil {
+                Button { createRoomOrigin = nil; showingCreateRoom = true } label: { Label(L("New room…"), systemImage: "plus.bubble") }
+                    .help(L("Create a new meeting room"))
                 Button { showMultiJoinSheet = true } label: { Label(L("Join with Rock…"), systemImage: "sparkles") }
                     .help(L("Join one or more meetings with an Obsidian skill"))
                 Button { addingFavorite = true } label: { Label(L("Add favorite"), systemImage: "plus") }
@@ -476,7 +533,24 @@ struct NativeDesktopHomeView: View {
                 Image(systemName: "person.crop.circle").foregroundStyle(.secondary)
                 TextField(L("Your name"), text: $library.displayName).focused($editingName).textFieldStyle(.plain).frame(maxWidth: 280).accessibilityIdentifier("nativeGuest.displayName")
                 Spacer()
+                Button { createRoomOrigin = nil; showingCreateRoom = true } label: { Label(L("New room…"), systemImage: "plus.bubble") }
+                    .accessibilityIdentifier("nativeGuest.createRoom")
                 Button { workspace.settingsTab = 3; workspace.selection = .settings } label: { Label(L("Camera & sound"), systemImage: "slider.horizontal.3") }
+            }
+            if let challenge = workspace.pendingAuthChallenge {
+                HStack(spacing: 8) {
+                    Button {
+                        retryAfterSignIn = (challenge.retryURL, challenge.title)
+                        signInSheetOrigin = IdentifiableSiteOrigin(challenge.origin)
+                    } label: {
+                        Label(
+                            L("Sign in to %@…", challenge.origin.host ?? challenge.origin.absoluteString),
+                            systemImage: "person.crop.circle.badge.checkmark"
+                        )
+                    }
+                    .buttonStyle(.bordered)
+                    .accessibilityIdentifier("nativeGuest.signInPrompt")
+                }
             }
             Label(L("Microphone and camera start off"), systemImage: "mic.slash").font(.caption).foregroundStyle(.secondary)
             if let destination = try? library.normalizedDestination(workspace.invitation) {
@@ -613,6 +687,8 @@ struct NativeDesktopSettingsView: View {
     var mcpService: NativeDesktopMCPService? = nil
     /// Obsidian one-way export settings and status.
     var obsidian: ObsidianExportCoordinator? = nil
+    var suggestedOrigins: [URL] = []
+    var onCreateRoom: (@MainActor (URL) -> Void)? = nil
     @State private var editingName = false
     @AppStorage(UniversalMeetingEngine.forceTCPRelayKey) private var forceTCPRelay = false
     @State private var settingsQuery = ""
@@ -815,6 +891,10 @@ struct NativeDesktopSettingsView: View {
                     TextField("https://salutejazz.ru", text: $library.guestWebsiteOrigin).nativeSettingAnchor("settings.website", nativeControlFocus: true)
                     Text(L("Used for guest invitations that contain a room code without a website.")).font(.caption).foregroundStyle(.secondary)
                 }
+                SiteAccountsSection(suggestedOrigins: suggestedOrigins, onCreateRoom: onCreateRoom)
+                    .nativeSettingAnchor("settings.site-accounts")
+                SiteCertificatesSection()
+                    .nativeSettingAnchor("settings.mtls-certificates")
                 RoomSyncSettingsView(sync: library.sync, continuation: library.continuation)
                 Section(L("Meeting setup")) {
                     NativeSettingsButton(title: L("Review meeting setup…"), id: "settings.setup") { library.setup.begin() }

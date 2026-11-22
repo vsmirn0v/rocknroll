@@ -102,6 +102,7 @@ extension TrueConfTransport: TrueConfSignalingTransport {}
     private var streamID = ""
     var localID = ""
     private var roomID = ""
+    private var invitationPassword = ""
     private var visibleParticipantIDs: Set<String>?
     private var lastPublishedSnapshot: NativeDesktopExternalSnapshot?
     private var lastPublishedSessionSnapshot: MeetingSessionSnapshot?
@@ -116,10 +117,22 @@ extension TrueConfTransport: TrueConfSignalingTransport {}
 
     init(sharedAudio: SharedAudioEngine? = nil,
          makeTransport: ((URL, URLSession) -> any TrueConfSignalingTransport)? = nil,
-         loadBootstrap: @escaping (TrueConfTarget, String, URLSession) async throws -> TrueConfBootstrap = { try await TrueConfBootstrap.load($0, name: $1, session: $2) }) {
+         loadBootstrap: ((TrueConfTarget, String, URLSession) async throws -> TrueConfBootstrap)? = nil) {
         self.sharedAudio = sharedAudio
         self.makeTransport = makeTransport ?? { TrueConfTransport(server: $0, session: $1) }
-        self.loadBootstrap = loadBootstrap
+        self.loadBootstrap = loadBootstrap ?? { target, name, session in
+            let creds = await SiteAuthCoordinator.shared.validCredentials(for: target.originURL, engine: .trueconf)
+            let savedPassword = creds.flatMap { SiteAccountStore.shared.readSecret(for: $0.account.originKey)?.savedPassword }
+            do {
+                return try await TrueConfBootstrap.load(target, name: name, session: session, credentials: creds, savedPassword: savedPassword)
+            } catch TrueConfError.unavailable where creds != nil {
+                if let refreshed = await SiteAuthCoordinator.shared.validCredentials(for: target.originURL, engine: .trueconf, forceRefresh: true) {
+                    let refreshedPassword = SiteAccountStore.shared.readSecret(for: refreshed.account.originKey)?.savedPassword
+                    return try await TrueConfBootstrap.load(target, name: name, session: session, credentials: refreshed, savedPassword: refreshedPassword)
+                }
+                return try await TrueConfBootstrap.load(target, name: name, session: session)
+            }
+        }
     }
 
     var connectionIdentity: MeetingConnectionIdentity? {
@@ -591,10 +604,13 @@ extension TrueConfTransport: TrueConfSignalingTransport {}
     private func startConnection(_ attempt: UUID) async throws {
         try check(attempt)
         guard let invitation else { throw NativeDesktopRTCError.invalidResponse }
-        let session = NativePeerOperations.makeEphemeralURLSession(delegate: AdditionalRootTrust())
-        http = session
         let target = try TrueConfTarget.parse(invitation.absoluteString)
+        let session = NativePeerOperations.makeEphemeralURLSession(
+            delegate: SiteTLSDelegate(preferredOrigin: target.originURL, lookup: SiteClientIdentityRegistry.shared)
+        )
+        http = session
         roomID = target.roomID
+        invitationPassword = target.invitationPassword ?? ""
         let bootstrap = try await loadBootstrap(target, name, session)
         try check(attempt)
         let client = makeTransport(bootstrap.socketURL, session)
@@ -611,7 +627,7 @@ extension TrueConfTransport: TrueConfSignalingTransport {}
         try await client.send(["method": "ping"])
         try check(attempt)
         try await client.send(["method": "loginUser", "AppID": UUID().uuidString.replacingOccurrences(of: "-", with: ""),
-            "login": bootstrap.login, "credentials": bootstrap.credential, "credentialsType": 3, "chatV2Enabled": false,
+            "login": bootstrap.login, "credentials": bootstrap.credential, "credentialsType": bootstrap.credentialsType, "chatV2Enabled": false,
             "browser": "RockNRoll Native", "appLang": "en", "appVersion": "5.1.0", "appName": "RockNRoll Native"])
         try check(attempt)
         refresh()
@@ -632,7 +648,7 @@ extension TrueConfTransport: TrueConfSignalingTransport {}
             guard let cid = body["CID"] as? String, !cid.isEmpty,
                   let id = body["trueconfId"] as? String, !id.isEmpty else { throw TrueConfError.invalidResponse }
             self.cid = cid; localID = id; client.cid = cid; helloAccepted = true
-            try await client.send(["method": "join", "conferenceId": roomID, "Password": "", "simulcastSupported": true])
+            try await client.send(["method": "join", "conferenceId": roomID, "Password": invitationPassword, "simulcastSupported": true])
         case "conferenceStateChange":
             guard let conference = body["conference"] as? [String: Any] else { throw TrueConfError.invalidResponse }
             if conference["message"] as? String == "deleteConference" { throw TrueConfError.ended }

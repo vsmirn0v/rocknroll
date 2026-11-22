@@ -47,6 +47,9 @@ public struct TelemostBootstrap {
         self.serverURL = serverURL; self.serviceName = serviceName; self.iceServers = iceServers; self.chatAllowed = chatAllowed
     }
     public static func load(_ target: TelemostTarget, name: String, session: URLSession) async throws -> Self {
+        try await load(target, name: name, session: session, credentials: nil)
+    }
+    public static func load(_ target: TelemostTarget, name: String, session: URLSession, credentials: ResolvedSiteCredentials?) async throws -> Self {
         let invitation = target.invitationURL.absoluteString.addingPercentEncoding(withAllowedCharacters: .alphanumerics)!
         var components = URLComponents(string: "https://cloud-api.yandex.ru/telemost_front/v2/telemost/conferences/\(invitation)/connection")!
         components.queryItems = [URLQueryItem(name: "next_gen_media_platform_allowed", value: "true"),
@@ -56,6 +59,11 @@ public struct TelemostBootstrap {
         for (key, value) in ["Accept": "application/json", "Content-Type": "application/json", "Origin": "https://telemost.yandex.ru",
             "Referer": target.invitationURL.absoluteString, "X-Telemost-Client-Version": "212.6.0",
             "Client-Instance-Id": UUID().uuidString, "idempotency-key": UUID().uuidString] { request.setValue(value, forHTTPHeaderField: key) }
+        if let credentials {
+            for (key, value) in credentials.httpHeaders(for: components.url!, engine: .telemost) {
+                request.setValue(value, forHTTPHeaderField: key)
+            }
+        }
         let (data, response) = try await BoundedHTTP.load(request, session: session, maximumBytes: 256_000)
         guard response.statusCode == 200 else { throw TelemostError.requestFailed(response.statusCode) }
         return try decode(data)

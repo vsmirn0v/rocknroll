@@ -145,11 +145,25 @@ extension TelemostTransport: TelemostSignalingTransport {}
     init(chat: ChatStore? = nil,
          sharedAudio: SharedAudioEngine? = nil,
          makeTransport: ((URL, URLSession) -> any TelemostSignalingTransport)? = nil,
-         loadBootstrap: @escaping (TelemostTarget, String, URLSession) async throws -> TelemostBootstrap = { try await TelemostBootstrap.load($0, name: $1, session: $2) }) {
+         loadBootstrap: ((TelemostTarget, String, URLSession) async throws -> TelemostBootstrap)? = nil) {
         self.telemostChat = TelemostChatService(store: chat ?? ChatStore())
         self.sharedAudio = sharedAudio
         self.makeTransport = makeTransport ?? { TelemostTransport(server: $0, session: $1) }
-        self.loadBootstrap = loadBootstrap
+        self.loadBootstrap = loadBootstrap ?? { target, name, session in
+            let creds = await SiteAuthCoordinator.shared.validCredentials(for: SiteOrigin.telemostCanonicalOrigin, engine: .telemost)
+            do {
+                return try await TelemostBootstrap.load(target, name: name, session: session, credentials: creds)
+            } catch TelemostError.requestFailed(let code) where (code == 401 || code == 403) && creds != nil {
+                if let refreshed = await SiteAuthCoordinator.shared.validCredentials(for: SiteOrigin.telemostCanonicalOrigin, engine: .telemost, forceRefresh: true) {
+                    do {
+                        return try await TelemostBootstrap.load(target, name: name, session: session, credentials: refreshed)
+                    } catch TelemostError.requestFailed(let inner) where inner == 401 || inner == 403 {
+                        return try await TelemostBootstrap.load(target, name: name, session: session)
+                    }
+                }
+                return try await TelemostBootstrap.load(target, name: name, session: session)
+            }
+        }
     }
 
     var connectionIdentity: MeetingConnectionIdentity? {

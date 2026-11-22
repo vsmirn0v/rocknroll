@@ -23,13 +23,26 @@ public struct TrueConfTarget: Equatable, Sendable {
         url.queryItems = [.init(name: "url_type", value: "fixed")]
         return url.url!
     }
-    public func supportsBrowser(in data: Data) -> Bool {
+    public var invitationPassword: String? {
+        guard let items = URLComponents(url: invitationURL, resolvingAgainstBaseURL: false)?.queryItems else {
+            return nil
+        }
+        for name in ["password", "psw"] {
+            if let value = items.first(where: { $0.name == name })?.value, !value.isEmpty {
+                return value
+            }
+        }
+        return nil
+    }
+
+    public func supportsBrowser(in data: Data, allowAuthenticated: Bool = false) -> Bool {
         struct Envelope: Decodable {
             struct Conference: Decodable { let id: String; let web_client_url: String; let allow_guests: Bool }
             let conference: Conference
         }
         guard let value = try? JSONDecoder().decode(Envelope.self, from: data),
-              value.conference.id == roomID, value.conference.allow_guests,
+              value.conference.id == roomID,
+              value.conference.allow_guests || allowAuthenticated,
               let browser = URL(string: value.conference.web_client_url, relativeTo: originURL)?.absoluteURL,
               browser.scheme?.lowercased() == "https", browser.host?.lowercased() == originURL.host?.lowercased(),
               (browser.port ?? 443) == (originURL.port ?? 443), browser.user == nil, browser.password == nil,
