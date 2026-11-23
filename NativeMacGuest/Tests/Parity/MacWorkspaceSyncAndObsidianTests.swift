@@ -1055,7 +1055,8 @@ final class MacWorkspaceSyncAndObsidianTests: XCTestCase {
         await f.sync.synchronizeNow()
 
         let thirdExport = try String(contentsOf: fileURL, encoding: .utf8)
-        let quoteCount = thirdExport.components(separatedBy: "> Note from another device:").count - 1
+        let quoteMarker = "> \(L("Note from another device:"))"
+        let quoteCount = thirdExport.components(separatedBy: quoteMarker).count - 1
         XCTAssertEqual(quoteCount, 1, "Expected exactly one conflict quote block in Obsidian export, got:\n\(thirdExport)")
     }
 }

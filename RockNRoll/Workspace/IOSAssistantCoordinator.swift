@@ -251,31 +251,78 @@ struct IOSAssistantLLMService: IOSAssistantEvaluating {
                 throw PortableOutcomeError.missingKey
             }
 
-            let body = PortableOutcomeService.requestBody(
+            struct ProviderRefusalError: Error {}
+            let allowsDisableThinking = endpoint.host?.lowercased() != "api.openai.com"
+            var body = PortableOutcomeService.requestBody(
                 messages: messages, model: model, provider: config.providerKind,
-                tokenLimit: config.providerKind == .openAI ? 2000 : 500, temperature: 0.1
+                tokenLimit: 2_000, temperature: 0.1
             )
-            var urlRequest = URLRequest(url: endpoint)
-            urlRequest.httpMethod = "POST"
-            urlRequest.timeoutInterval = 30
-            urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            if let key, !key.isEmpty {
-                urlRequest.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+
+            for attempt in 0...2 {
+                var urlRequest = URLRequest(url: endpoint)
+                urlRequest.httpMethod = "POST"
+                urlRequest.timeoutInterval = 30
+                urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                if let key, !key.isEmpty {
+                    urlRequest.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+                }
+                urlRequest.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+                do {
+                    let (data, response) = try await MeetingAITransfer.send(urlRequest, using: urlSession)
+                    guard let http = response as? HTTPURLResponse else { throw PortableOutcomeError.invalidResponse }
+                    guard (200..<300).contains(http.statusCode) else {
+                        throw PortableOutcomeService.httpError(status: http.statusCode, data: data)
+                    }
+                    guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                          let choices = root["choices"] as? [[String: Any]],
+                          let first = choices.first,
+                          let message = first["message"] as? [String: Any] else {
+                        throw PortableOutcomeError.invalidResponse
+                    }
+                    if let refusal = message["refusal"] as? String,
+                       !refusal.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        throw ProviderRefusalError()
+                    }
+                    let finishReason = first["finish_reason"] as? String ?? ""
+                    let extracted = OpenAIChatResponseExtractor.extractContent(
+                        from: message,
+                        finishReason: finishReason,
+                        allowTrailingReasoningJSON: attempt > 0
+                    )
+                    guard !extracted.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                        throw PortableOutcomeError.invalidResponse
+                    }
+                    return try Self.parseVerdict(extracted.text)
+                } catch is ProviderRefusalError {
+                    throw PortableOutcomeError.invalidResponse
+                } catch PortableOutcomeError.invalidResponse {
+                    if attempt == 0 {
+                        body.removeValue(forKey: "response_format")
+                        continue
+                    }
+                    if attempt == 1 && allowsDisableThinking {
+                        body.removeValue(forKey: "response_format")
+                        body["chat_template_kwargs"] = ["enable_thinking": false]
+                        continue
+                    }
+                    throw PortableOutcomeError.invalidResponse
+                } catch let error as PortableOutcomeError {
+                    if attempt == 0,
+                       case .http(status: let status, code: let code, parameter: let param) = error,
+                       PortableOutcomeService.shouldRetryWithoutStructuredFormat(status: status, code: code, parameter: param) {
+                        PortableOutcomeService.adjustFallbackParameters(&body, rejectedParameter: param, tokenLimit: 2_000)
+                        continue
+                    }
+                    if attempt == 2,
+                       case .http(status: let status, code: _, parameter: _) = error,
+                       status == 400 || status == 422 {
+                        throw PortableOutcomeError.invalidResponse
+                    }
+                    throw error
+                }
             }
-            urlRequest.httpBody = try JSONSerialization.data(withJSONObject: body)
-            let (data, response) = try await MeetingAITransfer.send(urlRequest, using: urlSession)
-            guard let http = response as? HTTPURLResponse else { throw PortableOutcomeError.invalidResponse }
-            guard (200..<300).contains(http.statusCode) else {
-                throw PortableOutcomeService.httpError(status: http.statusCode, data: data)
-            }
-            guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let choices = root["choices"] as? [[String: Any]],
-                  let first = choices.first,
-                  let message = first["message"] as? [String: Any],
-                  let content = message["content"] as? String else {
-                throw PortableOutcomeError.invalidResponse
-            }
-            return try Self.parseVerdict(content)
+            throw PortableOutcomeError.invalidResponse
         }
     }
 
@@ -334,12 +381,31 @@ struct IOSAssistantLLMService: IOSAssistantEvaluating {
     }
 
     static func parseVerdict(_ raw: String) throws -> IOSAssistantVerdict {
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        var text = OpenAIChatResponseExtractor.stripThinkingBlocks(raw)
+        if text.hasPrefix("```") {
+            text.removeFirst(3)
+            if let newline = text.firstIndex(of: "\n") {
+                text = String(text[text.index(after: newline)...])
+            }
+            if let close = text.range(of: "```", options: .backwards) {
+                text = String(text[..<close.lowerBound])
+            }
+            text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        } else if !text.hasPrefix("{"), let firstFence = text.range(of: "```") {
+            var inner = String(text[firstFence.upperBound...])
+            if let newline = inner.firstIndex(of: "\n") {
+                inner = String(inner[inner.index(after: newline)...])
+            }
+            if let close = inner.range(of: "```", options: .backwards) {
+                inner = String(inner[..<close.lowerBound])
+            }
+            text = inner.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
         let jsonString: String
-        if let start = trimmed.firstIndex(of: "{"), let end = trimmed.lastIndex(of: "}") {
-            jsonString = String(trimmed[start...end])
+        if let start = text.firstIndex(of: "{"), let end = text.lastIndex(of: "}"), end >= start {
+            jsonString = String(text[start...end])
         } else {
-            jsonString = trimmed
+            jsonString = text
         }
         guard let data = jsonString.data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {

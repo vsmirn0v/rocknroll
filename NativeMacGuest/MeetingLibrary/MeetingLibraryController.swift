@@ -16,6 +16,7 @@ enum MeetingNoteSaveStatus: Equatable {
     @Published private(set) var noteStatus: [UUID: MeetingNoteSaveStatus] = [:]
     @Published private(set) var persistenceError: String?
     var onSessionRenamed: (@MainActor (UUID, String) -> Void)?
+    private var prepareTask: Task<Void, Never>?
     private var refreshTask: Task<Void, Never>?
 
     init(root: URL) {
@@ -25,15 +26,37 @@ enum MeetingNoteSaveStatus: Equatable {
     }
 
     /// Opens (and creates if needed) the database, then loads the first snapshot.
+    /// Re-entrant callers await the active preparation and never re-run
+    /// `failInterruptedGenerations()` on an already-open store.
     func prepare() async {
-        do {
-            try await store.prepare()
-            let interrupted = try await store.failInterruptedGenerations()
-            if interrupted > 0 { probeLog("meeting-library-interrupted-generations", ["count": interrupted]) }
-            await refresh()
-        } catch {
-            persistenceError = MeetingLibraryError.persistenceFailed(error.localizedDescription).localizedDescription
+        while let existing = prepareTask {
+            await existing.value
+            if persistenceError == nil, await store.isOpen {
+                return
+            }
+            if prepareTask == existing {
+                prepareTask = nil
+            }
         }
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let opened = try await self.store.prepare()
+                if opened {
+                    let interrupted = try await self.store.failInterruptedGenerations()
+                    if interrupted > 0 { probeLog("meeting-library-interrupted-generations", ["count": interrupted]) }
+                }
+                self.persistenceError = nil
+                await self.refresh()
+            } catch is CancellationError {
+                self.prepareTask = nil
+            } catch {
+                self.persistenceError = MeetingLibraryError.persistenceFailed(error.localizedDescription).localizedDescription
+                self.prepareTask = nil
+            }
+        }
+        prepareTask = task
+        await task.value
     }
 
     var isReady: Bool { persistenceError == nil }
@@ -41,6 +64,9 @@ enum MeetingNoteSaveStatus: Equatable {
     /// Deterministic teardown for tests and app shutdown; the underlying store
     /// reopens on the next `prepare()` if the controller is used again.
     func close() async {
+        prepareTask?.cancel()
+        await prepareTask?.value
+        prepareTask = nil
         refreshTask?.cancel()
         await refreshTask?.value
         refreshTask = nil

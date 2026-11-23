@@ -1643,9 +1643,9 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
                     "messages": conversation
                 ]
                 if configuration.providerKind == .openAI {
-                    body["max_completion_tokens"] = 500
+                    body["max_completion_tokens"] = 2_000
                 } else {
-                    body["max_tokens"] = 500
+                    body["max_tokens"] = 2_000
                     body["temperature"] = 0.25
                 }
                 if !openAITools.isEmpty {
@@ -1680,7 +1680,8 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
 
                 guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                       let choices = root["choices"] as? [[String: Any]],
-                      let message = choices.first?["message"] as? [String: Any] else {
+                      let first = choices.first,
+                      let message = first["message"] as? [String: Any] else {
                     return nil
                 }
 
@@ -1701,11 +1702,12 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
                     continue
                 }
 
-                if let content = message["content"] as? String {
-                    let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
-                    return trimmed.isEmpty ? nil : trimmed
-                }
-                return nil
+                let finishReason = first["finish_reason"] as? String ?? ""
+                let trimmed = OpenAIChatResponseExtractor.extractPlainText(
+                    from: message,
+                    finishReason: finishReason
+                )
+                return trimmed.isEmpty ? nil : trimmed
             }
             return nil
         }
@@ -1726,7 +1728,7 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
             messages: messages,
             model: configuration.resolvedModel,
             provider: configuration.providerKind,
-            tokenLimit: 500,
+            tokenLimit: 2_000,
             temperature: 0.25
         )
         body.removeValue(forKey: "response_format")
@@ -1742,11 +1744,16 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
               (200..<300).contains(http.statusCode),
               let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let choices = root["choices"] as? [[String: Any]],
-              let message = choices.first?["message"] as? [String: Any],
-              let content = message["content"] as? String else {
+              let first = choices.first,
+              let message = first["message"] as? [String: Any] else {
             return nil
         }
-        return content.trimmingCharacters(in: .whitespacesAndNewlines)
+        let finishReason = first["finish_reason"] as? String ?? ""
+        let trimmed = OpenAIChatResponseExtractor.extractPlainText(
+            from: message,
+            finishReason: finishReason
+        )
+        return trimmed.isEmpty ? nil : trimmed
     }
 
     nonisolated static func jsonString(_ object: Any) -> String {

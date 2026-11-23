@@ -1,3 +1,4 @@
+import ConferenceCore
 import Foundation
 import FoundationModels
 import CoreFoundation
@@ -159,11 +160,17 @@ struct OpenAIAssistantAgentModel: AssistantAgentModel {
     var nativeToolCalling: Bool? = nil
 
     func next(_ request: AssistantAgentModelRequest) async throws -> AssistantAgentModelStep {
-        let message = try await completeMessage(Self.requestBody(request, provider: provider,
-                                                                  nativeToolCalling: nativeToolCalling))
+        let (message, finishReason) = try await completeMessage(Self.requestBody(request, provider: provider,
+                                                                                 nativeToolCalling: nativeToolCalling))
         if let calls = try parseNativeToolCalls(message) { return .toolCalls(calls) }
-        guard let content = message["content"] as? String, !content.trimmed.isEmpty else { throw AttentionJudgeError.emptyAnswer }
-        return try Self.parseStepContent(content)
+        let extracted = OpenAIChatResponseExtractor.extractContent(
+            from: message,
+            finishReason: finishReason,
+            allowTrailingReasoningJSON: true
+        ).text
+        let cleaned = OpenAIChatResponseExtractor.stripThinkingBlocks(extracted)
+        guard !cleaned.trimmed.isEmpty else { throw AttentionJudgeError.emptyAnswer }
+        return try Self.parseStepContent(cleaned)
     }
 
     static func parseStepContent(_ content: String) throws -> AssistantAgentModelStep {
@@ -247,7 +254,7 @@ struct OpenAIAssistantAgentModel: AssistantAgentModel {
         }
     }
 
-    private func completeMessage(_ object: [String: Any]) async throws -> [String: Any] {
+    private func completeMessage(_ object: [String: Any]) async throws -> (message: [String: Any], finishReason: String) {
         guard let endpoint = provider.endpoint, !provider.model.trimmed.isEmpty else { throw AttentionJudgeError.notConfigured }
         if provider.needsKey && (key ?? "").isEmpty { throw AttentionJudgeError.missingKey }
         var urlRequest = URLRequest(url: endpoint, timeoutInterval: provider.onThisMac ? max(timeout, 60) : timeout)
@@ -266,7 +273,8 @@ struct OpenAIAssistantAgentModel: AssistantAgentModel {
               let choice = (body["choices"] as? [[String: Any]])?.first,
               let message = choice["message"] as? [String: Any] else { throw AttentionJudgeError.emptyAnswer }
         if let refusal = message["refusal"] as? String, !refusal.isEmpty { throw AttentionJudgeError.refused }
-        return message
+        let finishReason = choice["finish_reason"] as? String ?? ""
+        return (message, finishReason)
     }
 }
 

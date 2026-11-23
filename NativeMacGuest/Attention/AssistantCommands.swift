@@ -285,9 +285,20 @@ enum AssistantTime {
 
 extension OpenAIChatJudge: AssistantCommandInterpreter {
     func interpret(_ request: AssistantCommandRequest) async throws -> AssistantCommand {
-        let (content, _) = try await complete(requestBody(messages: AssistantCommandPrompt.messages(request),
-            name: AssistantCommandPrompt.schemaName, schema: AssistantCommandPrompt.schema(request.context), hint: AssistantCommandPrompt.hint))
-        return try AssistantCommandPrompt.parse(content, context: request.context)
+        let (command, _) = try await completeWithSource(
+            requestBody(messages: AssistantCommandPrompt.messages(request),
+                        name: AssistantCommandPrompt.schemaName, schema: AssistantCommandPrompt.schema(request.context), hint: AssistantCommandPrompt.hint),
+            fallbackHint: AssistantCommandPrompt.hint
+        ) { content, fromReasoning in
+            do { return try AssistantCommandPrompt.parse(content, context: request.context) }
+            catch let error as AssistantCommandError {
+                if fromReasoning, error == .malformed {
+                    throw AttentionJudgeError.emptyAnswer
+                }
+                throw error
+            }
+        }
+        return command
     }
 }
 

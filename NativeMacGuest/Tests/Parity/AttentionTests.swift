@@ -1966,6 +1966,206 @@ import XCTest
         XCTAssertThrowsError(try MeetingOutcomePrompt.parse(#"{"summary":"","decisions":[],"tasks":[],"open_questions":[]}"#))
     }
 
+    func testLivePendingOutcomeSurvivesSyncPrepareWhileRestartStillFailsOrphans() async throws {
+        final class GatedOutcomeWriter: MeetingOutcomeWriter, @unchecked Sendable {
+            private let lock = NSLock()
+            private var continuation: CheckedContinuation<Void, Never>?
+            private var released = false
+            func release() {
+                lock.lock()
+                released = true
+                let cont = continuation
+                continuation = nil
+                lock.unlock()
+                cont?.resume()
+            }
+            func outcome(_ request: MeetingOutcomeRequest) async throws -> MeetingOutcomeContent {
+                await withCheckedContinuation { cont in
+                    lock.lock()
+                    if released {
+                        lock.unlock()
+                        cont.resume()
+                    } else {
+                        continuation = cont
+                        lock.unlock()
+                    }
+                }
+                return .init(summary: "DNS migration reviewed.", decisions: ["Migrate"], tasks: [], openQuestions: [])
+            }
+        }
+
+        let testStore = store()
+        let provider = AttentionProvider(kind: .local, baseURL: "http://127.0.0.1:1/v1", model: "m")
+        testStore.provider = provider
+        await testStore.waitForMeetingLibrary()
+        let (infra, _) = try await meeting("outcome-prepare-race")
+        infra.receiveLocalLineForTesting(.init(id: "race-line", trackID: "a", text: "Anna will update DNS.",
+                                               start: Date(), end: Date()))
+        let coordinator = AttentionCoordinator(store: testStore)
+        let gatedWriter = GatedOutcomeWriter()
+        coordinator.makeOutcomeWriter = { _, _ in gatedWriter }
+
+        coordinator.captureOutcome(for: infra)
+        try await spin {
+            testStore.meetingLibrary.cards.first { $0.sessionID == infra.sessionID }?.outcomeState == .pending
+        }
+
+        // Simulates MacWorkspaceSyncCoordinator.reconcileLocalHistory() calling prepare() mid-generation.
+        await testStore.meetingLibrary.prepare()
+        let duringSync = testStore.meetingLibrary.cards.first { $0.sessionID == infra.sessionID }
+        XCTAssertEqual(duringSync?.outcomeState, .pending)
+        XCTAssertNil(duringSync?.outcomeErrorCode)
+
+        gatedWriter.release()
+        try await spin { coordinator.outcomeStatus[infra.sessionID] == nil }
+        let completed = try XCTUnwrap(testStore.meetingLibrary.cards.first { $0.sessionID == infra.sessionID })
+        XCTAssertEqual(completed.outcomeState, .ready)
+        XCTAssertEqual(testStore.assistant.outcomes.first { $0.meetingID == infra.sessionID }?.summary, "DNS migration reviewed.")
+
+        // Closing and reopening on a fresh controller still marks orphaned pending generations as interrupted.
+        let orphanSession = UUID()
+        let orphanOutcome = MeetingOutcome(meetingID: orphanSession, meetingTitle: "Orphan", endedAt: Date(), summary: "")
+        let input = MeetingOutcomeInput(
+            request: .init(meetingTitle: "Orphan", endedAt: Date(), window: sampleWindow(), language: "en"),
+            provider: provider
+        )
+        _ = try await testStore.meetingLibrary.store.startOutcome(orphanOutcome, input: input, owner: "previous-process")
+        await testStore.meetingLibrary.close()
+
+        let reopened = MeetingLibraryController(root: testStore.root)
+        await reopened.prepare()
+        let orphanCard = try XCTUnwrap(reopened.cards.first { $0.outcomeID == orphanOutcome.id })
+        XCTAssertEqual(orphanCard.outcomeState, .failed)
+        XCTAssertEqual(orphanCard.outcomeErrorCode, "interrupted")
+        await reopened.close()
+    }
+
+    func testReasoningModelExtractionAndPromptGuidedFallbackForOutcomeAndJudge() async throws {
+        let customProvider = AttentionProvider(kind: .custom, baseURL: "https://litellm.example.test/v1", model: "cowork-pro")
+        let outcomeRequest = MeetingOutcomeRequest(meetingTitle: "Infra", endedAt: Date(), window: sampleWindow(), language: "ru")
+        let judgeRequest = JudgeRequest(window: sampleWindow(), preset: nil, profile: .init(), yourName: "Vitalii", language: "ru")
+
+        // Case A: reasoning_content carries the JSON while content is null -> succeeds on Attempt 0 (1 HTTP call).
+        var outcomeCallsA = 0
+        let outcomeSessionA = StubProtocol.session { _ in
+            outcomeCallsA += 1
+            return (200, Data(#"{"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":null,"reasoning_content":"{\"summary\":\"Infra synced.\",\"decisions\":[],\"tasks\":[],\"open_questions\":[]}"}}]}"#.utf8))
+        }
+        let outcomeA = try await OpenAIChatJudge(provider: customProvider, key: "k", session: outcomeSessionA, retryDelays: [0, 0]).outcome(outcomeRequest)
+        XCTAssertEqual(outcomeCallsA, 1)
+        XCTAssertEqual(outcomeA.summary, "Infra synced.")
+
+        var judgeCallsA = 0
+        let judgeSessionA = StubProtocol.session { _ in
+            judgeCallsA += 1
+            return (200, Data(#"{"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":null,"reasoning_content":"{\"attention\":\"now\",\"probability\":0.9,\"reason\":\"Anna waits.\",\"evidence\":[\"L2\"],\"action\":\"open\"}"}}]}"#.utf8))
+        }
+        let judgeA = try await OpenAIChatJudge(provider: customProvider, key: "k", session: judgeSessionA, retryDelays: [0, 0]).judge(judgeRequest)
+        XCTAssertEqual(judgeCallsA, 1)
+        XCTAssertEqual(judgeA.verdict.level, .now)
+
+        // Case B1: empty content + reasoning_tokens on Attempt 0 -> Attempt 1 removes response_format & adds hint -> succeeds.
+        var bodiesB1: [[String: Any]] = []
+        let sessionB1 = StubProtocol.session { urlRequest in
+            if let parsed = try JSONSerialization.jsonObject(with: StubProtocol.body(urlRequest)) as? [String: Any] {
+                bodiesB1.append(parsed)
+            }
+            if bodiesB1.count == 1 {
+                return (200, Data(#"{"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":null}}],"usage":{"completion_tokens":533,"completion_tokens_details":{"reasoning_tokens":532}}}"#.utf8))
+            }
+            return (200, StubProtocol.answer(#"{"summary":"Prompt-guided succeeded.","decisions":[],"tasks":[],"open_questions":[]}"#))
+        }
+        let outcomeB1 = try await OpenAIChatJudge(provider: customProvider, key: "k", session: sessionB1, retryDelays: [0, 0]).outcome(outcomeRequest)
+        XCTAssertEqual(bodiesB1.count, 2)
+        XCTAssertNotNil(bodiesB1[0]["response_format"])
+        XCTAssertNil(bodiesB1[1]["response_format"])
+        XCTAssertNil(bodiesB1[1]["chat_template_kwargs"])
+        let system1 = ((bodiesB1[1]["messages"] as? [[String: Any]])?.first?["content"] as? String) ?? ""
+        XCTAssertTrue(system1.contains(MeetingOutcomePrompt.hint))
+        XCTAssertEqual(outcomeB1.summary, "Prompt-guided succeeded.")
+
+        // Case B2: Attempt 2 adds chat_template_kwargs: enable_thinking = false on non-OpenAI hosts.
+        var bodiesB2: [[String: Any]] = []
+        let sessionB2 = StubProtocol.session { urlRequest in
+            if let parsed = try JSONSerialization.jsonObject(with: StubProtocol.body(urlRequest)) as? [String: Any] {
+                bodiesB2.append(parsed)
+            }
+            if bodiesB2.count < 3 {
+                return (200, Data(#"{"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":null}}]}"#.utf8))
+            }
+            return (200, StubProtocol.answer(#"{"summary":"No-thinking succeeded.","decisions":[],"tasks":[],"open_questions":[]}"#))
+        }
+        let outcomeB2 = try await OpenAIChatJudge(provider: customProvider, key: "k", session: sessionB2, retryDelays: [0, 0]).outcome(outcomeRequest)
+        XCTAssertEqual(bodiesB2.count, 3)
+        XCTAssertEqual((bodiesB2[2]["chat_template_kwargs"] as? [String: Bool])?["enable_thinking"], false)
+        XCTAssertEqual(outcomeB2.summary, "No-thinking succeeded.")
+
+        // Case B3: strict proxy rejecting chat_template_kwargs on Attempt 2 maps to .emptyAnswer (.invalidResponse).
+        var callsB3 = 0
+        let sessionB3 = StubProtocol.session { _ in
+            callsB3 += 1
+            if callsB3 < 3 {
+                return (200, Data(#"{"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":null}}]}"#.utf8))
+            }
+            return (400, Data(#"{"error":{"message":"Unrecognized request argument chat_template_kwargs"}}"#.utf8))
+        }
+        do {
+            _ = try await OpenAIChatJudge(provider: customProvider, key: "k", session: sessionB3, retryDelays: [0, 0]).outcome(outcomeRequest)
+            XCTFail("Expected emptyAnswer")
+        } catch {
+            XCTAssertEqual(error as? AttentionJudgeError, .emptyAnswer)
+            XCTAssertEqual(MeetingOutcomeFailure(writerError: error), .invalidResponse)
+        }
+
+        // Case B4: api.openai.com never receives chat_template_kwargs even on Attempt 2.
+        let openAIProvider = AttentionProvider(kind: .openAI, baseURL: "https://api.openai.com/v1", model: "gpt-5-mini")
+        var bodiesOpenAI: [[String: Any]] = []
+        let sessionOpenAI = StubProtocol.session { urlRequest in
+            if let parsed = try JSONSerialization.jsonObject(with: StubProtocol.body(urlRequest)) as? [String: Any] {
+                bodiesOpenAI.append(parsed)
+            }
+            if bodiesOpenAI.count < 3 {
+                return (200, Data(#"{"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":null}}]}"#.utf8))
+            }
+            return (200, StubProtocol.answer(#"{"summary":"OpenAI succeeded.","decisions":[],"tasks":[],"open_questions":[]}"#))
+        }
+        let outcomeOpenAI = try await OpenAIChatJudge(provider: openAIProvider, key: "k", session: sessionOpenAI, retryDelays: [0, 0]).outcome(outcomeRequest)
+        XCTAssertEqual(bodiesOpenAI.count, 3)
+        XCTAssertNil(bodiesOpenAI[1]["response_format"])
+        XCTAssertNil(bodiesOpenAI[2]["response_format"])
+        XCTAssertNil(bodiesOpenAI[2]["chat_template_kwargs"])
+        XCTAssertEqual(outcomeOpenAI.summary, "OpenAI succeeded.")
+
+        // Case C: Inline <think>...</think> with empty post-think content or unclosed <think> prose in judge/draft retries as .emptyAnswer instead of failing as .malformed.
+        var inlineJudgeCalls = 0
+        let inlineJudgeSession = StubProtocol.session { _ in
+            inlineJudgeCalls += 1
+            if inlineJudgeCalls == 1 {
+                return (200, StubProtocol.answer("<think>Checking {L1} and {L2}...</think>\n"))
+            }
+            if inlineJudgeCalls == 2 {
+                return (200, StubProtocol.answer("<think>Unclosed thought referencing {L2}"))
+            }
+            return (200, StubProtocol.answer(#"{"attention":"now","probability":0.88,"reason":"Anna waits.","evidence":["L2"],"action":"open"}"#))
+        }
+        let inlineVerdict = try await OpenAIChatJudge(provider: customProvider, key: "k", session: inlineJudgeSession, retryDelays: [0, 0]).judge(judgeRequest)
+        XCTAssertEqual(inlineJudgeCalls, 3)
+        XCTAssertEqual(inlineVerdict.verdict.level, .now)
+
+        // Case D: Space-separated HTTP 400 ("Structured outputs are not supported") triggers prompt-guided fallback.
+        var schema400Calls = 0
+        let schema400Session = StubProtocol.session { _ in
+            schema400Calls += 1
+            if schema400Calls == 1 {
+                return (400, Data(#"{"error":{"message":"Structured outputs are not supported for this model."}}"#.utf8))
+            }
+            return (200, StubProtocol.answer(#"{"summary":"Fallback after 400.","decisions":[],"tasks":[],"open_questions":[]}"#))
+        }
+        let outcome400 = try await OpenAIChatJudge(provider: customProvider, key: "k", session: schema400Session, retryDelays: [0, 0]).outcome(outcomeRequest)
+        XCTAssertEqual(schema400Calls, 2)
+        XCTAssertEqual(outcome400.summary, "Fallback after 400.")
+    }
+
     func testAssistantCommandSchemaParsesEveryActionAndRejectsUnknownIDs() throws {
         let meeting = UUID(), moment = UUID(), now = Date()
         let context = AssistantCommandContext(meetings: [.init(id: meeting, title: "Infra", invitation: nil, active: true)],

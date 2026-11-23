@@ -1018,10 +1018,11 @@ import FoundationModels
                         ["role": "system", "content": systemPrompt],
                         ["role": "user", "content": userPrompt]
                     ]
-                    let body = PortableOutcomeService.requestBody(
+                    var body = PortableOutcomeService.requestBody(
                         messages: messages, model: config.resolvedModel, provider: config.providerKind,
-                        tokenLimit: 600, temperature: 0.2
+                        tokenLimit: 2_000, temperature: 0.2
                     )
+                    body.removeValue(forKey: "response_format")
                     var request = URLRequest(url: endpoint)
                     request.httpMethod = "POST"
                     request.timeoutInterval = 30
@@ -1034,9 +1035,13 @@ import FoundationModels
                            (200..<300).contains(http.statusCode),
                            let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                            let choices = root["choices"] as? [[String: Any]],
-                           let message = choices.first?["message"] as? [String: Any],
-                           let content = message["content"] as? String {
-                            let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
+                           let first = choices.first,
+                           let message = first["message"] as? [String: Any] {
+                            let finishReason = first["finish_reason"] as? String ?? ""
+                            let trimmed = OpenAIChatResponseExtractor.extractPlainText(
+                                from: message,
+                                finishReason: finishReason
+                            )
                             if !trimmed.isEmpty { return trimmed }
                         }
                     }

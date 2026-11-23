@@ -85,7 +85,7 @@ final class IOSWorkspaceSyncTests: XCTestCase {
         )
 
         func calls() -> Int { callCount }
-        func fail(with error: PortableOutcomeError) { failure = error }
+        func fail(with error: PortableOutcomeError?) { failure = error }
 
         func generateOutcome(
             title: String,
@@ -419,6 +419,15 @@ final class IOSWorkspaceSyncTests: XCTestCase {
         XCTAssertEqual(event["hasNotes"] as? Bool, true)
         XCTAssertFalse(line.contains("Private diagnostics fixture"))
         XCTAssertFalse(line.contains("meet.example.com"))
+
+        let failedSession = try await f.store.session(sid)
+        XCTAssertEqual(failedSession?.outcomeClaim?.state, "failed")
+
+        await f.writer.fail(with: nil)
+        await f.workspace.generateOutcomeNow(sessionID: sid)
+        let recoveredSession = try await f.store.session(sid)
+        XCTAssertEqual(recoveredSession?.outcomeClaim?.state, "ready")
+        XCTAssertEqual(f.workspace.outcomesBySession[sid]?.summary, "Generated on iPhone")
     }
 
     func testRemoteMacCalendarProjectsIntoPhoneAgendaWhenLocalCalendarOff() async throws {

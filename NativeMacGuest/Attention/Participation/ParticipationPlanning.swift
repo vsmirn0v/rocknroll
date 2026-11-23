@@ -508,10 +508,19 @@ struct ParticipationPlanner: Sendable {
         let hint = "\nReturn one JSON object matching this schema: "
             + String(decoding: try JSONSerialization.data(withJSONObject: schema, options: .sortedKeys), as: UTF8.self)
         let client = OpenAIChatJudge(provider: provider, key: key, session: ParticipationNoRedirect.session,
-                                     timeout: 15, retryDelays: [])
+                                     timeout: 15, retryDelays: [0.5])
         let messages = [["role": "system", "content": instructions], ["role": "user", "content": prompt]]
-        let (result, _) = try await client.complete(client.requestBody(messages: messages, name: name, schema: schema, hint: hint))
-        return try JSONDecoder().decode(Output.self, from: Data(result.utf8))
+        let (result, _) = try await client.completeWithSource(
+            client.requestBody(messages: messages, name: name, schema: schema, hint: hint),
+            fallbackHint: hint
+        ) { content, fromReasoning in
+            do { return try JSONDecoder().decode(Output.self, from: Data(content.jsonPayload.utf8)) }
+            catch {
+                if fromReasoning { throw AttentionJudgeError.emptyAnswer }
+                throw error
+            }
+        }
+        return result
     }
 
     @available(macOS 26.0, *)

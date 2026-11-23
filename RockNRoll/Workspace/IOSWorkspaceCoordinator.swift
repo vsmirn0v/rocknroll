@@ -649,11 +649,12 @@ final class IOSWorkspaceCoordinator: ObservableObject {
         defer { generatingSessionIDs.remove(sid) }
 
         if var session = sessions.first(where: { $0.id == sid }) {
+            let nowClaim = Date()
             let claim = OutcomeGenerationClaim(
                 ownerDeviceID: deviceID,
                 deviceKind: .ios,
-                claimedAt: Date(),
-                leaseExpiresAt: Date().addingTimeInterval(60),
+                claimedAt: nowClaim,
+                leaseExpiresAt: nowClaim.addingTimeInterval(180),
                 state: "pending"
             )
             session.outcomeClaim = claim
@@ -926,6 +927,20 @@ final class IOSWorkspaceCoordinator: ObservableObject {
             }
         } catch {
             outcomeErrors[sid] = error.localizedDescription
+            let failedAt = Date()
+            if var updatedSession = try? await store.session(sid),
+               updatedSession.outcomeClaim?.state != "ready" {
+                updatedSession.outcomeClaim = OutcomeGenerationClaim(
+                    ownerDeviceID: deviceID,
+                    deviceKind: .ios,
+                    claimedAt: failedAt,
+                    leaseExpiresAt: failedAt,
+                    state: "failed"
+                )
+                try? await store.upsertSession(updatedSession)
+                upsertSessionIntoDoc(updatedSession, fieldChanges: .outcomeClaim)
+                await reloadFromStore()
+            }
             diagnostic["stage"] = stage
             switch error as? PortableOutcomeError {
             case .notConfigured: diagnostic["reason"] = "notConfigured"

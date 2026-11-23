@@ -336,6 +336,223 @@ public extension PortableOutcomeWriting {
     }
 }
 
+public enum OpenAIChatResponseExtractor {
+    public static func stripThinkingBlocks(_ raw: String) -> String {
+        let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let close = text.range(of: "</think>", options: [.caseInsensitive, .backwards]),
+           let open = text.range(of: "<think", options: .caseInsensitive),
+           open.lowerBound < close.lowerBound {
+            return String(text[close.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return text
+    }
+
+    public static func extractContent(
+        from message: [String: Any],
+        finishReason: String = "",
+        allowTrailingReasoningJSON: Bool = false
+    ) -> (text: String, fromReasoning: Bool) {
+        let standard = extractStandardContent(from: message)
+        let trimmedStandard = standard.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedStandard.isEmpty {
+            if let close = trimmedStandard.range(of: "</think>", options: [.caseInsensitive, .backwards]),
+               let open = trimmedStandard.range(of: "<think", options: .caseInsensitive),
+               open.lowerBound < close.lowerBound {
+                let afterClose = String(trimmedStandard[close.upperBound...])
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if !afterClose.isEmpty {
+                    return (afterClose, false)
+                }
+                if allowTrailingReasoningJSON && finishReason == "stop" {
+                    let inner = String(trimmedStandard[..<close.lowerBound])
+                    if let trailing = extractTrailingJSONObject(from: inner) {
+                        return (trailing, true)
+                    }
+                }
+            } else if trimmedStandard.lowercased().hasPrefix("<think") {
+                if let inlineExtracted = extractFromReasoningString(
+                    trimmedStandard,
+                    finishReason: finishReason,
+                    allowTrailingReasoningJSON: allowTrailingReasoningJSON
+                ) {
+                    return (inlineExtracted, true)
+                }
+            } else {
+                return (standard, false)
+            }
+        }
+
+        let reasoning = extractReasoningText(from: message).trimmingCharacters(in: .whitespacesAndNewlines)
+        if let extracted = extractFromReasoningString(
+            reasoning,
+            finishReason: finishReason,
+            allowTrailingReasoningJSON: allowTrailingReasoningJSON
+        ) {
+            return (extracted, true)
+        }
+
+        return ("", false)
+    }
+
+    /// Extracts natural-language assistant replies while stripping `<think>...</think>`
+    /// and never exposing unclosed chain-of-thought prose.
+    public static func extractPlainText(
+        from message: [String: Any],
+        finishReason: String = ""
+    ) -> String {
+        let _ = finishReason
+        let standard = extractStandardContent(from: message).trimmingCharacters(in: .whitespacesAndNewlines)
+        if !standard.isEmpty {
+            if let close = standard.range(of: "</think>", options: [.caseInsensitive, .backwards]),
+               let open = standard.range(of: "<think", options: .caseInsensitive),
+               open.lowerBound < close.lowerBound {
+                let afterClose = String(standard[close.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+                if !afterClose.isEmpty {
+                    return afterClose
+                }
+            } else if !standard.lowercased().hasPrefix("<think") {
+                return standard
+            }
+        }
+
+        let reasoning = extractReasoningText(from: message).trimmingCharacters(in: .whitespacesAndNewlines)
+        if let close = reasoning.range(of: "</think>", options: [.caseInsensitive, .backwards]) {
+            let afterClose = String(reasoning[close.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !afterClose.isEmpty {
+                return afterClose
+            }
+        }
+        return ""
+    }
+
+    public static func hasReasoningField(in message: [String: Any]) -> Bool {
+        !extractReasoningText(from: message).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private static func extractFromReasoningString(
+        _ reasoning: String,
+        finishReason: String,
+        allowTrailingReasoningJSON: Bool
+    ) -> String? {
+        let trimmed = reasoning.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+
+        if let close = trimmed.range(of: "</think>", options: [.caseInsensitive, .backwards]) {
+            let afterClose = String(trimmed[close.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !afterClose.isEmpty {
+                return afterClose
+            }
+        }
+
+        var withoutLeadingThink = trimmed
+        if let openRange = withoutLeadingThink.range(of: "<think>", options: [.anchored, .caseInsensitive]) {
+            withoutLeadingThink = String(withoutLeadingThink[openRange.upperBound...])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        } else if withoutLeadingThink.lowercased().hasPrefix("<think"),
+                  let gt = withoutLeadingThink.firstIndex(of: ">") {
+            withoutLeadingThink = String(withoutLeadingThink[withoutLeadingThink.index(after: gt)...])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        if withoutLeadingThink.hasPrefix("{") || withoutLeadingThink.hasPrefix("```") {
+            return withoutLeadingThink
+        }
+
+        if allowTrailingReasoningJSON && finishReason == "stop" {
+            return extractTrailingJSONObject(from: withoutLeadingThink)
+        }
+
+        return nil
+    }
+
+    private static func extractStandardContent(from message: [String: Any]) -> String {
+        if let text = message["content"] as? String {
+            return text
+        }
+        if let parts = message["content"] as? [[String: Any]] {
+            return parts.compactMap { part -> String? in
+                let type = part["type"] as? String ?? "text"
+                guard type == "text" || type == "output_text" else { return nil }
+                return part["text"] as? String
+            }.joined()
+        }
+        return ""
+    }
+
+    private static func extractReasoningText(from message: [String: Any]) -> String {
+        if let reasoning = message["reasoning_content"] as? String,
+           !reasoning.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return reasoning
+        }
+        if let reasoning = message["reasoning"] as? String,
+           !reasoning.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return reasoning
+        }
+        for key in ["content", "reasoning_content", "reasoning"] {
+            if let parts = message[key] as? [[String: Any]] {
+                let joined = parts.compactMap { part -> String? in
+                    let type = (part["type"] as? String ?? "").lowercased()
+                    if key == "content" && type != "reasoning" && type != "thinking" {
+                        return nil
+                    }
+                    return (part["text"] as? String)
+                        ?? (part["reasoning"] as? String)
+                        ?? (part["thinking"] as? String)
+                }.joined()
+                if !joined.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    return joined
+                }
+            }
+        }
+        return ""
+    }
+
+    private static func extractTrailingJSONObject(from reasoning: String) -> String? {
+        let trimmed = reasoning.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+
+        if trimmed.hasSuffix("```") {
+            let withoutSuffix = trimmed.dropLast(3)
+            if let openFence = withoutSuffix.range(of: "```", options: .backwards) {
+                var inner = String(withoutSuffix[openFence.upperBound...])
+                if let newline = inner.firstIndex(of: "\n") {
+                    let header = inner[..<newline].trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                    if header.isEmpty || header == "json" {
+                        inner = String(inner[inner.index(after: newline)...])
+                    }
+                }
+                let candidate = inner.trimmingCharacters(in: .whitespacesAndNewlines)
+                if candidate.hasPrefix("{"), isValidJSONObject(candidate) {
+                    return candidate
+                }
+            }
+        }
+
+        guard trimmed.hasSuffix("}") else { return nil }
+        var candidateStarts: [String.Index] = []
+        var searchEnd = trimmed.endIndex
+        while candidateStarts.count < 64,
+              let brace = trimmed[..<searchEnd].lastIndex(of: "{") {
+            candidateStarts.append(brace)
+            searchEnd = brace
+        }
+        for start in candidateStarts {
+            let candidate = String(trimmed[start...])
+            if isValidJSONObject(candidate) {
+                return candidate
+            }
+        }
+        return nil
+    }
+
+    private static func isValidJSONObject(_ text: String) -> Bool {
+        guard let data = text.data(using: .utf8),
+              let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return false
+        }
+        return !parsed.isEmpty
+    }
+}
+
 public enum PortableOutcomePrompt {
     public static let systemPrompt = """
     Create an editable outcome from this finished meeting. Use only facts in the supplied transcript, chat and notes. \
@@ -385,11 +602,12 @@ public enum PortableOutcomePrompt {
         }
         userContent += bodyLines.joined(separator: "\n")
         let trimmedCustom = customInstructions?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let resolvedSystem: String
-        if trimmedCustom.isEmpty {
-            resolvedSystem = systemPrompt
-        } else {
-            resolvedSystem = """
+        var resolvedSystem = systemPrompt
+        if !trimmedCustom.isEmpty {
+            resolvedSystem += """
+
+
+            Team summary instructions (Obsidian Prompts/MeetingSummary.md):
             \(trimmedCustom)
 
             Always answer with ONE valid JSON object matching this exact schema and nothing else: {"summary": string, "decisions": [string], "tasks": [{"text": string, "owner": string, "due_at": string}], "open_questions": [string]}.
@@ -403,6 +621,22 @@ public enum PortableOutcomePrompt {
 
     public static func parse(_ rawText: String) throws -> PortableOutcomeResult {
         let json = extractJSONObject(rawText)
+        if let decoded = decode(json) {
+            return decoded
+        }
+        if let repaired = repairTruncatedJSON(json), let decoded = decode(repaired) {
+            return decoded
+        }
+        let thinkingStripped = OpenAIChatResponseExtractor.stripThinkingBlocks(rawText)
+        if let brace = thinkingStripped.firstIndex(of: "{"),
+           let repaired = repairTruncatedJSON(String(thinkingStripped[brace...])),
+           let decoded = decode(repaired) {
+            return decoded
+        }
+        throw PortableOutcomeError.invalidResponse
+    }
+
+    private static func decode(_ json: String) -> PortableOutcomeResult? {
         struct RawTask: Decodable { var text: String?; var owner: String?; var due_at: String? }
         struct RawOutcome: Decodable {
             var summary: String?
@@ -412,7 +646,7 @@ public enum PortableOutcomePrompt {
         }
         guard let data = json.data(using: .utf8),
               let raw = try? JSONDecoder().decode(RawOutcome.self, from: data) else {
-            throw PortableOutcomeError.invalidResponse
+            return nil
         }
         func clean(_ items: [String]) -> [String] {
             var seen: Set<String> = []
@@ -444,7 +678,7 @@ public enum PortableOutcomePrompt {
         let summary = explicit.isEmpty
             ? (decisions + tasks.map(\.text) + openQuestions).prefix(2).joined(separator: " ")
             : explicit
-        guard !summary.isEmpty else { throw PortableOutcomeError.invalidResponse }
+        guard !summary.isEmpty else { return nil }
         return PortableOutcomeResult(
             summary: String(summary.prefix(1600)),
             decisions: decisions,
@@ -453,9 +687,77 @@ public enum PortableOutcomePrompt {
         )
     }
 
+    /// Closes a JSON object cut off by a token limit or followed by trailing prose.
+    /// A cut inside the first field or after a key with no finished value is rejected.
+    public static func repairTruncatedJSON(_ text: String) -> String? {
+        guard let start = text.firstIndex(of: "{") else { return nil }
+        let source = text[start...]
+        var out = ""
+        var stack: [Character] = []
+        var inString = false
+        var escape = false
+        var readingKey = true
+        var good = ""
+        var goodStack: [Character] = []
+        func markGood() {
+            good = out
+            goodStack = stack
+        }
+        loop: for character in source {
+            if inString {
+                out.append(character)
+                if escape { escape = false; continue }
+                if character == "\\" { escape = true; continue }
+                if character == "\"" {
+                    inString = false
+                    if readingKey { readingKey = false }
+                    else if stack.count == 1 || stack.last == "]" {
+                        markGood()
+                    }
+                }
+                continue
+            }
+            switch character {
+            case "\"":
+                inString = true
+                out.append(character)
+            case "{":
+                stack.append("}")
+                readingKey = true
+                out.append(character)
+            case "[":
+                stack.append("]")
+                readingKey = false
+                out.append(character)
+            case "}", "]":
+                guard stack.last == character else { continue }
+                stack.removeLast()
+                out.append(character)
+                readingKey = stack.last == "}"
+                markGood()
+                if stack.isEmpty { break loop }
+            case ":":
+                readingKey = false
+                out.append(character)
+            case ",":
+                readingKey = stack.last == "}"
+                out.append(character)
+            default:
+                if !character.isWhitespace { readingKey = false }
+                out.append(character)
+            }
+        }
+        guard !good.isEmpty else { return nil }
+        var repaired = good
+        while let last = repaired.last, last == "," || last == ":" || last.isWhitespace { repaired.removeLast() }
+        for closer in goodStack.reversed() { repaired.append(closer) }
+        return repaired == String(source) ? nil : repaired
+    }
+
     private static func extractJSONObject(_ raw: String) -> String {
-        var text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        var text = OpenAIChatResponseExtractor.stripThinkingBlocks(raw)
         if text.hasPrefix("```") {
+            text.removeFirst(3)
             if let newline = text.firstIndex(of: "\n") {
                 text = String(text[text.index(after: newline)...])
             }
@@ -463,9 +765,22 @@ public enum PortableOutcomePrompt {
                 text = String(text[..<close.lowerBound])
             }
             text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        } else if !text.hasPrefix("{"), let firstFence = text.range(of: "```") {
+            var inner = String(text[firstFence.upperBound...])
+            if let newline = inner.firstIndex(of: "\n") {
+                inner = String(inner[inner.index(after: newline)...])
+            }
+            if let close = inner.range(of: "```", options: .backwards) {
+                inner = String(inner[..<close.lowerBound])
+            }
+            text = inner.trimmingCharacters(in: .whitespacesAndNewlines)
         }
-        if !text.hasPrefix("{"), let start = text.firstIndex(of: "{"), let end = text.lastIndex(of: "}") {
-            text = String(text[start...end])
+        if !text.hasPrefix("{"), let start = text.firstIndex(of: "{") {
+            if let end = text.lastIndex(of: "}"), end >= start {
+                text = String(text[start...end])
+            } else {
+                text = String(text[start...])
+            }
         }
         return text
     }
@@ -488,10 +803,16 @@ public enum MeetingAITransfer {
 public struct PortableOutcomeService: PortableOutcomeWriting {
     private let session: URLSession
     private let keychain: WorkspaceAPIKeychain
+    private let apiKeyProvider: (@Sendable (PortableOutcomeProviderKind) -> String?)?
 
-    public init(session: URLSession = .shared, keychain: WorkspaceAPIKeychain = .init()) {
+    public init(
+        session: URLSession = .shared,
+        keychain: WorkspaceAPIKeychain = .init(),
+        apiKeyProvider: (@Sendable (PortableOutcomeProviderKind) -> String?)? = nil
+    ) {
         self.session = session
         self.keychain = keychain
+        self.apiKeyProvider = apiKeyProvider
     }
 
     public func generateOutcome(
@@ -553,7 +874,7 @@ public struct PortableOutcomeService: PortableOutcomeWriting {
             }
             let model = configuration.resolvedModel
             guard !model.isEmpty else { throw PortableOutcomeError.notConfigured }
-            let key = keychain.read(kind: configuration.providerKind)
+            let key = apiKeyProvider?(configuration.providerKind) ?? keychain.read(kind: configuration.providerKind)
             if configuration.providerKind.needsKey && (key?.isEmpty != false) {
                 throw PortableOutcomeError.missingKey
             }
@@ -565,30 +886,114 @@ public struct PortableOutcomeService: PortableOutcomeWriting {
                 language: language,
                 customInstructions: customInstructions
             )
-            let body = Self.requestBody(messages: messages, model: model, provider: configuration.providerKind)
-            var request = URLRequest(url: endpoint)
-            request.httpMethod = "POST"
-            request.timeoutInterval = 120
-            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            if let key, !key.isEmpty {
-                request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+            struct ProviderRefusalError: Error {}
+            let allowsDisableThinking = endpoint.host?.lowercased() != "api.openai.com"
+            var body = Self.requestBody(
+                messages: messages,
+                model: model,
+                provider: configuration.providerKind,
+                tokenLimit: 4_096
+            )
+
+            for attempt in 0...2 {
+                var request = URLRequest(url: endpoint)
+                request.httpMethod = "POST"
+                request.timeoutInterval = 120
+                request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                if let key, !key.isEmpty {
+                    request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+                }
+                request.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+                do {
+                    let (data, response) = try await MeetingAITransfer.send(request, using: session)
+                    guard let http = response as? HTTPURLResponse else {
+                        throw PortableOutcomeError.invalidResponse
+                    }
+                    guard (200..<300).contains(http.statusCode) else {
+                        throw Self.httpError(status: http.statusCode, data: data)
+                    }
+                    guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                          let choices = root["choices"] as? [[String: Any]],
+                          let first = choices.first,
+                          let message = first["message"] as? [String: Any] else {
+                        throw PortableOutcomeError.invalidResponse
+                    }
+                    if let refusal = message["refusal"] as? String,
+                       !refusal.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        throw ProviderRefusalError()
+                    }
+                    let finishReason = first["finish_reason"] as? String ?? ""
+                    let extracted = OpenAIChatResponseExtractor.extractContent(
+                        from: message,
+                        finishReason: finishReason,
+                        allowTrailingReasoningJSON: attempt > 0
+                    )
+                    guard !extracted.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                        throw PortableOutcomeError.invalidResponse
+                    }
+                    return try PortableOutcomePrompt.parse(extracted.text)
+                } catch is ProviderRefusalError {
+                    throw PortableOutcomeError.invalidResponse
+                } catch PortableOutcomeError.invalidResponse {
+                    if attempt == 0 {
+                        body.removeValue(forKey: "response_format")
+                        continue
+                    }
+                    if attempt == 1 && allowsDisableThinking {
+                        body.removeValue(forKey: "response_format")
+                        body["chat_template_kwargs"] = ["enable_thinking": false]
+                        continue
+                    }
+                    throw PortableOutcomeError.invalidResponse
+                } catch let error as PortableOutcomeError {
+                    if attempt == 0,
+                       case .http(status: let status, code: let code, parameter: let param) = error,
+                       Self.shouldRetryWithoutStructuredFormat(status: status, code: code, parameter: param) {
+                        Self.adjustFallbackParameters(&body, rejectedParameter: param, tokenLimit: 4_096)
+                        continue
+                    }
+                    if attempt == 2,
+                       case .http(status: let status, code: _, parameter: _) = error,
+                       status == 400 || status == 422 {
+                        throw PortableOutcomeError.invalidResponse
+                    }
+                    throw error
+                }
             }
-            request.httpBody = try JSONSerialization.data(withJSONObject: body)
-            let (data, response) = try await MeetingAITransfer.send(request, using: session)
-            guard let http = response as? HTTPURLResponse else {
-                throw PortableOutcomeError.invalidResponse
-            }
-            guard (200..<300).contains(http.statusCode) else {
-                throw Self.httpError(status: http.statusCode, data: data)
-            }
-            guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let choices = root["choices"] as? [[String: Any]],
-                  let first = choices.first,
-                  let message = first["message"] as? [String: Any],
-                  let content = message["content"] as? String else {
-                throw PortableOutcomeError.invalidResponse
-            }
-            return try PortableOutcomePrompt.parse(content)
+            throw PortableOutcomeError.invalidResponse
+        }
+    }
+
+    public static func shouldRetryWithoutStructuredFormat(
+        status: Int,
+        code: String?,
+        parameter: String?
+    ) -> Bool {
+        guard status == 400 || status == 422 else { return false }
+        let terminalCodes: Set<String> = [
+            "model_not_found", "invalid_api_key", "insufficient_quota",
+            "context_length_exceeded", "rate_limit_exceeded", "unsupported_country_region_territory"
+        ]
+        if let code, terminalCodes.contains(code) { return false }
+        return parameter == nil
+            || ["response_format", "max_tokens", "max_completion_tokens", "temperature", "other"].contains(parameter!)
+    }
+
+    public static func adjustFallbackParameters(
+        _ body: inout [String: Any],
+        rejectedParameter: String?,
+        tokenLimit: Int
+    ) {
+        body.removeValue(forKey: "response_format")
+        if rejectedParameter == "temperature" {
+            body.removeValue(forKey: "temperature")
+        } else if rejectedParameter == "max_tokens" {
+            body.removeValue(forKey: "max_tokens")
+            body["max_completion_tokens"] = tokenLimit
+        } else if rejectedParameter == "max_completion_tokens" {
+            body.removeValue(forKey: "max_completion_tokens")
+            body["max_tokens"] = tokenLimit
         }
     }
 

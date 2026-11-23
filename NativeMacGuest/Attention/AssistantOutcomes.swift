@@ -323,70 +323,7 @@ enum MeetingOutcomePrompt {
     /// Closes a JSON object cut off by a token limit or followed by trailing prose.
     /// A cut inside the first field or after a key with no finished value is rejected.
     static func repairTruncatedJSON(_ text: String) -> String? {
-        guard let start = text.firstIndex(of: "{") else { return nil }
-        let source = text[start...]
-        var out = ""
-        var stack: [Character] = []
-        var inString = false
-        var escape = false
-        var readingKey = true
-        var good = ""
-        var goodStack: [Character] = []
-        func markGood() {
-            good = out
-            goodStack = stack
-        }
-        loop: for character in source {
-            if inString {
-                out.append(character)
-                if escape { escape = false; continue }
-                if character == "\\" { escape = true; continue }
-                if character == "\"" {
-                    inString = false
-                    if readingKey { readingKey = false }
-                    else if stack.count == 1 || stack.last == "]" {
-                        // A finished string in the root object, or a finished element of an array.
-                        // A string inside an unfinished task object (stack ends in "}") is not complete.
-                        markGood()
-                    }
-                }
-                continue
-            }
-            switch character {
-            case "\"":
-                inString = true
-                out.append(character)
-            case "{":
-                stack.append("}")
-                readingKey = true
-                out.append(character)
-            case "[":
-                stack.append("]")
-                readingKey = false
-                out.append(character)
-            case "}", "]":
-                guard stack.last == character else { continue }
-                stack.removeLast()
-                out.append(character)
-                readingKey = stack.last == "}"
-                markGood()
-                if stack.isEmpty { break loop }
-            case ":":
-                readingKey = false
-                out.append(character)
-            case ",":
-                readingKey = stack.last == "}"
-                out.append(character)
-            default:
-                if !character.isWhitespace { readingKey = false }
-                out.append(character)
-            }
-        }
-        guard !good.isEmpty else { return nil }
-        var repaired = good
-        while let last = repaired.last, last == "," || last == ":" || last.isWhitespace { repaired.removeLast() }
-        for closer in goodStack.reversed() { repaired.append(closer) }
-        return repaired == String(source) ? nil : repaired
+        PortableOutcomePrompt.repairTruncatedJSON(text)
     }
 
     /// The on-device model only sees the newest slice. A remote writer keeps the start and the end.

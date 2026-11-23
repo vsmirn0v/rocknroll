@@ -536,7 +536,109 @@ final class IOSAssistantModeTests: XCTestCase {
         ]
         let found = IOSAssistantCoordinator.findMention(in: partial, aliases: ["Vitalii"])
         XCTAssertEqual(found?.event.id, "2")
+
+        let thoughtAndFenced = try IOSAssistantLLMService.parseVerdict("""
+        <think>Check {braces} inside thinking</think>
+        ```json
+        {"needs_user": true, "urgency": "soon", "reason": "Roadmap mentioned.", "suggested_reply": null, "confidence": 0.81}
+        ```
+        """)
+        XCTAssertTrue(thoughtAndFenced.needsUser)
+        XCTAssertEqual(thoughtAndFenced.urgency, .soon)
     }
+
+    func testIOSEvaluatorHandlesReasoningContentAndPromptGuidedFallback() async throws {
+        let req = IOSAssistantEvaluationRequest(
+            mode: .follow,
+            meetingTitle: "Standup",
+            participantNames: ["Anna", "Vitalii"],
+            userAliases: ["Vitalii"],
+            contextAbout: "",
+            contextMatters: "",
+            contextNever: "",
+            guidanceRules: [],
+            participationGoal: "",
+            replyStyle: "",
+            notesDraft: "",
+            recentEvents: [makeEvent(id: "e1", speaker: "Anna", text: "Vitalii, can we ship today?")],
+            language: "en"
+        )
+        let sessionConfig = URLSessionConfiguration.ephemeral
+        sessionConfig.protocolClasses = [ReasoningEvaluatorStubProtocol.self]
+        let session = URLSession(configuration: sessionConfig)
+        defer { session.invalidateAndCancel() }
+
+        let service = IOSAssistantLLMService(
+            configProvider: {
+                PortableOutcomeConfiguration(
+                    providerKind: .custom,
+                    baseURL: "https://litellm.example.test/v1",
+                    model: "cowork-pro"
+                )
+            },
+            apiKeyProvider: { _ in "test-key" },
+            urlSession: session
+        )
+
+        // 1. JSON trapped in reasoning_content succeeds on Attempt 0 (1 HTTP call).
+        var calls1 = 0
+        ReasoningEvaluatorStubProtocol.handler = { _ in
+            calls1 += 1
+            return (200, Data(#"{"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":null,"reasoning_content":"{\"needs_user\":true,\"urgency\":\"now\",\"reason\":\"Ship question\",\"suggested_reply\":\"Yes.\",\"confidence\":0.92}"}}]}"#.utf8))
+        }
+        let v1 = try await service.evaluate(req)
+        XCTAssertEqual(calls1, 1)
+        XCTAssertTrue(v1.needsUser)
+        XCTAssertEqual(v1.urgency, .now)
+
+        // 2. Empty content on Attempt 0 retries without response_format on Attempt 1 and succeeds.
+        var bodies2: [[String: Any]] = []
+        ReasoningEvaluatorStubProtocol.handler = { request in
+            if let parsed = try JSONSerialization.jsonObject(with: ReasoningEvaluatorStubProtocol.body(request)) as? [String: Any] {
+                bodies2.append(parsed)
+            }
+            if bodies2.count == 1 {
+                return (200, Data(#"{"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":null}}]}"#.utf8))
+            }
+            return (200, Data(#"{"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"{\"needs_user\":true,\"urgency\":\"soon\",\"reason\":\"Follow-up\",\"suggested_reply\":null,\"confidence\":0.8}"}}]}"#.utf8))
+        }
+        let v2 = try await service.evaluate(req)
+        XCTAssertEqual(bodies2.count, 2)
+        XCTAssertNotNil(bodies2[0]["response_format"])
+        XCTAssertNil(bodies2[1]["response_format"])
+        XCTAssertEqual(bodies2[0]["max_tokens"] as? Int, 2_000)
+        XCTAssertEqual(v2.urgency, .soon)
+    }
+}
+
+private final class ReasoningEvaluatorStubProtocol: URLProtocol {
+    nonisolated(unsafe) static var handler: ((URLRequest) throws -> (Int, Data))?
+    static func body(_ request: URLRequest) -> Data {
+        if let data = request.httpBody { return data }
+        guard let stream = request.httpBodyStream else { return Data() }
+        stream.open(); defer { stream.close() }
+        var data = Data(); var buffer = [UInt8](repeating: 0, count: 4096)
+        while stream.hasBytesAvailable {
+            let count = stream.read(&buffer, maxLength: buffer.count)
+            if count <= 0 { break }
+            data.append(buffer, count: count)
+        }
+        return data
+    }
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override func startLoading() {
+        do {
+            let (status, data) = try Self.handler?(request) ?? (500, Data())
+            let response = HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: nil, headerFields: nil)!
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: data)
+            client?.urlProtocolDidFinishLoading(self)
+        } catch {
+            client?.urlProtocol(self, didFailWithError: error)
+        }
+    }
+    override func stopLoading() {}
 }
 
 private final class AssistantProviderFixture: URLProtocol {

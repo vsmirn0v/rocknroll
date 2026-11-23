@@ -122,7 +122,7 @@ public enum TaskContextLLMService {
                     ],
                     model: model,
                     provider: configuration.providerKind,
-                    tokenLimit: 1800,
+                    tokenLimit: 3200,
                     temperature: 0
                 )
                 var request = URLRequest(url: endpoint)
@@ -138,14 +138,26 @@ public enum TaskContextLLMService {
                       (200..<300).contains(http.statusCode),
                       let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                       let choices = root["choices"] as? [[String: Any]],
-                      let message = choices.first?["message"] as? [String: Any],
-                      let content = message["content"] as? String else {
+                      let first = choices.first,
+                      let message = first["message"] as? [String: Any] else {
                     return TaskContextEnrichmentResult(
                         enrichedSnapshots: deterministicSnapshots,
                         standaloneFollowUps: deterministicFollowUps
                     )
                 }
-                rawJSON = content
+                let finishReason = first["finish_reason"] as? String ?? ""
+                let extracted = OpenAIChatResponseExtractor.extractContent(
+                    from: message,
+                    finishReason: finishReason,
+                    allowTrailingReasoningJSON: true
+                )
+                guard !extracted.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    return TaskContextEnrichmentResult(
+                        enrichedSnapshots: deterministicSnapshots,
+                        standaloneFollowUps: deterministicFollowUps
+                    )
+                }
+                rawJSON = extracted.text
             }
 
             if let parsed = parseLLMResult(
@@ -344,7 +356,7 @@ public enum TaskContextLLMService {
     }
 
     private static func extractJSONObject(_ raw: String) -> String {
-        var text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        var text = OpenAIChatResponseExtractor.stripThinkingBlocks(raw)
         if text.hasPrefix("```") {
             if let newline = text.firstIndex(of: "\n") {
                 text = String(text[text.index(after: newline)...])

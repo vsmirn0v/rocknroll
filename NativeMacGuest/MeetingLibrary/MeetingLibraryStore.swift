@@ -256,9 +256,11 @@ actor MeetingLibraryStore: @unchecked Sendable {
     }
 
     var databaseURL: URL { root.appendingPathComponent("meetings.sqlite3", isDirectory: false) }
+    var isOpen: Bool { connectionBox.current() != nil }
 
-    func prepare() async throws {
-        if connectionBox.current() != nil { return }
+    @discardableResult
+    func prepare() async throws -> Bool {
+        if connectionBox.current() != nil { return false }
         guard !Task.isCancelled else { throw CancellationError() }
         let opened = try MeetingSQLiteConnection(path: databaseURL)
         try Task.checkCancellation()
@@ -308,6 +310,7 @@ actor MeetingLibraryStore: @unchecked Sendable {
             }
         }
         connectionBox.install(opened)
+        return true
     }
 
     /// Deterministic teardown: closes the SQLite connection — checkpointing and
