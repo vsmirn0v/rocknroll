@@ -183,8 +183,15 @@ enum AppleOnDevice {
     /// weaker on Russian (25/31 vs 29/31 on the bench) but still a verdict.
     static func englishRequest(_ request: JudgeRequest) async throws -> (JudgeRequest, Locale.Language?) {
         var out = request
+        guard let source = meetingLanguage(request.window) else {
+            out.language = "en"
+            return (out, nil)
+        }
+        guard needsTranslation(source) else {
+            out.language = source.minimalIdentifier
+            return (out, nil)
+        }
         out.language = "en"
-        guard let source = meetingLanguage(request.window), needsTranslation(source) else { return (out, nil) }
         var texts = [request.window.meetingTitle, request.profile.name, request.profile.role] + request.profile.aliases
         texts += request.window.lines.flatMap { [$0.speaker, $0.text] }
         texts += request.memory.map(\.text)
@@ -250,7 +257,7 @@ enum AppleOnDevice {
         var translated = request
         let (english, source) = try await englishRequest(JudgeRequest(window: request.window, profile: AttentionProfile(),
             yourName: "", language: request.language))
-        translated.window = english.window; translated.language = "en"
+        translated.window = english.window; translated.language = english.language
         if source != nil {
             translated.moment.verdict.reason = (try? await OnDeviceTranslator.shared.translate([request.moment.verdict.reason],
                 from: Locale.Language(identifier: request.language), to: Self.english, cache: false))?[request.moment.verdict.reason]
@@ -275,7 +282,10 @@ enum AppleOnDevice {
         var translated = request
         let (english, source) = try await englishRequest(JudgeRequest(window: request.window, profile: AttentionProfile(),
             yourName: "", language: request.language))
-        translated.window = english.window; translated.language = "en"
+        translated.window = english.window; translated.language = english.language; translated.lockLanguage = (source != nil)
+        if let source, let notes = request.notes?.trimmed, !notes.isEmpty {
+            translated.notes = (try? await OnDeviceTranslator.shared.translate([notes], from: source, to: Self.english, cache: false))?[notes] ?? notes
+        }
         let messages = MeetingOutcomePrompt.messages(translated)
         let taskText = DynamicGenerationSchema(type: String.self)
         let schema = try GenerationSchema(root: DynamicGenerationSchema(name: "MeetingOutcome", properties: [

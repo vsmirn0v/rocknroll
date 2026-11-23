@@ -2166,6 +2166,197 @@ import XCTest
         XCTAssertEqual(outcome400.summary, "Fallback after 400.")
     }
 
+    func testRussianOutcomePromptPrecedenceAndRegenerationUpdatesVersionHistory() async throws {
+        let now = Date()
+        let window = sampleWindow()
+        let request = MeetingOutcomeRequest(
+            meetingTitle: "Standup",
+            endedAt: now,
+            window: window,
+            language: "en",
+            customInstructions: DefaultAssistantPrompts.content(for: .meetingSummary),
+            notes: "Проверить сертификаты DNS."
+        )
+        let messages = MeetingOutcomePrompt.messages(request)
+        let system = try XCTUnwrap(messages.first?["content"])
+        let user = try XCTUnwrap(messages.last?["content"])
+        let customRange = try XCTUnwrap(system.range(of: "Team summary instructions"))
+        let ruleRange = try XCTUnwrap(system.range(of: "Language rule (highest priority)"))
+        XCTAssertLessThan(customRange.lowerBound, ruleRange.lowerBound)
+        XCTAssertTrue(system[ruleRange.lowerBound...].contains("Russian (русский)"))
+        XCTAssertTrue(user.contains("Notes:\nПроверить сертификаты DNS."))
+        XCTAssertTrue(user.contains("Output language: Russian (русский)"))
+
+        let store = store()
+        store.provider = .init(kind: .local, baseURL: "http://127.0.0.1:1/v1", model: "m")
+        store.enabled = true
+        store.generateOutcomes = true
+        await store.waitForMeetingLibrary()
+
+        let sessionID = UUID()
+        let outcomeID = UUID()
+        let initialInput = MeetingOutcomeInput(request: request, provider: store.provider)
+        let draft = MeetingOutcome(id: outcomeID, meetingID: sessionID, meetingTitle: "Standup", endedAt: now, summary: "")
+        _ = try await store.meetingLibrary.store.startOutcome(draft, input: initialInput, owner: "init-owner")
+        var seeded = draft
+        seeded.summary = "Old English summary."
+        seeded.decisions = ["Old English decision"]
+        seeded.tasks = [.init(text: "Existing task", owner: "Vitalii")]
+        seeded.transcriptFingerprint = MeetingOutcomePrompt.fingerprint(window)
+        _ = try await store.meetingLibrary.store.finishOutcome(seeded, owner: "init-owner", errorCode: nil)
+        await store.meetingLibrary.refresh()
+
+        let card = try XCTUnwrap(store.meetingLibrary.cards.first { $0.sessionID == sessionID })
+        let writer = FakeOutcomeWriter()
+        writer.nextContent = .init(
+            summary: "Новый итог на русском языке.",
+            decisions: ["Обновили сертификаты DNS"],
+            tasks: [.init(text: "Проверить переключение", owner: "Анна")],
+            openQuestions: ["Нужен ли бэкап?"],
+            decisionSources: ["Обновили сертификаты DNS": ["L1"]]
+        )
+        let coordinator = AttentionCoordinator(store: store)
+        coordinator.language = "en"
+        coordinator.makeOutcomeWriter = { _, _ in writer }
+
+        try await coordinator.saveAssistantPrompt(.meetingSummary, content: "Custom summary guide.")
+        let archived = [
+            SyncedTranscriptEvent(
+                id: "t2",
+                kind: "transcript",
+                occurredAt: now,
+                speaker: "Анна",
+                isOwn: false,
+                text: "Виталий, подтверди обновление сертификатов DNS на пятницу.",
+                deviceID: "mac-1"
+            )
+        ]
+        await coordinator.regenerateOutcome(card: card, archivedEvents: archived)?.value
+
+        let updated = try await store.meetingLibrary.store.outcomeBySession(sessionID)
+        XCTAssertEqual(updated?.summary, "Новый итог на русском языке.")
+        XCTAssertEqual(updated?.decisions, ["Обновили сертификаты DNS"])
+        XCTAssertEqual(updated?.decisionEvidence?["Обновили сертификаты DNS"], ["t2"])
+        XCTAssertEqual(updated?.openQuestions, ["Нужен ли бэкап?"])
+        XCTAssertEqual(updated?.tasks.map(\.text), ["Existing task"])
+        XCTAssertEqual(updated?.taskReviewCandidates.map(\.text), ["Проверить переключение"])
+        XCTAssertEqual(
+            writer.request?.customInstructions?.trimmingCharacters(in: .whitespacesAndNewlines),
+            "Custom summary guide."
+        )
+        let versions = try await store.meetingLibrary.store.outcomeVersions(sessionID: sessionID)
+        XCTAssertTrue(versions.contains { $0.outcome.summary == "Old English summary." })
+        XCTAssertTrue(versions.contains { $0.outcome.summary == "Новый итог на русском языке." })
+    }
+
+    func testSyncedWindowAssistantChatAttributionMultiLegNotesAndStaleCandidateReplacement() async throws {
+        let now = Date()
+        let syncedChatWithAssistantRole = [
+            SyncedTranscriptEvent(
+                id: "s1",
+                kind: "transcript",
+                occurredAt: now,
+                speaker: "Анна",
+                isOwn: false,
+                text: "Давайте обновим статус релиза.",
+                deviceID: "ios-1"
+            ),
+            SyncedTranscriptEvent(
+                id: "c1",
+                kind: "chat",
+                occurredAt: now.addingTimeInterval(5),
+                speaker: "Helper Bot",
+                isOwn: false,
+                speakerRole: "assistant",
+                text: "Release readiness checklist verified with all CI gates green and approval pending from security.",
+                deviceID: "mac-1"
+            ),
+        ]
+        let syncedWin = MeetingOutcomePrompt.syncedWindow(
+            title: "Weekly Sync",
+            events: syncedChatWithAssistantRole,
+            endedAt: now.addingTimeInterval(30),
+            onDevice: false,
+            contextTokens: 8_000
+        )
+        let syncedMsgs = MeetingOutcomePrompt.messages(.init(
+            meetingTitle: "Weekly Sync",
+            endedAt: now.addingTimeInterval(30),
+            window: syncedWin,
+            language: "en"
+        ))
+        let syncedSystem = try XCTUnwrap(syncedMsgs.first?["content"])
+        let syncedUser = try XCTUnwrap(syncedMsgs.last?["content"])
+        XCTAssertTrue(syncedSystem.contains("Use only facts in the supplied transcript, chat and notes."))
+        XCTAssertTrue(syncedUser.contains("\(AssistantSpeechLedger.canonicalSpeakerName) [assistant] [chat]"))
+        // Long English assistant chat message must not override Russian speech language.
+        XCTAssertTrue(syncedUser.contains("Output language: Russian (русский)"))
+
+        let store = store()
+        store.provider = .init(kind: .local, baseURL: "http://127.0.0.1:1/v1", model: "m")
+        store.enabled = true
+        store.generateOutcomes = true
+        await store.waitForMeetingLibrary()
+
+        let primarySessionID = UUID()
+        let secondarySessionID = UUID()
+        try await store.meetingLibrary.store.upsertSession(
+            .init(id: primarySessionID, title: "Sync", startedAt: now.addingTimeInterval(-600), endedAt: now, state: .ended)
+        )
+        try await store.meetingLibrary.store.upsertSession(
+            .init(id: secondarySessionID, title: "Sync", startedAt: now.addingTimeInterval(-500), endedAt: now, state: .ended)
+        )
+        _ = try await store.meetingLibrary.store.saveNote(sessionID: primarySessionID, markdown: "Основная заметка по сертификатам.")
+        _ = try await store.meetingLibrary.store.saveNote(sessionID: secondarySessionID, markdown: "Вторичная заметка с телефона.")
+
+        var seeded = MeetingOutcome(
+            id: UUID(),
+            meetingID: primarySessionID,
+            meetingTitle: "Sync",
+            endedAt: now,
+            summary: "Old summary.",
+            tasks: [.init(text: "Keep existing task", owner: "Vitalii")]
+        )
+        seeded.taskReviewCandidates = [.init(id: UUID(), text: "Stale English candidate", owner: "Bob")]
+        let initialInput = MeetingOutcomeInput(
+            request: .init(meetingTitle: "Sync", endedAt: now, window: syncedWin, language: "en"),
+            provider: store.provider
+        )
+        _ = try await store.meetingLibrary.store.startOutcome(seeded, input: initialInput, owner: "init-owner")
+        seeded.transcriptFingerprint = MeetingOutcomePrompt.fingerprint(syncedWin)
+        _ = try await store.meetingLibrary.store.finishOutcome(seeded, owner: "init-owner", errorCode: nil)
+        await store.meetingLibrary.refresh()
+
+        let card = try XCTUnwrap(store.meetingLibrary.cards.first { $0.sessionID == primarySessionID })
+        let writer = FakeOutcomeWriter()
+        writer.nextContent = .init(
+            summary: "Сводка с учётом заметок обеих сессий.",
+            decisions: ["Перенести релиз"],
+            tasks: [.init(text: "Обновить сертификаты", owner: "Анна")],
+            openQuestions: []
+        )
+        let coordinator = AttentionCoordinator(store: store)
+        coordinator.language = "en"
+        coordinator.makeOutcomeWriter = { _, _ in writer }
+
+        await coordinator.regenerateOutcome(
+            card: card,
+            noteSessionIDs: [primarySessionID, secondarySessionID],
+            journalEvents: [],
+            syncedEvents: syncedChatWithAssistantRole
+        )?.value
+
+        let sentNotes = try XCTUnwrap(writer.request?.notes)
+        XCTAssertTrue(sentNotes.contains("Основная заметка по сертификатам."))
+        XCTAssertTrue(sentNotes.contains("Вторичная заметка с телефона."))
+        XCTAssertEqual(writer.request?.window.lines.contains(where: { $0.text.contains("Давайте обновим статус релиза.") }), true)
+
+        let maybeRegenerated = try await store.meetingLibrary.store.outcomeBySession(primarySessionID)
+        let regenerated = try XCTUnwrap(maybeRegenerated)
+        XCTAssertEqual(regenerated.tasks.map(\.text), ["Keep existing task"])
+        XCTAssertEqual(regenerated.taskReviewCandidates.map(\.text), ["Обновить сертификаты"])
+    }
+
     func testAssistantCommandSchemaParsesEveryActionAndRejectsUnknownIDs() throws {
         let meeting = UUID(), moment = UUID(), now = Date()
         let context = AssistantCommandContext(meetings: [.init(id: meeting, title: "Infra", invitation: nil, active: true)],
@@ -2663,13 +2854,14 @@ import XCTest
 private final class FakeOutcomeWriter: MeetingOutcomeWriter, @unchecked Sendable {
     var calls = 0
     var request: MeetingOutcomeRequest?
+    var nextContent: MeetingOutcomeContent?
     let failure: MeetingOutcomeFailure?
     init(failure: MeetingOutcomeFailure? = nil) { self.failure = failure }
     func outcome(_ request: MeetingOutcomeRequest) async throws -> MeetingOutcomeContent {
         calls += 1; self.request = request
         try? await Task.sleep(for: .milliseconds(30))
         if let failure { throw failure }
-        return .init(summary: "DNS migration reviewed.", decisions: ["Migrate"], tasks: [.init(text: "Update DNS", owner: "Anna")], openQuestions: [])
+        return nextContent ?? .init(summary: "DNS migration reviewed.", decisions: ["Migrate"], tasks: [.init(text: "Update DNS", owner: "Anna")], openQuestions: [])
     }
 }
 

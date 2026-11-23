@@ -528,10 +528,24 @@ struct MeetingHistoryView: View {
             if card.outcomeState == .failed || card.outcomeState == .pending {
                 generationDetail(card)
             } else if let outcome = data.outcomes.first(where: { $0.id == card.outcomeID }) {
-                detail(outcome)
-            } else {
-                Text(card.state == .active || card.state == .reconnecting ? L("Meeting in progress") : L("Outcome unavailable"))
+                detail(outcome, card: card)
+            } else if card.state == .active || card.state == .reconnecting {
+                Text(L("Meeting in progress"))
                     .foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading).padding(20)
+            } else {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text(L("Outcome unavailable")).foregroundStyle(.secondary)
+                    if let error = attention.outcomeError[card.sessionID] {
+                        Text(error).font(.caption).foregroundStyle(.red)
+                    }
+                    Button {
+                        triggerRegenerate(card)
+                    } label: {
+                        Label(L("Generate summary"), systemImage: "sparkles")
+                    }
+                    .disabled(attention.outcomeStatus[card.sessionID] != nil)
+                    .accessibilityIdentifier("assistant.generate-outcome")
+                }.frame(maxWidth: .infinity, alignment: .leading).padding(20)
             }
         }
     }
@@ -556,7 +570,8 @@ struct MeetingHistoryView: View {
                     Button(previous == nil ? L("Generate summary") : L("Refresh summary")) {
                         attention.prepareHistoryOutcome(sessionID: card.sessionID, title: card.title, endedAt: end, window: window)
                     }
-                    if let error = attention.outcomeError[card.sessionID] {
+                    if (card.state == .active || card.state == .reconnecting),
+                       let error = attention.outcomeError[card.sessionID] {
                         Text(error).foregroundStyle(.orange)
                     }
                 }.padding(16)
@@ -623,14 +638,45 @@ struct MeetingHistoryView: View {
             }
             if card.outcomeState == .failed {
                 if card.hasOutcomeInput, let id = card.outcomeID {
-                    Button(L("Retry outcome")) { attention.retryOutcome(for: card.sessionID, outcomeID: id) }
-                        .accessibilityIdentifier("assistant.retry-outcome")
+                    HStack {
+                        Button(L("Retry outcome")) { attention.retryOutcome(for: card.sessionID, outcomeID: id, refreshPrompt: true) }
+                            .accessibilityIdentifier("assistant.retry-outcome")
+                            .disabled(attention.outcomeStatus[card.sessionID] != nil)
+                        Button {
+                            triggerRegenerate(card)
+                        } label: {
+                            Label(L("Regenerate"), systemImage: "sparkles")
+                        }
                         .disabled(attention.outcomeStatus[card.sessionID] != nil)
+                        .accessibilityIdentifier("assistant.regenerate-outcome")
+                    }
                 } else {
                     Text(L("The original meeting input is unavailable for retry.")).foregroundStyle(.secondary)
+                    Button {
+                        triggerRegenerate(card)
+                    } label: {
+                        Label(L("Regenerate"), systemImage: "sparkles")
+                    }
+                    .disabled(attention.outcomeStatus[card.sessionID] != nil)
+                    .accessibilityIdentifier("assistant.regenerate-outcome")
                 }
             }
         }.padding(20).frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func triggerRegenerate(_ card: MeetingLibraryCard) {
+        let sourceIDs = groupedCards(for: card.sessionID).map(\.sessionID)
+        let events = conversation(card.sessionID)?.events ?? []
+        let synced = workspace?.workspaceSync.syncedTranscriptEvents(for: sourceIDs) ?? []
+        let archive = loadedArchiveID == card.sessionID ? archivedEvents : []
+        attention.regenerateOutcome(
+            card: card,
+            noteSessionIDs: sourceIDs,
+            journalEvents: events,
+            syncedEvents: synced,
+            archivedEvents: archive,
+            archiveStore: workspace?.workspaceSync.archiveStore
+        )
     }
 
     private func exportButtons(sessionID: UUID) -> some View {
@@ -652,7 +698,7 @@ struct MeetingHistoryView: View {
         }
     }
 
-    @ViewBuilder private func detail(_ outcome: MeetingOutcome) -> some View {
+    @ViewBuilder private func detail(_ outcome: MeetingOutcome, card: MeetingLibraryCard) -> some View {
         let binding = Binding(get: { data.outcomes.first { $0.id == outcome.id } ?? outcome },
             set: { data.updateOutcome($0) })
         let summary = Binding(get: { MeetingOutcomePrompt.displayText(binding.wrappedValue.summary) }, set: { text in
@@ -672,6 +718,13 @@ struct MeetingHistoryView: View {
                     }
                 }
                 .disabled(attention.outcomeChatTarget(outcome) == nil)
+                Button {
+                    triggerRegenerate(card)
+                } label: {
+                    Label(L("Regenerate"), systemImage: "sparkles")
+                }
+                .disabled(attention.outcomeStatus[card.sessionID] != nil)
+                .accessibilityIdentifier("assistant.regenerate-outcome")
             }
             if pendingSend?.outcome == outcome.id, let meetingID = pendingSend?.meeting,
                let target = attention.meetings().first(where: { $0.sessionID == meetingID && !$0.isClosed }) {

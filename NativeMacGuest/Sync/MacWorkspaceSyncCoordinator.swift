@@ -288,6 +288,19 @@ final class MacWorkspaceSyncCoordinator: ObservableObject {
         return session
     }
 
+    func syncedTranscriptEvents(for sessionIDs: [UUID]) -> [SyncedTranscriptEvent] {
+        var seen = Set<UUID>()
+        var byEventID: [String: SyncedTranscriptEvent] = [:]
+        for rawID in sessionIDs {
+            let canonical = canonicalSessionID(rawID)
+            guard seen.insert(canonical).inserted else { continue }
+            for event in replica.workspaceDoc.mergedTranscript(for: canonical) {
+                byEventID[event.id] = event
+            }
+        }
+        return byEventID.values.sorted { ($0.occurredAt, $0.id) < ($1.occurredAt, $1.id) }
+    }
+
     func association(for id: UUID) -> MeetingCalendarAssociation? {
         calendarLink(for: id)?.value
     }

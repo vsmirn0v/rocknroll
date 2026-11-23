@@ -61,6 +61,7 @@ struct AssistantAgentModelPrompt {
            !persona.isEmpty {
             system += "\n\n## User & Team Persona (Obsidian Prompts/BasePersona.md)\n" + persona
         }
+        system += "\nAlways reply in the language of the user's message, even if persona or skill instructions above are written in English."
         let envPairs = request.context
             .filter { $0.key != "obsidian_base_persona" }
             .sorted { $0.key < $1.key }

@@ -245,6 +245,100 @@ final class PortableOutcomeProviderTests: XCTestCase {
             XCTAssertEqual(terminalCalls, 1, "\(terminalCode) must not retry")
         }
     }
+
+    func testMeetingLanguageResolverAndCustomPromptLanguagePrecedence() throws {
+        let base = Date(timeIntervalSince1970: 1_795_000_000)
+        func ev(_ id: String, kind: String = "transcript", speaker: String = "Анна", text: String) -> SyncedTranscriptEvent {
+            SyncedTranscriptEvent(id: id, kind: kind, occurredAt: base, speaker: speaker, isOwn: false, text: text, deviceID: "ios-1")
+        }
+
+        // 1. Russian meeting + English appLanguage ("en" on iOS) -> "ru" with directive AFTER customInstructions & at end of userContent
+        let ruEvents = [ev("1", text: "Привет! Давайте обсудим план релиза на следующую неделю.")]
+        let customSummary = DefaultAssistantPrompts.content(for: .meetingSummary)
+        let messages = PortableOutcomePrompt.messages(
+            title: "Weekly Sync",
+            endedAt: base.addingTimeInterval(60),
+            events: ruEvents,
+            notes: "",
+            language: "en",
+            customInstructions: customSummary
+        )
+        let system = try XCTUnwrap(messages.first?["content"])
+        let user = try XCTUnwrap(messages.last?["content"])
+        let customPos = try XCTUnwrap(system.range(of: "Team summary instructions")?.lowerBound)
+        let rulePos = try XCTUnwrap(system.range(of: "Language rule (highest priority)")?.lowerBound)
+        XCTAssertLessThan(customPos, rulePos)
+        XCTAssertTrue(system[rulePos...].contains("Russian (русский)"))
+        XCTAssertTrue(user.hasSuffix("Output language: Russian (русский). Write all summary, decision, task, and open_question text in Russian (русский) (keep JSON keys in English)."))
+
+        // 2. Russian meeting with heavy English tech terms and Jira keys -> "ru"
+        let techRu = [ev("2", text: "Нужно смержить PR по ROCK-142 в ConferenceCore и выкатить TestFlight beta.")]
+        XCTAssertEqual(
+            MeetingLanguageResolver.resolve(events: techRu, notes: "", title: "Sync", appLanguage: "en"),
+            "ru"
+        )
+
+        // 3. Spoken Russian wins over long pasted English stack trace in chat
+        let stackTrace = String(repeating: "Fatal error in SwiftUI view update at MetalRenderer.swift line 42. ", count: 4)
+        XCTAssertEqual(
+            MeetingLanguageResolver.resolve(
+                events: [
+                    ev("s1", kind: "transcript", text: "Ребят, посмотрите пожалуйста этот крэш в логах после созвона."),
+                    ev("c1", kind: "chat", text: stackTrace)
+                ],
+                appLanguage: "en"
+            ),
+            "ru"
+        )
+
+        // 4. English meeting + Russian appLanguage ("ru") -> "en" (meeting language beats app language both ways)
+        let enEvents = [ev("3", speaker: "Anna", text: "Hi team, let us review the TestFlight rollout timeline and finalize the API contract today.")]
+        XCTAssertEqual(
+            MeetingLanguageResolver.resolve(events: enEvents, notes: "", title: "Синк", appLanguage: "ru"),
+            "en"
+        )
+
+        // 5. Minimal/ambiguous transcript + short generic title -> falls back to appLanguage
+        XCTAssertEqual(
+            MeetingLanguageResolver.resolve(events: [ev("4", text: "OK +")], title: "Standup", appLanguage: "ru"),
+            "ru"
+        )
+        XCTAssertEqual(
+            MeetingLanguageResolver.resolve(events: [], notes: "", title: "Standup", appLanguage: "en"),
+            "en"
+        )
+
+        // 6. Notes-only Russian meeting on English app -> "ru"
+        XCTAssertEqual(
+            MeetingLanguageResolver.resolve(
+                events: [],
+                notes: "Обсудили перенос релиза на следующую пятницу и назначили ответственных.",
+                title: "Sync",
+                appLanguage: "en"
+            ),
+            "ru"
+        )
+
+        // 7. Short mixed Cyrillic + ASCII and Japanese + ASCII still override English appLanguage
+        XCTAssertEqual(
+            MeetingLanguageResolver.resolve(
+                events: [ev("short-ru", text: "Синк PR")],
+                notes: "",
+                title: "Sync",
+                appLanguage: "en"
+            ),
+            "ru"
+        )
+        XCTAssertEqual(
+            MeetingLanguageResolver.resolve(
+                events: [ev("short-ja", speaker: "Kenji", text: "リリース PR API review")],
+                notes: "",
+                title: "Sync",
+                appLanguage: "en"
+            ),
+            "ja"
+        )
+    }
 }
 
 private final class OutcomeStubProtocol: URLProtocol {

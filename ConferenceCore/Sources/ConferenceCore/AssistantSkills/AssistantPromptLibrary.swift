@@ -80,6 +80,7 @@ public enum DefaultAssistantPrompts {
             return """
             # Meeting Summary & Outcome Guidelines
 
+            - Always write the summary, decisions, task descriptions, and open questions in the primary language used in the meeting (falling back to the app language only when the meeting has no clear language), even when these guidelines are written in English.
             - Group key outcomes clearly: concise factual summary, concrete decisions made, explicit commitments (tasks with owners and due dates if stated), and unresolved open questions.
             - Prefer crisp, scannable phrasing suitable for Obsidian vault review and team sync.
             - Transcript lines explicitly separate the human user (`(you)` / `(the user)`) from `Rock Assistant` (`[assistant]`). Clearly distinguish what you/participants said vs what Rock Assistant suggested or read aloud; never treat Rock Assistant's questions, standup prompts, or spoken confirmations as commitments spoken by the user unless a human agreed.
@@ -93,6 +94,7 @@ public enum DefaultAssistantPrompts {
 
             - Trigger **"now"** immediately if someone asks the user a direct question, assigns them a blocker/action, or mentions their area of responsibility directly.
             - Trigger **"soon"** when an active decision or roadmap topic relevant to the user's role is building up.
+            - Match the meeting's spoken/written language for drafted replies, and write alert reasons in the target language requested by the app regardless of the language of these guidelines.
             - Keep drafted replies direct, natural, first-person, and aligned with the team's communication style (no robotic greetings or filler).
             """
         }

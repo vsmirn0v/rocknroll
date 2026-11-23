@@ -573,7 +573,6 @@ public enum PortableOutcomePrompt {
         maxCharacters: Int = 60_000,
         customInstructions: String? = nil
     ) -> [[String: String]] {
-        let lang = Localization.englishLanguageName(for: language)
         let clock = ISO8601DateFormatter()
         let lines = events.filter {
             ($0.kind == "transcript" || $0.kind == "chat") &&
@@ -596,11 +595,20 @@ public enum PortableOutcomePrompt {
             used += line.count
         }
         let cleanNotes = notes.trimmingCharacters(in: .whitespacesAndNewlines)
+        let effectiveLangCode = MeetingLanguageResolver.resolve(
+            events: events,
+            notes: cleanNotes,
+            title: title,
+            appLanguage: language
+        )
+        let langLabel = Localization.languageLabel(for: effectiveLangCode)
+        let langDirective = Localization.outputLanguageDirective(for: effectiveLangCode)
         var userContent = "Meeting: \(title)\nEnded: \(clock.string(from: endedAt))\n\n"
         if !cleanNotes.isEmpty {
             userContent += "Notes:\n\(String(cleanNotes.prefix(8_000)))\n\n"
         }
         userContent += bodyLines.joined(separator: "\n")
+        userContent += "\n\nOutput language: \(langLabel). Write all summary, decision, task, and open_question text in \(langLabel) (keep JSON keys in English)."
         let trimmedCustom = customInstructions?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         var resolvedSystem = systemPrompt
         if !trimmedCustom.isEmpty {
@@ -613,8 +621,9 @@ public enum PortableOutcomePrompt {
             Always answer with ONE valid JSON object matching this exact schema and nothing else: {"summary": string, "decisions": [string], "tasks": [{"text": string, "owner": string, "due_at": string}], "open_questions": [string]}.
             """
         }
+        resolvedSystem += "\n\n" + langDirective
         return [
-            ["role": "system", "content": resolvedSystem + "\nWrite in \(lang)."],
+            ["role": "system", "content": resolvedSystem],
             ["role": "user", "content": userContent]
         ]
     }

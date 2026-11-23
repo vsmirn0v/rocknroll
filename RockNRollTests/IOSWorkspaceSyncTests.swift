@@ -70,6 +70,7 @@ final class IOSWorkspaceSyncTests: XCTestCase {
     private actor MockOutcomeWriter: PortableOutcomeWriting {
         var callCount = 0
         private var failure: PortableOutcomeError?
+        private var recordedLanguages: [String] = []
         var nextResult = PortableOutcomeResult(
             summary: "Generated on iPhone",
             decisions: ["Proceed offline"],
@@ -86,6 +87,8 @@ final class IOSWorkspaceSyncTests: XCTestCase {
 
         func calls() -> Int { callCount }
         func fail(with error: PortableOutcomeError?) { failure = error }
+        func languages() -> [String] { recordedLanguages }
+        func setNextResult(_ result: PortableOutcomeResult) { nextResult = result }
 
         func generateOutcome(
             title: String,
@@ -95,7 +98,28 @@ final class IOSWorkspaceSyncTests: XCTestCase {
             language: String,
             configuration: PortableOutcomeConfiguration
         ) async throws -> PortableOutcomeResult {
+            try await generateOutcome(
+                title: title,
+                endedAt: endedAt,
+                events: events,
+                notes: notes,
+                language: language,
+                configuration: configuration,
+                customInstructions: nil
+            )
+        }
+
+        func generateOutcome(
+            title: String,
+            endedAt: Date,
+            events: [SyncedTranscriptEvent],
+            notes: String,
+            language: String,
+            configuration: PortableOutcomeConfiguration,
+            customInstructions: String?
+        ) async throws -> PortableOutcomeResult {
             callCount += 1
+            recordedLanguages.append(language)
             if let failure { throw failure }
             return nextResult
         }
@@ -1324,5 +1348,110 @@ final class IOSWorkspaceSyncTests: XCTestCase {
 
         let allIDs = Set(f.workspace.visibleHistorySessions(includeEmpty: true).map(\.id))
         XCTAssertEqual(allIDs.count, 7)
+    }
+
+    func testRussianMeetingResolvesRussianAndManualRegenerateReplacesEditedSummary() async throws {
+        let f = try await makeCoordinator(isOnline: { true }, graceOverride: 0.05)
+        f.workspace.outcomeConfig = PortableOutcomeConfiguration(
+            autoGenerateOnLeave: false,
+            providerKind: .openAI,
+            model: "gpt-4.1-mini"
+        )
+        f.workspace.setRemoteAIConsent(true)
+        f.workspace.saveAPIKey("sk-test-token", for: .openAI)
+
+        let controllerID = UUID()
+        let url = URL(string: "https://meet.example.com/ru-regen")!
+        let sid = f.workspace.beginSession(
+            controllerID: controllerID,
+            requestedWorkspaceID: nil,
+            title: "Weekly Sync",
+            invitation: url,
+            roomIdentity: url.absoluteString,
+            calendarMeeting: nil
+        )
+        f.workspace.recordLiveEvents(
+            controllerID: controllerID,
+            events: [
+                SyncedTranscriptEvent(
+                    id: "ru-1",
+                    kind: "transcript",
+                    occurredAt: Date(),
+                    speaker: "Виталий",
+                    isOwn: true,
+                    text: "Давайте перенесём релиз новой версии на следующую неделю и проверим сертификаты.",
+                    deviceID: f.roomSync.deviceID
+                )
+            ],
+            micIntervals: []
+        )
+        f.workspace.finishSession(controllerID: controllerID, endedAt: Date())
+
+        await f.workspace.generateOutcomeNow(sessionID: sid)
+        let recorded = await f.writer.languages()
+        XCTAssertEqual(recorded, ["ru"])
+        XCTAssertEqual(f.workspace.tasks.filter { $0.sessionID == sid }.map(\.text), ["Send follow-up notes"])
+
+        await f.writer.setNextResult(
+            PortableOutcomeResult(
+                summary: "Intermediate English summary",
+                decisions: ["Intermediate decision"],
+                tasks: [
+                    SyncedTaskSnapshot(
+                        id: UUID(),
+                        text: "Stale English review task",
+                        owner: "Bob"
+                    )
+                ],
+                openQuestions: []
+            )
+        )
+        await f.workspace.generateOutcomeNow(sessionID: sid)
+        XCTAssertEqual(
+            f.workspace.outcomesBySession[sid]?.reviewCandidates.map(\.text),
+            ["Stale English review task"]
+        )
+
+        await f.workspace.saveEditedOutcome(
+            sessionID: sid,
+            summary: "Manually edited English summary",
+            decisions: ["Old English decision"],
+            openQuestions: ["Old English question?"]
+        )
+        XCTAssertEqual(f.workspace.outcomesBySession[sid]?.summaryEdited, true)
+
+        await f.writer.setNextResult(
+            PortableOutcomeResult(
+                summary: "Обновлённый русский итог",
+                decisions: ["Перенести релиз"],
+                tasks: [
+                    SyncedTaskSnapshot(
+                        id: UUID(),
+                        text: "Проверить сертификаты",
+                        owner: "Виталий"
+                    )
+                ],
+                openQuestions: ["Нужен ли хотфикс?"]
+            )
+        )
+        await f.workspace.generateOutcomeNow(sessionID: sid)
+
+        let regenerated = try XCTUnwrap(f.workspace.outcomesBySession[sid])
+        XCTAssertEqual(regenerated.summary, "Обновлённый русский итог")
+        XCTAssertEqual(regenerated.decisions, ["Перенести релиз"])
+        XCTAssertEqual(regenerated.openQuestions, ["Нужен ли хотфикс?"])
+        XCTAssertTrue(regenerated.summaryEdited)
+        XCTAssertTrue(regenerated.versions.contains { $0.summary == "Manually edited English summary" })
+        XCTAssertEqual(f.workspace.tasks.filter { $0.sessionID == sid }.map(\.text), ["Send follow-up notes"])
+        XCTAssertEqual(regenerated.reviewCandidates.map(\.text), ["Проверить сертификаты"])
+
+        await f.workspace.synchronizeNow()
+        guard case .outcome(let synced)? = f.libraryCloud.records["outcome:" + sid.uuidString] else {
+            return XCTFail("Expected synced outcome record in CloudKit zone")
+        }
+        XCTAssertEqual(synced.summary.value, "Обновлённый русский итог")
+        XCTAssertTrue(synced.summaryEdited)
+        XCTAssertTrue(synced.decisionsEdited)
+        XCTAssertTrue(synced.questionsEdited)
     }
 }

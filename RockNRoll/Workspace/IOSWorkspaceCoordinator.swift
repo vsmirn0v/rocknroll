@@ -637,6 +637,10 @@ final class IOSWorkspaceCoordinator: ObservableObject {
         await generateOutcomeNow(sessionID: resolvedSID, automatic: true)
     }
 
+    func canonicalSessionID(for sessionID: UUID) -> UUID {
+        replica.workspaceDoc.resolveCanonicalSessionID(for: sessionID)
+    }
+
     func generateOutcomeNow(sessionID: UUID, automatic: Bool = false) async {
         let sid = replica.workspaceDoc.resolveCanonicalSessionID(for: sessionID)
         if outcomeConfig.providerKind.needsKey && !remoteAISharingAllowed {
@@ -647,6 +651,10 @@ final class IOSWorkspaceCoordinator: ObservableObject {
         generatingSessionIDs.insert(sid)
         outcomeErrors[sid] = nil
         defer { generatingSessionIDs.remove(sid) }
+
+        if !automatic {
+            await flushNotesNow()
+        }
 
         if var session = sessions.first(where: { $0.id == sid }) {
             let nowClaim = Date()
@@ -667,7 +675,13 @@ final class IOSWorkspaceCoordinator: ObservableObject {
         let session = sessions.first { $0.id == sid }
         let title = session?.title ?? L("Meeting")
         let endedAt = session?.endedAt ?? Date()
-        let language = Locale.current.language.languageCode?.identifier ?? "en"
+        let appLanguage = Localization.preferredAppLanguageCode()
+        let language = MeetingLanguageResolver.resolve(
+            events: events,
+            notes: noteText,
+            title: title,
+            appLanguage: appLanguage
+        )
         let configuration = outcomeConfig
         var diagnostic = outcomeDiagnosticConfiguration(configuration)
         diagnostic["attempt"] = UUID().uuidString
@@ -730,6 +744,7 @@ final class IOSWorkspaceCoordinator: ObservableObject {
                     extractedTasks: result.tasks,
                     existingOpenTasks: existingCandidates.filter { !$0.done && $0.sessionID != sid },
                     configuration: configuration,
+                    language: language,
                     keychain: keychain
                 )
             } else {
@@ -810,23 +825,30 @@ final class IOSWorkspaceCoordinator: ObservableObject {
                 versions.append(.init(revision: next, summary: prior.summary, decisions: prior.decisions,
                     openQuestions: prior.openQuestions, savedAt: prior.updatedAt, deviceID: deviceID))
             }
-            var candidates = prior?.reviewCandidates ?? []
+            let manualRegenerate = !automatic && prior?.state == "ready"
+            var candidates: [SyncedTaskSnapshot] = manualRegenerate ? [] : (prior?.reviewCandidates ?? [])
             let reviewAdditions = (reviewingExisting ? reconciliation.newTasks : []) + reconciliation.reviewCandidates
-            let existingFolded = Set(existingTasks.map { $0.text.workspaceFolded + "|" + $0.owner.workspaceFolded })
+            var existingFolded = Set(existingTasks.map { $0.text.workspaceFolded + "|" + $0.owner.workspaceFolded })
                 .union(candidates.map { $0.text.workspaceFolded + "|" + $0.owner.workspaceFolded })
-            for add in reviewAdditions where !existingFolded.contains(add.snapshot.text.workspaceFolded + "|" + add.snapshot.owner.workspaceFolded) {
-                candidates.append(add.snapshot)
+            for add in reviewAdditions {
+                let foldedKey = add.snapshot.text.workspaceFolded + "|" + add.snapshot.owner.workspaceFolded
+                if existingFolded.insert(foldedKey).inserted {
+                    candidates.append(add.snapshot)
+                }
             }
+            let summaryEdited = manualRegenerate || (prior?.summaryEdited ?? false)
+            let decisionsEdited = manualRegenerate || (prior?.decisionsEdited ?? false)
+            let questionsEdited = manualRegenerate || (prior?.questionsEdited ?? false)
             let newOutcome = IOSMeetingOutcomeItem(
                 outcomeID: outcomeID,
                 sessionID: sid,
                 state: "ready",
-                summary: prior?.summaryEdited == true ? (prior?.summary ?? "") : result.summary,
-                decisions: prior?.decisionsEdited == true ? (prior?.decisions ?? []) : result.decisions,
-                openQuestions: prior?.questionsEdited == true ? (prior?.openQuestions ?? []) : result.openQuestions,
-                summaryEdited: prior?.summaryEdited ?? false,
-                decisionsEdited: prior?.decisionsEdited ?? false,
-                questionsEdited: prior?.questionsEdited ?? false,
+                summary: (!automatic || prior?.summaryEdited != true) ? result.summary : (prior?.summary ?? ""),
+                decisions: (!automatic || prior?.decisionsEdited != true) ? result.decisions : (prior?.decisions ?? []),
+                openQuestions: (!automatic || prior?.questionsEdited != true) ? result.openQuestions : (prior?.openQuestions ?? []),
+                summaryEdited: summaryEdited,
+                decisionsEdited: decisionsEdited,
+                questionsEdited: questionsEdited,
                 coverageSeconds: duration,
                 writerTier: 1,
                 versions: Array(versions.suffix(8)),
@@ -844,9 +866,9 @@ final class IOSWorkspaceCoordinator: ObservableObject {
                 summary: SyncValue(newOutcome.summary, version: v),
                 decisions: SyncValue(newOutcome.decisions, version: v),
                 openQuestions: SyncValue(newOutcome.openQuestions, version: v),
-                summaryEdited: prior?.summaryEdited ?? false,
-                decisionsEdited: prior?.decisionsEdited ?? false,
-                questionsEdited: prior?.questionsEdited ?? false,
+                summaryEdited: summaryEdited,
+                decisionsEdited: decisionsEdited,
+                questionsEdited: questionsEdited,
                 coverageSeconds: duration,
                 writerTier: 1,
                 versions: newOutcome.versions,

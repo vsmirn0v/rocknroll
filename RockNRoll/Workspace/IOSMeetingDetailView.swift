@@ -65,20 +65,24 @@ struct IOSMeetingDetailView: View {
     @State private var settingsSaved = false
     @State private var isLoadingContext = false
 
+    private var resolvedSessionID: UUID {
+        workspace.canonicalSessionID(for: sessionID)
+    }
+
     private var session: IOSMeetingSessionItem? {
-        workspace.sessions.first { $0.id == sessionID }
+        workspace.sessions.first { $0.id == resolvedSessionID }
     }
 
     private var outcome: IOSMeetingOutcomeItem? {
-        workspace.outcomesBySession[sessionID]
+        workspace.outcomesBySession[resolvedSessionID]
     }
 
     private var note: IOSMeetingNoteItem? {
-        workspace.notesBySession[sessionID]
+        workspace.notesBySession[resolvedSessionID]
     }
 
     private var sessionTasks: [IOSMeetingTaskItem] {
-        workspace.tasks.filter { $0.sessionID == sessionID }
+        workspace.tasks.filter { $0.sessionID == resolvedSessionID }
     }
 
     private var preferredSeriesID: String? {
@@ -302,9 +306,10 @@ struct IOSMeetingDetailView: View {
                         }
                         Spacer()
                         Button {
-                            Task { await workspace.generateOutcomeNow(sessionID: sessionID) }
+                            editingOutcome = false
+                            Task { await workspace.generateOutcomeNow(sessionID: resolvedSessionID) }
                         } label: {
-                            if workspace.generatingSessionIDs.contains(sessionID) {
+                            if workspace.generatingSessionIDs.contains(resolvedSessionID) {
                                 ProgressView()
                             } else {
                                 Label(
@@ -314,10 +319,10 @@ struct IOSMeetingDetailView: View {
                             }
                         }
                         .buttonStyle(.bordered)
-                        .disabled(workspace.generatingSessionIDs.contains(sessionID))
+                        .disabled(workspace.generatingSessionIDs.contains(resolvedSessionID))
                     }
 
-                    if let error = workspace.outcomeErrors[sessionID] {
+                    if let error = workspace.outcomeErrors[resolvedSessionID] {
                         Text(error)
                             .font(.caption)
                             .foregroundStyle(.red)
@@ -348,7 +353,7 @@ struct IOSMeetingDetailView: View {
                                 editingOutcome = false
                                 Task {
                                     await workspace.saveEditedOutcome(
-                                        sessionID: sessionID,
+                                        sessionID: resolvedSessionID,
                                         summary: summaryDraft,
                                         decisions: decs,
                                         openQuestions: qs
@@ -362,6 +367,7 @@ struct IOSMeetingDetailView: View {
                             }
                         }
                         .font(.caption)
+                        .disabled(workspace.generatingSessionIDs.contains(resolvedSessionID))
                     }
                 }
 
@@ -783,6 +789,7 @@ struct IOSMeetingDetailView: View {
     // MARK: - Helpers
 
     private func loadInitialState() {
+        editingOutcome = false
         noteText = workspace.noteDraft(for: sessionID)
         useSeriesScope = (preferredSeriesID?.isEmpty == false)
         availableSkills = (skills?.skills ?? DefaultAssistantSkills.all).filter(\.enabled)

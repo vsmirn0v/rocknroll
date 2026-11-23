@@ -230,7 +230,7 @@ final class AttentionMemoryPressure: @unchecked Sendable {
     /// Replaces the configured voice, for tests.
     var synthesizeOverride: ((String) async throws -> AVAudioPCMBuffer)?
     var now: () -> Date = Date.init
-    var language: String = Bundle.main.preferredLocalizations.first ?? "en"
+    var language: String = Localization.preferredAppLanguageCode()
     lazy var talk = AssistantTalkController(attention: self)
     lazy var speech = AssistantSpeechInputCoordinator(attention: self)
     /// Readiness and residency of the local speech and voice models, for the
@@ -593,12 +593,23 @@ final class AttentionMemoryPressure: @unchecked Sendable {
             captured.insert(segment.sessionID)
             let draft = MeetingOutcome(meetingID: segment.sessionID, meetingTitle: segment.title,
                 invitation: segment.invitation, seriesID: segment.seriesID, endedAt: segment.endedAt, summary: "")
-            let summaryPrompt = cachedPromptTexts[.meetingSummary]
-            let input = MeetingOutcomeInput(request: .init(meetingTitle: segment.title, endedAt: segment.endedAt,
-                window: window, language: language, customInstructions: summaryPrompt), provider: writer)
-            previousTask = runOutcome(for: segment.sessionID, after: previousTask) { library, owner in
-                let persisted = try await library.startOutcome(draft, input: input, owner: owner)
-                return (persisted, input)
+            let initialPrompt = cachedPromptTexts[.meetingSummary]
+            let initialNote = store.notes.buffer(sessionID: segment.sessionID).trimmingCharacters(in: .whitespacesAndNewlines)
+            let initialInput = MeetingOutcomeInput(request: .init(meetingTitle: segment.title, endedAt: segment.endedAt,
+                window: window, language: language, customInstructions: initialPrompt,
+                notes: initialNote.isEmpty ? nil : initialNote), provider: writer)
+            previousTask = runOutcome(for: segment.sessionID, after: previousTask) { [weak self] library, owner in
+                var resolvedInput = initialInput
+                if resolvedInput.request.customInstructions == nil, let self {
+                    resolvedInput.request.customInstructions = await self.loadAssistantPrompt(.meetingSummary).content
+                }
+                if resolvedInput.request.notes == nil,
+                   let storedNote = try? await library.note(segment.sessionID)?.markdown.trimmingCharacters(in: .whitespacesAndNewlines),
+                   !storedNote.isEmpty {
+                    resolvedInput.request.notes = storedNote
+                }
+                let persisted = try await library.startOutcome(draft, input: resolvedInput, owner: owner)
+                return (persisted, resolvedInput)
             }
         }
         return captured
@@ -627,12 +638,210 @@ final class AttentionMemoryPressure: @unchecked Sendable {
                 } else {
                     summaryPrompt = await loadAssistantPrompt(.meetingSummary).content
                 }
+                let noteMarkdown = (try? await store.meetingLibrary.store.note(sessionID))?.markdown
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
                 let content = try await writer.outcome(.init(meetingTitle: title, endedAt: endedAt,
-                    window: window, language: language, customInstructions: summaryPrompt))
+                    window: window, language: language, customInstructions: summaryPrompt,
+                    notes: noteMarkdown?.isEmpty == false ? noteMarkdown : nil))
                 historyOutcomeDrafts[sessionID] = .init(id: sessionID, content: content,
                     evidence: MeetingOutcomePrompt.verifiedEvidence(content, window: window), fingerprint: fingerprint)
             } catch {
                 outcomeError[sessionID] = MeetingOutcomeFailure(writerError: error).localizedDescription
+            }
+        }
+    }
+
+    @discardableResult
+    func regenerateOutcome(
+        card: MeetingLibraryCard,
+        noteSessionIDs: [UUID] = [],
+        journalEvents: [MeetingWorkspaceEvent] = [],
+        syncedEvents: [SyncedTranscriptEvent] = [],
+        archivedEvents: [SyncedTranscriptEvent] = [],
+        archiveStore: TranscriptArchiveStore? = nil
+    ) -> Task<Void, Never>? {
+        guard outcomeStatus[card.sessionID] == nil else { return nil }
+        let provider = store.effectiveWriter
+        guard store.writerConfigured, provider.onThisMac || (store.enabled && store.remoteOutcomes) else {
+            outcomeError[card.sessionID] = MeetingOutcomeFailure.configuration.localizedDescription
+            return nil
+        }
+        outcomeError[card.sessionID] = nil
+        if let outcomeID = card.outcomeID {
+            outcomeError[outcomeID] = nil
+        }
+        outcomeStatus[card.sessionID] = L("Preparing the meeting outcome…")
+        return Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { outcomeStatus[card.sessionID] = nil }
+            do {
+                store.assistant.flushOutcomeEdits()
+                await store.waitForOutcomeWrites()
+                await store.waitForMeetingLibrary()
+                let summaryPrompt = await loadAssistantPrompt(.meetingSummary).content
+
+                var sessionIDs = [card.sessionID]
+                for sid in noteSessionIDs where !sessionIDs.contains(sid) {
+                    sessionIDs.append(sid)
+                }
+                var noteBlocks: [String] = []
+                var seenNotes = Set<String>()
+                for sid in sessionIDs {
+                    _ = await store.notes.flush(sessionID: sid)
+                    let md = (try? await store.meetingLibrary.store.note(sid))?.markdown
+                        .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                    if !md.isEmpty, seenNotes.insert(md).inserted {
+                        noteBlocks.append(md)
+                    }
+                }
+                let noteMarkdown = noteBlocks.joined(separator: "\n\n")
+
+                let end = card.endedAt ?? card.effectiveDate?.date ?? now()
+                let onDevice = provider.kind == .apple
+                let contextTokens = store.outcomeContextTokens
+
+                var window = MeetingOutcomePrompt.historyWindow(
+                    title: card.title,
+                    events: journalEvents,
+                    endedAt: end,
+                    onDevice: onDevice,
+                    contextTokens: contextTokens
+                )
+                if !window.lines.contains(where: { $0.source != .note }), !syncedEvents.isEmpty {
+                    window = MeetingOutcomePrompt.syncedWindow(
+                        title: card.title,
+                        events: syncedEvents,
+                        endedAt: end,
+                        onDevice: onDevice,
+                        contextTokens: contextTokens
+                    )
+                }
+                if !window.lines.contains(where: { $0.source != .note }) {
+                    var resolvedArchive = archivedEvents
+                    if resolvedArchive.isEmpty, let archiveStore {
+                        var byID: [String: SyncedTranscriptEvent] = [:]
+                        for sid in sessionIDs {
+                            for event in (await archiveStore.loadTranscript(sessionID: sid) ?? []) {
+                                byID[event.id] = event
+                            }
+                        }
+                        resolvedArchive = byID.values.sorted { ($0.occurredAt, $0.id) < ($1.occurredAt, $1.id) }
+                    }
+                    if !resolvedArchive.isEmpty {
+                        window = MeetingOutcomePrompt.syncedWindow(
+                            title: card.title,
+                            events: resolvedArchive,
+                            endedAt: end,
+                            onDevice: onDevice,
+                            contextTokens: contextTokens
+                        )
+                    }
+                }
+                if !window.lines.contains(where: { $0.source != .note }),
+                   let outcomeID = card.outcomeID,
+                   let retained = try? await store.meetingLibrary.store.outcomeInput(outcomeID),
+                   retained.request.window.lines.contains(where: { $0.source != .note }) {
+                    window = retained.request.window
+                }
+                if !window.lines.contains(where: { $0.source != .note }) {
+                    guard !noteMarkdown.isEmpty else {
+                        outcomeError[card.sessionID] = L("No saved transcript or assistant reply text is available for this meeting.")
+                        return
+                    }
+                    window = AttentionWindow(
+                        meetingTitle: card.title,
+                        lines: [],
+                        reactions: [],
+                        joined: [],
+                        left: [],
+                        participantCount: 0,
+                        microphoneOn: false,
+                        soundOn: false,
+                        builtAt: end
+                    )
+                }
+
+                let writer = makeOutcomeWriter(provider, store.apiKey(for: provider))
+                let request = MeetingOutcomeRequest(
+                    meetingTitle: card.title,
+                    endedAt: end,
+                    window: window,
+                    language: language,
+                    customInstructions: summaryPrompt,
+                    notes: noteMarkdown.isEmpty ? nil : noteMarkdown
+                )
+                let content = try await writer.outcome(request)
+                try Task.checkCancellation()
+                let fingerprint = MeetingOutcomePrompt.fingerprint(window)
+                let evidence = MeetingOutcomePrompt.verifiedEvidence(content, window: window)
+
+                let input = MeetingOutcomeInput(request: request, provider: provider)
+                var provisional = MeetingOutcome(
+                    id: card.outcomeID ?? UUID(),
+                    meetingID: card.sessionID,
+                    meetingTitle: card.title,
+                    endedAt: end,
+                    summary: content.summary,
+                    decisions: content.decisions,
+                    tasks: content.tasks,
+                    openQuestions: content.openQuestions
+                )
+                let reconciliation = await reconcileAndEnrichTasks(
+                    sessionID: card.sessionID,
+                    outcome: &provisional,
+                    input: input
+                )
+                let enrichedContent = MeetingOutcomeContent(
+                    summary: provisional.summary,
+                    decisions: provisional.decisions,
+                    tasks: provisional.tasks,
+                    openQuestions: provisional.openQuestions,
+                    decisionSources: content.decisionSources
+                )
+
+                store.assistant.flushOutcomeEdits()
+                await store.waitForOutcomeWrites()
+                let library = store.meetingLibrary
+                let committed = try await store.publishOutcomeMutation {
+                    try await library.store.commitHistorySummary(
+                        card: card,
+                        content: enrichedContent,
+                        evidence: evidence,
+                        fingerprint: fingerprint,
+                        replaceSummary: true,
+                        replaceDecisions: true,
+                        replaceQuestions: true,
+                        force: true,
+                        reviewCandidates: provisional.taskReviewCandidates,
+                        reviewMatches: provisional.taskReviewMatches
+                    )
+                }
+                if let committed,
+                   let reconciliation,
+                   !reconciliation.canonicalUpdates.isEmpty || !reconciliation.links.isEmpty {
+                    _ = try? await store.publishOutcomeCommits {
+                        try await library.store.applyCrossMeetingReconciliation(
+                            reconciliation,
+                            sourceOutcomeID: committed.outcomeID
+                        )
+                    }
+                }
+                historyOutcomeDrafts[card.sessionID] = nil
+                await library.refresh()
+                if let committed,
+                   taskSync.preferences.autoSyncAfterMeetingOutcome,
+                   taskSync.preferences.anyProviderEnabled {
+                    let affectedIDs = Set(committed.outcome.tasks.map(\.id))
+                        .union(reconciliation?.canonicalUpdates.map(\.existingTaskID) ?? [])
+                    if !affectedIDs.isEmpty {
+                        Task { @MainActor [weak self] in
+                            await self?.taskSync.runSync(explicitTaskIDs: affectedIDs, automaticTrigger: true)
+                        }
+                    }
+                }
+            } catch {
+                guard !Task.isCancelled else { return }
+                outcomeError[card.sessionID] = MeetingOutcomeFailure(writerError: error).localizedDescription
             }
         }
     }
@@ -695,10 +904,20 @@ final class AttentionMemoryPressure: @unchecked Sendable {
 
     @discardableResult
     func retryOutcome(for sessionID: UUID, outcomeID: UUID,
-                      after previous: Task<Void, Never>? = nil) -> Task<Void, Never>? {
+                      after previous: Task<Void, Never>? = nil,
+                      refreshPrompt: Bool = false) -> Task<Void, Never>? {
         runOutcome(for: sessionID, after: previous) { [self] library, owner in
-            guard let input = try await library.outcomeInput(outcomeID) else { return nil }
+            guard var input = try await library.outcomeInput(outcomeID) else { return nil }
             try checkOutcomeProvider(input.provider)
+            if refreshPrompt {
+                let latestPrompt = await loadAssistantPrompt(.meetingSummary).content
+                let noteMarkdown = (try? await library.note(sessionID))?.markdown.trimmingCharacters(in: .whitespacesAndNewlines)
+                input.request.customInstructions = latestPrompt
+                input.request.language = language
+                if let noteMarkdown, !noteMarkdown.isEmpty {
+                    input.request.notes = noteMarkdown
+                }
+            }
             guard let draft = try await library.claimOutcomeRetry(outcomeID, owner: owner) else { return nil }
             return (draft, input)
         }
@@ -1148,11 +1367,12 @@ final class AttentionMemoryPressure: @unchecked Sendable {
                 meetingTitle: outcome.meetingTitle,
                 endedAt: outcome.endedAt,
                 events: syncedEvents,
-                notes: "",
+                notes: input.request.notes ?? "",
                 decisions: outcome.decisions,
                 extractedTasks: snapshots,
                 existingOpenTasks: existingCandidates.filter { !$0.done && $0.sessionID != sessionID },
-                configuration: portableConfig
+                configuration: portableConfig,
+                language: input.request.language
             )
         } else {
             let enriched = snapshots.map {
@@ -1172,7 +1392,7 @@ final class AttentionMemoryPressure: @unchecked Sendable {
                 seriesID: outcome.seriesID,
                 roomIdentity: outcome.invitation.flatMap { MeetingRoomIdentity($0)?.displayDetails },
                 events: syncedEvents,
-                notes: "",
+                notes: input.request.notes ?? "",
                 decisions: outcome.decisions,
                 existingTasks: existingCandidates.filter { !$0.done && $0.sessionID != sessionID },
                 onlyUpdateOwnedExistingTasks: taskSync.preferences.roleMode == .personalOwner,

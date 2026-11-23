@@ -333,6 +333,14 @@ struct IOSAssistantLLMService: IOSAssistantEvaluating {
             return "\(speaker): \(prefix)\(ev.text)"
         }.joined(separator: "\n")
 
+        let resolvedLang = MeetingLanguageResolver.resolve(
+            events: req.recentEvents,
+            notes: req.notesDraft,
+            title: req.meetingTitle,
+            appLanguage: req.language
+        )
+        let langLabel = Localization.languageLabel(for: resolvedLang)
+
         let modeRule: String
         switch req.mode {
         case .off:
@@ -342,7 +350,7 @@ struct IOSAssistantLLMService: IOSAssistantEvaluating {
         case .follow:
             modeRule = "Trigger needs_user=true whenever the conversation needs the user's attention, opinion, decision, action item, or mentions their area."
         case .participating:
-            modeRule = "Actively participate on the user's behalf: determine when a concise first-person response is helpful or expected, and write suggested_reply in first person matching the meeting language (\(req.language)). Goal: \(req.participationGoal.isEmpty ? "Help answer direct questions and confirm ownership concisely." : req.participationGoal). Style: \(req.replyStyle)."
+            modeRule = "Actively participate on the user's behalf: determine when a concise first-person response is helpful or expected, and write suggested_reply in first person matching the meeting language (\(langLabel)). Goal: \(req.participationGoal.isEmpty ? "Help answer direct questions and confirm ownership concisely." : req.participationGoal). Style: \(req.replyStyle)."
         }
 
         let baseIntro = (req.customJudgePrompt?.trimmingCharacters(in: .whitespacesAndNewlines)).flatMap { $0.isEmpty ? nil : $0 }
@@ -352,8 +360,8 @@ struct IOSAssistantLLMService: IOSAssistantEvaluating {
         Return ONLY valid JSON with keys:
         {"needs_user": boolean, "urgency": "none"|"soon"|"now", "reason": string, "suggested_reply": string|null, "confidence": number}
         Mode instruction: \(modeRule)
-        Keep `reason` concise (<= 16 words) in the user language (\(req.language)).
-        Only set `suggested_reply` when responding makes sense or the user wants a reply draft.
+        Keep `reason` concise (<= 16 words) in \(langLabel) (even if instructions above are written in English).
+        Only set `suggested_reply` when responding makes sense or the user wants a reply draft, and write it in \(langLabel).
         Never invent facts not present in the transcript or notes.
         Judge the newest remote speech or chat. Use earlier turns only as context.
         """
@@ -883,7 +891,7 @@ final class IOSAssistantCoordinator: ObservableObject {
                 replyStyle: participationConfig.replyStyle,
                 notesDraft: workspace?.workspaceSessionID(forControllerID: controllerID).flatMap { workspace?.noteDraft(for: $0) } ?? "",
                 recentEvents: Array(recentEvents.suffix(24)),
-                language: Locale.current.language.languageCode?.identifier ?? "en",
+                language: Localization.preferredAppLanguageCode(),
                 customJudgePrompt: attentionPromptProvider?()
             )
             do {

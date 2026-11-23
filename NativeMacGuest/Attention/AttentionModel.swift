@@ -463,6 +463,7 @@ enum ReplyPrompt {
         if let custom = request.judge.customInstructions?.trimmed, !custom.isEmpty {
             system += "\n\nTeam reply & judgment instructions (Obsidian Prompts/AttentionJudge.md):\n" + String(custom.prefix(2_000))
         }
+        system += "\n- Write every reply variant in the language used by the participants in the recent meeting lines, regardless of the language of the instructions above."
         return [["role": "system", "content": system], ["role": "user", "content": userContent(request)]]
     }
 
@@ -597,10 +598,30 @@ enum AttentionPrompt {
     """
 
     static func messages(_ request: JudgeRequest) -> [[String: String]] {
-        var systemContent = system + "\n- Write the reason in " + languageName(request.language) + "."
+        let speechTexts = request.window.lines.compactMap { line -> String? in
+            guard line.source == .speech,
+                  !line.id.hasPrefix("assistant:"),
+                  !line.id.hasPrefix("transcript:assistant:"),
+                  !AssistantSpeechLedger.isAssistantSpeaker(line.speaker, role: nil) else { return nil }
+            return line.text
+        }
+        let chatTexts = request.window.lines.compactMap { line -> String? in
+            guard line.source == .chat,
+                  !line.id.hasPrefix("assistant:"),
+                  !AssistantSpeechLedger.isAssistantSpeaker(line.speaker, role: nil) else { return nil }
+            return line.text
+        }
+        let effectiveLanguage = MeetingLanguageResolver.resolve(
+            speechTexts: speechTexts,
+            chatTexts: chatTexts,
+            title: request.window.meetingTitle,
+            appLanguage: request.language
+        )
+        var systemContent = system
         if let custom = request.customInstructions?.trimmed, !custom.isEmpty {
             systemContent += "\n\nTeam alert instructions (Obsidian Prompts/AttentionJudge.md):\n" + String(custom.prefix(2_000))
         }
+        systemContent += "\n- Write the reason in " + Localization.languageLabel(for: effectiveLanguage) + " (even if instructions above are in another language)."
         return [["role": "system", "content": systemContent],
                 ["role": "user", "content": userContent(request)]]
     }

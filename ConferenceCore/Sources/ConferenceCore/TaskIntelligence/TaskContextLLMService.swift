@@ -32,6 +32,7 @@ public enum TaskContextLLMService {
         extractedTasks: [SyncedTaskSnapshot],
         existingOpenTasks: [TaskReconciliationCandidateInput],
         configuration: PortableOutcomeConfiguration,
+        language: String = Localization.preferredAppLanguageCode(),
         keychain: WorkspaceAPIKeychain = .init(),
         session: URLSession = .shared
     ) async -> TaskContextEnrichmentResult {
@@ -68,7 +69,8 @@ public enum TaskContextLLMService {
             notes: notes,
             decisions: decisions,
             extractedTasks: deterministicSnapshots,
-            existingOpenTasks: existingOpenTasks
+            existingOpenTasks: existingOpenTasks,
+            language: language
         )
         guard let promptPayload else {
             return TaskContextEnrichmentResult(
@@ -188,7 +190,8 @@ public enum TaskContextLLMService {
         notes: String,
         decisions: [String],
         extractedTasks: [SyncedTaskSnapshot],
-        existingOpenTasks: [TaskReconciliationCandidateInput]
+        existingOpenTasks: [TaskReconciliationCandidateInput],
+        language: String
     ) -> (system: String, user: String)? {
         let lines = events
             .filter { ($0.kind == "transcript" || $0.kind == "chat") && !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
@@ -198,6 +201,14 @@ public enum TaskContextLLMService {
                 return (speaker.isEmpty ? "" : "\(speaker): ") + event.text.trimmingCharacters(in: .whitespacesAndNewlines)
             }
         guard !lines.isEmpty || !notes.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+
+        let effectiveLangCode = MeetingLanguageResolver.resolve(
+            events: events,
+            notes: notes + "\n" + decisions.joined(separator: "\n"),
+            title: meetingTitle,
+            appLanguage: language
+        )
+        let langLabel = Localization.languageLabel(for: effectiveLangCode)
 
         var budget = 18_000
         var transcriptSlice: [String] = []
@@ -228,6 +239,7 @@ public enum TaskContextLLMService {
           "existing_updates": [{"existing_id": string, "extracted_id": string, "new_status": string, "context_addition": string, "evidence_quote": string}]
         }
         Only include entries in "existing_updates" when the meeting clearly refers to the same deliverable/task from existing_tasks. If extracted_id matches an existing task, include its UUID in "extracted_id"; if discovered directly in conversation without a new extracted row, leave "extracted_id" empty "".
+        Write "context_notes" and "context_addition" in \(langLabel) (matching the meeting's language even though these instructions are in English). Keep "status", "new_status", "priority", and JSON keys in exact English.
         """
 
         let clock = ISO8601DateFormatter()
@@ -241,6 +253,8 @@ public enum TaskContextLLMService {
 
         Transcript:
         \(transcriptSlice.joined(separator: "\n"))
+
+        Output language for context_notes and context_addition: \(langLabel).
         """
         return (system, user)
     }

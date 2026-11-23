@@ -223,9 +223,9 @@ struct HistoryOutcomeReview: View {
     let draft: AttentionCoordinator.HistoryOutcomeDraft
     let attention: AttentionCoordinator
     @Environment(\.dismiss) private var dismiss
-    @State private var replaceSummary = false
-    @State private var replaceDecisions = false
-    @State private var replaceQuestions = false
+    @State private var replaceSummary = true
+    @State private var replaceDecisions = true
+    @State private var replaceQuestions = true
     @State private var applying = false
     @State private var error: String?
 
