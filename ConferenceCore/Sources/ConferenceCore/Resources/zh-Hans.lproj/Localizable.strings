@@ -9,3 +9,11 @@
 "Hardware" = "硬件";
 "Software" = "软件";
 "Sending %@" = "正在发送 %@";
+"%ld min" = "%ld 分钟";
+"Chat" = "聊天";
+"Date" = "日期";
+"Meeting" = "会议";
+"Participant" = "参会者";
+"Rock Assistant" = "Rock 助手";
+"Transcript" = "文字记录";
+"You" = "你";

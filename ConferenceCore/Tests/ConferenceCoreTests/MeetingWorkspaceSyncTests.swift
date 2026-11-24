@@ -985,4 +985,64 @@ final class MeetingWorkspaceSyncTests: XCTestCase {
         XCTAssertNil(legacy.autoJoin)
         XCTAssertNil(legacy.autoFacilitatorSkillID)
     }
+
+    func testSyncedMeetingContextSettingsMergesJiraConfigAndAutoExportTriStateOverrides() throws {
+        XCTAssertEqual(
+            SyncedMeetingContextSettings.normalizedJiraProjectKeys(from: [" sdbprod, sps ", "SDBPROD", " rock "]),
+            ["SDBPROD", "SPS", "ROCK"]
+        )
+
+        let v1 = SyncVersion(counter: 1, device: "mac-1")
+        let v2 = SyncVersion(counter: 2, device: "ios-1")
+        let v3 = SyncVersion(counter: 3, device: "ios-1")
+
+        let base = SyncedMeetingContextSettings(
+            scopeKey: "series:daily",
+            scopeKind: .calendarSeries,
+            title: SyncValue("CTO Daily", version: v1)
+        )
+        XCTAssertEqual(base.autoExportSettings?.overrides ?? .init(), MeetingAutoExportOverrides())
+
+        let overrideUpdate = SyncedMeetingContextSettings(
+            scopeKey: "series:daily",
+            scopeKind: .calendarSeries,
+            title: SyncValue("CTO Daily", version: v1),
+            jiraBoardURL: SyncValue("https://jira.example.com/secure/RapidBoard.jspa?rapidView=77", version: v2),
+            jiraProjectKeys: SyncValue(["SDBPROD", "SPS"], version: v2),
+            autoExportSettings: SyncedMeetingAutoExportSettings(
+                autoExport: SyncValue(false, version: v2),
+                includeTranscript: SyncValue(true, version: v2),
+                autoGenerateSummary: SyncValue(true, version: v2),
+                autoSyncTasks: SyncValue(false, version: v2)
+            )
+        )
+
+        let merged = base.merging(overrideUpdate)
+        XCTAssertEqual(merged.jiraBoardURL?.value, "https://jira.example.com/secure/RapidBoard.jspa?rapidView=77")
+        XCTAssertEqual(merged.jiraProjectKeys?.value, ["SDBPROD", "SPS"])
+        XCTAssertEqual(merged.autoExportSettings?.overrides.autoExport, false)
+        XCTAssertEqual(merged.autoExportSettings?.overrides.includeTranscript, true)
+        XCTAssertNil(merged.autoExportSettings?.overrides.includeSummary)
+        XCTAssertEqual(merged.autoExportSettings?.overrides.autoGenerateSummary, true)
+        XCTAssertEqual(merged.autoExportSettings?.overrides.autoSyncTasks, false)
+
+        // Resetting back to "Use default" (nil with higher CRDT version) propagates nil.
+        let resetUpdate = SyncedMeetingContextSettings(
+            scopeKey: "series:daily",
+            scopeKind: .calendarSeries,
+            title: SyncValue("CTO Daily", version: v1),
+            jiraBoardURL: SyncValue(nil, version: v3),
+            jiraProjectKeys: SyncValue(nil, version: v3),
+            autoExportSettings: SyncedMeetingAutoExportSettings(
+                autoExport: SyncValue(nil, version: v3),
+                includeTranscript: SyncValue(nil, version: v3),
+                autoGenerateSummary: SyncValue(nil, version: v3),
+                autoSyncTasks: SyncValue(nil, version: v3)
+            )
+        )
+        let afterReset = merged.merging(resetUpdate)
+        XCTAssertNil(afterReset.jiraBoardURL?.value ?? nil)
+        XCTAssertNil(afterReset.jiraProjectKeys?.value ?? nil)
+        XCTAssertFalse(afterReset.autoExportSettings?.hasAnyExplicitOverride ?? true)
+    }
 }

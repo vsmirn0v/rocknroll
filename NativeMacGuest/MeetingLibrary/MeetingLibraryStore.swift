@@ -32,6 +32,73 @@ final class MeetingSQLiteConnection: @unchecked Sendable {
     var onOutboxQueued: (@Sendable () -> Void)?
     private var transactionDepth = 0
     private var pendingOutboxWake = false
+    private let overrideLock = NSLock()
+    private var autoExportOverridesByScope: [String: MeetingAutoExportOverrides] = [:]
+    private var externalSeriesBySessionID: [UUID: String] = [:]
+
+    func setAutoExportOverrides(
+        _ overridesByScope: [String: MeetingAutoExportOverrides],
+        externalSeriesBySessionID: [UUID: String]? = nil
+    ) {
+        overrideLock.lock()
+        autoExportOverridesByScope = overridesByScope
+        if let externalSeriesBySessionID {
+            for (k, v) in externalSeriesBySessionID where !v.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                self.externalSeriesBySessionID[k] = v
+            }
+        }
+        overrideLock.unlock()
+    }
+
+    func setExternalSeriesID(_ externalSeriesID: String?, for sessionID: UUID) {
+        let trimmed = externalSeriesID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        overrideLock.lock()
+        if trimmed.isEmpty {
+            externalSeriesBySessionID.removeValue(forKey: sessionID)
+        } else {
+            externalSeriesBySessionID[sessionID] = trimmed
+        }
+        overrideLock.unlock()
+    }
+
+    func snapshotOverridesAndExternalSeries() -> ([String: MeetingAutoExportOverrides], [UUID: String]) {
+        overrideLock.lock()
+        defer { overrideLock.unlock() }
+        return (autoExportOverridesByScope, externalSeriesBySessionID)
+    }
+
+    func autoExportOverrides(for session: MeetingSessionRecord) -> MeetingAutoExportOverrides {
+        overrideLock.lock()
+        let map = autoExportOverridesByScope
+        let external = externalSeriesBySessionID[session.id]
+        overrideLock.unlock()
+        guard !map.isEmpty else { return .init() }
+
+        var keys: [String] = []
+        if let external, !external.isEmpty {
+            keys.append("series:" + external)
+        }
+        if let cal = session.calendarSeriesID?.trimmingCharacters(in: .whitespacesAndNewlines), !cal.isEmpty {
+            let k = "series:" + cal
+            if !keys.contains(k) { keys.append(k) }
+        }
+        if let inv = session.invitation?.absoluteString.trimmingCharacters(in: .whitespacesAndNewlines), !inv.isEmpty {
+            keys.append("room:" + inv)
+        }
+        let roomID = session.roomIdentity.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !roomID.isEmpty {
+            let k = "room:" + roomID
+            if !keys.contains(k) { keys.append(k) }
+        }
+
+        var merged = MeetingAutoExportOverrides()
+        for key in keys {
+            if let entry = map[key] {
+                merged = merged.mergingFallback(entry)
+            }
+        }
+        return merged
+    }
 
     init(path: URL) throws {
         self.path = path
@@ -209,12 +276,40 @@ private final class MeetingSQLiteConnectionBox: @unchecked Sendable {
     private let lock = NSLock()
     private var connection: MeetingSQLiteConnection?
     private var outboxWakeHandler: (@Sendable () -> Void)?
+    private var cachedOverridesByScope: [String: MeetingAutoExportOverrides]?
+    private var cachedExternalSeries: [UUID: String] = [:]
 
     func install(_ connection: MeetingSQLiteConnection) {
         lock.lock()
         connection.onOutboxQueued = outboxWakeHandler
+        if let cachedOverridesByScope {
+            connection.setAutoExportOverrides(cachedOverridesByScope, externalSeriesBySessionID: cachedExternalSeries)
+        } else if !cachedExternalSeries.isEmpty {
+            connection.setAutoExportOverrides([:], externalSeriesBySessionID: cachedExternalSeries)
+        }
         self.connection = connection
         lock.unlock()
+    }
+
+    func setCachedOverrides(
+        _ overridesByScope: [String: MeetingAutoExportOverrides],
+        externalSeriesBySessionID: [UUID: String]?
+    ) {
+        lock.lock()
+        cachedOverridesByScope = overridesByScope
+        if let externalSeriesBySessionID {
+            for (k, v) in externalSeriesBySessionID where !v.isEmpty {
+                cachedExternalSeries[k] = v
+            }
+        }
+        connection?.setAutoExportOverrides(overridesByScope, externalSeriesBySessionID: externalSeriesBySessionID)
+        lock.unlock()
+    }
+
+    func cachedOverridesState() -> ([String: MeetingAutoExportOverrides]?, [UUID: String]) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (cachedOverridesByScope, cachedExternalSeries)
     }
 
     func setOutboxWakeHandler(_ handler: (@Sendable () -> Void)?) {
@@ -308,6 +403,26 @@ actor MeetingLibraryStore: @unchecked Sendable {
                     }
                 }
             }
+            var loadedOverrides: [String: MeetingAutoExportOverrides] = [:]
+            if let rawOverrides = try opened.one("SELECT value FROM meeting_library_meta WHERE key='per_meeting_auto_export_overrides'")?.text(0),
+               let data = rawOverrides.data(using: .utf8),
+               let decoded = try? JSONDecoder.attention.decode([String: MeetingAutoExportOverrides].self, from: data) {
+                loadedOverrides = decoded
+            }
+            var loadedExternal: [UUID: String] = [:]
+            if let rawExternal = try opened.one("SELECT value FROM meeting_library_meta WHERE key='session_external_series'")?.text(0),
+               let data = rawExternal.data(using: .utf8),
+               let decoded = try? JSONDecoder.attention.decode([UUID: String].self, from: data) {
+                loadedExternal = decoded
+            }
+            let (cachedOverrides, cachedExternal) = connectionBox.cachedOverridesState()
+            if let cachedOverrides {
+                loadedOverrides = cachedOverrides
+            }
+            for (k, v) in cachedExternal {
+                loadedExternal[k] = v
+            }
+            opened.setAutoExportOverrides(loadedOverrides, externalSeriesBySessionID: loadedExternal)
         }
         connectionBox.install(opened)
         return true
@@ -1005,11 +1120,14 @@ actor MeetingLibraryStore: @unchecked Sendable {
                             outcomeReady: Bool = false, finalEnd: Bool = false,
                             awaitingOutcome: Bool = false) throws -> Int {
         guard let destination = try activeDestination(db) else { return 0 }
+        guard var snapshot = try exportSnapshot(db, sessionID: sessionID),
+              snapshot.session.exportRevision == desiredRevision else { return 0 }
+        let overrides = db.autoExportOverrides(for: snapshot.session)
         let linked = try isObsidianLinked(db: db, destination: destination, sessionID: sessionID)
         let stage = try db.one("SELECT stage FROM export_initial_state WHERE destination_id=? AND session_id=?",
             bind: { try bindExportKey($0, destination: destination.id, session: sessionID) })?.text(0)
-        let after = destination.enabled && destination.saveAfterMeeting
-        let sync = destination.enabled && destination.syncChanges
+        let after = overrides.autoExport ?? (destination.enabled && destination.saveAfterMeeting)
+        let sync = overrides.autoExport ?? (destination.enabled && destination.syncChanges)
         let intent: ObsidianExportIntent
         let held: Bool
         var forcedState: MeetingOutcomePersistenceState?
@@ -1031,8 +1149,6 @@ actor MeetingLibraryStore: @unchecked Sendable {
         } else {
             return 0
         }
-        guard var snapshot = try exportSnapshot(db, sessionID: sessionID),
-              snapshot.session.exportRevision == desiredRevision else { return 0 }
         if let forcedState { snapshot.outcomeState = forcedState }
         try putExport(db: db, destination: destination, snapshot: snapshot, intent: intent, held: held)
         return 1
@@ -1147,8 +1263,10 @@ actor MeetingLibraryStore: @unchecked Sendable {
             WHERE destination_id=? AND session_id=? AND policy_held=0 ORDER BY revision LIMIT 1
             """, bind: { try bindExportKey($0, destination: destination.id, session: sessionID) }),
             let intent = next.text(0).flatMap(ObsidianExportIntent.init(rawValue:)),
-            intent.permitted(by: destination), case .blob(let data)? = next[1] else { return }
+            case .blob(let data)? = next[1] else { return }
         let snapshot = try JSONDecoder.attention.decode(ObsidianExportSnapshot.self, from: data)
+        let overrides = db.autoExportOverrides(for: snapshot.session)
+        guard intent.permitted(by: destination, overrides: overrides) else { return }
         let head = try db.one("SELECT policy_held,desired_revision FROM export_outbox WHERE destination_id=? AND session_id=?",
             bind: { try bindExportKey($0, destination: destination.id, session: sessionID) })
         guard head == nil || head?.bool(0) == true && (head?.integer(1) ?? 0) <= snapshot.session.exportRevision else { return }
@@ -2012,22 +2130,88 @@ extension MeetingLibraryStore {
                 try Self.bindInt($0, destination.updatedAt.ms, at: 8)
             }
             if !destination.enabled || !destination.saveAfterMeeting {
-                try db.run("UPDATE export_initial_state SET stage='held' WHERE destination_id=? AND stage='waiting'") {
+                let initialRows = try db.rows("SELECT session_id FROM export_initial_state WHERE destination_id=? AND stage='waiting'") {
                     try Self.bindText($0, destination.id.uuidString, at: 1)
                 }
-                try db.run("UPDATE export_deferred SET policy_held=1 WHERE destination_id=? AND intent IN ('initialEnd','initialFirstReady')") {
+                for row in initialRows {
+                    if let sid = row.text(0).flatMap(UUID.init(uuidString:)),
+                       let snap = try Self.exportSnapshot(db, sessionID: sid),
+                       db.autoExportOverrides(for: snap.session).autoExport == true {
+                        continue
+                    }
+                    if let rawID = row.text(0) {
+                        try db.run("UPDATE export_initial_state SET stage='held' WHERE destination_id=? AND session_id=? AND stage='waiting'") {
+                            try Self.bindText($0, destination.id.uuidString, at: 1)
+                            try Self.bindText($0, rawID, at: 2)
+                        }
+                    }
+                }
+                let deferredRows = try db.rows("SELECT session_id,intent,snapshot_json FROM export_deferred WHERE destination_id=? AND intent IN ('initialEnd','initialFirstReady')") {
                     try Self.bindText($0, destination.id.uuidString, at: 1)
                 }
-                try db.run("UPDATE export_outbox SET policy_held=1 WHERE destination_id=? AND intent IN ('initialEnd','initialFirstReady')") {
+                for row in deferredRows {
+                    if case .blob(let data)? = row[2],
+                       let snap = try? JSONDecoder.attention.decode(ObsidianExportSnapshot.self, from: data),
+                       db.autoExportOverrides(for: snap.session).autoExport == true {
+                        continue
+                    }
+                    if let rawID = row.text(0), let rawIntent = row.text(1) {
+                        try db.run("UPDATE export_deferred SET policy_held=1 WHERE destination_id=? AND session_id=? AND intent=?") {
+                            try Self.bindText($0, destination.id.uuidString, at: 1)
+                            try Self.bindText($0, rawID, at: 2)
+                            try Self.bindText($0, rawIntent, at: 3)
+                        }
+                    }
+                }
+                let outboxRows = try db.rows("SELECT session_id,snapshot_json FROM export_outbox WHERE destination_id=? AND intent IN ('initialEnd','initialFirstReady')") {
                     try Self.bindText($0, destination.id.uuidString, at: 1)
+                }
+                for row in outboxRows {
+                    if case .blob(let data)? = row[1],
+                       let snap = try? JSONDecoder.attention.decode(ObsidianExportSnapshot.self, from: data),
+                       db.autoExportOverrides(for: snap.session).autoExport == true {
+                        continue
+                    }
+                    if let rawID = row.text(0) {
+                        try db.run("UPDATE export_outbox SET policy_held=1 WHERE destination_id=? AND session_id=? AND intent IN ('initialEnd','initialFirstReady')") {
+                            try Self.bindText($0, destination.id.uuidString, at: 1)
+                            try Self.bindText($0, rawID, at: 2)
+                        }
+                    }
                 }
             }
             if !destination.enabled || !destination.syncChanges {
-                try db.run("UPDATE export_deferred SET policy_held=1 WHERE destination_id=? AND intent='linkedUpdate'") {
+                let deferredRows = try db.rows("SELECT session_id,snapshot_json FROM export_deferred WHERE destination_id=? AND intent='linkedUpdate'") {
                     try Self.bindText($0, destination.id.uuidString, at: 1)
                 }
-                try db.run("UPDATE export_outbox SET policy_held=1 WHERE destination_id=? AND intent='linkedUpdate'") {
+                for row in deferredRows {
+                    if case .blob(let data)? = row[1],
+                       let snap = try? JSONDecoder.attention.decode(ObsidianExportSnapshot.self, from: data),
+                       db.autoExportOverrides(for: snap.session).autoExport == true {
+                        continue
+                    }
+                    if let rawID = row.text(0) {
+                        try db.run("UPDATE export_deferred SET policy_held=1 WHERE destination_id=? AND session_id=? AND intent='linkedUpdate'") {
+                            try Self.bindText($0, destination.id.uuidString, at: 1)
+                            try Self.bindText($0, rawID, at: 2)
+                        }
+                    }
+                }
+                let outboxRows = try db.rows("SELECT session_id,snapshot_json FROM export_outbox WHERE destination_id=? AND intent='linkedUpdate'") {
                     try Self.bindText($0, destination.id.uuidString, at: 1)
+                }
+                for row in outboxRows {
+                    if case .blob(let data)? = row[1],
+                       let snap = try? JSONDecoder.attention.decode(ObsidianExportSnapshot.self, from: data),
+                       db.autoExportOverrides(for: snap.session).autoExport == true {
+                        continue
+                    }
+                    if let rawID = row.text(0) {
+                        try db.run("UPDATE export_outbox SET policy_held=1 WHERE destination_id=? AND session_id=? AND intent='linkedUpdate'") {
+                            try Self.bindText($0, destination.id.uuidString, at: 1)
+                            try Self.bindText($0, rawID, at: 2)
+                        }
+                    }
                 }
             }
             // Changing authorization refreshes configuration for pending retries without
@@ -2238,21 +2422,60 @@ extension MeetingLibraryStore {
         }
     }
 
+    func setAutoExportOverrides(
+        _ overridesByScope: [String: MeetingAutoExportOverrides],
+        externalSeriesBySessionID: [UUID: String]? = nil
+    ) throws {
+        connectionBox.setCachedOverrides(overridesByScope, externalSeriesBySessionID: externalSeriesBySessionID)
+        guard let db = connectionBox.current() else { return }
+        let (mergedOverrides, mergedExternal) = db.snapshotOverridesAndExternalSeries()
+        if let encoded = try? JSONEncoder.attention.encode(mergedOverrides),
+           let text = String(data: encoded, encoding: .utf8) {
+            try? db.run("""
+                INSERT INTO meeting_library_meta(key,value) VALUES('per_meeting_auto_export_overrides',?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value
+                """) { try Self.bindText($0, text, at: 1) }
+        }
+        if let encodedExt = try? JSONEncoder.attention.encode(mergedExternal),
+           let extText = String(data: encodedExt, encoding: .utf8) {
+            try? db.run("""
+                INSERT INTO meeting_library_meta(key,value) VALUES('session_external_series',?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value
+                """) { try Self.bindText($0, extText, at: 1) }
+        }
+        connectionBox.notifyOutboxQueued()
+    }
+
+    func autoExportOverrides(for session: MeetingSessionRecord) throws -> MeetingAutoExportOverrides {
+        try db().autoExportOverrides(for: session)
+    }
+
     func dueOutbox(now: Date = Date()) async throws -> [ObsidianOutboxRecord] {
         let db = try db()
+        let destination = try Self.activeDestination(db)
         let rows = try db.rows("""
         SELECT o.*, d.enabled FROM export_outbox o
         JOIN export_destinations d ON d.destination_id = o.destination_id
-        WHERE o.paused=0 AND o.policy_held=0 AND (d.enabled=1 OR o.intent='manualSave') AND o.next_attempt_at <= ?
+        WHERE o.paused=0 AND o.policy_held=0 AND o.next_attempt_at <= ?
         ORDER BY o.next_attempt_at
         """) { try Self.bindInt($0, now.ms, at: 1) }
-        return rows.compactMap(Self.outboxRecord(from:))
+        let records = rows.compactMap(Self.outboxRecord(from:))
+        guard let destination else { return records }
+        return records.filter { record in
+            guard record.destinationID == destination.id else {
+                return record.intent == .manualSave
+            }
+            let overrides = record.snapshot.map { db.autoExportOverrides(for: $0.session) } ?? .init()
+            return record.intent.permitted(by: destination, overrides: overrides)
+        }
     }
 
     func isAuthorizedForWrite(_ row: ObsidianOutboxRecord) throws -> Bool {
         let db = try db()
+        let overrides = row.snapshot.map { db.autoExportOverrides(for: $0.session) } ?? .init()
         guard let destination = try Self.activeDestination(db), destination.id == row.destinationID,
-              destination.configRevision == row.desiredConfigRevision, row.intent.permitted(by: destination) else { return false }
+              destination.configRevision == row.desiredConfigRevision,
+              row.intent.permitted(by: destination, overrides: overrides) else { return false }
         return try db.one("""
             SELECT 1 FROM export_outbox WHERE destination_id=? AND session_id=? AND desired_revision=?
               AND desired_config_revision=? AND intent=? AND paused=0 AND policy_held=0

@@ -1,3 +1,4 @@
+import ConferenceCore
 import Foundation
 
 enum MeetingStartProvenance: String, Codable, Equatable, Sendable {
@@ -232,6 +233,13 @@ struct ObsidianDestinationRecord: Codable, Equatable, Identifiable, Sendable {
         self.configRevision = configRevision; self.vaultBookmark = vaultBookmark
         self.createdAt = createdAt; self.updatedAt = updatedAt
     }
+
+    func effective(for overrides: MeetingAutoExportOverrides) -> Self {
+        guard !overrides.isEmpty else { return self }
+        var copy = self
+        copy.layout.sections = layout.sections.applying(overrides)
+        return copy
+    }
 }
 
 enum ObsidianExportComponent: String, Codable, Sendable {
@@ -263,11 +271,16 @@ struct ObsidianExportBindingRecord: Codable, Equatable, Sendable {
 enum ObsidianExportIntent: String, Codable, Sendable {
     case initialEnd, initialFirstReady, linkedUpdate, manualSave, legacy
 
-    func permitted(by destination: ObsidianDestinationRecord) -> Bool {
+    func permitted(by destination: ObsidianDestinationRecord,
+                   overrides: MeetingAutoExportOverrides = .init()) -> Bool {
         switch self {
         case .manualSave: return true
-        case .initialEnd, .initialFirstReady: return destination.enabled && destination.saveAfterMeeting
-        case .linkedUpdate: return destination.enabled && destination.syncChanges
+        case .initialEnd, .initialFirstReady:
+            if let explicit = overrides.autoExport { return explicit }
+            return destination.enabled && destination.saveAfterMeeting
+        case .linkedUpdate:
+            if let explicit = overrides.autoExport { return explicit }
+            return destination.enabled && destination.syncChanges
         case .legacy: return false
         }
     }

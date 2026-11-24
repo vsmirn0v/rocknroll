@@ -615,8 +615,10 @@ struct AssistantSkillsView: View {
                         Button(L("Open Assistant Board")) {
                             Task {
                                 do {
-                                    if !teamContext.defaultJiraBoardURL.trimmed.isEmpty {
-                                        _ = try await board.open(urlString: teamContext.defaultJiraBoardURL)
+                                    let active = attention.meetings().first(where: { !$0.isClosed })
+                                    let resolved = await attention.resolvedJiraBoardConfig(for: active).boardURL?.absoluteString ?? ""
+                                    if !resolved.isEmpty {
+                                        _ = try await board.open(urlString: resolved)
                                         statusIsError = false
                                     } else {
                                         board.showWindow()
@@ -681,8 +683,9 @@ struct AssistantSkillsView: View {
                                                 board.stopSharing()
                                             } else {
                                                 do {
-                                                    if board.currentURL == nil && !teamContext.defaultJiraBoardURL.trimmed.isEmpty {
-                                                        _ = try await board.open(urlString: teamContext.defaultJiraBoardURL)
+                                                    let resolved = await attention.resolvedJiraBoardConfig(for: model).boardURL?.absoluteString ?? ""
+                                                    if board.currentURL == nil && !resolved.isEmpty {
+                                                        _ = try await board.open(urlString: resolved)
                                                     }
                                                     _ = try await board.startSharing(to: model)
                                                     statusIsError = false
@@ -843,9 +846,9 @@ struct NativeMeetingAssistantMenu: View {
             Button(L("Open Assistant Board")) {
                 Task {
                     do {
-                        let team = await attention.loadTeamContext()
-                        if board.currentURL == nil && !team.defaultJiraBoardURL.trimmed.isEmpty {
-                            _ = try await board.open(urlString: team.defaultJiraBoardURL)
+                        let resolved = await attention.resolvedJiraBoardConfig(for: meeting).boardURL?.absoluteString ?? ""
+                        if board.currentURL == nil && !resolved.isEmpty {
+                            _ = try await board.open(urlString: resolved)
                         } else {
                             board.showWindow()
                         }
@@ -854,15 +857,15 @@ struct NativeMeetingAssistantMenu: View {
                     }
                 }
             }
-            Button(board.sharingMeetingID == meeting.sessionID ? L("Stop Board Share") : L("Share Board to Meeting")) {
+            Button((board.sharingMeetingID == meeting.sessionID || board.isRecoveringShare) ? L("Stop Board Share") : L("Share Board to Meeting")) {
                 Task {
-                    if board.sharingMeetingID == meeting.sessionID {
+                    if board.sharingMeetingID == meeting.sessionID || board.isRecoveringShare {
                         board.stopSharing()
                     } else {
                         do {
-                            let team = await attention.loadTeamContext()
-                            if board.currentURL == nil && !team.defaultJiraBoardURL.trimmed.isEmpty {
-                                _ = try await board.open(urlString: team.defaultJiraBoardURL)
+                            let resolved = await attention.resolvedJiraBoardConfig(for: meeting).boardURL?.absoluteString ?? ""
+                            if board.currentURL == nil && !resolved.isEmpty {
+                                _ = try await board.open(urlString: resolved)
                             }
                             _ = try await board.startSharing(to: meeting)
                         } catch {

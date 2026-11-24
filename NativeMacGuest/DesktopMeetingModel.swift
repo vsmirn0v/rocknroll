@@ -142,6 +142,7 @@ import UniformTypeIdentifiers
     }
     var onConnected: (() -> Void)?
     var onLeave: (() async -> Void)?
+    var isFacilitatorActive: (() -> Bool)?
     /// Conversation panel tab: 0 Chat, 1 Live text, 2 Catch up.
     @Published var conversationTab = 0
     /// Content first: stage chrome fades until the pointer moves; Esc leaves.
@@ -678,6 +679,10 @@ import UniformTypeIdentifiers
         onTranscriptChanged?()
     }
     private func observeParticipation() {
+        if isFacilitatorActive?() == true {
+            participation.cancelPendingDispatch()
+            return
+        }
         if !participationVoiceEligible || participationRemoteSpeaking { participation.interruptVoice() }
         if participationSomeoneSpeaking { participation.cancelPendingDispatch() }
         participation.observe(guestFeatures, transcriptSource: participationTranscriptSource,
@@ -2224,13 +2229,19 @@ import UniformTypeIdentifiers
     @Published private(set) var shareStartedAt: Date?
     @Published private(set) var quickSharePending = false
     var onExternalShareStopped: (() -> Void)?
+    var onShareInterrupted: (() -> Void)?
+    private var userStoppingShare = false
     private func noteShareState() {
         let live = !closed && isSharingLive
         if live, shareStartedAt == nil {
             shareStartedAt = Date()
         } else if !live, shareStartedAt != nil {
             shareStartedAt = nil
-            onExternalShareStopped?()
+            if !closed, !userStoppingShare, !connected, let onShareInterrupted {
+                onShareInterrupted()
+            } else {
+                onExternalShareStopped?()
+            }
         }
     }
     var shareSourceTitle: String { captureCoordinator.shareSourceTitle }
@@ -2309,12 +2320,20 @@ import UniformTypeIdentifiers
             engine: { [weak self] in self?.engine },
             setSharingPending: { [weak self] pending in self?.sharingPending = pending },
             setLocalShare: { [weak self] track in self?.localShare = track },
-            onError: { [weak self] message in self?.error = message })
+            onError: { [weak self] message in
+                guard let self else { return }
+                self.error = message
+                if !self.closed, !self.userStoppingShare {
+                    self.onShareInterrupted?()
+                }
+            })
     }
     func pushBoardShareFrame(_ pixels: CVPixelBuffer) {
         captureCoordinator.pushExternalShareFrame(pixels)
     }
     @discardableResult func stopSharing() async -> Bool {
+        userStoppingShare = true
+        defer { userStoppingShare = false }
         let stopped = await captureCoordinator.stopSharing(
             engine: engine,
             isSnapshotSharing: snapshot.sharing,
@@ -2322,6 +2341,7 @@ import UniformTypeIdentifiers
             setLocalShare: { [weak self] track in self?.localShare = track },
             onError: { [weak self] message in self?.error = message })
         if stopped || !isSharingLive {
+            onShareInterrupted = nil
             onExternalShareStopped?()
         }
         return stopped

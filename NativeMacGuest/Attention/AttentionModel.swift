@@ -104,6 +104,12 @@ struct MeetingPreset: Codable, Identifiable, Equatable, Sendable {
     var autoJoin: Bool? = nil
     /// Optional role assistant skill slug (e.g. `"scrum-master"`) to auto-engage on join (`nil` = Off).
     var autoFacilitatorSkillID: String? = nil
+    /// Optional custom Jira board URL for occurrences of this meeting or series (`nil` = inherit default).
+    var jiraBoardURL: String? = nil
+    /// Optional custom Jira project keys for JQL scoping (`nil` = inherit default).
+    var jiraProjectKeys: [String]? = nil
+    /// Optional per-meeting overrides for Obsidian auto-export and post-meeting summary/task sync.
+    var autoExportOverrides: MeetingAutoExportOverrides = .init()
     static let replyEditLimit = 10
     static let promptReplyEditLimit = 5
 
@@ -126,7 +132,13 @@ struct MeetingPreset: Codable, Identifiable, Equatable, Sendable {
         min(Self.thresholdRange.upperBound, max(Self.thresholdRange.lowerBound, urgency.baseThreshold + thresholdAdjustment))
     }
     var isEmpty: Bool {
-        about.trimmed.isEmpty && matters.trimmed.isEmpty && never.trimmed.isEmpty && people.allSatisfy { $0.trimmed.isEmpty }
+        about.trimmed.isEmpty && matters.trimmed.isEmpty && never.trimmed.isEmpty &&
+            people.allSatisfy { $0.trimmed.isEmpty } &&
+            mode == nil && suggestReplies == nil && sameRoomTransition == nil &&
+            autoJoin == nil && (autoFacilitatorSkillID?.trimmed.isEmpty ?? true) &&
+            (jiraBoardURL?.trimmed.isEmpty ?? true) &&
+            (jiraProjectKeys?.allSatisfy { $0.trimmed.isEmpty } ?? true) &&
+            autoExportOverrides.isEmpty
     }
 
     /// Keeps the newest examples and moves the threshold one step: an approval
@@ -140,6 +152,38 @@ struct MeetingPreset: Codable, Identifiable, Equatable, Sendable {
     }
     /// The most recent examples the judge sees, newest first.
     var promptExamples: [PresetExample] { Array(examples.suffix(Self.promptExampleLimit).reversed()) }
+}
+
+extension MeetingPreset {
+    private enum CodingKeys: String, CodingKey {
+        case id, title, bindings, about, matters, people, never, urgency, mode
+        case thresholdAdjustment, examples, suggestReplies, replyEdits
+        case sameRoomTransition, autoJoin, autoFacilitatorSkillID
+        case jiraBoardURL, jiraProjectKeys, autoExportOverrides
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
+        title = try c.decodeIfPresent(String.self, forKey: .title) ?? ""
+        bindings = try c.decodeIfPresent([Binding].self, forKey: .bindings) ?? []
+        about = try c.decodeIfPresent(String.self, forKey: .about) ?? ""
+        matters = try c.decodeIfPresent(String.self, forKey: .matters) ?? ""
+        people = try c.decodeIfPresent([String].self, forKey: .people) ?? []
+        never = try c.decodeIfPresent(String.self, forKey: .never) ?? ""
+        urgency = try c.decodeIfPresent(AttentionUrgency.self, forKey: .urgency) ?? .normal
+        mode = try c.decodeIfPresent(AttentionMode.self, forKey: .mode)
+        thresholdAdjustment = try c.decodeIfPresent(Double.self, forKey: .thresholdAdjustment) ?? 0.0
+        examples = try c.decodeIfPresent([PresetExample].self, forKey: .examples) ?? []
+        suggestReplies = try c.decodeIfPresent(Bool.self, forKey: .suggestReplies)
+        replyEdits = try c.decodeIfPresent([ReplyEdit].self, forKey: .replyEdits)
+        sameRoomTransition = try c.decodeIfPresent(SameRoomMeetingTransitionMode.self, forKey: .sameRoomTransition)
+        autoJoin = try c.decodeIfPresent(Bool.self, forKey: .autoJoin)
+        autoFacilitatorSkillID = try c.decodeIfPresent(String.self, forKey: .autoFacilitatorSkillID)
+        jiraBoardURL = try c.decodeIfPresent(String.self, forKey: .jiraBoardURL)
+        jiraProjectKeys = try c.decodeIfPresent([String].self, forKey: .jiraProjectKeys)
+        autoExportOverrides = try c.decodeIfPresent(MeetingAutoExportOverrides.self, forKey: .autoExportOverrides) ?? .init()
+    }
 }
 
 /// A draft you rewrote before sending it.

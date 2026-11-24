@@ -286,6 +286,11 @@ final class AttentionMemoryPressure: @unchecked Sendable {
         bindFacilitatorObserver()
         boardController.taskSync = taskSync
         taskSync.boardWebEvaluator = boardController
+        boardController.defaultBoardURLProvider = { [weak self] in
+            guard let self else { return "" }
+            let active = self.meetings().first(where: { !$0.isClosed })
+            return await self.resolvedJiraBoardConfig(for: active).boardURL?.absoluteString ?? ""
+        }
         boardController.onBoardURLChanged = { [weak store] urlString in
             guard let store, store.lastBoardURL != urlString else { return }
             store.lastBoardURL = urlString
@@ -389,6 +394,60 @@ final class AttentionMemoryPressure: @unchecked Sendable {
     @Published var editingPreset: PresetTarget?
     func editInstructions(for model: NativeDesktopMeetingModel) {
         editingPreset = .init(invitation: model.invitation, seriesID: model.calendarSeriesID, title: model.title)
+    }
+
+    func editInstructions(invitation: URL, latest: URL? = nil, seriesID: String?, title: String) {
+        editingPreset = .init(invitation: invitation, latest: latest, seriesID: seriesID, title: title)
+    }
+
+    func seriesIDs(for model: NativeDesktopMeetingModel, extraSeriesID: String? = nil) -> [String] {
+        var ids: [String] = []
+        if let extra = extraSeriesID?.trimmed, !extra.isEmpty { ids.append(extra) }
+        if let cal = model.calendarSeriesID?.trimmed, !cal.isEmpty, !ids.contains(cal) { ids.append(cal) }
+        return ids
+    }
+
+    func shouldAutoSyncTasks(
+        sessionID: UUID?,
+        invitation: URL?,
+        roomIdentity: String? = nil,
+        seriesID: String? = nil
+    ) async -> Bool {
+        var resolvedInvitation = invitation
+        var resolvedRoomIdentity = roomIdentity
+        var seriesList: [String] = []
+        if let s = seriesID?.trimmed, !s.isEmpty { seriesList.append(s) }
+        if let sid = sessionID,
+           let record = try? await store.meetingLibrary.store.session(sid) {
+            if resolvedInvitation == nil { resolvedInvitation = record.invitation }
+            if resolvedRoomIdentity?.isEmpty ?? true { resolvedRoomIdentity = record.roomIdentity }
+            if let cardSeries = record.calendarSeriesID?.trimmed,
+               !cardSeries.isEmpty,
+               !seriesList.contains(cardSeries) {
+                seriesList.append(cardSeries)
+            }
+        }
+        let overrides = store.resolvedAutoExportOverrides(
+            room: resolvedInvitation,
+            roomIdentity: resolvedRoomIdentity,
+            seriesIDs: seriesList
+        )
+        return (overrides.autoSyncTasks ?? taskSync.preferences.autoSyncAfterMeetingOutcome)
+            && taskSync.preferences.anyProviderEnabled
+    }
+
+    func resolvedJiraBoardConfig(for model: NativeDesktopMeetingModel?) async -> (boardURL: URL?, projectKeys: [String]) {
+        let team = await loadTeamContext()
+        let series = model?.calendarSeriesID.map { [$0] } ?? []
+        let roomID = model.flatMap { MeetingRoomIdentity($0.invitation, engine: $0.kind)?.displayDetails }
+        return store.resolvedJiraBoardConfig(
+            room: model?.invitation,
+            roomIdentity: roomID,
+            seriesIDs: series,
+            defaultBoardURL: team.defaultJiraBoardURL,
+            defaultProjectKey: team.defaultJiraProjectKey,
+            jiraSettings: taskSync.preferences.jira
+        )
     }
 
     // MARK: Queries for views
@@ -571,7 +630,6 @@ final class AttentionMemoryPressure: @unchecked Sendable {
     }
 
     @discardableResult func captureOutcomes(for model: NativeDesktopMeetingModel, segments: [OutcomeSegmentSpec]) -> Set<UUID> {
-        guard store.shouldCaptureOutcome else { return [] }
         let transcript = model.transcript
         let chat = model.chat.items
         let yourName = model.displayName
@@ -581,6 +639,12 @@ final class AttentionMemoryPressure: @unchecked Sendable {
         var captured: Set<UUID> = []
         var previousTask: Task<Void, Never>?
         for segment in segments {
+            let roomID = MeetingRoomIdentity(segment.invitation, engine: model.kind)?.displayDetails
+            guard store.shouldCaptureOutcome(
+                room: segment.invitation,
+                roomIdentity: roomID,
+                seriesIDs: seriesIDs(for: model, extraSeriesID: segment.seriesID)
+            ) else { continue }
             if store.assistant.outcomes.contains(where: { $0.meetingID == segment.sessionID && !$0.summary.isEmpty }) {
                 continue
             }
@@ -835,8 +899,11 @@ final class AttentionMemoryPressure: @unchecked Sendable {
                 historyOutcomeDrafts[card.sessionID] = nil
                 await library.refresh()
                 if let committed,
-                   taskSync.preferences.autoSyncAfterMeetingOutcome,
-                   taskSync.preferences.anyProviderEnabled {
+                   await shouldAutoSyncTasks(
+                       sessionID: card.sessionID,
+                       invitation: committed.outcome.invitation,
+                       seriesID: committed.outcome.seriesID
+                   ) {
                     let affectedIDs = Set(committed.outcome.tasks.map(\.id))
                         .union(reconciliation?.canonicalUpdates.map(\.existingTaskID) ?? [])
                     if !affectedIDs.isEmpty {
@@ -914,7 +981,14 @@ final class AttentionMemoryPressure: @unchecked Sendable {
                       refreshPrompt: Bool = false) -> Task<Void, Never>? {
         runOutcome(for: sessionID, after: previous) { [self] library, owner in
             guard var input = try await library.outcomeInput(outcomeID) else { return nil }
-            try checkOutcomeProvider(input.provider)
+            let sessionRecord = try? await library.session(sessionID)
+            let seriesIDs = [sessionRecord?.calendarSeriesID].compactMap { $0 }
+            try checkOutcomeProvider(
+                input.provider,
+                room: sessionRecord?.invitation,
+                roomIdentity: sessionRecord?.roomIdentity,
+                seriesIDs: seriesIDs
+            )
             if refreshPrompt {
                 let latestPrompt = await loadAssistantPrompt(.meetingSummary).content
                 let noteMarkdown = (try? await library.note(sessionID))?.markdown.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -929,8 +1003,15 @@ final class AttentionMemoryPressure: @unchecked Sendable {
         }
     }
 
-    private func checkOutcomeProvider(_ provider: AttentionProvider) throws {
-        guard store.shouldCaptureOutcome else { throw MeetingOutcomeFailure.configuration }
+    private func checkOutcomeProvider(
+        _ provider: AttentionProvider,
+        room: URL? = nil,
+        roomIdentity: String? = nil,
+        seriesIDs: [String] = []
+    ) throws {
+        guard store.shouldCaptureOutcome(room: room, roomIdentity: roomIdentity, seriesIDs: seriesIDs) else {
+            throw MeetingOutcomeFailure.configuration
+        }
         let current = store.effectiveWriter
         guard provider.kind == current.kind, provider.endpoint == current.endpoint, provider.model == current.model else {
             throw MeetingOutcomeFailure.destinationChanged
@@ -953,11 +1034,20 @@ final class AttentionMemoryPressure: @unchecked Sendable {
                 await store.waitForMeetingLibrary()
                 guard let (draft, input) = try await claim(library.store, owner) else { return }
                 await library.refresh()
+                let sessionRecord = try? await library.store.session(sessionID)
                 let started = ProcessInfo.processInfo.systemUptime
                 var outcome = draft
                 var failure: MeetingOutcomeFailure?
                 do {
-                    try checkOutcomeProvider(input.provider)
+                    let roomURL = draft.invitation ?? sessionRecord?.invitation
+                    let roomID = sessionRecord?.roomIdentity
+                    let seriesIDs = [draft.seriesID, sessionRecord?.calendarSeriesID].compactMap { $0 }
+                    try checkOutcomeProvider(
+                        input.provider,
+                        room: roomURL,
+                        roomIdentity: roomID,
+                        seriesIDs: seriesIDs
+                    )
                     let writer = makeOutcomeWriter(input.provider, store.apiKey(for: input.provider))
                     let content = try await writer.outcome(input.request)
                     try Task.checkCancellation()
@@ -1003,8 +1093,11 @@ final class AttentionMemoryPressure: @unchecked Sendable {
                 }
                 await library.refresh()
                 if ready != nil,
-                   taskSync.preferences.autoSyncAfterMeetingOutcome,
-                   taskSync.preferences.anyProviderEnabled {
+                   await shouldAutoSyncTasks(
+                       sessionID: sessionID,
+                       invitation: outcome.invitation,
+                       seriesID: outcome.seriesID
+                   ) {
                     let affectedIDs = Set(outcome.tasks.map(\.id))
                         .union(reconciliation?.canonicalUpdates.map(\.existingTaskID) ?? [])
                     if !affectedIDs.isEmpty {

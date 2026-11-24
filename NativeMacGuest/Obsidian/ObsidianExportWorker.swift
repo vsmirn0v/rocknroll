@@ -49,13 +49,21 @@ actor ObsidianExportWorker {
             stopVaultAccess()
             return
         }
-        let due = ((try? await store.dueOutbox(now: now)) ?? []).filter {
-            $0.destinationID == destination.id && $0.intent.permitted(by: destination)
+        let due = ((try? await store.dueOutbox(now: now)) ?? []).filter { row in
+            row.destinationID == destination.id
         }
         guard !due.isEmpty else { return }
         guard let vault = await resolveVault(destination) else { return }
         for row in due {
-            await export(row: row, destination: destination, vault: vault, now: now)
+            let overrides: MeetingAutoExportOverrides
+            if let snap = row.snapshot {
+                overrides = (try? await store.autoExportOverrides(for: snap.session)) ?? .init()
+            } else {
+                overrides = .init()
+            }
+            guard row.intent.permitted(by: destination, overrides: overrides) else { continue }
+            let effectiveDestination = destination.effective(for: overrides)
+            await export(row: row, destination: effectiveDestination, vault: vault, now: now)
         }
     }
 
@@ -102,7 +110,6 @@ actor ObsidianExportWorker {
 
     private func nextSleepDelay(now: Date = Date()) async -> TimeInterval {
         guard let destination = try? await store.destination(),
-              destination.enabled,
               destination.vaultBookmark != nil else {
             return 30.0
         }
@@ -382,11 +389,13 @@ actor ObsidianExportWorker {
 
     func compare(_ conflict: ObsidianConflict) async throws -> ObsidianConflictComparison {
         let row = conflict.row, binding = conflict.binding
-        guard let destination = try await store.destination(), destination.id == row.destinationID,
+        guard let rawDestination = try await store.destination(), rawDestination.id == row.destinationID,
               let snapshot = row.snapshot else { throw ObsidianExportError.destinationChanged }
+        let overrides = (try? await store.autoExportOverrides(for: snapshot.session)) ?? .init()
+        let destination = rawDestination.effective(for: overrides)
         let transcript = destination.layout.sections.contains(.transcript) ? await transcriptProvider(snapshot.session) : nil
         let copy = MeetingMarkdownTemplate.managedContent(session: snapshot.session, note: snapshot.note,
-            outcome: snapshot.outcome, outcomeState: snapshot.outcomeState)
+            outcome: snapshot.outcome, outcomeState: snapshot.outcomeState, sections: destination.layout.sections)
             + ObsidianComponentRenderer.transcriptSection(component: .meeting, layout: destination.layout,
                 path: binding.relativePath, body: transcript, transcriptPath: nil)
         guard let vault = await resolveVault(destination) else {

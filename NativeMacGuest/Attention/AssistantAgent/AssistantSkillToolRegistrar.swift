@@ -11,6 +11,7 @@ enum AssistantSkillToolRegistrar {
         attention: AttentionCoordinator,
         explicitSkillIDs: [String] = [],
         meetingTitle: String = "",
+        meetingID: UUID? = nil,
         commandText: String = "",
         speakerName: String? = nil,
         isApprovedSpeaker: Bool = true
@@ -24,23 +25,67 @@ enum AssistantSkillToolRegistrar {
                 commandText: commandText
             )
         }
-        var identityGuidanceParticipants: [String] = []
-        if let activeMeeting = await MainActor.run(body: {
-            attention.meetings().first(where: { !$0.isClosed && $0.title == meetingTitle })
+        let activeMeeting: NativeDesktopMeetingModel? = await MainActor.run(body: {
+            if let meetingID,
+               let byID = attention.meetings().first(where: { !$0.isClosed && $0.sessionID == meetingID }) {
+                return byID
+            }
+            return attention.meetings().first(where: { !$0.isClosed && $0.title == meetingTitle })
                 ?? attention.meetings().first(where: { !$0.isClosed })
-        }) {
+        })
+        var identityGuidanceParticipants: [String] = []
+        if let activeMeeting {
             identityGuidanceParticipants = [activeMeeting.displayName] + activeMeeting.participants.filter { !$0.isLocal }.map(\.name)
+            let youLabel = L("You")
+            let recentLines = activeMeeting.transcript.suffix(30).map { line -> String in
+                let isAssistant = line.id.hasPrefix("assistant:") || AssistantSpeechLedger.isAssistantSpeaker(line.participantName, role: nil)
+                let role = isAssistant ? AssistantSpeechLedger.speakerRoleAssistant : (line.isOwn ? AssistantSpeechLedger.speakerRoleUser : AssistantSpeechLedger.speakerRoleParticipant)
+                let author = AssistantSpeechLedger.displayAuthor(
+                    speaker: line.participantName,
+                    isOwn: line.isOwn,
+                    speakerRole: role,
+                    youLabel: youLabel
+                )
+                return "\(author): \(line.text)"
+            }.joined(separator: "\n")
+            if !recentLines.isEmpty {
+                context["recent_meeting_transcript"] = recentLines
+            }
+        }
+        let jiraConfig = await attention.resolvedJiraBoardConfig(for: activeMeeting)
+        let resolvedBoardURLString = jiraConfig.boardURL?.absoluteString ?? rendered.teamContext.defaultJiraBoardURL
+        let boardState = await MainActor.run {
+            let board = attention.boardController
+            return (
+                open: board.currentURL != nil,
+                url: board.currentURL?.absoluteString ?? "none",
+                sharing: board.sharingMeetingID != nil,
+                recovering: board.isRecoveringShare
+            )
         }
         let guidance = DefaultAssistantPrompts.jiraIdentityResolutionGuidance(meetingParticipants: identityGuidanceParticipants)
-        let combinedSkills = [rendered.instructions, guidance].filter { !$0.isEmpty }.joined(separator: "\n\n")
+        let voiceConductRules = """
+        Live Board & Voice Facilitation Rules:
+        - board_open: \(boardState.open), board_current_url: \(boardState.url), board_sharing: \(boardState.sharing), board_recovering: \(boardState.recovering)
+        - effective_jira_board_url: \(resolvedBoardURLString.isEmpty ? "none" : resolvedBoardURLString)
+        - effective_jira_project_keys: \(jiraConfig.projectKeys.isEmpty ? "none" : jiraConfig.projectKeys.joined(separator: ", "))
+        - Keep spoken replies crisp (1-3 sentences) in the meeting language. Never repeat a sentence/paragraph or read Markdown syntax such as backticks (`KEY-1`) aloud.
+        - Conduct standups step-by-step across participants (yesterday, today, blockers) using the meeting transcript and move cleanly to the next person without repeating previous prompts.
+        - For board person/quick filters, call rocknroll_control_board(command="select_person_filter", query="<name>") or clear_filters; for screen sharing, call share_to_meeting or stop_share.
+        """
+        let combinedSkills = [rendered.instructions, guidance, voiceConductRules].filter { !$0.isEmpty }.joined(separator: "\n\n")
         if !combinedSkills.isEmpty {
             context["obsidian_skills"] = combinedSkills
         }
         if !rendered.basePersona.isEmpty {
             context["obsidian_base_persona"] = rendered.basePersona
         }
-        if !rendered.teamContext.defaultJiraBoardURL.isEmpty {
-            context["team_board_url"] = rendered.teamContext.defaultJiraBoardURL
+        if !resolvedBoardURLString.isEmpty {
+            context["team_board_url"] = resolvedBoardURLString
+            context["meeting_jira_board_url"] = resolvedBoardURLString
+        }
+        if !jiraConfig.projectKeys.isEmpty {
+            context["meeting_jira_project_keys"] = jiraConfig.projectKeys.joined(separator: ", ")
         }
         context["approved_user_always"] = "true"
         if let speakerName, !speakerName.isEmpty {
@@ -77,7 +122,12 @@ enum AssistantSkillToolRegistrar {
     ) {
         registerReadTools(into: registry, attention: attention, allowedToolGroups: allowedToolGroups)
         if allowedToolGroups?.contains(.jira) ?? true {
-            registerJiraActionTool(into: registry, attention: attention, allowComments: allowPrivilegedActions)
+            registerJiraActionTool(
+                into: registry,
+                attention: attention,
+                snapshot: snapshot,
+                allowComments: allowPrivilegedActions
+            )
         }
         if allowPrivilegedActions || allowPeopleIdentityBinding {
             registerManagePeopleTool(
@@ -98,13 +148,30 @@ enum AssistantSkillToolRegistrar {
         )
     }
 
-    nonisolated static func resolvedJiraJQL(rawJQL: String?, query: String?, teamProjectKey: String, jiraProjectKey: String) -> String {
+    nonisolated static func resolvedJiraJQL(
+        rawJQL: String?,
+        query: String?,
+        teamProjectKey: String,
+        jiraProjectKey: String,
+        projectKeys: [String] = []
+    ) -> String {
         let explicit = rawJQL?.trimmed ?? ""
         if !explicit.isEmpty { return explicit }
-        let project = teamProjectKey.trimmed.isEmpty ? jiraProjectKey : teamProjectKey.trimmed
+        let normalizedExplicit = SyncedMeetingContextSettings.normalizedJiraProjectKeys(from: projectKeys)
+        let fallback = teamProjectKey.trimmed.isEmpty ? jiraProjectKey : teamProjectKey.trimmed
+        let effectiveProjects = !normalizedExplicit.isEmpty
+            ? normalizedExplicit
+            : SyncedMeetingContextSettings.normalizedJiraProjectKeys(from: [fallback])
         let cleanQuery = (query ?? "").trimmed.replacingOccurrences(of: "\"", with: "")
         var clauses: [String] = []
-        if !project.isEmpty { clauses.append("project = \(project)") }
+        if effectiveProjects.count == 1, let single = effectiveProjects.first {
+            clauses.append("project = \(single)")
+        } else if effectiveProjects.count > 1 {
+            let list = effectiveProjects
+                .map { "\"\(WorkspaceTaskSyncController.escapedJQLString($0))\"" }
+                .joined(separator: ", ")
+            clauses.append("project in (\(list))")
+        }
         if !cleanQuery.isEmpty { clauses.append("text ~ \"\(cleanQuery)\"") }
         return clauses.isEmpty ? "ORDER BY updated DESC" : (clauses.joined(separator: " AND ") + " ORDER BY updated DESC")
     }
@@ -275,6 +342,7 @@ enum AssistantSkillToolRegistrar {
     private static func registerJiraActionTool(
         into registry: AssistantAgentToolRegistry,
         attention: AttentionCoordinator,
+        snapshot: AssistantNativeSnapshot,
         allowComments: Bool
     ) {
         let allowedOps = allowComments
@@ -327,12 +395,19 @@ enum AssistantSkillToolRegistrar {
                     summary: L("Added a Jira comment on %@.", key)
                 )
             case "search_users":
+                let activeMeeting = await MainActor.run {
+                    snapshot.contextMeetingID.flatMap { id in
+                        attention.meetings().first(where: { $0.sessionID == id && !$0.isClosed })
+                    } ?? attention.meetings().first(where: { !$0.isClosed })
+                }
+                let jiraConfig = await attention.resolvedJiraBoardConfig(for: activeMeeting)
                 let team = await attention.loadTeamContext()
+                let scopedProject = jiraConfig.projectKeys.first ?? team.defaultJiraProjectKey.trimmed
                 let query = (args["query"]?.stringValue ?? args["assignee"]?.stringValue ?? "").trimmed
                 let maxResults = max(1, min(args["max_results"]?.intValue ?? 15, 50))
                 let users = try await attention.taskSync.searchJiraUsers(
                     query: query,
-                    projectKey: team.defaultJiraProjectKey.trimmed.isEmpty ? nil : team.defaultJiraProjectKey.trimmed,
+                    projectKey: scopedProject.isEmpty ? nil : scopedProject,
                     maxResults: maxResults
                 )
                 let rows: [AssistantJSON] = users.map { AssistantJSON.make(WorkspaceTaskSyncController.jiraUserPayload($0)) }
@@ -517,9 +592,15 @@ enum AssistantSkillToolRegistrar {
                         )
                     }
                 }
+                let activeMeeting = await MainActor.run {
+                    snapshot.contextMeetingID.flatMap { id in
+                        attention.meetings().first(where: { $0.sessionID == id && !$0.isClosed })
+                    } ?? attention.meetings().first(where: { !$0.isClosed })
+                }
+                let jiraConfig = await attention.resolvedJiraBoardConfig(for: activeMeeting)
                 let team = await attention.loadTeamContext()
                 let explicitProject = args["project_key"]?.stringValue?.trimmed ?? ""
-                let teamProject = team.defaultJiraProjectKey.trimmed
+                let teamProject = jiraConfig.projectKeys.first ?? team.defaultJiraProjectKey.trimmed
                 let projectKey = explicitProject.isEmpty ? (teamProject.isEmpty ? nil : teamProject) : explicitProject
                 let kind = args["issue_kind"]?.stringValue.flatMap(TaskIssueKind.init(rawValue:)) ?? .task
                 let priority = args["priority"]?.stringValue.flatMap(TaskPriorityLevel.init(rawValue:))
@@ -539,15 +620,23 @@ enum AssistantSkillToolRegistrar {
                     summary: L("Created Jira issue %@.", created.key)
                 )
             case "search":
+                let activeMeeting = await MainActor.run {
+                    snapshot.contextMeetingID.flatMap { id in
+                        attention.meetings().first(where: { $0.sessionID == id && !$0.isClosed })
+                    } ?? attention.meetings().first(where: { !$0.isClosed })
+                }
+                let jiraConfig = await attention.resolvedJiraBoardConfig(for: activeMeeting)
                 let team = await attention.loadTeamContext()
                 let configuredProject = await MainActor.run { attention.taskSync.preferences.jira.cleanProjectKey }
+                let fallbackProject = jiraConfig.projectKeys.first ?? team.defaultJiraProjectKey
                 var resolvedAssigneeID: String?
-                if let rawAssignee = args["assignee"]?.stringValue?.trimmed, !rawAssignee.isEmpty {
+                let rawAssignee = args["assignee"]?.stringValue?.trimmed ?? ""
+                if !rawAssignee.isEmpty {
                     let people = await attention.loadPeopleDirectory()
                     switch await attention.taskSync.resolveJiraAssignee(
                         rawAssignee,
                         people: people,
-                        defaultProjectKey: team.defaultJiraProjectKey
+                        defaultProjectKey: fallbackProject
                     ) {
                     case .resolved(let jqlID, _):
                         resolvedAssigneeID = jqlID
@@ -564,17 +653,19 @@ enum AssistantSkillToolRegistrar {
                         )
                     }
                 }
+                let rawQuery = args["query"]?.stringValue
                 let baseJQL = resolvedJiraJQL(
                     rawJQL: args["jql"]?.stringValue,
-                    query: args["query"]?.stringValue,
+                    query: rawQuery,
                     teamProjectKey: team.defaultJiraProjectKey,
-                    jiraProjectKey: configuredProject
+                    jiraProjectKey: configuredProject,
+                    projectKeys: jiraConfig.projectKeys
                 )
                 let jql = resolvedAssigneeID.map {
                     WorkspaceTaskSyncController.injectAssignee($0, intoJQL: baseJQL)
                 } ?? baseJQL
                 let maxResults = max(1, min(args["max_results"]?.intValue ?? 15, 50))
-                let issues: [JiraRemoteIssue]
+                var issues: [JiraRemoteIssue]
                 var finalJQL = jql
                 do {
                     issues = try await attention.taskSync.searchJiraIssues(jql: jql, maxResults: maxResults)
@@ -584,7 +675,7 @@ enum AssistantSkillToolRegistrar {
                         switch await attention.taskSync.resolveJiraAssignee(
                             literalAssignee,
                             people: people,
-                            defaultProjectKey: team.defaultJiraProjectKey
+                            defaultProjectKey: fallbackProject
                         ) {
                         case .resolved(let handle, _):
                             finalJQL = WorkspaceTaskSyncController.replacingLiteralAssignee(in: jql, with: handle)
@@ -605,7 +696,36 @@ enum AssistantSkillToolRegistrar {
                         throw JiraConnectorError.badRequest(detail)
                     }
                 }
-                let rows: [AssistantJSON] = issues.map { issue in
+                let cleanQuery = (rawQuery ?? "").trimmed
+                let boardOpen = await MainActor.run { attention.boardController.currentURL != nil }
+                let hasExactMatch = !cleanQuery.isEmpty && issues.contains {
+                    $0.key.localizedCaseInsensitiveContains(cleanQuery)
+                        || $0.summary.localizedCaseInsensitiveContains(cleanQuery)
+                }
+                if boardOpen, (issues.isEmpty || (!cleanQuery.isEmpty && !hasExactMatch)) {
+                    if let (_, boardIssues) = try? await attention.taskSync.fetchBoardUsersAndIssues(maxResults: 50),
+                       !boardIssues.isEmpty {
+                        let normalizedQuery = cleanQuery.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil)
+                        let normalizedAssignee = (resolvedAssigneeID ?? rawAssignee)
+                            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil)
+                        let visibleMatches = boardIssues.filter { issue in
+                            let queryOK = normalizedQuery.isEmpty
+                                || issue.key.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil).contains(normalizedQuery)
+                                || issue.summary.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil).contains(normalizedQuery)
+                            let assigneeOK = normalizedAssignee.isEmpty
+                                || (issue.assigneeName ?? "").folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil).contains(normalizedAssignee)
+                                || (issue.assigneeIdentifier ?? "").folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil).contains(normalizedAssignee)
+                                || (issue.assigneeContact?.username ?? "").folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil).contains(normalizedAssignee)
+                                || (issue.assigneeContact?.accountId ?? "").folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil).contains(normalizedAssignee)
+                            return queryOK && assigneeOK
+                        }
+                        if !visibleMatches.isEmpty {
+                            let existingKeys = Set(visibleMatches.map(\.key))
+                            issues = visibleMatches + issues.filter { !existingKeys.contains($0.key) }
+                        }
+                    }
+                }
+                let rows: [AssistantJSON] = Array(issues.prefix(maxResults)).map { issue in
                     .object(
                         ("key", .string(issue.key)),
                         ("summary", .string(issue.summary)),
@@ -1077,10 +1197,16 @@ enum AssistantSkillToolRegistrar {
             let board = attention.boardController
             switch command {
             case "open_url":
+                let activeMeeting = await MainActor.run {
+                    snapshot.contextMeetingID.flatMap { id in
+                        attention.meetings().first(where: { $0.sessionID == id && !$0.isClosed })
+                    } ?? attention.meetings().first(where: { !$0.isClosed })
+                }
+                let jiraConfig = await attention.resolvedJiraBoardConfig(for: activeMeeting)
                 let team = await attention.loadTeamContext()
-                let urlToOpen = args["url"]?.stringValue?.trimmed.isEmpty == false
-                    ? (args["url"]?.stringValue ?? "")
-                    : team.defaultJiraBoardURL
+                let explicitURL = args["url"]?.stringValue?.trimmed ?? ""
+                let fallbackURL = jiraConfig.boardURL?.absoluteString ?? team.defaultJiraBoardURL
+                let urlToOpen = !explicitURL.isEmpty ? explicitURL : fallbackURL
                 let msg = try await board.open(urlString: urlToOpen)
                 return .init(callID: call.id, toolName: call.name, json: .object(["message": .string(msg)]), summary: msg)
             case "share_to_meeting":
@@ -1088,7 +1214,7 @@ enum AssistantSkillToolRegistrar {
                 let model = await MainActor.run {
                     targetID.flatMap { id in
                         attention.meetings().first(where: { $0.sessionID == id && !$0.isClosed })
-                    }
+                    } ?? attention.meetings().first(where: { !$0.isClosed })
                 }
                 guard let model else {
                     return .error(call, L("Join or select an active meeting before sharing the board."))
@@ -1098,8 +1224,9 @@ enum AssistantSkillToolRegistrar {
                 if !rawURL.isEmpty {
                     urlToOpen = rawURL
                 } else if await MainActor.run(body: { board.currentURL == nil }) {
+                    let jiraConfig = await attention.resolvedJiraBoardConfig(for: model)
                     let team = await attention.loadTeamContext()
-                    let fallback = team.defaultJiraBoardURL.trimmed
+                    let fallback = jiraConfig.boardURL?.absoluteString ?? team.defaultJiraBoardURL.trimmed
                     urlToOpen = fallback.isEmpty ? nil : fallback
                 } else {
                     urlToOpen = nil
@@ -1118,9 +1245,35 @@ enum AssistantSkillToolRegistrar {
                 let msg = try await board.scroll(deltaY: args["delta_y"]?.intValue ?? 450)
                 return .init(callID: call.id, toolName: call.name, json: .object(["message": .string(msg)]), summary: msg)
             case "filter":
+                if await MainActor.run(body: { board.currentURL == nil }) {
+                    let activeMeeting = await MainActor.run {
+                        snapshot.contextMeetingID.flatMap { id in
+                            attention.meetings().first(where: { $0.sessionID == id && !$0.isClosed })
+                        } ?? attention.meetings().first(where: { !$0.isClosed })
+                    }
+                    let jiraConfig = await attention.resolvedJiraBoardConfig(for: activeMeeting)
+                    let team = await attention.loadTeamContext()
+                    let fallback = jiraConfig.boardURL?.absoluteString ?? team.defaultJiraBoardURL.trimmed
+                    if !fallback.isEmpty {
+                        _ = try? await board.open(urlString: fallback)
+                    }
+                }
                 let msg = try await board.filter(query: args["query"]?.stringValue ?? args["text"]?.stringValue ?? "")
                 return .init(callID: call.id, toolName: call.name, json: .object(["message": .string(msg)]), summary: msg)
             case "select_person_filter":
+                if await MainActor.run(body: { board.currentURL == nil }) {
+                    let activeMeeting = await MainActor.run {
+                        snapshot.contextMeetingID.flatMap { id in
+                            attention.meetings().first(where: { $0.sessionID == id && !$0.isClosed })
+                        } ?? attention.meetings().first(where: { !$0.isClosed })
+                    }
+                    let jiraConfig = await attention.resolvedJiraBoardConfig(for: activeMeeting)
+                    let team = await attention.loadTeamContext()
+                    let fallback = jiraConfig.boardURL?.absoluteString ?? team.defaultJiraBoardURL.trimmed
+                    if !fallback.isEmpty {
+                        _ = try? await board.open(urlString: fallback)
+                    }
+                }
                 let people = await attention.loadPeopleDirectory()
                 let query = args["query"]?.stringValue ?? args["text"]?.stringValue ?? ""
                 let msg = try await board.selectPersonFilter(query: query, people: people)

@@ -9,3 +9,11 @@
 "Hardware" = "المكوّنات المادية";
 "Software" = "البرمجيات";
 "Sending %@" = "جارٍ إرسال %@";
+"%ld min" = "%ld د";
+"Chat" = "الدردشة";
+"Date" = "التاريخ";
+"Meeting" = "اجتماع";
+"Participant" = "مشارك";
+"Rock Assistant" = "مساعد Rock";
+"Transcript" = "نص الاجتماع";
+"You" = "أنت";

@@ -402,23 +402,24 @@ public enum DefaultAssistantSkills {
             tools: [.boardShare, .jira, .tasks, .obsidianSearch, .meetingSearch, .meetingSummary, .meetingJoin],
             approvedSpeakersOnly: true,
             realtimePreferred: true,
+            autoGreet: true,
             instructions: """
             # Scrum Master & Daily Standup
 
             You act as the team's Scrum Master and Meeting Facilitator inside live calls or Assistant requests.
 
             ## How to Run a Standup
-            1. If a Jira board URL is configured in Team Context or requested by the user, open it in the Assistant Board window and start sharing it into the active meeting (`rocknroll_control_board` with `open_url` then `share_to_meeting`).
-            2. Inspect visible tickets (`inspect`) and visible people on the board (`rocknroll_jira_action` `board_users`).
-            3. Before asking a teammate for their status update while the board is open/shared, **visibly select their board filter** (`rocknroll_control_board` with `command: "select_person_filter"`, `query: "<person name>"`) so the screen focuses on their tasks. When moving to general team overview, call `clear_filters`.
-            4. Invite each teammate sequentially (yesterday, today, blockers), keeping spoken replies concise (1–3 sentences) when answering by voice in a meeting.
-            5. When status changes or comments are agreed during the call, execute them live (`rocknroll_control_board` `move_issue` or `rocknroll_jira_action` `transition` / `assign` / `comment` / `create`) so the card moves visibly on the board.
+            1. At the start of a standup, if an Effective Jira Board URL is configured and `board_is_sharing` is `false`, automatically open and share the board into the active meeting (`rocknroll_control_board` with `command: "share_to_meeting"`). Then inspect visible cards (`rocknroll_control_board` `inspect`) and board members (`rocknroll_jira_action` `board_users`, plus `rocknroll_manage_people` `lookup`) so you know who is in the call and what tasks they own.
+            2. Track who has already reported vs who hasn't in the recent transcript. Before calling on a teammate for their update while the board is open/shared, **visibly select their board quick-filter** (`rocknroll_control_board` with `command: "select_person_filter"`, `query: "<person name>"`) so everyone sees their tasks on screen. When returning to general board review, call `clear_filters`.
+            3. Invite each teammate sequentially (yesterday, today, blockers). After each person finishes their update, briefly acknowledge it, ask about blockers if unmentioned, execute any requested Jira/task updates, and explicitly invite the next teammate by name. Once everyone has spoken, summarize key blockers and offer to stop sharing (`rocknroll_control_board` `stop_share`) if appropriate.
+            4. When the user mentions quick filters ("квикфильтр", "фильтр по имени ..."), scrolling, clicking/opening cards, or starting/stopping board sharing ("расшарь доску", "останови показ/шаринг"), ALWAYS use `rocknroll_control_board` (`select_person_filter`, `filter`, `clear_filters`, `inspect`, `share_to_meeting`, `stop_share`, `move_issue`, `click`, `scroll`).
+            5. When status changes, descriptions, assignments, or comments are agreed during the call, execute them live (`rocknroll_control_board` `move_issue` or `rocknroll_jira_action` `transition` / `assign` / `comment` / `create`) so the card updates visibly on the board. Always prefer the meeting's Effective Jira Project Keys or open board scope when searching.
             6. Check `People.md` (`rocknroll_manage_people` `lookup`) to resolve spoken or meeting display names into Jira usernames/account IDs — never put an unmapped meeting name directly into JQL. If a person's Jira handle is missing, run `rocknroll_jira_action` (`search_users` or `board_users`, or `copy_user_from_issue` if they ask to copy from an assigned card), ask the speaker to confirm the matching candidate BEFORE saving `People.md`, and then run the Jira action.
 
-            ## Authorization & Task Changes
+            ## Voice Style & Authorization
+            - Speak naturally in 1–3 crisp sentences in the meeting language; NEVER repeat the same sentence twice and NEVER read out markdown backticks or raw formatting syntax.
             - Only execute task creation, updates, reassignments, or Jira changes when instructed by an **approved speaker** (the local app owner is always approved) or directly confirmed in chat/voice by the owner.
-            - Use `rocknroll_create_task` and `rocknroll_update_task` (with `sync_to_jira: true` when requested or enabled) to reflect concrete standup outcomes.
-            - Always call `rocknroll_update_meeting_artifacts` to capture blockers, decisions, and created/updated action items in the meeting summary.
+            - Use `rocknroll_create_task` and `rocknroll_update_task` (with `sync_to_jira: true` when requested or enabled) and `rocknroll_update_meeting_artifacts` to capture concrete standup outcomes and blockers.
             """
         ),
         AssistantSkill(

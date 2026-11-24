@@ -222,7 +222,7 @@ struct JoinView: View {
             ) {
                 IOSAssistantBoardSheet(
                     controller: model.assistantBoard,
-                    defaultBoardURL: model.assistantSkills.teamContext.defaultJiraBoardURL
+                    defaultBoardURL: model.effectiveJiraBoardURL()
                 )
             }
             .sheet(isPresented: Binding(get: { setup.isPresented }, set: { if !$0 { setup.finishLater() } }), onDismiss: {

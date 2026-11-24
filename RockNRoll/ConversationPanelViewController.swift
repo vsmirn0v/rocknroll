@@ -37,6 +37,8 @@ final class ConversationPanelViewController: UIViewController, UITextViewDelegat
     private let transcriptTools = UIStackView()
     private let transcriptToggleButton = UIButton(type: .system)
     private let transcriptHistoryButton = UIButton(type: .system)
+    private let transcriptCopyButton = UIButton(type: .system)
+    private let transcriptExportButton = UIButton(type: .system)
     private let transcriptSettingsButton = UIButton(type: .system)
     private let voiceReplyButton = UIButton(type: .system)
     private let reactionsButton = UIButton(type: .system)
@@ -213,6 +215,26 @@ final class ConversationPanelViewController: UIViewController, UITextViewDelegat
             self?.call?.openVoiceReply?()
         }, for: .touchUpInside)
 
+        var copyConfig = UIButton.Configuration.bordered()
+        copyConfig.image = UIImage(systemName: "doc.on.doc")
+        copyConfig.contentInsets = NSDirectionalEdgeInsets(top: 4, leading: 8, bottom: 4, trailing: 8)
+        transcriptCopyButton.configuration = copyConfig
+        transcriptCopyButton.accessibilityLabel = L("Copy transcript")
+        transcriptCopyButton.accessibilityIdentifier = "transcript.copy"
+        transcriptCopyButton.addAction(UIAction { [weak self] _ in
+            self?.copyLiveTranscript()
+        }, for: .touchUpInside)
+
+        var exportConfig = UIButton.Configuration.bordered()
+        exportConfig.image = UIImage(systemName: "square.and.arrow.up")
+        exportConfig.contentInsets = NSDirectionalEdgeInsets(top: 4, leading: 8, bottom: 4, trailing: 8)
+        transcriptExportButton.configuration = exportConfig
+        transcriptExportButton.accessibilityLabel = L("Export transcript")
+        transcriptExportButton.accessibilityIdentifier = "transcript.export"
+        transcriptExportButton.addAction(UIAction { [weak self] _ in
+            self?.exportLiveTranscript()
+        }, for: .touchUpInside)
+
         var settingsConfig = UIButton.Configuration.bordered()
         settingsConfig.image = UIImage(systemName: "gearshape")
         settingsConfig.contentInsets = NSDirectionalEdgeInsets(top: 4, leading: 8, bottom: 4, trailing: 8)
@@ -225,6 +247,8 @@ final class ConversationPanelViewController: UIViewController, UITextViewDelegat
 
         transcriptTools.addArrangedSubview(transcriptToggleButton)
         transcriptTools.addArrangedSubview(transcriptHistoryButton)
+        transcriptTools.addArrangedSubview(transcriptCopyButton)
+        transcriptTools.addArrangedSubview(transcriptExportButton)
         transcriptTools.addArrangedSubview(voiceReplyButton)
         transcriptTools.addArrangedSubview(transcriptSettingsButton)
 
@@ -761,16 +785,71 @@ final class ConversationPanelViewController: UIViewController, UITextViewDelegat
         let showHistory = (catchUp.canViewTranscript == true) && catchUp.onLoadTranscriptHistory != nil
         transcriptHistoryButton.isHidden = !showHistory
         transcriptHistoryButton.isEnabled = !catchUp.isLoadingTranscriptHistory
+        let hasTranscriptSegments = !timeline.segments.isEmpty
+        transcriptCopyButton.isHidden = !hasTranscriptSegments
+        transcriptExportButton.isHidden = !hasTranscriptSegments
         voiceReplyButton.isHidden = call?.openVoiceReply == nil
         transcriptSettingsButton.isHidden = call?.openTranscriptionSettings == nil
         let selected = ConversationMode(rawValue: mode.selectedSegmentIndex) ?? .chat
         let anyVisible = !transcriptToggleButton.isHidden
             || !transcriptHistoryButton.isHidden
+            || !transcriptCopyButton.isHidden
+            || !transcriptExportButton.isHidden
             || !voiceReplyButton.isHidden
             || !transcriptSettingsButton.isHidden
         let hidden = selected != .liveText || !anyVisible
         transcriptTools.isHidden = hidden
         transcriptToolsScroll.isHidden = hidden
+    }
+
+    private func liveTranscriptEventsForExport() -> [SyncedTranscriptEvent] {
+        timeline.segments.map { segment in
+            let isAssistant = AssistantSpeechLedger.isAssistantSpeaker(segment.speaker, role: segment.speakerRole)
+            let isOwn = segment.isOwn == true
+            return SyncedTranscriptEvent(
+                id: segment.id,
+                kind: "transcript",
+                sourceTier: isAssistant ? 3 : 2,
+                occurredAt: segment.spokenAt ?? Date(),
+                speaker: isAssistant ? AssistantSpeechLedger.canonicalSpeakerName : segment.speaker,
+                isOwn: isOwn,
+                speakerRole: segment.speakerRole ?? (isAssistant ? AssistantSpeechLedger.speakerRoleAssistant : (isOwn ? AssistantSpeechLedger.speakerRoleUser : AssistantSpeechLedger.speakerRoleParticipant)),
+                text: segment.text,
+                deviceID: "ios"
+            )
+        }
+    }
+
+    private func copyLiveTranscript() {
+        let events = liveTranscriptEventsForExport()
+        let text = TranscriptExportFormatter.formatPlainText(events: events, meetingTitle: navigationItem.title)
+        guard !text.isEmpty else { return }
+        UIPasteboard.general.string = text
+        transcriptCopyButton.configuration?.image = UIImage(systemName: "checkmark")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            self?.transcriptCopyButton.configuration?.image = UIImage(systemName: "doc.on.doc")
+        }
+    }
+
+    private func exportLiveTranscript() {
+        let events = liveTranscriptEventsForExport()
+        let title = navigationItem.title ?? L("Meeting")
+        let startedAt = events.first?.occurredAt ?? Date()
+        let markdown = TranscriptExportFormatter.formatMarkdown(events: events, title: title, startedAt: startedAt)
+        guard !markdown.isEmpty else { return }
+        let fileName = TranscriptExportFormatter.suggestedFileName(title: title, startedAt: startedAt)
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(fileName)
+        do {
+            try markdown.write(to: url, atomically: true, encoding: .utf8)
+            let sheet = UIActivityViewController(activityItems: [url], applicationActivities: nil)
+            if let popover = sheet.popoverPresentationController {
+                popover.sourceView = transcriptExportButton
+                popover.sourceRect = transcriptExportButton.bounds
+            }
+            present(sheet, animated: true)
+        } catch {
+            AppDiagnostics.log("live-transcript-export-error", ["error": error.localizedDescription])
+        }
     }
 
     private func renderMode() {

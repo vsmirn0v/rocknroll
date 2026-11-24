@@ -594,4 +594,24 @@ final class ObsidianExportTests: XCTestCase {
         XCTAssertLessThanOrEqual(nameA.count, 90)
         XCTAssertLessThanOrEqual(nameB.count, 90)
     }
+
+    func testMeetingMarkdownSectionsApplyingOverridesPreservesUntouchedDefaults() {
+        let global: MeetingMarkdownSections = [.summary, .notes, .tasks, .decisions]
+        let overrides = MeetingAutoExportOverrides(
+            autoExport: nil,
+            includeTranscript: true,
+            includeSummary: nil,
+            includeNotes: false,
+            includeTasks: nil,
+            includeDecisions: nil,
+            includeQuestions: true
+        )
+        let effective = global.applying(overrides)
+        XCTAssertTrue(effective.contains(.transcript), "Explicit true override adds transcript")
+        XCTAssertTrue(effective.contains(.questions), "Explicit true override adds open questions")
+        XCTAssertFalse(effective.contains(.notes), "Explicit false override removes notes")
+        XCTAssertTrue(effective.contains(.summary), "Untouched nil inherits global default")
+        XCTAssertTrue(effective.contains(.tasks), "Untouched nil inherits global default")
+        XCTAssertTrue(effective.contains(.decisions), "Untouched nil inherits global default")
+    }
 }

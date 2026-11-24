@@ -759,7 +759,12 @@ final class IOSAssistantSkillsController: ObservableObject {
         return try await workspace.taskSync.createTaskDiscussionCalendarEvent(draft, forTaskID: UUID())
     }
 
-    func resolvedJiraJQL(rawJQL: String?, query: String?, assigneeIdentifier: String? = nil) -> String {
+    func resolvedJiraJQL(
+        rawJQL: String?,
+        query: String?,
+        assigneeIdentifier: String? = nil,
+        projectKeys: [String] = []
+    ) -> String {
         let explicit = (rawJQL ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         if !explicit.isEmpty {
             if let assigneeIdentifier, !assigneeIdentifier.isEmpty {
@@ -767,13 +772,24 @@ final class IOSAssistantSkillsController: ObservableObject {
             }
             return explicit
         }
+        let normalizedExplicit = SyncedMeetingContextSettings.normalizedJiraProjectKeys(from: projectKeys)
         let teamProject = teamContext.defaultJiraProjectKey.trimmingCharacters(in: .whitespacesAndNewlines)
         let jiraProject = workspace?.taskSync.preferences.jira.cleanProjectKey ?? ""
-        let project = teamProject.isEmpty ? jiraProject : teamProject
+        let fallbackProject = teamProject.isEmpty ? jiraProject : teamProject
+        let effectiveProjects = !normalizedExplicit.isEmpty
+            ? normalizedExplicit
+            : SyncedMeetingContextSettings.normalizedJiraProjectKeys(from: [fallbackProject])
         let cleanQuery = (query ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             .replacingOccurrences(of: "\"", with: "")
         var clauses: [String] = []
-        if !project.isEmpty { clauses.append("project = \(project)") }
+        if effectiveProjects.count == 1, let single = effectiveProjects.first {
+            clauses.append("project = \(single)")
+        } else if effectiveProjects.count > 1 {
+            let list = effectiveProjects
+                .map { "\"\(WorkspaceTaskSyncController.escapedJQLString($0))\"" }
+                .joined(separator: ", ")
+            clauses.append("project in (\(list))")
+        }
         if let assigneeIdentifier, !assigneeIdentifier.isEmpty {
             clauses.append("assignee = \"\(WorkspaceTaskSyncController.escapedJQLString(assigneeIdentifier))\"")
         }
@@ -805,8 +821,19 @@ final class IOSAssistantSkillsController: ObservableObject {
         return try await workspace.taskSync.searchJiraIssues(jql: jql, maxResults: max(1, min(maxResults, 50)))
     }
 
-    func searchJiraIssues(jql: String?, query: String?, assigneeIdentifier: String? = nil, maxResults: Int = 15) async throws -> [JiraRemoteIssue] {
-        let resolved = resolvedJiraJQL(rawJQL: jql, query: query, assigneeIdentifier: assigneeIdentifier)
+    func searchJiraIssues(
+        jql: String?,
+        query: String?,
+        assigneeIdentifier: String? = nil,
+        projectKeys: [String] = [],
+        maxResults: Int = 15
+    ) async throws -> [JiraRemoteIssue] {
+        let resolved = resolvedJiraJQL(
+            rawJQL: jql,
+            query: query,
+            assigneeIdentifier: assigneeIdentifier,
+            projectKeys: projectKeys
+        )
         return try await searchJiraIssues(jql: resolved, maxResults: maxResults)
     }
 

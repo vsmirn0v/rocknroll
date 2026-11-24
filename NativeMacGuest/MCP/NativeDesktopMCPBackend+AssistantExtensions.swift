@@ -894,14 +894,19 @@ extension NativeDesktopMCPBackend {
         }
 
         // search
+        let activeMeeting = await MainActor.run {
+            attention.meetings().first(where: { !$0.isClosed })
+        }
+        let jiraConfig = await attention.resolvedJiraBoardConfig(for: activeMeeting)
         let team = await attention.loadTeamContext()
+        let fallbackProject = jiraConfig.projectKeys.first ?? team.defaultJiraProjectKey
         var resolvedAssigneeID: String?
         if let assignee, !assignee.isEmpty {
             let people = await attention.loadPeopleDirectory()
             switch await attention.taskSync.resolveJiraAssignee(
                 assignee,
                 people: people,
-                defaultProjectKey: team.defaultJiraProjectKey
+                defaultProjectKey: fallbackProject
             ) {
             case .resolved(let handle, _):
                 resolvedAssigneeID = handle
@@ -922,14 +927,15 @@ extension NativeDesktopMCPBackend {
             rawJQL: rawJQL,
             query: query,
             teamProjectKey: team.defaultJiraProjectKey,
-            jiraProjectKey: attention.taskSync.preferences.jira.cleanProjectKey
+            jiraProjectKey: attention.taskSync.preferences.jira.cleanProjectKey,
+            projectKeys: jiraConfig.projectKeys
         )
         let jql = resolvedAssigneeID.map {
             WorkspaceTaskSyncController.injectAssignee($0, intoJQL: baseJQL)
         } ?? baseJQL
 
         var finalJQL = jql
-        let issues: [JiraRemoteIssue]
+        var issues: [JiraRemoteIssue]
         do {
             issues = try await attention.taskSync.searchJiraIssues(jql: jql, maxResults: maxResults)
         } catch JiraConnectorError.badRequest(let detail) {
@@ -938,7 +944,7 @@ extension NativeDesktopMCPBackend {
                 switch await attention.taskSync.resolveJiraAssignee(
                     literalAssignee,
                     people: people,
-                    defaultProjectKey: team.defaultJiraProjectKey
+                    defaultProjectKey: fallbackProject
                 ) {
                 case .resolved(let handle, _):
                     finalJQL = WorkspaceTaskSyncController.replacingLiteralAssignee(in: jql, with: handle)
@@ -959,7 +965,36 @@ extension NativeDesktopMCPBackend {
                 throw JiraConnectorError.badRequest(detail)
             }
         }
-        let rows: [MCPJSON] = issues.map { issue in
+        let cleanQuery = (query ?? "").trimmed
+        let boardOpen = await MainActor.run { attention.boardController.currentURL != nil }
+        let hasExactMatch = !cleanQuery.isEmpty && issues.contains {
+            $0.key.localizedCaseInsensitiveContains(cleanQuery)
+                || $0.summary.localizedCaseInsensitiveContains(cleanQuery)
+        }
+        if boardOpen, (issues.isEmpty || (!cleanQuery.isEmpty && !hasExactMatch)) {
+            if let (_, boardIssues) = try? await attention.taskSync.fetchBoardUsersAndIssues(maxResults: 50),
+               !boardIssues.isEmpty {
+                let normalizedQuery = cleanQuery.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil)
+                let normalizedAssignee = (resolvedAssigneeID ?? assignee ?? "")
+                    .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil)
+                let visibleMatches = boardIssues.filter { issue in
+                    let queryOK = normalizedQuery.isEmpty
+                        || issue.key.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil).contains(normalizedQuery)
+                        || issue.summary.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil).contains(normalizedQuery)
+                    let assigneeOK = normalizedAssignee.isEmpty
+                        || (issue.assigneeName ?? "").folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil).contains(normalizedAssignee)
+                        || (issue.assigneeIdentifier ?? "").folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil).contains(normalizedAssignee)
+                        || (issue.assigneeContact?.username ?? "").folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil).contains(normalizedAssignee)
+                        || (issue.assigneeContact?.accountId ?? "").folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil).contains(normalizedAssignee)
+                    return queryOK && assigneeOK
+                }
+                if !visibleMatches.isEmpty {
+                    let existingKeys = Set(visibleMatches.map(\.key))
+                    issues = visibleMatches + issues.filter { !existingKeys.contains($0.key) }
+                }
+            }
+        }
+        let rows: [MCPJSON] = Array(issues.prefix(maxResults)).map { issue in
             [
                 "key": issue.key,
                 "summary": issue.summary,

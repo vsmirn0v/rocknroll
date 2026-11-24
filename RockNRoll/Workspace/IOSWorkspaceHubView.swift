@@ -158,7 +158,16 @@ struct IOSWorkspaceHubView: View {
                 showingBoardSheet: $showingBoardSheet,
                 showingSkillsSheet: showingSkillsSheet,
                 showingSettings: showingSettings,
-                defaultBoardURL: skills?.teamContext.defaultJiraBoardURL ?? ""
+                defaultBoardURL: board?.defaultBoardURLForTarget?(selectedSessionID)
+                    ?? board?.defaultBoardURLProvider?()
+                    ?? workspace.resolvedJiraBoardConfig(
+                        for: selectedSessionID,
+                        defaultBoardURL: skills?.teamContext.defaultJiraBoardURL ?? "",
+                        defaultProjectKey: skills?.teamContext.defaultJiraProjectKey ?? "",
+                        lastBoardURL: skills?.lastBoardURL,
+                        jiraSettings: workspace.taskSync.preferences.jira
+                    ).boardURL?.absoluteString
+                    ?? ""
             )
         )
         .confirmationDialog(

@@ -341,13 +341,22 @@ struct MeetingPresetEditor: View {
     @State private var appliesToSeries: Bool
     @State private var sameRoomTransition: SameRoomMeetingTransitionMode?
     @State private var availableSkills: [AssistantSkill]
+    @State private var jiraBoardURLDraft: String
+    @State private var jiraProjectKeysDraft: String
+    @State private var defaultJiraBoardURL: String
+    @State private var defaultJiraProjectKey: String
+    @State private var autoExportDraft: MeetingAutoExportOverrides
     @State private var tuning: ThresholdTuner.Result?
     @State private var tuneMessage: String?
 
     init(store: AttentionStore, target: AttentionCoordinator.PresetTarget) {
         self.store = store; self.target = target
         let existing = store.preset(room: target.invitation, latest: target.latest, series: target.seriesID)
-        let resolved = existing ?? MeetingPreset(title: target.title, bindings: [.room(target.invitation.absoluteString)])
+        let bindings: [MeetingPreset.Binding] = target.invitation.absoluteString == "about:blank"
+            ? (target.seriesID.map { [.calendarSeries($0)] } ?? [])
+            : [.room(target.invitation.absoluteString)]
+        let resolved = existing ?? MeetingPreset(title: target.title, bindings: bindings)
+        let teamContext = store.localSkillRepository().loadTeamContext()
         _preset = State(initialValue: resolved)
         _people = State(initialValue: resolved.people.joined(separator: ", "))
         _appliesToSeries = State(initialValue: target.seriesID.map { id in
@@ -356,6 +365,11 @@ struct MeetingPresetEditor: View {
         _sameRoomTransition = State(initialValue: store.savedSameRoomTransition(
             room: target.invitation, latest: target.latest, series: target.seriesID))
         _availableSkills = State(initialValue: store.localSkillRepository().listSkills().filter(\.enabled))
+        _jiraBoardURLDraft = State(initialValue: resolved.jiraBoardURL ?? "")
+        _jiraProjectKeysDraft = State(initialValue: resolved.jiraProjectKeys?.joined(separator: ", ") ?? "")
+        _defaultJiraBoardURL = State(initialValue: teamContext.defaultJiraBoardURL)
+        _defaultJiraProjectKey = State(initialValue: teamContext.defaultJiraProjectKey)
+        _autoExportDraft = State(initialValue: resolved.autoExportOverrides)
     }
 
     var body: some View {
@@ -382,6 +396,40 @@ struct MeetingPresetEditor: View {
                         }
                     }
                     Text(L("Keep this Off on shared team calls so multiple assistants do not talk over each other."))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Section(L("Jira Board & Project")) {
+                    TextField(
+                        L("Custom Jira Board URL"),
+                        text: $jiraBoardURLDraft,
+                        prompt: Text(defaultJiraBoardURL.isEmpty ? "https://jira.example.com/secure/RapidBoard.jspa?rapidView=1" : defaultJiraBoardURL)
+                    )
+                    TextField(
+                        L("Jira project keys"),
+                        text: $jiraProjectKeysDraft,
+                        prompt: Text(defaultJiraProjectKey.isEmpty ? "SDBPROD, SPS" : L("Default: %@", defaultJiraProjectKey))
+                    )
+                    Text(L("Leave empty to use the app default Jira board and project keys."))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Section(L("Automatic Export & Post-Meeting")) {
+                    autoExportPicker(L("Auto-generate summary after meeting"), selection: $autoExportDraft.autoGenerateSummary)
+                    autoExportPicker(L("Auto-sync tasks after summary"), selection: $autoExportDraft.autoSyncTasks)
+                    autoExportPicker(L("Obsidian auto-export"), selection: $autoExportDraft.autoExport)
+                    autoExportPicker(L("Export transcript"), selection: $autoExportDraft.includeTranscript)
+                    autoExportPicker(L("Export summary"), selection: $autoExportDraft.includeSummary)
+                    autoExportPicker(L("Export notes"), selection: $autoExportDraft.includeNotes)
+                    autoExportPicker(L("Export tasks"), selection: $autoExportDraft.includeTasks)
+                    autoExportPicker(L("Export decisions"), selection: $autoExportDraft.includeDecisions)
+                    autoExportPicker(L("Export open questions"), selection: $autoExportDraft.includeQuestions)
+                    if !autoExportDraft.isEmpty {
+                        Button(L("Reset export settings to defaults"), role: .destructive) {
+                            autoExportDraft = .init()
+                        }
+                    }
+                    Text(L("Fields left on Use default follow your global app and Obsidian layout settings."))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -457,6 +505,14 @@ struct MeetingPresetEditor: View {
         }.frame(width: 560, height: 640)
     }
 
+    private func autoExportPicker(_ title: String, selection: Binding<Bool?>) -> some View {
+        Picker(title, selection: selection) {
+            Text(L("Use default")).tag(Bool?.none)
+            Text(L("On")).tag(Bool?.some(true))
+            Text(L("Off")).tag(Bool?.some(false))
+        }
+    }
+
     private func field(_ title: String, text: Binding<String>, prompt: String) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             Text(title).font(.caption).foregroundStyle(.secondary)
@@ -484,8 +540,15 @@ struct MeetingPresetEditor: View {
         var value = preset
         value.people = people.split(separator: ",").map { String($0).trimmed }.filter { !$0.isEmpty }
         value.title = target.title
+        let cleanBoardURL = jiraBoardURLDraft.trimmed
+        value.jiraBoardURL = cleanBoardURL.isEmpty ? nil : cleanBoardURL
+        let normalizedKeys = SyncedMeetingContextSettings.normalizedJiraProjectKeys(from: jiraProjectKeysDraft)
+        value.jiraProjectKeys = normalizedKeys.isEmpty ? nil : normalizedKeys
+        value.autoExportOverrides = autoExportDraft
         var bindings = value.bindings.filter { if case .calendarSeries = $0 { false } else { true } }
-        if !bindings.contains(.room(target.invitation.absoluteString)) { bindings.append(.room(target.invitation.absoluteString)) }
+        if target.invitation.absoluteString != "about:blank", !bindings.contains(.room(target.invitation.absoluteString)) {
+            bindings.append(.room(target.invitation.absoluteString))
+        }
         if appliesToSeries, let series = target.seriesID { bindings.append(.calendarSeries(series)) }
         else { bindings += value.bindings.filter { if case .calendarSeries(let id) = $0 { id != target.seriesID } else { false } } }
         value.bindings = bindings

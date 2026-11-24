@@ -49,6 +49,7 @@ struct IOSMeetingDetailView: View {
     @State private var foldedTranscriptIndex: [String: String] = [:]
     @State private var transcriptIsLocalOnly = false
     @State private var transcriptSearch = ""
+    @State private var copiedTranscriptFeedback = false
     @State private var cachedPreviewMarkdown: AttributedString?
     @State private var cachedPreviewSource = ""
 
@@ -61,6 +62,9 @@ struct IOSMeetingDetailView: View {
     @State private var mattersDraft = ""
     @State private var neverDraft = ""
     @State private var peopleDraft = ""
+    @State private var jiraBoardURLDraft = ""
+    @State private var jiraProjectKeysDraft = ""
+    @State private var autoExportOverridesDraft = MeetingAutoExportOverrides()
     @State private var newRuleDraft = ""
     @State private var settingsSaved = false
     @State private var isLoadingContext = false
@@ -166,6 +170,22 @@ struct IOSMeetingDetailView: View {
         }
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
+            ToolbarItemGroup(placement: .topBarTrailing) {
+                if tab == .transcript && !transcriptEvents.isEmpty {
+                    Button {
+                        copyTranscript()
+                    } label: {
+                        Image(systemName: copiedTranscriptFeedback ? "checkmark" : "doc.on.doc")
+                    }
+                    .accessibilityLabel(L("Copy transcript"))
+                    Button {
+                        exportTranscriptMarkdown()
+                    } label: {
+                        Image(systemName: "square.and.arrow.up")
+                    }
+                    .accessibilityLabel(L("Export transcript"))
+                }
+            }
             ToolbarItemGroup(placement: .keyboard) {
                 Spacer()
                 Button(L("Done")) {
@@ -190,6 +210,7 @@ struct IOSMeetingDetailView: View {
             await loadTranscript()
         }
         .onDisappear {
+            flushPendingJiraDraftsIfNeeded()
             Task { await workspace.flushNotesNow() }
         }
         .sheet(item: $editingTask) { task in IOSMeetingTaskEditor(workspace: workspace, task: task) }
@@ -613,6 +634,34 @@ struct IOSMeetingDetailView: View {
                 .textFieldStyle(.roundedBorder)
                 .padding(.horizontal)
 
+            if !transcriptEvents.isEmpty {
+                HStack(spacing: 10) {
+                    Button {
+                        copyTranscript()
+                    } label: {
+                        Label(
+                            copiedTranscriptFeedback ? L("Copied") : L("Copy transcript"),
+                            systemImage: copiedTranscriptFeedback ? "checkmark" : "doc.on.doc"
+                        )
+                        .font(.subheadline)
+                    }
+                    .buttonStyle(.bordered)
+                    .accessibilityIdentifier("workspace.transcript.copy")
+
+                    Button {
+                        exportTranscriptMarkdown()
+                    } label: {
+                        Label(L("Export Markdown"), systemImage: "square.and.arrow.up")
+                            .font(.subheadline)
+                    }
+                    .buttonStyle(.bordered)
+                    .accessibilityIdentifier("workspace.transcript.export")
+
+                    Spacer()
+                }
+                .padding(.horizontal)
+            }
+
             if filtered.isEmpty {
                 ContentUnavailableView(
                     L("No Transcript"),
@@ -642,6 +691,7 @@ struct IOSMeetingDetailView: View {
                         }
                         Text(event.text)
                             .font(.body)
+                            .textSelection(.enabled)
                     }
                     .padding(.vertical, 2)
                 }
@@ -708,6 +758,84 @@ struct IOSMeetingDetailView: View {
                 }
             }
 
+            Section {
+                TextField(
+                    skills?.teamContext.defaultJiraBoardURL.isEmpty == false
+                        ? (skills?.teamContext.defaultJiraBoardURL ?? "")
+                        : "https://jira.example.com/secure/RapidBoard.jspa?rapidView=1",
+                    text: $jiraBoardURLDraft
+                )
+                .keyboardType(.URL)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .onSubmit { saveCurrentContextSettings() }
+                TextField(
+                    skills?.teamContext.defaultJiraProjectKey.isEmpty == false
+                        ? L("Default: %@", skills?.teamContext.defaultJiraProjectKey ?? "")
+                        : L("Jira project keys (e.g. SDBPROD, SPS)"),
+                    text: $jiraProjectKeysDraft
+                )
+                .textInputAutocapitalization(.characters)
+                .autocorrectionDisabled()
+                .onSubmit { saveCurrentContextSettings() }
+                Button(L("Save Jira Settings")) {
+                    saveCurrentContextSettings()
+                }
+            } header: {
+                Text(L("Jira Board & Project"))
+            } footer: {
+                Text(L("Leave empty to use the app default Jira board and project keys."))
+            }
+
+            Section {
+                autoExportOverridePicker(
+                    L("Auto-generate summary after meeting"),
+                    selection: autoExportBinding(\.autoGenerateSummary)
+                )
+                autoExportOverridePicker(
+                    L("Auto-sync tasks after summary"),
+                    selection: autoExportBinding(\.autoSyncTasks)
+                )
+                autoExportOverridePicker(
+                    L("Obsidian auto-export"),
+                    selection: autoExportBinding(\.autoExport)
+                )
+                autoExportOverridePicker(
+                    L("Export transcript"),
+                    selection: autoExportBinding(\.includeTranscript)
+                )
+                autoExportOverridePicker(
+                    L("Export summary"),
+                    selection: autoExportBinding(\.includeSummary)
+                )
+                autoExportOverridePicker(
+                    L("Export notes"),
+                    selection: autoExportBinding(\.includeNotes)
+                )
+                autoExportOverridePicker(
+                    L("Export tasks"),
+                    selection: autoExportBinding(\.includeTasks)
+                )
+                autoExportOverridePicker(
+                    L("Export decisions"),
+                    selection: autoExportBinding(\.includeDecisions)
+                )
+                autoExportOverridePicker(
+                    L("Export open questions"),
+                    selection: autoExportBinding(\.includeQuestions)
+                )
+                if !autoExportOverridesDraft.isEmpty {
+                    Button(L("Reset export settings to defaults"), role: .destructive) {
+                        autoExportOverridesDraft = .init()
+                        saveCurrentContextSettings()
+                    }
+                }
+            } header: {
+                Text(L("Automatic Export & Post-Meeting"))
+            } footer: {
+                Text(L("Fields left on Use default follow your global app and Obsidian layout settings."))
+            }
+
             Section(L("Assistant Context")) {
                 TextField(L("What this meeting is about"), text: $aboutDraft, axis: .vertical)
                 TextField(L("What matters most"), text: $mattersDraft, axis: .vertical)
@@ -760,10 +888,30 @@ struct IOSMeetingDetailView: View {
         }
     }
 
+    private func autoExportBinding(_ keyPath: WritableKeyPath<MeetingAutoExportOverrides, Bool?>) -> Binding<Bool?> {
+        Binding(
+            get: { autoExportOverridesDraft[keyPath: keyPath] },
+            set: { newValue in
+                autoExportOverridesDraft[keyPath: keyPath] = newValue
+                guard !isLoadingContext else { return }
+                saveCurrentContextSettings()
+            }
+        )
+    }
+
+    private func autoExportOverridePicker(_ title: String, selection: Binding<Bool?>) -> some View {
+        Picker(title, selection: selection) {
+            Text(L("Use default")).tag(Bool?.none)
+            Text(L("On")).tag(Bool?.some(true))
+            Text(L("Off")).tag(Bool?.some(false))
+        }
+    }
+
     private func saveCurrentContextSettings() {
         let people = peopleDraft.split(separator: ",")
             .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
+        let projectKeys = SyncedMeetingContextSettings.normalizedJiraProjectKeys(from: jiraProjectKeysDraft)
         let kind: SyncedMeetingContextSettings.ScopeKind = useSeriesScope ? .calendarSeries : .room
         Task {
             await workspace.saveContextSettings(
@@ -778,7 +926,13 @@ struct IOSMeetingDetailView: View {
                 autoJoin: autoJoinChoice,
                 updateAutoJoin: true,
                 autoFacilitatorSkillID: autoFacilitatorSkillID,
-                updateAutoFacilitatorSkillID: true
+                updateAutoFacilitatorSkillID: true,
+                jiraBoardURL: jiraBoardURLDraft,
+                updateJiraBoardURL: true,
+                jiraProjectKeys: projectKeys,
+                updateJiraProjectKeys: true,
+                autoExportOverrides: autoExportOverridesDraft,
+                updateAutoExportOverrides: true
             )
             settingsSaved = true
             try? await Task.sleep(for: .seconds(2))
@@ -816,6 +970,71 @@ struct IOSMeetingDetailView: View {
         mattersDraft = settings?.matters?.value ?? ""
         neverDraft = settings?.never?.value ?? ""
         peopleDraft = settings?.people?.value.joined(separator: ", ") ?? ""
+        jiraBoardURLDraft = settings?.jiraBoardURL?.value ?? ""
+        jiraProjectKeysDraft = settings?.jiraProjectKeys?.value?.joined(separator: ", ") ?? ""
+        autoExportOverridesDraft = settings?.autoExportSettings?.overrides ?? .init()
+    }
+
+    private func flushPendingJiraDraftsIfNeeded() {
+        guard !isLoadingContext else { return }
+        let settings = workspace.settings(for: contextScopeKey)
+        let savedBoard = (settings?.jiraBoardURL?.value ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let draftBoard = jiraBoardURLDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        let savedProjects = settings?.jiraProjectKeys?.value ?? []
+        let draftProjects = SyncedMeetingContextSettings.normalizedJiraProjectKeys(from: jiraProjectKeysDraft)
+        guard draftBoard != savedBoard || draftProjects != savedProjects else { return }
+        saveCurrentContextSettings()
+    }
+
+    private func copyTranscript() {
+        let text = TranscriptExportFormatter.formatPlainText(
+            events: transcriptEvents,
+            meetingTitle: session?.title,
+            startedAt: session?.startedAt
+        )
+        guard !text.isEmpty else { return }
+        UIPasteboard.general.string = text
+        copiedTranscriptFeedback = true
+        Task {
+            try? await Task.sleep(for: .seconds(2))
+            copiedTranscriptFeedback = false
+        }
+    }
+
+    private func exportTranscriptMarkdown() {
+        let title = session?.title ?? L("Meeting")
+        let startedAt = session?.startedAt ?? .distantPast
+        let markdown = TranscriptExportFormatter.formatMarkdown(
+            events: transcriptEvents,
+            title: title,
+            startedAt: startedAt,
+            endedAt: session?.endedAt
+        )
+        guard !markdown.isEmpty else { return }
+        let fileName = TranscriptExportFormatter.suggestedFileName(title: title, startedAt: session?.startedAt)
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(fileName)
+        do {
+            try markdown.write(to: url, atomically: true, encoding: .utf8)
+            presentActivitySheet(items: [url])
+        } catch {
+            AppDiagnostics.log("transcript-export-error", ["error": error.localizedDescription])
+        }
+    }
+
+    private func presentActivitySheet(items: [Any]) {
+        guard let scene = UIApplication.shared.connectedScenes.first(where: { $0.activationState == .foregroundActive }) as? UIWindowScene
+            ?? UIApplication.shared.connectedScenes.first as? UIWindowScene,
+              let root = scene.keyWindow?.rootViewController ?? scene.windows.first?.rootViewController else { return }
+        var presenter = root
+        while let next = presenter.presentedViewController {
+            presenter = next
+        }
+        let sheet = UIActivityViewController(activityItems: items, applicationActivities: nil)
+        if let popover = sheet.popoverPresentationController {
+            popover.sourceView = presenter.view
+            popover.sourceRect = CGRect(x: presenter.view.bounds.midX, y: 80, width: 1, height: 1)
+        }
+        presenter.present(sheet, animated: true)
     }
 
     private func loadTranscript() async {

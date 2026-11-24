@@ -105,6 +105,9 @@ final class MacWorkspaceSyncCoordinator: ObservableObject {
         var people: [String]?
         var autoJoin: Bool?
         var autoFacilitatorSkillID: String?
+        var jiraBoardURL: String?
+        var jiraProjectKeys: [String]?
+        var autoExportOverrides: MeetingAutoExportOverrides = .init()
         var guidanceTexts: [String]
     }
 
@@ -702,6 +705,7 @@ final class MacWorkspaceSyncCoordinator: ObservableObject {
         }
         ingestLocalSnapshotIntoDocument(snapshot)
         ingestLocalContextSettings()
+        await pushAutoExportOverridesToLibrary()
         _ = await ingestLocalAssistantStateIntoDocument()
         exportLocalTranscriptsAndArchive(snapshot: snapshot)
         let associations = (calendar?.meetings ?? []).compactMap { event -> MeetingCalendarAssociation? in
@@ -791,9 +795,13 @@ final class MacWorkspaceSyncCoordinator: ObservableObject {
 
         // Transcript records arrive in a different zone. Import them before creating
         // export jobs for the incoming meetings, including phone-initiated saves.
+        await pushAutoExportOverridesToLibrary(in: doc)
+        let globalHasTranscript = (try? await meetingLibrary.store.destination()?.layout.sections.contains(.transcript)) == true
+        let overrideWantsTranscript = doc.contextSettings.values.contains(where: { $0.autoExportSettings?.includeTranscript?.value == true })
+            || (attentionStore?.presets.contains(where: { $0.autoExportOverrides.includeTranscript == true }) ?? false)
         var prefetchedTranscripts: CloudZoneSession?
         if !report.changedSessions.isEmpty, syncPreferences.transcriptRetention != .off,
-           try await meetingLibrary.store.destination()?.layout.sections.contains(.transcript) == true,
+           globalHasTranscript || overrideWantsTranscript,
            let session = try? await connectTranscriptZone(),
            (try? await mergeIncomingTranscripts(session: session)) != nil {
             prefetchedTranscripts = session
@@ -1274,6 +1282,9 @@ final class MacWorkspaceSyncCoordinator: ObservableObject {
                     people: preset?.people,
                     autoJoin: preset?.autoJoin,
                     autoFacilitatorSkillID: preset?.autoFacilitatorSkillID,
+                    jiraBoardURL: preset?.jiraBoardURL,
+                    jiraProjectKeys: preset?.jiraProjectKeys,
+                    autoExportOverrides: preset?.autoExportOverrides ?? .init(),
                     guidanceTexts: guidanceTexts(.calendarSeries(seriesID))
                 )
             } else if scopeKey.hasPrefix("room:") {
@@ -1292,6 +1303,9 @@ final class MacWorkspaceSyncCoordinator: ObservableObject {
                     people: preset?.people,
                     autoJoin: preset?.autoJoin,
                     autoFacilitatorSkillID: preset?.autoFacilitatorSkillID,
+                    jiraBoardURL: preset?.jiraBoardURL,
+                    jiraProjectKeys: preset?.jiraProjectKeys,
+                    autoExportOverrides: preset?.autoExportOverrides ?? .init(),
                     guidanceTexts: guidanceTexts(.room(room))
                 )
             }
@@ -1336,6 +1350,30 @@ final class MacWorkspaceSyncCoordinator: ObservableObject {
                 }
             }
 
+            let oldExport = existing?.autoExportSettings
+            let syncedAutoExport: SyncedMeetingAutoExportSettings?
+            if fp.autoExportOverrides.isEmpty && oldExport == nil {
+                syncedAutoExport = nil
+            } else {
+                syncedAutoExport = SyncedMeetingAutoExportSettings(
+                    autoExport: syncNullable(fp.autoExportOverrides.autoExport, old: oldExport?.autoExport),
+                    includeTranscript: syncNullable(fp.autoExportOverrides.includeTranscript, old: oldExport?.includeTranscript),
+                    includeSummary: syncNullable(fp.autoExportOverrides.includeSummary, old: oldExport?.includeSummary),
+                    includeNotes: syncNullable(fp.autoExportOverrides.includeNotes, old: oldExport?.includeNotes),
+                    includeTasks: syncNullable(fp.autoExportOverrides.includeTasks, old: oldExport?.includeTasks),
+                    includeDecisions: syncNullable(fp.autoExportOverrides.includeDecisions, old: oldExport?.includeDecisions),
+                    includeQuestions: syncNullable(fp.autoExportOverrides.includeQuestions, old: oldExport?.includeQuestions),
+                    autoGenerateSummary: syncNullable(fp.autoExportOverrides.autoGenerateSummary, old: oldExport?.autoGenerateSummary),
+                    autoSyncTasks: syncNullable(fp.autoExportOverrides.autoSyncTasks, old: oldExport?.autoSyncTasks)
+                )
+            }
+            let cleanBoardURL = fp.jiraBoardURL?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let normalizedBoardURL = (cleanBoardURL?.isEmpty == false) ? cleanBoardURL : nil
+            let cleanProjectKeys = fp.jiraProjectKeys.map {
+                SyncedMeetingContextSettings.normalizedJiraProjectKeys(from: $0.joined(separator: ","))
+            }
+            let normalizedProjectKeys = (cleanProjectKeys?.isEmpty == false) ? cleanProjectKeys : nil
+
             let synced = SyncedMeetingContextSettings(
                 scopeKey: key,
                 scopeKind: kind,
@@ -1351,6 +1389,9 @@ final class MacWorkspaceSyncCoordinator: ObservableObject {
                 defaultReminderOverride: existing?.defaultReminderOverride,
                 autoJoin: syncNullable(fp.autoJoin, old: existing?.autoJoin),
                 autoFacilitatorSkillID: syncNullable(fp.autoFacilitatorSkillID, old: existing?.autoFacilitatorSkillID),
+                jiraBoardURL: syncNullable(normalizedBoardURL, old: existing?.jiraBoardURL),
+                jiraProjectKeys: syncNullable(normalizedProjectKeys, old: existing?.jiraProjectKeys),
+                autoExportSettings: syncedAutoExport,
                 guidanceRules: updatedRules
             )
             replica.workspaceDoc.upsertContextSettings(synced)
@@ -1475,9 +1516,12 @@ final class MacWorkspaceSyncCoordinator: ObservableObject {
 
         if !report.changedSettingsKeys.isEmpty {
             applyRemoteContextSettings(report.changedSettingsKeys)
+            await pushAutoExportOverridesToLibrary()
             if report.changedSettingsKeys.contains(where: { AssistantCloudSync.isAssistantScopeKey($0) }) {
                 await applySyncedAssistantSettingsIfAvailable()
             }
+        } else if !report.changedSessions.isEmpty {
+            await pushAutoExportOverridesToLibrary()
         }
 
         await meetingLibrary.refresh()
@@ -1660,7 +1704,10 @@ final class MacWorkspaceSyncCoordinator: ObservableObject {
             settings.attentionMode?.value != nil ||
             settings.suggestReplies?.value != nil ||
             settings.autoJoin?.value != nil ||
-            (settings.autoFacilitatorSkillID?.value.map { !$0.isEmpty } ?? false)
+            (settings.autoFacilitatorSkillID?.value.map { !$0.isEmpty } ?? false) ||
+            (settings.jiraBoardURL?.value.map { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty } ?? false) ||
+            (settings.jiraProjectKeys?.value.map { !$0.isEmpty } ?? false) ||
+            (settings.autoExportSettings?.hasAnyExplicitOverride ?? false)
         guard hasPresetData else { return }
 
         var preset = existing ?? MeetingPreset(title: settings.title.value, bindings: [binding])
@@ -1685,12 +1732,62 @@ final class MacWorkspaceSyncCoordinator: ObservableObject {
             let trimmed = skillBox.value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             preset.autoFacilitatorSkillID = trimmed.isEmpty ? nil : trimmed
         }
+        if let boardBox = settings.jiraBoardURL {
+            let trimmed = boardBox.value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            preset.jiraBoardURL = trimmed.isEmpty ? nil : trimmed
+        }
+        if let projBox = settings.jiraProjectKeys {
+            let normalized = projBox.value.map {
+                SyncedMeetingContextSettings.normalizedJiraProjectKeys(from: $0.joined(separator: ","))
+            }
+            preset.jiraProjectKeys = (normalized?.isEmpty == false) ? normalized : nil
+        }
+        if let exportSettings = settings.autoExportSettings {
+            var next = preset.autoExportOverrides
+            if let v = exportSettings.autoExport { next.autoExport = v.value }
+            if let v = exportSettings.includeTranscript { next.includeTranscript = v.value }
+            if let v = exportSettings.includeSummary { next.includeSummary = v.value }
+            if let v = exportSettings.includeNotes { next.includeNotes = v.value }
+            if let v = exportSettings.includeTasks { next.includeTasks = v.value }
+            if let v = exportSettings.includeDecisions { next.includeDecisions = v.value }
+            if let v = exportSettings.includeQuestions { next.includeQuestions = v.value }
+            if let v = exportSettings.autoGenerateSummary { next.autoGenerateSummary = v.value }
+            if let v = exportSettings.autoSyncTasks { next.autoSyncTasks = v.value }
+            preset.autoExportOverrides = next
+        }
         if case .room = binding, let trBox = settings.sameRoomTransition {
             preset.sameRoomTransition = trBox.value.flatMap(SameRoomMeetingTransitionMode.init(rawValue:))
         }
         if existing != preset {
             store.save(preset)
         }
+    }
+
+    private func pushAutoExportOverridesToLibrary(in doc: MeetingWorkspaceSyncDocument? = nil) async {
+        let sourceDoc = doc ?? replica.workspaceDoc
+        var mergedMap = attentionStore?.autoExportOverridesByScopeMap() ?? [:]
+        for (key, settings) in sourceDoc.contextSettings
+        where settings.scopeKind == .room || settings.scopeKind == .calendarSeries {
+            guard let export = settings.autoExportSettings else { continue }
+            if export.hasAnyExplicitOverride {
+                mergedMap[key] = export.overrides
+            } else {
+                mergedMap.removeValue(forKey: key)
+            }
+        }
+        var externalSeriesBySession: [UUID: String] = [:]
+        for session in sourceDoc.sessions.values {
+            if let ext = session.externalSeriesID?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !ext.isEmpty {
+                let canonical = sourceDoc.resolveCanonicalSessionID(for: session.id)
+                externalSeriesBySession[canonical] = ext
+                externalSeriesBySession[session.id] = ext
+            }
+        }
+        try? await meetingLibrary.store.setAutoExportOverrides(
+            mergedMap,
+            externalSeriesBySessionID: externalSeriesBySession.isEmpty ? nil : externalSeriesBySession
+        )
     }
 
     private func applyGuidanceRules(

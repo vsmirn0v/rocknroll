@@ -14,6 +14,7 @@ protocol IOSBoardShareSession: AnyObject {
     var isBoardShareSessionAlive: Bool { get }
     var isSharingScreen: Bool { get }
     var onExternalBoardShareStopped: (() -> Void)? { get set }
+    var onBoardShareInterrupted: (() -> Void)? { get set }
     func startBoardSharing(initialSample: CMSampleBuffer) async throws
     func pushBoardShareFrame(_ sample: CMSampleBuffer)
     func stopBoardSharing() async
@@ -21,6 +22,10 @@ protocol IOSBoardShareSession: AnyObject {
 
 extension IOSBoardShareSession {
     var isBoardShareSessionAlive: Bool { canShareBoard }
+    var onBoardShareInterrupted: (() -> Void)? {
+        get { nil }
+        set {}
+    }
 }
 
 private final class IOSBoardDirtyScriptHandlerProxy: NSObject, WKScriptMessageHandler {
@@ -92,6 +97,7 @@ final class IOSAssistantBoardController: NSObject, ObservableObject, WKNavigatio
     @Published private(set) var sharingSessionID: UUID?
     @Published private(set) var sharingMeetingTitle: String?
     @Published private(set) var isStartingShare = false
+    @Published private(set) var isRecoveringShare = false
     @Published var isPresented = false
     var isInlineSheetActive = false
 
@@ -99,6 +105,7 @@ final class IOSAssistantBoardController: NSObject, ObservableObject, WKNavigatio
     var canShareToActiveMeeting: Bool { resolveShareTarget?(nil)?.canShareBoard == true }
     var resolveShareTarget: ((UUID?) -> (any IOSBoardShareSession)?)?
     var defaultBoardURLProvider: (() -> String)?
+    var defaultBoardURLForTarget: ((UUID?) -> String)?
     var snapshotOverrideForTesting: (() async -> CGImage?)?
     weak var taskSync: WorkspaceTaskSyncController?
     var onBoardURLChanged: ((String) -> Void)?
@@ -129,6 +136,9 @@ final class IOSAssistantBoardController: NSObject, ObservableObject, WKNavigatio
     private var parkingHostView: UIView?
     private weak var sharedTarget: (any IOSBoardShareSession)?
     private var frameTask: Task<Void, Never>?
+    private var recoveryTask: Task<Void, Never>?
+    private var desiredShareTargetID: UUID?
+    private var desiredShareURL: String?
     private var shareAttemptGeneration: UInt64 = 0
     private var lastDirtyUptime: TimeInterval = 0
     private var dirtyGeneration: UInt64 = 0
@@ -136,6 +146,7 @@ final class IOSAssistantBoardController: NSObject, ObservableObject, WKNavigatio
 
     deinit {
         frameTask?.cancel()
+        recoveryTask?.cancel()
     }
 
     func markBoardDirty() {
@@ -258,7 +269,7 @@ final class IOSAssistantBoardController: NSObject, ObservableObject, WKNavigatio
 
     @discardableResult
     func startSharing(targetID: UUID? = nil, urlOverride: String? = nil) async throws -> String {
-        guard let target = resolveShareTarget?(targetID), target.canShareBoard else {
+        guard let target = resolveShareTarget?(targetID) else {
             AppDiagnostics.log("board-share-error", [
                 "stage": "resolveTarget",
                 "errorType": "unavailable",
@@ -269,6 +280,34 @@ final class IOSAssistantBoardController: NSObject, ObservableObject, WKNavigatio
             throw MeetingSessionError.unavailable(L("Connect to a meeting before sharing the Assistant Board."))
         }
         let explicitURL = urlOverride?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let resolvedSeedURL: String = {
+            if !explicitURL.isEmpty { return explicitURL }
+            if let existing = currentURL?.absoluteString, !existing.isEmpty { return existing }
+            let draftSeed = urlDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !draftSeed.isEmpty { return draftSeed }
+            let scoped = defaultBoardURLForTarget?(target.id).trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if !scoped.isEmpty { return scoped }
+            return defaultBoardURLProvider?().trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        }()
+
+        if !target.canShareBoard {
+            if target.isBoardShareSessionAlive, !resolvedSeedURL.isEmpty {
+                desiredShareTargetID = target.id
+                desiredShareURL = resolvedSeedURL
+                scheduleShareRecovery(targetID: target.id, reason: "waitingForReconnect")
+                lastActionSummary = L("Connection interrupted — waiting to share board to %@", target.title)
+                return L("Waiting for connection recovery to share desktop board to “%@”.", target.title)
+            }
+            AppDiagnostics.log("board-share-error", [
+                "stage": "resolveTarget",
+                "errorType": "unavailable",
+                "errorDomain": "RockNRoll.Board",
+                "errorCode": 1,
+                "cancelled": false
+            ])
+            throw MeetingSessionError.unavailable(L("Connect to a meeting before sharing the Assistant Board."))
+        }
+
         if isSharing, sharingSessionID == target.id {
             if !explicitURL.isEmpty, explicitURL != currentURL?.absoluteString {
                 _ = try await open(urlString: explicitURL, presentSheet: isPresented)
@@ -278,6 +317,12 @@ final class IOSAssistantBoardController: NSObject, ObservableObject, WKNavigatio
         guard !isStartingShare else {
             throw MeetingSessionError.unavailable(L("Starting Assistant Board share…"))
         }
+
+        recoveryTask?.cancel()
+        recoveryTask = nil
+        isRecoveringShare = false
+        desiredShareTargetID = target.id
+        desiredShareURL = resolvedSeedURL.isEmpty ? nil : resolvedSeedURL
 
         AppDiagnostics.log("board-share-begin", [
             "hasCurrentURL": currentURL != nil,
@@ -293,7 +338,7 @@ final class IOSAssistantBoardController: NSObject, ObservableObject, WKNavigatio
 
         if isSharing {
             let previous = sharedTarget
-            stopSharing(notifyTarget: false)
+            teardownActiveShare(clearDesiredIntent: false, notifyTarget: false)
             if let previous {
                 await previous.stopBoardSharing()
             }
@@ -311,13 +356,14 @@ final class IOSAssistantBoardController: NSObject, ObservableObject, WKNavigatio
                     ensureWebViewHostedForRendering(force: true)
                 }
             } else if currentURL == nil {
-                let draftSeed = urlDraft.trimmingCharacters(in: .whitespacesAndNewlines)
-                let defaultSeed = defaultBoardURLProvider?().trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                let seed = !draftSeed.isEmpty ? draftSeed : defaultSeed
-                guard !seed.isEmpty else {
+                guard !resolvedSeedURL.isEmpty else {
+                    clearShareIntent()
                     throw MeetingSessionError.unavailable(L("Enter a Jira board URL or set a Default Jira Board URL in Skills → Team Context first."))
                 }
-                _ = try await open(urlString: seed, presentSheet: isPresented)
+                _ = try await open(urlString: resolvedSeedURL, presentSheet: isPresented)
+            }
+            if let loaded = currentURL?.absoluteString, !loaded.isEmpty {
+                desiredShareURL = loaded
             }
 
             guard shareAttemptGeneration == attempt else { throw CancellationError() }
@@ -361,6 +407,9 @@ final class IOSAssistantBoardController: NSObject, ObservableObject, WKNavigatio
             target.onExternalBoardShareStopped = { [weak self] in
                 self?.stopSharing(notifyTarget: false)
             }
+            target.onBoardShareInterrupted = { [weak self] in
+                self?.handleInterruptedShare(targetID: target.id)
+            }
 
             let sessionID = target.id
             markBoardDirty()
@@ -399,8 +448,11 @@ final class IOSAssistantBoardController: NSObject, ObservableObject, WKNavigatio
                         let fresh = await self.captureBoardPixelBuffer()
                         guard !Task.isCancelled,
                               self.sharedTarget === currentTarget,
-                              self.sharingSessionID == sessionID,
-                              currentTarget.isBoardShareSessionAlive else {
+                              self.sharingSessionID == sessionID else {
+                            return
+                        }
+                        if !currentTarget.isBoardShareSessionAlive {
+                            self.stopSharing(notifyTarget: false)
                             return
                         }
                         if currentTarget.canShareBoard,
@@ -441,12 +493,44 @@ final class IOSAssistantBoardController: NSObject, ObservableObject, WKNavigatio
                 "errorCode": ns.code,
                 "cancelled": error is CancellationError
             ])
+            if !(error is CancellationError),
+               desiredShareTargetID == target.id,
+               target.isBoardShareSessionAlive,
+               (!(desiredShareURL ?? "").isEmpty || currentURL != nil) {
+                scheduleShareRecovery(targetID: target.id, reason: "startError")
+            }
             throw error
         }
     }
 
     func stopSharing(notifyTarget: Bool = true) {
+        teardownActiveShare(clearDesiredIntent: true, notifyTarget: notifyTarget)
+    }
+
+    private func handleInterruptedShare(targetID: UUID) {
+        let shouldRecover = (desiredShareTargetID == targetID || sharingSessionID == targetID)
+        let target = resolveShareTarget?(targetID)
+        teardownActiveShare(clearDesiredIntent: !shouldRecover, notifyTarget: false)
+        if shouldRecover, let target, target.isBoardShareSessionAlive {
+            scheduleShareRecovery(targetID: targetID, reason: "interrupted")
+        } else {
+            clearShareIntent()
+        }
+    }
+
+    private func clearShareIntent() {
+        recoveryTask?.cancel()
+        recoveryTask = nil
+        desiredShareTargetID = nil
+        desiredShareURL = nil
+        isRecoveringShare = false
+    }
+
+    private func teardownActiveShare(clearDesiredIntent: Bool, notifyTarget: Bool) {
         shareAttemptGeneration &+= 1
+        if clearDesiredIntent {
+            clearShareIntent()
+        }
         let wasSharing = isSharing || frameTask != nil || sharedTarget != nil
         frameTask?.cancel()
         frameTask = nil
@@ -455,6 +539,7 @@ final class IOSAssistantBoardController: NSObject, ObservableObject, WKNavigatio
         sharingSessionID = nil
         sharingMeetingTitle = nil
         target?.onExternalBoardShareStopped = nil
+        target?.onBoardShareInterrupted = nil
         if notifyTarget, let target {
             Task { @MainActor in
                 await target.stopBoardSharing()
@@ -465,9 +550,53 @@ final class IOSAssistantBoardController: NSObject, ObservableObject, WKNavigatio
             AppDiagnostics.log("board-share-stop", [
                 "notifyTarget": notifyTarget,
                 "wasSharing": wasSharing,
-                "reason": notifyTarget ? "userOrTool" : "external"
+                "reason": notifyTarget ? "userOrTool" : (clearDesiredIntent ? "external" : "interrupted")
             ])
-            lastActionSummary = L("Stopped sharing board")
+            if clearDesiredIntent {
+                lastActionSummary = L("Stopped sharing board")
+            }
+        }
+    }
+
+    private func scheduleShareRecovery(targetID: UUID, reason: String) {
+        recoveryTask?.cancel()
+        isRecoveringShare = true
+        AppDiagnostics.log("board-share-recovery-scheduled", ["reason": reason])
+        lastActionSummary = L("Board share interrupted — reconnecting automatically…")
+        recoveryTask = Task { @MainActor [weak self] in
+            defer {
+                if self?.desiredShareTargetID == nil || self?.isSharing == true {
+                    self?.isRecoveringShare = false
+                }
+            }
+            for attempt in 1...60 {
+                try? await Task.sleep(for: .milliseconds(1200))
+                guard !Task.isCancelled, let self else { return }
+                guard self.desiredShareTargetID == targetID else { return }
+                if self.isSharing, self.sharingSessionID == targetID {
+                    self.isRecoveringShare = false
+                    return
+                }
+                guard let target = self.resolveShareTarget?(targetID), target.isBoardShareSessionAlive else {
+                    self.clearShareIntent()
+                    return
+                }
+                guard target.canShareBoard, !self.isStartingShare else { continue }
+                do {
+                    _ = try await self.startSharing(targetID: targetID, urlOverride: self.desiredShareURL)
+                    AppDiagnostics.log("board-share-recovered", ["attempt": attempt])
+                    self.isRecoveringShare = false
+                    return
+                } catch is CancellationError {
+                    return
+                } catch {
+                    if !target.isBoardShareSessionAlive {
+                        self.clearShareIntent()
+                        return
+                    }
+                }
+            }
+            self?.isRecoveringShare = false
         }
     }
 
@@ -1071,6 +1200,12 @@ struct IOSAssistantBoardSheet: View {
     @State private var filterText = ""
     @State private var errorMessage: String?
 
+    private var effectiveDefaultURL: String {
+        let passed = defaultBoardURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !passed.isEmpty { return passed }
+        return controller.defaultBoardURLProvider?().trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    }
+
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
@@ -1105,6 +1240,27 @@ struct IOSAssistantBoardSheet: View {
 
                     Button(L("Go")) { openDraft() }
                         .buttonStyle(.borderedProminent)
+
+                    if !effectiveDefaultURL.isEmpty,
+                       controller.currentURL?.absoluteString != effectiveDefaultURL {
+                        Button {
+                            dismissKeyboard()
+                            errorMessage = nil
+                            let url = effectiveDefaultURL
+                            controller.urlDraft = url
+                            Task {
+                                do {
+                                    _ = try await controller.open(urlString: url)
+                                } catch {
+                                    errorMessage = error.localizedDescription
+                                }
+                            }
+                        } label: {
+                            Image(systemName: "link")
+                        }
+                        .buttonStyle(.bordered)
+                        .accessibilityLabel(L("Open Jira Board"))
+                    }
 
                     Button {
                         errorMessage = nil
@@ -1182,9 +1338,13 @@ struct IOSAssistantBoardSheet: View {
                 controller.isPresented = false
             }
             .task {
+                let resolved = effectiveDefaultURL
+                if controller.urlDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, !resolved.isEmpty {
+                    controller.urlDraft = resolved
+                }
                 if controller.currentURL == nil {
                     let seed = controller.urlDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                        ? defaultBoardURL
+                        ? resolved
                         : controller.urlDraft
                     if !seed.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                         errorMessage = nil
@@ -1221,6 +1381,22 @@ struct IOSAssistantBoardSheet: View {
                 Text(L("You can tap Done to return to the call — the 1440×810 desktop board keeps streaming."))
                     .font(.caption2)
                     .foregroundStyle(.secondary)
+            } else if controller.isRecoveringShare {
+                HStack(spacing: 8) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text(L("Reconnecting board share automatically…"))
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.orange)
+                        .lineLimit(1)
+                    Spacer()
+                    Button(L("Stop Share"), role: .destructive) {
+                        errorMessage = nil
+                        controller.stopSharing()
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
             } else if controller.canShareToActiveMeeting {
                 HStack(spacing: 8) {
                     Button {

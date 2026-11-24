@@ -446,6 +446,14 @@ struct AttentionDecisionRecord: Codable, Equatable, Sendable {
         if effectiveWriter.onThisMac { return true }
         return enabled && remoteOutcomes
     }
+
+    func shouldCaptureOutcome(room: URL?, latest: URL? = nil, roomIdentity: String? = nil, seriesIDs: [String] = []) -> Bool {
+        let overrides = resolvedAutoExportOverrides(room: room, latest: latest, roomIdentity: roomIdentity, seriesIDs: seriesIDs)
+        let enabledForMeeting = overrides.autoGenerateSummary ?? generateOutcomes
+        guard enabledForMeeting, writerConfigured else { return false }
+        if effectiveWriter.onThisMac { return true }
+        return enabled && remoteOutcomes
+    }
     var effectiveWriter: AttentionProvider { writerProvider ?? provider }
     /// Context of the model that writes outcomes. A separate writer with the same model id
     /// reuses the length learned for the judge. A different, uncatalogued model stays unknown.
@@ -599,6 +607,7 @@ struct AttentionDecisionRecord: Codable, Equatable, Sendable {
         load()
         momentLoadTask = Task { @MainActor [weak self] in await self?.loadMoments() }
         installMeetingLibrary()
+        pushAutoExportOverridesToLibrary(waitForPrepare: true)
         CalendarReminderBroker.shared.isTaskReminderAllowed = { [weak self] taskID in
             guard let self else { return false }
             await self.waitForMeetingLibrary()
@@ -830,6 +839,7 @@ struct AttentionDecisionRecord: Codable, Equatable, Sendable {
             try data.write(to: documentURL, options: .atomic)
             persistenceWarning = nil
         } catch { persistenceWarning = L("Meeting instructions could not be saved.") }
+        pushAutoExportOverridesToLibrary(waitForPrepare: false)
     }
 
     // MARK: Key
@@ -988,6 +998,144 @@ struct AttentionDecisionRecord: Codable, Equatable, Sendable {
             return value
         }
         return nil
+    }
+
+    func resolvedAutoExportOverrides(
+        room: URL?,
+        latest: URL? = nil,
+        roomIdentity: String? = nil,
+        seriesIDs: [String] = []
+    ) -> MeetingAutoExportOverrides {
+        var resolved = MeetingAutoExportOverrides()
+        for sid in seriesIDs {
+            let trimmed = sid.trimmed
+            guard !trimmed.isEmpty else { continue }
+            for match in presets where match.bindings.contains(.calendarSeries(trimmed)) {
+                resolved = resolved.mergingFallback(match.autoExportOverrides)
+            }
+        }
+        let roomKeys = [room?.absoluteString, latest?.absoluteString, roomIdentity]
+            .compactMap { $0?.trimmed }
+            .filter { !$0.isEmpty }
+        for key in roomKeys {
+            for match in presets where match.bindings.contains(.room(key)) {
+                resolved = resolved.mergingFallback(match.autoExportOverrides)
+            }
+        }
+        return resolved
+    }
+
+    func autoExportOverridesByScopeMap() -> [String: MeetingAutoExportOverrides] {
+        var result: [String: MeetingAutoExportOverrides] = [:]
+        for preset in presets where !preset.autoExportOverrides.isEmpty {
+            for binding in preset.bindings {
+                let key: String
+                switch binding {
+                case .calendarSeries(let id):
+                    let clean = id.trimmed
+                    guard !clean.isEmpty else { continue }
+                    key = "series:" + clean
+                case .room(let room):
+                    let clean = room.trimmed
+                    guard !clean.isEmpty else { continue }
+                    key = "room:" + clean
+                }
+                result[key] = result[key]?.mergingFallback(preset.autoExportOverrides) ?? preset.autoExportOverrides
+            }
+        }
+        return result
+    }
+
+    func resolvedJiraBoardConfig(
+        room: URL?,
+        latest: URL? = nil,
+        roomIdentity: String? = nil,
+        seriesIDs: [String] = [],
+        defaultBoardURL: String,
+        defaultProjectKey: String,
+        lastBoardURL rawLastBoardURL: String? = nil,
+        jiraSettings: JiraConnectionSettings
+    ) -> (boardURL: URL?, projectKeys: [String]) {
+        func validBoardURL(_ raw: String?) -> URL? {
+            guard let clean = raw?.trimmed, !clean.isEmpty,
+                  let url = URL(string: clean),
+                  let scheme = url.scheme?.lowercased(),
+                  scheme == "http" || scheme == "https",
+                  url.host != nil else { return nil }
+            return url
+        }
+
+        let cleanSeries = seriesIDs.map(\.trimmed).filter { !$0.isEmpty }
+        let roomKeys = [room?.absoluteString, latest?.absoluteString, roomIdentity]
+            .compactMap { $0?.trimmed }
+            .filter { !$0.isEmpty }
+
+        var chosenURL: URL?
+        for sid in cleanSeries {
+            if let match = presets.first(where: { $0.bindings.contains(.calendarSeries(sid)) }),
+               let url = validBoardURL(match.jiraBoardURL) {
+                chosenURL = url
+                break
+            }
+        }
+        if chosenURL == nil {
+            for key in roomKeys {
+                if let match = presets.first(where: { $0.bindings.contains(.room(key)) }),
+                   let url = validBoardURL(match.jiraBoardURL) {
+                    chosenURL = url
+                    break
+                }
+            }
+        }
+        if chosenURL == nil {
+            chosenURL = validBoardURL(defaultBoardURL)
+                ?? validBoardURL(rawLastBoardURL ?? lastBoardURL)
+                ?? jiraSettings.normalizedBaseURL
+        }
+
+        var chosenProjects: [String] = []
+        for sid in cleanSeries {
+            if let match = presets.first(where: { $0.bindings.contains(.calendarSeries(sid)) }),
+               let keys = match.jiraProjectKeys {
+                let normalized = SyncedMeetingContextSettings.normalizedJiraProjectKeys(from: keys.joined(separator: ","))
+                if !normalized.isEmpty {
+                    chosenProjects = normalized
+                    break
+                }
+            }
+        }
+        if chosenProjects.isEmpty {
+            for key in roomKeys {
+                if let match = presets.first(where: { $0.bindings.contains(.room(key)) }),
+                   let keys = match.jiraProjectKeys {
+                    let normalized = SyncedMeetingContextSettings.normalizedJiraProjectKeys(from: keys.joined(separator: ","))
+                    if !normalized.isEmpty {
+                        chosenProjects = normalized
+                        break
+                    }
+                }
+            }
+        }
+        if chosenProjects.isEmpty {
+            let defaults = [defaultProjectKey, jiraSettings.cleanProjectKey]
+                .map(\.trimmed)
+                .filter { !$0.isEmpty }
+                .joined(separator: ",")
+            chosenProjects = SyncedMeetingContextSettings.normalizedJiraProjectKeys(from: defaults)
+        }
+
+        return (chosenURL, chosenProjects)
+    }
+
+    func pushAutoExportOverridesToLibrary(waitForPrepare: Bool = false) {
+        let map = autoExportOverridesByScopeMap()
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            if waitForPrepare {
+                await self.waitForMeetingLibrary()
+            }
+            try? await self.meetingLibrary.store.setAutoExportOverrides(map)
+        }
     }
     func record(_ example: PresetExample, in preset: MeetingPreset) {
         var updated = self.preset(id: preset.id) ?? preset

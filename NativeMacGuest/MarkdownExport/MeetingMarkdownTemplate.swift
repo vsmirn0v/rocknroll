@@ -12,6 +12,22 @@ struct MeetingMarkdownSections: OptionSet, Codable, Sendable {
     static let transcript = Self(rawValue: 1 << 5)
     // Transcripts are opt-in for both new and existing destinations.
     static let all: Self = [.notes, .summary, .decisions, .tasks, .questions]
+
+    func applying(_ overrides: MeetingAutoExportOverrides) -> Self {
+        var result = self
+        func apply(_ flag: Bool?, to member: Self) {
+            guard let flag else { return }
+            if flag { result.insert(member) }
+            else { result.remove(member) }
+        }
+        apply(overrides.includeTranscript, to: .transcript)
+        apply(overrides.includeNotes, to: .notes)
+        apply(overrides.includeSummary, to: .summary)
+        apply(overrides.includeDecisions, to: .decisions)
+        apply(overrides.includeTasks, to: .tasks)
+        apply(overrides.includeQuestions, to: .questions)
+        return result
+    }
 }
 
 /// Fixed Markdown templates. Raw local notes are never normalized: the template wraps

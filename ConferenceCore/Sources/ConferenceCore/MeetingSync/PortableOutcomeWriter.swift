@@ -469,11 +469,19 @@ public enum OpenAIChatResponseExtractor {
             return text
         }
         if let parts = message["content"] as? [[String: Any]] {
-            return parts.compactMap { part -> String? in
+            var pieces: [String] = []
+            var seenTrimmed: Set<String> = []
+            for part in parts {
                 let type = part["type"] as? String ?? "text"
-                guard type == "text" || type == "output_text" else { return nil }
-                return part["text"] as? String
-            }.joined()
+                guard type == "text" || type == "output_text",
+                      let text = part["text"] as? String else { continue }
+                let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty && !seenTrimmed.insert(trimmed).inserted {
+                    continue
+                }
+                pieces.append(text)
+            }
+            return pieces.joined()
         }
         return ""
     }

@@ -2845,6 +2845,58 @@ import XCTest
         XCTAssertEqual(facilitator.activeSessionSkills[retroMeeting.sessionID], "task-manager")
     }
 
+    func testPerMeetingAutoGenerateSummaryOverrideRunsCaptureAndRetryWhenGlobalIsOff() async throws {
+        let testStore = store()
+        testStore.provider = .init(kind: .local, baseURL: "http://127.0.0.1:1/v1", model: "m")
+        testStore.generateOutcomes = false
+
+        let (overridden, _) = try await meeting("outcome-override")
+        overridden.calendarSeriesID = "series-override"
+        testStore.save(MeetingPreset(
+            title: "Override",
+            bindings: [.calendarSeries("series-override")],
+            autoExportOverrides: MeetingAutoExportOverrides(autoGenerateSummary: true)
+        ))
+        overridden.receiveLocalLineForTesting(.init(
+            id: "override-line",
+            trackID: "a",
+            text: "Anna will update DNS.",
+            start: Date(),
+            end: Date()
+        ))
+
+        let (untouched, _) = try await meeting("outcome-untouched")
+        untouched.receiveLocalLineForTesting(.init(
+            id: "untouched-line",
+            trackID: "a",
+            text: "No summary should run here.",
+            start: Date(),
+            end: Date()
+        ))
+
+        let failingWriter = FakeOutcomeWriter(failure: .timeout)
+        let coordinator = AttentionCoordinator(store: testStore)
+        coordinator.makeOutcomeWriter = { _, _ in failingWriter }
+
+        XCTAssertFalse(coordinator.captureOutcome(for: untouched))
+        XCTAssertTrue(coordinator.captureOutcome(for: overridden))
+        try await spin { coordinator.outcomeStatus[overridden.sessionID] == nil }
+        XCTAssertEqual(failingWriter.calls, 1)
+
+        let failed = try XCTUnwrap(testStore.meetingLibrary.cards.first { $0.sessionID == overridden.sessionID })
+        XCTAssertEqual(failed.outcomeState, .failed)
+        XCTAssertEqual(failed.outcomeErrorCode, "timeout")
+        let outcomeID = try XCTUnwrap(failed.outcomeID)
+
+        let writer = FakeOutcomeWriter()
+        coordinator.makeOutcomeWriter = { _, _ in writer }
+        coordinator.retryOutcome(for: overridden.sessionID, outcomeID: outcomeID)
+        try await spin { coordinator.outcomeStatus[overridden.sessionID] == nil }
+        XCTAssertEqual(writer.calls, 1)
+        let saved = try await testStore.meetingLibrary.store.outcome(outcomeID)
+        XCTAssertEqual(saved?.summary, "DNS migration reviewed.")
+    }
+
     private func spin(_ predicate: () -> Bool) async throws {
         for _ in 0..<200 where !predicate() { try await Task.sleep(for: .milliseconds(10)) }
         XCTAssertTrue(predicate())

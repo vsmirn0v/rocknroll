@@ -1365,4 +1365,43 @@ final class AssistantAgentTests: XCTestCase {
         XCTAssertTrue(resolvedResult.json["jql"]?.stringValue?.contains(#"assignee = "v.smirnov""#) == true)
         XCTAssertEqual(resolvedResult.json["issues"]?.arrayValue?.first?["key"]?.stringValue, "SDBCTO-77")
     }
+
+    func testResolvedJiraJQLSupportsSingleAndMultipleProjectKeys() {
+        let single = AssistantSkillToolRegistrar.resolvedJiraJQL(
+            rawJQL: nil,
+            query: "поддержке",
+            teamProjectKey: "FALLBACK",
+            jiraProjectKey: "CFG",
+            projectKeys: ["SDBPROD"]
+        )
+        XCTAssertEqual(single, "project = SDBPROD AND text ~ \"поддержке\" ORDER BY updated DESC")
+
+        let multi = AssistantSkillToolRegistrar.resolvedJiraJQL(
+            rawJQL: nil,
+            query: "поддержке 1",
+            teamProjectKey: "FALLBACK",
+            jiraProjectKey: "CFG",
+            projectKeys: ["sdbprod", "SPS", "sdbprod"]
+        )
+        XCTAssertEqual(multi, "project in (\"SDBPROD\", \"SPS\") AND text ~ \"поддержке 1\" ORDER BY updated DESC")
+    }
+
+    func testAutonomousFacilitatorExtractPersonFilterQueryHandlesTruncatedQuickFilterAndConjunctions() {
+        let lower1 = "там у тебя на рабочем столе квикфильт виталий"
+        XCTAssertEqual(
+            AutonomousMeetingFacilitator.extractPersonFilterQuery(
+                from: "Там у тебя на рабочем столе квикфильт Виталий",
+                lower: lower1
+            ),
+            "Виталий"
+        )
+        let lower2 = "на доске фильтр по имени виталий и ты увидишь задачу"
+        XCTAssertEqual(
+            AutonomousMeetingFacilitator.extractPersonFilterQuery(
+                from: "На доске фильтр по имени Виталий и ты увидишь задачу",
+                lower: lower2
+            ),
+            "Виталий"
+        )
+    }
 }

@@ -115,10 +115,16 @@ final class AutonomousMeetingFacilitator: ObservableObject {
         }
     }
 
+    var wakeCoalesceDelay: Duration = .milliseconds(350)
+    var followUpCoalesceDelay: Duration = .milliseconds(900)
+
+    private static let followUpWindowSeconds: TimeInterval = 90
+
     private weak var attention: AttentionCoordinator?
     private var processedLineIDsBySession: [UUID: Set<String>] = [:]
     private var processedLineOrderBySession: [UUID: [String]] = [:]
     private var pendingTranscriptObservationSessions: Set<UUID> = []
+    private var coalesceTasksBySession: [UUID: Task<Void, Never>] = [:]
     private var busySessions: Set<UUID> = []
     private var manuallyDisabledSessions: Set<UUID> = []
     private var lastSpokeAtBySession: [UUID: Date] = [:]
@@ -170,6 +176,10 @@ final class AutonomousMeetingFacilitator: ObservableObject {
         manuallyDisabledSessions.remove(model.sessionID)
         var chosen = resolveSkillID(explicitSkillID: skillID, meetingTitle: model.title)
         activeSessionSkills[model.sessionID] = chosen
+        model.isFacilitatorActive = { [weak self, sessionID = model.sessionID] in
+            self?.activeSessionSkills[sessionID] != nil
+        }
+        model.participation.cancelPendingDispatch()
         probeLog("assistant-facilitator-enable", [
             "skill": chosen,
             "trigger": trigger
@@ -178,6 +188,7 @@ final class AutonomousMeetingFacilitator: ObservableObject {
         let initialIDs = model.transcript.map(\.id)
         processedLineIDsBySession[model.sessionID] = Set(initialIDs)
         processedLineOrderBySession[model.sessionID] = initialIDs
+        coalesceTasksBySession.removeValue(forKey: model.sessionID)?.cancel()
         model.onTranscriptChanged = { [weak self, weak model] in
             guard let self, let model else { return }
             self.observeTranscriptChanged(for: model)
@@ -206,6 +217,7 @@ final class AutonomousMeetingFacilitator: ObservableObject {
         if let removedSkill {
             probeLog("assistant-facilitator-disable", ["skill": removedSkill])
         }
+        coalesceTasksBySession.removeValue(forKey: sessionID)?.cancel()
         processedLineIDsBySession.removeValue(forKey: sessionID)
         processedLineOrderBySession.removeValue(forKey: sessionID)
         pendingTranscriptObservationSessions.remove(sessionID)
@@ -215,6 +227,7 @@ final class AutonomousMeetingFacilitator: ObservableObject {
         if let model = attention?.meetings().first(where: { $0.sessionID == sessionID }) {
             model.onRealtimeAudioPCM16 = nil
             model.onTranscriptChanged = nil
+            model.isFacilitatorActive = nil
         }
         if let state = realtimeSessions.removeValue(forKey: sessionID) {
             state.turnTimeoutTask?.cancel()
@@ -229,7 +242,8 @@ final class AutonomousMeetingFacilitator: ObservableObject {
 
     /// Proactively introduces the bound skill into the meeting (e.g. starting a Daily Standup).
     func kickOffSkill(for model: NativeDesktopMeetingModel, skillID: String? = nil) async {
-        guard let attention, !model.isClosed else { return }
+        guard let attention, !model.isClosed, !busySessions.contains(model.sessionID) else { return }
+        busySessions.insert(model.sessionID)
         let activeID = skillID ?? activeSessionSkills[model.sessionID] ?? "scrum-master"
         await refreshSkillsCache()
         let skill = cachedSkills.first(where: { $0.id == activeID })
@@ -297,14 +311,11 @@ final class AutonomousMeetingFacilitator: ObservableObject {
         }
     }
 
-    private func evaluateTranscriptLines(for model: NativeDesktopMeetingModel, skillID: String, now: Date) {
-        guard !busySessions.contains(model.sessionID) else { return }
-        var seen = processedLineIDsBySession[model.sessionID] ?? []
-        var order = processedLineOrderBySession[model.sessionID] ?? []
-        let unseen = model.transcript.suffix(80).filter { !seen.contains($0.id) }
-        guard !unseen.isEmpty else { return }
-        for line in unseen {
-            seen.insert(line.id)
+    private func markLinesSeen(_ lines: [GuestMeetingMessage], for sessionID: UUID) {
+        guard !lines.isEmpty else { return }
+        var seen = processedLineIDsBySession[sessionID] ?? []
+        var order = processedLineOrderBySession[sessionID] ?? []
+        for line in lines where seen.insert(line.id).inserted {
             order.append(line.id)
         }
         if order.count > 2_000 {
@@ -314,16 +325,29 @@ final class AutonomousMeetingFacilitator: ObservableObject {
             }
             order.removeFirst(overflow)
         }
-        processedLineIDsBySession[model.sessionID] = seen
-        processedLineOrderBySession[model.sessionID] = order
+        processedLineIDsBySession[sessionID] = seen
+        processedLineOrderBySession[sessionID] = order
+    }
 
-        let inFollowUpWindow = lastSpokeAtBySession[model.sessionID].map { now.timeIntervalSince($0) <= 20 } ?? false
-        let inEchoWindow = lastVoiceDeliveryEndedAtBySession[model.sessionID].map { now.timeIntervalSince($0) <= 6 } ?? false
+    private func evaluateTranscriptLines(for model: NativeDesktopMeetingModel, skillID: String, now: Date) {
+        guard !busySessions.contains(model.sessionID) else { return }
+        let seen = processedLineIDsBySession[model.sessionID] ?? []
+        let unseen = model.transcript.suffix(80).filter {
+            !seen.contains($0.id) && !$0.text.trimmed.isEmpty
+        }
+        guard !unseen.isEmpty else { return }
+
+        let inFollowUpWindow = lastSpokeAtBySession[model.sessionID].map {
+            now.timeIntervalSince($0) <= Self.followUpWindowSeconds
+        } ?? false
+        let inEchoWindow = lastVoiceDeliveryEndedAtBySession[model.sessionID].map {
+            now.timeIntervalSince($0) <= 6
+        } ?? false
         let lastSpoken = lastSpokenAnswerBySession[model.sessionID]?.trimmed ?? ""
 
-        var matchedLine = unseen.first { _ in false }
-        var matchedCommand = ""
-        for line in unseen.reversed() {
+        var hasWake = false
+        var hasFollowUp = false
+        for line in unseen {
             if line.id.hasPrefix("assistant:") || AssistantSpeechLedger.isAssistantSpeaker(line.participantName, role: nil) {
                 continue
             }
@@ -332,33 +356,102 @@ final class AutonomousMeetingFacilitator: ObservableObject {
             if Self.isLikelySelfEcho(candidate: text, lastSpoken: lastSpoken, isLocal: line.isOwn, withinEchoWindow: inEchoWindow) {
                 continue
             }
-            if case .command(let cmd) = AssistantWakePhraseMatcher.match(text),
-               !cmd.trimmed.isEmpty {
-                matchedLine = line
-                matchedCommand = cmd.trimmed
-                break
-            }
-            // Within a 20s active follow-up window, accept direct follow-up utterances from approved/local speakers.
-            if inFollowUpWindow && text.count >= 4 {
-                matchedLine = line
-                matchedCommand = text
-                break
+            switch AssistantWakePhraseMatcher.match(text) {
+            case .command(let cmd) where !cmd.trimmed.isEmpty:
+                hasWake = true
+            case .wakeOnly:
+                hasWake = true
+            default:
+                if inFollowUpWindow && text.count >= 3 {
+                    hasFollowUp = true
+                }
             }
         }
-        guard let triggerLine = matchedLine, !matchedCommand.isEmpty else { return }
 
-        busySessions.insert(model.sessionID)
-        let commandText = matchedCommand
-        Task { @MainActor [weak self, weak model] in
-            guard let self, let model else { return }
-            await self.handleVoiceTurn(
-                model: model,
-                skillID: skillID,
-                speakerName: triggerLine.participantName,
-                isLocalSpeaker: triggerLine.isOwn,
-                commandText: commandText
-            )
+        if !hasWake && !hasFollowUp {
+            markLinesSeen(unseen, for: model.sessionID)
+            return
         }
+
+        let sid = model.sessionID
+        coalesceTasksBySession.removeValue(forKey: sid)?.cancel()
+        let delay = hasWake ? wakeCoalesceDelay : followUpCoalesceDelay
+        coalesceTasksBySession[sid] = Task { @MainActor [weak self, weak model] in
+            if delay > .zero {
+                try? await Task.sleep(for: delay)
+            }
+            guard !Task.isCancelled, let self, let model else { return }
+            self.coalesceTasksBySession.removeValue(forKey: sid)
+            await self.flushCoalescedTranscriptTurn(for: model, skillID: skillID)
+        }
+    }
+
+    private func flushCoalescedTranscriptTurn(for model: NativeDesktopMeetingModel, skillID: String) async {
+        let sid = model.sessionID
+        guard !busySessions.contains(sid),
+              activeSessionSkills[sid] == skillID,
+              !model.isClosed, model.connected else { return }
+
+        let seen = processedLineIDsBySession[sid] ?? []
+        let unseen = model.transcript.suffix(80).filter {
+            !seen.contains($0.id) && !$0.text.trimmed.isEmpty
+        }
+        guard !unseen.isEmpty else { return }
+        markLinesSeen(unseen, for: sid)
+
+        let now = Date()
+        let inFollowUpWindow = lastSpokeAtBySession[sid].map {
+            now.timeIntervalSince($0) <= Self.followUpWindowSeconds
+        } ?? false
+        let inEchoWindow = lastVoiceDeliveryEndedAtBySession[sid].map {
+            now.timeIntervalSince($0) <= 6
+        } ?? false
+        let lastSpoken = lastSpokenAnswerBySession[sid]?.trimmed ?? ""
+
+        var sawWake = false
+        var fragments: [String] = []
+        var triggerLine: GuestMeetingMessage?
+        for line in unseen {
+            if line.id.hasPrefix("assistant:") || AssistantSpeechLedger.isAssistantSpeaker(line.participantName, role: nil) {
+                continue
+            }
+            let text = line.text.trimmed
+            guard !text.isEmpty else { continue }
+            if Self.isLikelySelfEcho(candidate: text, lastSpoken: lastSpoken, isLocal: line.isOwn, withinEchoWindow: inEchoWindow) {
+                continue
+            }
+            switch AssistantWakePhraseMatcher.match(text) {
+            case .command(let cmd) where !cmd.trimmed.isEmpty:
+                sawWake = true
+                triggerLine = line
+                fragments.append(cmd.trimmed)
+            case .wakeOnly:
+                sawWake = true
+                triggerLine = line
+                fragments.append(text)
+            default:
+                if (inFollowUpWindow || sawWake) && text.count >= 3 {
+                    triggerLine = line
+                    fragments.append(text)
+                }
+            }
+        }
+        guard let trigger = triggerLine else { return }
+        var deduped: [String] = []
+        for fragment in fragments where !deduped.contains(fragment) {
+            deduped.append(fragment)
+        }
+        let commandText = deduped.joined(separator: "\n")
+        guard !commandText.isEmpty else { return }
+
+        busySessions.insert(sid)
+        await handleVoiceTurn(
+            model: model,
+            skillID: skillID,
+            speakerName: trigger.participantName,
+            isLocalSpeaker: trigger.isOwn,
+            commandText: commandText
+        )
     }
 
     // MARK: - Turn Execution
@@ -383,13 +476,49 @@ final class AutonomousMeetingFacilitator: ObservableObject {
         let allowedGroups: Set<AssistantSkillToolGroup>? = skill.map { Set($0.tools) }
 
         // If this was a non-wake follow-up from an unapproved speaker, ignore quietly rather than interrupting.
-        if !approved, case .none = AssistantWakePhraseMatcher.match(commandText) {
-            if let lastSpoke = lastSpokeAtBySession[model.sessionID], Date().timeIntervalSince(lastSpoke) <= 20, !isLocalSpeaker {
+        let hasWakeInBatch = commandText
+            .components(separatedBy: .newlines)
+            .contains { AssistantWakePhraseMatcher.match($0) != .none }
+        if !approved, !hasWakeInBatch {
+            if let lastSpoke = lastSpokeAtBySession[model.sessionID],
+               Date().timeIntervalSince(lastSpoke) <= Self.followUpWindowSeconds,
+               !isLocalSpeaker {
                 // Only proceed without wake phrase in follow-up window if speaker is approved (or skill allows everyone).
                 if skill?.approvedSpeakersOnly != false {
                     busySessions.remove(model.sessionID)
+                    if activeSessionSkills[model.sessionID] != nil {
+                        observeTranscriptChanged(for: model)
+                    }
                     return
                 }
+            }
+        }
+
+        // Direct deterministic board controls (share, stop share, quick/person filter, clear filters, open URL)
+        if allowWrites, (allowedGroups == nil || allowedGroups?.contains(.boardShare) == true) {
+            let jiraConfig = await attention.resolvedJiraBoardConfig(for: model)
+            let team = await attention.loadTeamContext()
+            let defaultBoardURL = jiraConfig.boardURL?.absoluteString ?? team.defaultJiraBoardURL
+            if let boardReply = await Self.handleDeterministicBoardCommand(
+                commandText,
+                board: attention.boardController,
+                defaultBoardURL: defaultBoardURL,
+                model: model,
+                people: directory
+            ) {
+                probeLog("assistant-facilitator-turn", [
+                    "skill": skillID,
+                    "route": "deterministic-board",
+                    "allowWrites": allowWrites
+                ])
+                busySessions.remove(model.sessionID)
+                if !boardReply.isEmpty {
+                    await speakIntoMeeting(boardReply, model: model)
+                }
+                if activeSessionSkills[model.sessionID] != nil {
+                    observeTranscriptChanged(for: model)
+                }
+                return
             }
         }
 
@@ -406,6 +535,9 @@ final class AutonomousMeetingFacilitator: ObservableObject {
                 || rtState.gate.recentlyForwardedAudio(within: 3.0) {
                 if !rtState.responseInProgress {
                     busySessions.remove(model.sessionID)
+                    if activeSessionSkills[model.sessionID] != nil {
+                        observeTranscriptChanged(for: model)
+                    }
                 }
                 return
             }
@@ -423,16 +555,25 @@ final class AutonomousMeetingFacilitator: ObservableObject {
                     try? await Task.sleep(for: .seconds(25))
                     guard let self, let rtState, !Task.isCancelled else { return }
                     self.busySessions.remove(sid)
-                    if !rtState.transcriptBuffer.trimmed.isEmpty {
-                        await self.speakIntoMeeting(rtState.transcriptBuffer.trimmed, model: model)
-                        rtState.transcriptBuffer = ""
+                    let buffered = AssistantSpeechLedger.sanitizeSpokenReply(rtState.transcriptBuffer)
+                    rtState.transcriptBuffer = ""
+                    if !buffered.isEmpty {
+                        await self.speakIntoMeeting(buffered, model: model)
+                    }
+                    if self.activeSessionSkills[sid] != nil {
+                        self.observeTranscriptChanged(for: model)
                     }
                 }
                 return
             }
         }
 
-        defer { busySessions.remove(model.sessionID) }
+        defer {
+            busySessions.remove(model.sessionID)
+            if activeSessionSkills[model.sessionID] != nil {
+                observeTranscriptChanged(for: model)
+            }
+        }
 
         // Standard pipeline fallback (works with local models, cloud chat completions, and Vox/macOS TTS)
         let talk = attention.talk
@@ -463,6 +604,7 @@ final class AutonomousMeetingFacilitator: ObservableObject {
             attention: attention,
             explicitSkillIDs: [skillID],
             meetingTitle: model.title,
+            meetingID: model.sessionID,
             commandText: commandText,
             speakerName: speakerName,
             isApprovedSpeaker: allowWrites
@@ -559,6 +701,7 @@ final class AutonomousMeetingFacilitator: ObservableObject {
             attention: attention,
             explicitSkillIDs: [skillID],
             meetingTitle: model.title,
+            meetingID: model.sessionID,
             commandText: "",
             speakerName: nil,
             isApprovedSpeaker: true
@@ -720,13 +863,16 @@ final class AutonomousMeetingFacilitator: ObservableObject {
             }
             let combined = Self.combinePCMChunks(state.audioChunks)
             state.audioChunks.removeAll()
-            let text = state.transcriptBuffer.trimmed
+            let text = AssistantSpeechLedger.sanitizeSpokenReply(state.transcriptBuffer)
             state.transcriptBuffer = ""
             if let model, !model.isClosed {
                 if let buffer = Self.pcm16ToAudioBuffer(data: combined, sampleRate: state.outputSampleRate) {
                     await deliverSpokenBuffer(buffer, fallbackText: text, model: model)
                 } else if !text.isEmpty {
                     await speakIntoMeeting(text, model: model)
+                }
+                if activeSessionSkills[model.sessionID] != nil {
+                    observeTranscriptChanged(for: model)
                 }
             }
         case .error(let msg):
@@ -738,6 +884,9 @@ final class AutonomousMeetingFacilitator: ObservableObject {
                 busySessions.remove(sessionID)
                 if !stillConnected {
                     lastStatusBySession[sessionID] = L("Realtime fallback active (%@)", msg)
+                }
+                if let model, activeSessionSkills[sessionID] != nil {
+                    observeTranscriptChanged(for: model)
                 }
             }
             if !stillConnected {
@@ -754,6 +903,9 @@ final class AutonomousMeetingFacilitator: ObservableObject {
             state.turnTimeoutTask = nil
             if let sessionID = model?.sessionID {
                 busySessions.remove(sessionID)
+                if let model, activeSessionSkills[sessionID] != nil {
+                    observeTranscriptChanged(for: model)
+                }
             }
             state.connected = false
             probeLog("assistant-facilitator-realtime", [
@@ -768,11 +920,14 @@ final class AutonomousMeetingFacilitator: ObservableObject {
 
     func speakIntoMeeting(_ text: String, model: NativeDesktopMeetingModel) async {
         guard let attention, !model.isClosed else { return }
+        let clean = AssistantSpeechLedger.sanitizeSpokenReply(text)
+        guard !clean.isEmpty else { return }
         lastSpokeAtBySession[model.sessionID] = Date()
-        lastSpokenAnswerBySession[model.sessionID] = text
+        lastSpokenAnswerBySession[model.sessionID] = clean
         realtimeSessions[model.sessionID]?.gate.markVoiceDeliveryStarted()
         defer {
             let endedAt = Date()
+            lastSpokeAtBySession[model.sessionID] = endedAt
             lastVoiceDeliveryEndedAtBySession[model.sessionID] = endedAt
             realtimeSessions[model.sessionID]?.gate.markVoiceDeliveryEnded(at: endedAt)
         }
@@ -783,12 +938,12 @@ final class AutonomousMeetingFacilitator: ObservableObject {
                 }
                 let request = UUID()
                 let pre = try await AttentionCoordinator.preparePrepulledStream(
-                    from: attention.streamSynthesize(text, cloneRequest: request),
+                    from: attention.streamSynthesize(clean, cloneRequest: request),
                     cloneRequest: request
                 )
                 let utteranceID = UUID().uuidString
                 let startedAt = Date()
-                model.recordAssistantSpokenUtterance(id: utteranceID, text: text, startedAt: startedAt, endedAt: nil)
+                model.recordAssistantSpokenUtterance(id: utteranceID, text: clean, startedAt: startedAt, endedAt: nil)
                 do {
                     try await attention.deliverVoiceStream(model, pre.replayStream)
                     model.assistantSpeechLedger.endUtterance(id: utteranceID, endedAt: Date())
@@ -800,12 +955,16 @@ final class AutonomousMeetingFacilitator: ObservableObject {
                     // Fall through to local audition playback if WebRTC send fails before playing.
                 }
             } else if !model.supportsVoiceReply || !model.snapshot.playoutOn {
-                await playLocalAuditionAndWait(text, attention: attention)
+                let utteranceID = UUID().uuidString
+                let startedAt = Date()
+                model.recordAssistantSpokenUtterance(id: utteranceID, text: clean, startedAt: startedAt, endedAt: nil)
+                await playLocalAuditionAndWait(clean, attention: attention)
+                model.assistantSpeechLedger.endUtterance(id: utteranceID, endedAt: Date())
                 lastStatusBySession[model.sessionID] = L("Auditioned locally (meeting audio off).")
                 return
             }
-            let buffer = try await attention.store.voiceConfiguration.synthesize(text)
-            await deliverSpokenBuffer(buffer, fallbackText: text, model: model)
+            let buffer = try await attention.store.voiceConfiguration.synthesize(clean)
+            await deliverSpokenBuffer(buffer, fallbackText: clean, model: model)
         } catch {
             lastStatusBySession[model.sessionID] = error.localizedDescription
         }
@@ -862,13 +1021,15 @@ final class AutonomousMeetingFacilitator: ObservableObject {
 
     private func deliverSpokenBuffer(_ buffer: AVAudioPCMBuffer, fallbackText: String, model: NativeDesktopMeetingModel) async {
         guard let attention, !model.isClosed else { return }
+        let cleanFallback = AssistantSpeechLedger.sanitizeSpokenReply(fallbackText)
         lastSpokeAtBySession[model.sessionID] = Date()
-        if !fallbackText.isEmpty {
-            lastSpokenAnswerBySession[model.sessionID] = fallbackText
+        if !cleanFallback.isEmpty {
+            lastSpokenAnswerBySession[model.sessionID] = cleanFallback
         }
         realtimeSessions[model.sessionID]?.gate.markVoiceDeliveryStarted()
         defer {
             let endedAt = Date()
+            lastSpokeAtBySession[model.sessionID] = endedAt
             lastVoiceDeliveryEndedAtBySession[model.sessionID] = endedAt
             realtimeSessions[model.sessionID]?.gate.markVoiceDeliveryEnded(at: endedAt)
         }
@@ -878,8 +1039,8 @@ final class AutonomousMeetingFacilitator: ObservableObject {
             }
             let utteranceID = UUID().uuidString
             let startedAt = Date()
-            if !fallbackText.isEmpty {
-                model.recordAssistantSpokenUtterance(id: utteranceID, text: fallbackText, startedAt: startedAt, endedAt: nil)
+            if !cleanFallback.isEmpty {
+                model.recordAssistantSpokenUtterance(id: utteranceID, text: cleanFallback, startedAt: startedAt, endedAt: nil)
             }
             do {
                 try await attention.deliverVoice(model, buffer)
@@ -891,8 +1052,8 @@ final class AutonomousMeetingFacilitator: ObservableObject {
                 // Fall through to local preview playback if WebRTC send fails.
             }
         }
-        if (try? VoicePreviewPlayer.shared.play(buffer)) == nil, !fallbackText.isEmpty {
-            await playLocalAuditionAndWait(fallbackText, attention: attention)
+        if (try? VoicePreviewPlayer.shared.play(buffer)) == nil, !cleanFallback.isEmpty {
+            await playLocalAuditionAndWait(cleanFallback, attention: attention)
         }
         lastStatusBySession[model.sessionID] = L("Auditioned locally (meeting audio off).")
     }
@@ -941,5 +1102,109 @@ final class AutonomousMeetingFacilitator: ObservableObject {
             isLocal: isLocal,
             withinEchoWindow: withinEchoWindow
         )
+    }
+
+    static func handleDeterministicBoardCommand(
+        _ input: String,
+        board: AssistantBoardWindowController?,
+        defaultBoardURL: String,
+        model: NativeDesktopMeetingModel,
+        people: AssistantPeopleDirectory = AssistantPeopleDirectory()
+    ) async -> String? {
+        guard let board else { return nil }
+        let lower = input.lowercased().replacingOccurrences(of: "ё", with: "е")
+        let hasBoardKeyword = lower.contains("доск") || lower.contains("board") || lower.contains("jira")
+        let hasFilterKeyword = lower.contains("квикфильт") || lower.contains("quick filter")
+            || lower.contains("фильтр по имени") || lower.contains("фильтр ")
+        guard hasBoardKeyword || hasFilterKeyword else {
+            return nil
+        }
+
+        let hasJiraTaskAction = lower.contains("задач") || lower.contains("таск")
+            || lower.contains("описан") || lower.contains("issue") || lower.contains("ticket")
+
+        let asksClearFilter = (lower.contains("сброс") || lower.contains("очист") || lower.contains("убер")
+            || lower.contains("удал") || lower.contains("сним") || lower.contains("clear") || lower.contains("reset"))
+            && (lower.contains("фильтр") || lower.contains("квикфильт") || lower.contains("filter"))
+        if asksClearFilter && !hasJiraTaskAction {
+            do {
+                return try await board.clearFilters()
+            } catch {
+                return error.localizedDescription
+            }
+        }
+
+        if let filterQuery = extractPersonFilterQuery(from: input, lower: lower), !hasJiraTaskAction {
+            let trimmedDefault = defaultBoardURL.trimmingCharacters(in: .whitespacesAndNewlines)
+            if board.currentURL == nil && !trimmedDefault.isEmpty {
+                _ = try? await board.open(urlString: trimmedDefault)
+            }
+            do {
+                return try await board.selectPersonFilter(query: filterQuery, people: people)
+            } catch {
+                return error.localizedDescription
+            }
+        }
+
+        let asksStop = lower.contains("останов") || lower.contains("прекрат") || lower.contains("выключ")
+            || lower.contains("stop shar") || lower.contains("unshare")
+        if asksStop && hasBoardKeyword {
+            board.stopSharing()
+            return L("Stopped sharing the Assistant Board.")
+        }
+
+        let asksShare = lower.contains("расшар") || lower.contains("пошар") || lower.contains("демонстр")
+            || lower.contains("поделис") || lower.contains("share") || lower.contains("present")
+        if asksShare && hasBoardKeyword {
+            let trimmedDefault = defaultBoardURL.trimmingCharacters(in: .whitespacesAndNewlines)
+            if board.currentURL == nil && !trimmedDefault.isEmpty {
+                _ = try? await board.open(urlString: trimmedDefault)
+            }
+            do {
+                return try await board.startSharing(to: model)
+            } catch {
+                return error.localizedDescription
+            }
+        }
+
+        let asksOpen = lower.contains("открой") || lower.contains("покажи") || lower.contains("open") || lower.contains("show")
+        if asksOpen && hasBoardKeyword && !hasJiraTaskAction {
+            let trimmedDefault = defaultBoardURL.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmedDefault.isEmpty, let msg = try? await board.open(urlString: trimmedDefault) {
+                return msg
+            }
+        }
+        return nil
+    }
+
+    nonisolated static func extractPersonFilterQuery(from input: String, lower: String) -> String? {
+        let markers = [
+            "фильтр по имени ", "квикфильтр по имени ", "квикфильт по имени ",
+            "квикфильтр на ", "квикфильт на ", "квикфильтр ", "квикфильт ",
+            "quick filter by name ", "quick filter by ", "quick filter ",
+            "filter by name ", "filter by ", "отфильтруй по ", "фильтр на "
+        ]
+        for marker in markers {
+            if let range = lower.range(of: marker) {
+                let offset = lower.distance(from: lower.startIndex, to: range.upperBound)
+                guard offset < input.count else { continue }
+                let idx = input.index(input.startIndex, offsetBy: offset)
+                var tail = String(input[idx...])
+                    .components(separatedBy: CharacterSet(charactersIn: ".,;!?\n"))
+                    .first?
+                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                for conjunction in [" и ", " and ", " пожалуйста", " please"] {
+                    let lowerTail = tail.lowercased().replacingOccurrences(of: "ё", with: "е")
+                    if let cRange = lowerTail.range(of: conjunction) {
+                        let cOffset = lowerTail.distance(from: lowerTail.startIndex, to: cRange.lowerBound)
+                        tail = String(tail.prefix(cOffset)).trimmingCharacters(in: .whitespacesAndNewlines)
+                    }
+                }
+                if !tail.isEmpty {
+                    return tail
+                }
+            }
+        }
+        return nil
     }
 }

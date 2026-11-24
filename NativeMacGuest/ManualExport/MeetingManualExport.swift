@@ -8,6 +8,7 @@ struct MeetingManualExportItem: Identifiable, Sendable {
     var outcome: MeetingOutcome?
     var outcomeState: MeetingOutcomePersistenceState
     var isUnsavedDraft: Bool
+    var transcriptBody: String? = nil
 
     var effectiveDate: Date? {
         session.effectiveDate?.date
@@ -163,10 +164,18 @@ enum MeetingManualExport {
     }
 
     private static func renderBody(_ item: MeetingManualExportItem, sections: MeetingMarkdownSections, heading: Int) -> String {
-        let body = MeetingMarkdownTemplate.managedContent(session: item.session, note: item.note, outcome: item.outcome,
+        var body = MeetingMarkdownTemplate.managedContent(session: item.session, note: item.note, outcome: item.outcome,
             outcomeState: item.outcomeState, sections: sections, headingLevel: heading)
-        guard item.isUnsavedDraft, sections.contains(.notes) else { return body }
-        return body + "\n\n> " + L("Unsaved draft: the local note had not finished saving when this file was written.")
+        if item.isUnsavedDraft, sections.contains(.notes) {
+            body += "\n\n> " + L("Unsaved draft: the local note had not finished saving when this file was written.")
+        }
+        if sections.contains(.transcript),
+           let transcriptBody = item.transcriptBody,
+           !transcriptBody.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let transcriptHeading = String(repeating: "#", count: heading + 1) + " " + L("Transcript")
+            body += "\n\n" + transcriptHeading + "\n\n" + transcriptBody
+        }
+        return body
     }
 
     private static func orderedBefore(_ left: Date?, _ right: Date?, newestFirst: Bool) -> Bool {

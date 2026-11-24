@@ -26,9 +26,11 @@ final class AssistantBoardWindowController: NSObject, ObservableObject, WKNaviga
     @Published private(set) var isWindowVisible = false
     @Published private(set) var sharingMeetingID: UUID?
     @Published private(set) var sharingMeetingTitle: String?
+    @Published private(set) var isRecoveringShare = false
     @Published private(set) var lastActionSummary: String?
     @Published private(set) var loadError: String?
     weak var taskSync: WorkspaceTaskSyncController?
+    var defaultBoardURLProvider: (() async -> String)?
     var onBoardURLChanged: ((String) -> Void)?
 
     private var window: NSWindow?
@@ -37,12 +39,15 @@ final class AssistantBoardWindowController: NSObject, ObservableObject, WKNaviga
     private var backButton: NSButton?
     private var forwardButton: NSButton?
     private var reloadButton: NSButton?
+    private var jiraButton: NSButton?
     private var loadingIndicator: NSProgressIndicator?
     private var shareBannerLabel: NSTextField?
     private var stopShareButton: NSButton?
     private var frameTask: Task<Void, Never>?
+    private var recoveryTask: Task<Void, Never>?
     private var navigationContinuation: CheckedContinuation<Void, Never>?
     private weak var sharedMeetingModel: NativeDesktopMeetingModel?
+    private weak var desiredShareModel: NativeDesktopMeetingModel?
     private var lastDirtyUptime: TimeInterval = 0
     private var lastCaptureUptime: TimeInterval = 0
     private static let shareRenderQueue = DispatchQueue(label: "RockNRoll.board-share-render", qos: .userInitiated)
@@ -74,6 +79,19 @@ final class AssistantBoardWindowController: NSObject, ObservableObject, WKNaviga
         ensureWindow()
         window?.makeKeyAndOrderFront(nil)
         isWindowVisible = true
+        if currentURL == nil, (urlField?.stringValue.trimmed.isEmpty ?? true), let provider = defaultBoardURLProvider {
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let seed = (await provider()).trimmed
+                guard !seed.isEmpty else { return }
+                if self.urlField?.stringValue.trimmed.isEmpty == true {
+                    self.urlField?.stringValue = seed
+                }
+                if self.currentURL == nil && !self.isLoading {
+                    _ = try? await self.open(urlString: seed)
+                }
+            }
+        }
     }
 
     func closeWindow() {
@@ -125,14 +143,40 @@ final class AssistantBoardWindowController: NSObject, ObservableObject, WKNaviga
     }
 
     func startSharing(to model: NativeDesktopMeetingModel) async throws -> String {
-        guard !model.isClosed, model.connected else {
+        guard !model.isClosed else {
             throw NativeDesktopError.unavailable(L("Connect to the meeting before sharing the board."))
         }
         showWindow()
+        desiredShareModel = model
+        if currentURL == nil {
+            let fieldSeed = urlField?.stringValue.trimmed ?? ""
+            let resolvedSeed: String
+            if !fieldSeed.isEmpty {
+                resolvedSeed = fieldSeed
+            } else if let provider = defaultBoardURLProvider {
+                resolvedSeed = (await provider()).trimmed
+            } else {
+                resolvedSeed = ""
+            }
+            if !resolvedSeed.isEmpty {
+                if urlField?.stringValue.trimmed.isEmpty == true {
+                    urlField?.stringValue = resolvedSeed
+                }
+                _ = try? await open(urlString: resolvedSeed)
+            }
+        }
+        if !model.connected {
+            scheduleShareRecovery(for: model, reason: "waitingForReconnect")
+            return L("Waiting for connection recovery to share Assistant Board to “%@”.", model.title)
+        }
+        recoveryTask?.cancel()
+        recoveryTask = nil
+        isRecoveringShare = false
         if let activeModel = sharedMeetingModel, activeModel.sessionID != model.sessionID {
             activeModel.onExternalShareStopped = nil
+            activeModel.onShareInterrupted = nil
             await activeModel.stopSharing()
-            stopSharing(notifyModel: false)
+            teardownActiveShare(clearDesiredIntent: false, notifyModel: false)
         }
         probeLog("board-share-start", [
             "hasLoadedBoard": currentURL != nil,
@@ -140,6 +184,9 @@ final class AssistantBoardWindowController: NSObject, ObservableObject, WKNaviga
         ])
         guard model.startBoardSharing() else {
             probeLog("board-share-error", ["reason": "share-already-active-or-not-ready"])
+            if !model.isClosed {
+                scheduleShareRecovery(for: model, reason: "startNotReady")
+            }
             throw NativeDesktopError.unavailable(L("Stop the active screen share before sharing the Assistant Board."))
         }
         probeLog("board-share-ready", [
@@ -151,6 +198,10 @@ final class AssistantBoardWindowController: NSObject, ObservableObject, WKNaviga
         sharingMeetingTitle = model.title
         model.onExternalShareStopped = { [weak self] in
             self?.stopSharing(notifyModel: false)
+        }
+        model.onShareInterrupted = { [weak self, weak model] in
+            guard let model else { return }
+            self?.handleInterruptedShare(for: model)
         }
         refreshBanner()
 
@@ -174,7 +225,7 @@ final class AssistantBoardWindowController: NSObject, ObservableObject, WKNaviga
                 if Date().timeIntervalSince(shareStartedAt) > 8.0,
                    !meeting.isSharingLive,
                    !meeting.sharingPending {
-                    self.stopSharing(notifyModel: false)
+                    self.handleInterruptedShare(for: meeting)
                     return
                 }
                 guard meeting.connected else {
@@ -200,11 +251,31 @@ final class AssistantBoardWindowController: NSObject, ObservableObject, WKNaviga
     }
 
     func stopSharing(notifyModel: Bool) {
+        teardownActiveShare(clearDesiredIntent: true, notifyModel: notifyModel)
+    }
+
+    private func handleInterruptedShare(for model: NativeDesktopMeetingModel) {
+        let shouldRecover = !model.isClosed && (desiredShareModel?.sessionID == model.sessionID || sharingMeetingID == model.sessionID)
+        teardownActiveShare(clearDesiredIntent: !shouldRecover, notifyModel: false)
+        if shouldRecover {
+            scheduleShareRecovery(for: model, reason: "interrupted")
+        }
+    }
+
+    private func teardownActiveShare(clearDesiredIntent: Bool, notifyModel: Bool) {
+        if clearDesiredIntent {
+            recoveryTask?.cancel()
+            recoveryTask = nil
+            desiredShareModel?.onShareInterrupted = nil
+            desiredShareModel = nil
+            isRecoveringShare = false
+        }
         let wasSharing = sharingMeetingID != nil || frameTask != nil
         frameTask?.cancel()
         frameTask = nil
         if let model = sharedMeetingModel {
             model.onExternalShareStopped = nil
+            model.onShareInterrupted = nil
             if notifyModel {
                 Task { @MainActor in await model.stopSharing() }
             }
@@ -213,10 +284,64 @@ final class AssistantBoardWindowController: NSObject, ObservableObject, WKNaviga
         sharingMeetingID = nil
         sharingMeetingTitle = nil
         if wasSharing {
-            probeLog("board-share-stop", ["notifyModel": notifyModel])
+            probeLog("board-share-stop", ["notifyModel": notifyModel, "recoveredPending": !clearDesiredIntent])
         }
         refreshBanner()
-        lastActionSummary = L("Stopped sharing board")
+        if clearDesiredIntent {
+            lastActionSummary = L("Stopped sharing board")
+        }
+    }
+
+    private func scheduleShareRecovery(for model: NativeDesktopMeetingModel, reason: String) {
+        let targetID = model.sessionID
+        desiredShareModel = model
+        recoveryTask?.cancel()
+        isRecoveringShare = true
+        probeLog("board-share-recovery-scheduled", ["reason": reason])
+        lastActionSummary = L("Board share interrupted — reconnecting automatically…")
+        refreshBanner()
+        recoveryTask = Task { @MainActor [weak self] in
+            defer {
+                if self?.desiredShareModel == nil || self?.sharingMeetingID == targetID {
+                    self?.isRecoveringShare = false
+                    self?.refreshBanner()
+                }
+            }
+            for attempt in 1...60 {
+                try? await Task.sleep(for: .milliseconds(1200))
+                guard !Task.isCancelled, let self else { return }
+                guard let candidate = self.desiredShareModel,
+                      candidate.sessionID == targetID,
+                      !candidate.isClosed else {
+                    self.desiredShareModel = nil
+                    self.isRecoveringShare = false
+                    self.refreshBanner()
+                    return
+                }
+                if self.sharingMeetingID == targetID {
+                    self.isRecoveringShare = false
+                    self.refreshBanner()
+                    return
+                }
+                guard candidate.connected, !candidate.isClosed, !candidate.sharingPending else { continue }
+                do {
+                    _ = try await self.startSharing(to: candidate)
+                    probeLog("board-share-recovered", ["attempt": attempt])
+                    self.isRecoveringShare = false
+                    self.refreshBanner()
+                    return
+                } catch {
+                    if candidate.isClosed {
+                        self.desiredShareModel = nil
+                        self.isRecoveringShare = false
+                        self.refreshBanner()
+                        return
+                    }
+                }
+            }
+            self?.isRecoveringShare = false
+            self?.refreshBanner()
+        }
     }
 
     func scroll(deltaY: Int) async throws -> String {
@@ -534,7 +659,11 @@ final class AssistantBoardWindowController: NSObject, ObservableObject, WKNaviga
         stopBtn.bezelStyle = .rounded
         stopBtn.isHidden = true
 
-        let toolbarStack = NSStackView(views: [back, forward, reload, field, spinner, banner, stopBtn])
+        let jiraBtn = NSButton(title: L("Open Jira"), target: self, action: #selector(handleOpenDefaultJira(_:)))
+        jiraBtn.bezelStyle = .rounded
+        jiraBtn.setContentHuggingPriority(.required, for: .horizontal)
+
+        let toolbarStack = NSStackView(views: [back, forward, reload, jiraBtn, field, spinner, banner, stopBtn])
         toolbarStack.orientation = .horizontal
         toolbarStack.alignment = .centerY
         toolbarStack.spacing = 8
@@ -602,6 +731,7 @@ final class AssistantBoardWindowController: NSObject, ObservableObject, WKNaviga
         self.backButton = back
         self.forwardButton = forward
         self.reloadButton = reload
+        self.jiraButton = jiraBtn
         self.loadingIndicator = spinner
         self.urlField = field
         self.shareBannerLabel = banner
@@ -655,6 +785,26 @@ final class AssistantBoardWindowController: NSObject, ObservableObject, WKNaviga
         stopSharing()
     }
 
+    @objc private func handleOpenDefaultJira(_ sender: Any?) {
+        guard let provider = defaultBoardURLProvider else { return }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let seed = (await provider()).trimmed
+            guard !seed.isEmpty else {
+                self.loadError = L("Configure a Jira board URL in Meeting Settings or Team Context first.")
+                self.refreshBanner()
+                return
+            }
+            self.urlField?.stringValue = seed
+            do {
+                _ = try await self.open(urlString: seed)
+            } catch {
+                self.loadError = error.localizedDescription
+                self.refreshBanner()
+            }
+        }
+    }
+
     private func refreshNavigationUI() {
         backButton?.isEnabled = webView?.canGoBack ?? false
         forwardButton?.isEnabled = webView?.canGoForward ?? false
@@ -674,9 +824,13 @@ final class AssistantBoardWindowController: NSObject, ObservableObject, WKNaviga
         if let err = loadError, !err.isEmpty {
             shareBannerLabel?.stringValue = err
             shareBannerLabel?.textColor = .systemRed
-            stopShareButton?.isHidden = sharingMeetingTitle == nil
+            stopShareButton?.isHidden = (sharingMeetingTitle == nil && !isRecoveringShare)
         } else if let title = sharingMeetingTitle {
             shareBannerLabel?.stringValue = L("Sharing to %@", title)
+            shareBannerLabel?.textColor = .systemOrange
+            stopShareButton?.isHidden = false
+        } else if isRecoveringShare {
+            shareBannerLabel?.stringValue = L("Reconnecting share…")
             shareBannerLabel?.textColor = .systemOrange
             stopShareButton?.isHidden = false
         } else {

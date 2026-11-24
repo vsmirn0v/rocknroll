@@ -625,11 +625,17 @@ import FoundationModels
         }
 
         // 9. Open / Share / Stop Jira / Assistant Board
+        let targetID = resolvedTargetMeetingID()
+        let resolvedDefaultBoard = board?.defaultBoardURLForTarget?(targetID)
+            ?? board?.defaultBoardURLProvider?()
+            ?? skills?.teamContext.defaultJiraBoardURL
+            ?? ""
         if let boardReply = await IOSAutonomousMeetingFacilitator.handleDeterministicBoardCommand(
             input,
             board: board,
-            defaultBoardURL: skills?.teamContext.defaultJiraBoardURL ?? "",
-            targetID: resolvedTargetMeetingID()
+            defaultBoardURL: resolvedDefaultBoard,
+            targetID: targetID,
+            people: skills?.people ?? AssistantPeopleDirectory()
         ) {
             return boardReply
         }

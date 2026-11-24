@@ -9,3 +9,11 @@
 "Hardware" = "Perangkat keras";
 "Software" = "Perangkat lunak";
 "Sending %@" = "Mengirim %@";
+"%ld min" = "%ld mnt";
+"Chat" = "Obrolan";
+"Date" = "Tanggal";
+"Meeting" = "Rapat";
+"Participant" = "Peserta";
+"Rock Assistant" = "Asisten Rock";
+"Transcript" = "Transkrip";
+"You" = "Anda";

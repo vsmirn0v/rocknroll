@@ -148,11 +148,47 @@ final class ConferenceModel: ObservableObject {
         preferences: preferences,
         keychain: workspace.keychain
     )
+    func resolvedJiraBoardConfig(for controllerID: UUID? = nil) -> (boardURL: URL?, projectKeys: [String]) {
+        let controller = controllerID.flatMap { id in
+            sessions.first(where: { $0.id == id || $0.workspaceSessionID == id })
+        } ?? foregroundSession ?? sessions.first
+        let matchedCalendar = controller.flatMap { ctrl in
+            calendar.meetings.first { $0.invitation == ctrl.invitationURL }
+        }
+        let session = controller.flatMap { ctrl in
+            workspace.sessions.first(where: { $0.id == ctrl.workspaceSessionID })
+        }
+        let seriesIDs = [
+            matchedCalendar?.externalSeriesID,
+            session?.externalSeriesID,
+            matchedCalendar?.seriesID,
+            session?.calendarSeriesID
+        ].compactMap { $0 }
+        let roomKeys = [
+            controller?.invitationURL.absoluteString,
+            session?.roomIdentity
+        ].compactMap { $0 }
+        return workspace.resolvedJiraBoardConfig(
+            seriesIDs: seriesIDs,
+            roomKeys: roomKeys,
+            defaultBoardURL: assistantSkills.teamContext.defaultJiraBoardURL,
+            defaultProjectKey: assistantSkills.teamContext.defaultJiraProjectKey,
+            lastBoardURL: assistantSkills.lastBoardURL,
+            jiraSettings: workspace.taskSync.preferences.jira
+        )
+    }
+
+    func effectiveJiraBoardURL(for controllerID: UUID? = nil) -> String {
+        resolvedJiraBoardConfig(for: controllerID).boardURL?.absoluteString ?? ""
+    }
+
     lazy var assistantBoard: IOSAssistantBoardController = {
         let controller = IOSAssistantBoardController()
         controller.defaultBoardURLProvider = { [weak self] in
-            let configured = self?.assistantSkills.teamContext.defaultJiraBoardURL ?? ""
-            return configured.isEmpty ? (self?.assistantSkills.lastBoardURL ?? "") : configured
+            self?.effectiveJiraBoardURL() ?? ""
+        }
+        controller.defaultBoardURLForTarget = { [weak self] targetID in
+            self?.effectiveJiraBoardURL(for: targetID) ?? ""
         }
         controller.resolveShareTarget = { [weak self] requestedID in
             guard let self else { return nil }
@@ -164,6 +200,8 @@ final class ConferenceModel: ObservableObject {
                 return foreground
             }
             return self.sessions.first(where: \.canShareBoard)
+                ?? (self.foregroundSession?.isBoardShareSessionAlive == true ? self.foregroundSession : nil)
+                ?? self.sessions.first(where: \.isBoardShareSessionAlive)
         }
         return controller
     }()
@@ -195,6 +233,9 @@ final class ConferenceModel: ObservableObject {
                 events: events,
                 localNames: localNames
             )
+        }
+        coordinator.isFacilitatorActive = { [weak self] controllerID in
+            self?.assistantFacilitator.activeSessionSkills[controllerID] != nil
         }
         coordinator.onSessionModeChanged = { [weak self] controllerID, _, _ in
             self?.syncAssistantBadge(for: controllerID)
@@ -549,10 +590,10 @@ final class ConferenceModel: ObservableObject {
                           !self.assistantBoard.isInlineSheetActive,
                           !self.isCallMinimized,
                           let foreground = self.foregroundSession else { return }
-                    let configuredURL = self.assistantSkills.teamContext.defaultJiraBoardURL
+                    let effectiveURL = self.effectiveJiraBoardURL(for: foreground.id)
                     foreground.presentBoardSheet(
                         controller: self.assistantBoard,
-                        defaultBoardURL: configuredURL.isEmpty ? self.assistantSkills.lastBoardURL : configuredURL
+                        defaultBoardURL: effectiveURL
                     )
                 }
             }
@@ -1594,10 +1635,10 @@ final class ConferenceModel: ObservableObject {
                 }
                 controller.onOpenBoard = { [weak self, weak controller] in
                     guard let self, let controller else { return }
-                    let configuredURL = self.assistantSkills.teamContext.defaultJiraBoardURL
+                    let effectiveURL = self.effectiveJiraBoardURL(for: controller.id)
                     controller.presentBoardSheet(
                         controller: self.assistantBoard,
-                        defaultBoardURL: configuredURL.isEmpty ? self.assistantSkills.lastBoardURL : configuredURL
+                        defaultBoardURL: effectiveURL
                     )
                 }
                 controller.configureAssistantHUD(talk: self.assistantTalk, speech: self.assistantSpeech)

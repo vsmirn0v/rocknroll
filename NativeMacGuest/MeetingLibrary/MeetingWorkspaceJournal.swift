@@ -415,8 +415,11 @@ struct MeetingWorkspaceSession: Codable, Equatable, Identifiable {
     }
 
     func exportSyncedEvents(sessionID: UUID, deviceID: String) -> [SyncedTranscriptEvent] {
-        let events = session(id: sessionID)?.events ?? []
-        return events.compactMap { event -> SyncedTranscriptEvent? in
+        Self.syncedTranscriptEvents(from: session(id: sessionID)?.events ?? [], deviceID: deviceID)
+    }
+
+    static func syncedTranscriptEvents(from events: [MeetingWorkspaceEvent], deviceID: String = "") -> [SyncedTranscriptEvent] {
+        events.compactMap { event -> SyncedTranscriptEvent? in
             let isAssistant = event.source == "assistantVoice"
                 || AssistantSpeechLedger.isAssistantSpeaker(event.author, role: nil)
             let isServerTranscript = event.source == "server"

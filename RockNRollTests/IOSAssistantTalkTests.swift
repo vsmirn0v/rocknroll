@@ -850,6 +850,7 @@ final class IOSAssistantTalkTests: XCTestCase {
         var isBoardShareSessionAlive = true
         private(set) var isSharingScreen = false
         var onExternalBoardShareStopped: (() -> Void)?
+        var onBoardShareInterrupted: (() -> Void)?
         private(set) var startedSamples: [CMSampleBuffer] = []
         private(set) var pushedSamples: [CMSampleBuffer] = []
         private(set) var stopCount = 0
@@ -1628,6 +1629,259 @@ final class IOSAssistantTalkTests: XCTestCase {
         XCTAssertTrue(facilitator.realtimeActive, "Non-fatal Realtime .error must preserve active session")
 
         facilitator.sessionEnded(controllerID: rtCID)
+        for _ in 0..<40 where facilitator.realtimeActive {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        await store.close()
+    }
+
+    func testIOSScrumMasterRollingTranscriptBusyQueueBoardShareAutoRecoveryAndScopedJira() async throws {
+        let suite = SuiteBox()
+        let tempRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ios-scrum-fixes-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempRoot) }
+
+        let (workspace, store) = try await makeTestWorkspace(tempRoot: tempRoot, prefs: suite.defaults)
+        let skills = IOSAssistantSkillsController(
+            workspace: workspace,
+            preferences: suite.defaults,
+            keychain: WorkspaceAPIKeychain(service: "dev.vsmirn0v.ios.scrumfixes.\(UUID().uuidString)"),
+            customRootURL: tempRoot.appendingPathComponent("skills", isDirectory: true)
+        )
+        defer { skills.stopWatcher() }
+
+        // 1. Multi-project JQL scoping & per-meeting Jira config vs app default inheritance.
+        XCTAssertEqual(
+            skills.resolvedJiraJQL(rawJQL: nil, query: "поддержке", projectKeys: ["SDBPROD", "SPS"]),
+            "project in (\"SDBPROD\", \"SPS\") AND text ~ \"поддержке\" ORDER BY updated DESC"
+        )
+        let customRoomID = UUID()
+        let customSID = workspace.beginSession(
+            controllerID: customRoomID,
+            requestedWorkspaceID: nil,
+            title: "CTO Daily",
+            invitation: URL(string: "https://meet.example.com/cto-daily")!,
+            roomIdentity: "meet.example.com/cto-daily",
+            calendarMeeting: nil,
+            engine: .guest
+        )
+        await workspace.saveContextSettings(
+            scopeKey: "room:meet.example.com/cto-daily",
+            scopeKind: .room,
+            title: "CTO Daily",
+            sameRoomTransition: nil,
+            about: nil,
+            matters: nil,
+            never: nil,
+            people: nil,
+            jiraBoardURL: "https://jira.example.com/secure/RapidBoard.jspa?rapidView=99",
+            updateJiraBoardURL: true,
+            jiraProjectKeys: ["SDBCTO", "SPS"],
+            updateJiraProjectKeys: true
+        )
+        let scoped = workspace.resolvedJiraBoardConfig(
+            for: customSID,
+            defaultBoardURL: "https://jira.example.com/default",
+            defaultProjectKey: "DEF",
+            lastBoardURL: "",
+            jiraSettings: .init()
+        )
+        XCTAssertEqual(scoped.boardURL?.absoluteString, "https://jira.example.com/secure/RapidBoard.jspa?rapidView=99")
+        XCTAssertEqual(scoped.projectKeys, ["SDBCTO", "SPS"])
+
+        let inherited = workspace.resolvedJiraBoardConfig(
+            for: nil,
+            defaultBoardURL: "https://jira.example.com/default",
+            defaultProjectKey: "DEF",
+            lastBoardURL: "",
+            jiraSettings: .init()
+        )
+        XCTAssertEqual(inherited.boardURL?.absoluteString, "https://jira.example.com/default")
+        XCTAssertEqual(inherited.projectKeys, ["DEF"])
+
+        var jiraPrefFallback = JiraConnectionSettings()
+        jiraPrefFallback.baseURL = "https://jira-host.example.com"
+        let dashboardFallback = workspace.resolvedJiraBoardConfig(
+            for: nil,
+            defaultBoardURL: "",
+            defaultProjectKey: "",
+            lastBoardURL: "",
+            jiraSettings: jiraPrefFallback
+        )
+        XCTAssertEqual(dashboardFallback.boardURL?.absoluteString, "https://jira-host.example.com")
+
+        // 2. Board share auto-recovery after unexpected interruption while session stays alive,
+        // plus deterministic quick filter & clear filter commands.
+        let mockSession = MockBoardShareSession(title: "CTO Daily")
+        let board = IOSAssistantBoardController()
+        board.resolveShareTarget = { requested in
+            (requested == nil || requested == mockSession.id) ? mockSession : nil
+        }
+        let testImage = makeSolidBoardCGImage()
+        board.snapshotOverrideForTesting = { testImage }
+        await board.loadHTMLForTesting("<!doctype html><html><body><button>Виталий</button><button>Clear all filters</button></body></html>")
+
+        _ = try await board.startSharing(targetID: mockSession.id)
+        XCTAssertTrue(board.isSharing)
+        XCTAssertEqual(mockSession.startedSamples.count, 1)
+
+        mockSession.canShareBoard = false
+        mockSession.isBoardShareSessionAlive = true
+        mockSession.onBoardShareInterrupted?()
+        XCTAssertTrue(board.isRecoveringShare)
+        XCTAssertFalse(board.isSharing)
+
+        mockSession.canShareBoard = true
+        for _ in 0..<40 where !board.isSharing {
+            try await Task.sleep(for: .milliseconds(100))
+        }
+        XCTAssertTrue(board.isSharing, "Board share must automatically restart once peer share capability recovers")
+        XCTAssertFalse(board.isRecoveringShare)
+        XCTAssertGreaterThanOrEqual(mockSession.startedSamples.count, 2)
+
+        // Healthy connected session: remote screen-share takeover stops board share WITHOUT auto-recovery.
+        _ = try await board.startSharing(targetID: mockSession.id)
+        XCTAssertTrue(board.isSharing)
+        mockSession.onExternalBoardShareStopped?()
+        XCTAssertFalse(board.isSharing)
+        XCTAssertFalse(board.isRecoveringShare, "Healthy remote share takeover must not enter recovery mode")
+
+        let truncatedQuery = IOSAutonomousMeetingFacilitator.extractPersonFilterQuery(
+            from: "Там у тебя квикфильт Виталий",
+            lower: "там у тебя квикфильт виталий"
+        )
+        XCTAssertEqual(truncatedQuery, "Виталий")
+        let conjunctionQuery = IOSAutonomousMeetingFacilitator.extractPersonFilterQuery(
+            from: "На доске фильтр по имени Виталий и ты увидишь",
+            lower: "на доске фильтр по имени виталий и ты увидишь"
+        )
+        XCTAssertEqual(conjunctionQuery, "Виталий")
+
+        let filterReply = await IOSAutonomousMeetingFacilitator.handleDeterministicBoardCommand(
+            "На доске квикфильтр Виталий",
+            board: board,
+            defaultBoardURL: scoped.boardURL?.absoluteString ?? "",
+            targetID: mockSession.id,
+            people: skills.people
+        )
+        XCTAssertNotNil(filterReply)
+        board.stopSharing()
+
+        // 3. Busy-turn transcript queue drain & duplicate coordinator suppression when facilitator is active.
+        if var scrum = skills.skills.first(where: { $0.id == "scrum-master" }) {
+            scrum.autoGreet = false
+            try skills.saveSkill(scrum)
+        }
+        skills.realtimeProvider = .openAIRealtime
+        XCTAssertTrue(skills.setRealtimeAPIKey("test-rt-key", for: .openAIRealtime))
+
+        let cid = UUID()
+        let bridge = IOSAssistantSessionBridge(
+            controllerID: cid,
+            title: "CTO Daily",
+            roomKey: "https://meet.example.com/cto-daily",
+            localDisplayName: "Vitalii",
+            participantNames: ["Anna"],
+            canSendChat: true,
+            isMicUnmuted: true,
+            isForeground: true,
+            ensureTranscription: {},
+            ensureFacilitatorTranscription: {},
+            releaseFacilitatorTranscription: {},
+            sendChat: { _ in },
+            speakVoice: { _ in }
+        )
+
+        let transport = MockRealtimeTransport()
+        transport.onTextTurn = { text, cont in
+            Task {
+                try? await Task.sleep(for: .milliseconds(140))
+                cont.yield(.assistantTranscriptDone("Ответ на: \(text)"))
+                cont.yield(.audioDone)
+            }
+        }
+        let facilitator = IOSAutonomousMeetingFacilitator(
+            skills: skills,
+            workspace: workspace,
+            board: board,
+            resolveBridge: { $0 == cid ? bridge : nil }
+        )
+        facilitator.wakeCoalesceDelay = .zero
+        facilitator.followUpCoalesceDelay = .zero
+        facilitator.customRealtimeTransportFactory = { transport }
+        facilitator.enable(controllerID: cid, title: "CTO Daily", skillID: "scrum-master", suppressAutoGreet: true)
+
+        for _ in 0..<80 where !facilitator.realtimeActive {
+            try await Task.sleep(for: .milliseconds(25))
+        }
+
+        struct NoEvalWhenFacilitatorActive: IOSAssistantEvaluating {
+            func evaluate(_ request: IOSAssistantEvaluationRequest) async throws -> IOSAssistantVerdict {
+                XCTFail("IOSAssistantCoordinator must not evaluate duplicates while facilitator owns session")
+                return .quiet
+            }
+        }
+        let coordinator = IOSAssistantCoordinator(
+            workspace: workspace,
+            preferences: suite.defaults,
+            evaluator: NoEvalWhenFacilitatorActive(),
+            modelAvailable: { true },
+            evaluationCooldown: 0,
+            mentionCooldown: 0,
+            resolveBridge: { $0 == cid ? bridge : nil }
+        )
+        coordinator.setMode(.participating, for: cid)
+        coordinator.isFacilitatorActive = { id in facilitator.activeSessionSkills[id] != nil }
+        coordinator.onTranscriptEvents = { id, title, invitation, events, localNames in
+            facilitator.observeEvents(
+                controllerID: id,
+                title: title,
+                invitationURL: invitation,
+                events: events,
+                localNames: localNames
+            )
+        }
+
+        let t0 = Date()
+        coordinator.observeEvents([
+            SyncedTranscriptEvent(
+                id: "ev-1",
+                kind: "transcript",
+                occurredAt: t0,
+                speaker: "Vitalii",
+                isOwn: true,
+                speakerRole: AssistantSpeechLedger.speakerRoleUser,
+                text: "Рок, найди задачу по поддержке",
+                deviceID: "ios-1"
+            )
+        ], for: cid)
+
+        for _ in 0..<60 where await transport.storage.sentTexts.isEmpty {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        // Send second utterance WHILE turn 1 is still in flight (~140ms): must queue and drain after audioDone!
+        coordinator.observeEvents([
+            SyncedTranscriptEvent(
+                id: "ev-2",
+                kind: "transcript",
+                occurredAt: t0.addingTimeInterval(0.03),
+                speaker: "Vitalii",
+                isOwn: true,
+                speakerRole: AssistantSpeechLedger.speakerRoleUser,
+                text: "Рок, и фильтр на Виталия",
+                deviceID: "ios-1"
+            )
+        ], for: cid)
+
+        for _ in 0..<120 where await transport.storage.sentTexts.count < 2 {
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        let sent = await transport.storage.sentTexts
+        XCTAssertEqual(sent.count, 2, "Utterance spoken while busy must not be dropped")
+        XCTAssertTrue(sent[0].contains("поддержке"))
+        XCTAssertTrue(sent[1].contains("фильтр на Виталия"))
+
+        facilitator.sessionEnded(controllerID: cid)
         for _ in 0..<40 where facilitator.realtimeActive {
             try await Task.sleep(for: .milliseconds(20))
         }

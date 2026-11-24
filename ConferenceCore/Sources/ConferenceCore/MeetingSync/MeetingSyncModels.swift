@@ -1110,6 +1110,163 @@ public struct SyncedGuidanceRule: Codable, Equatable, Identifiable, Sendable {
     }
 }
 
+public struct MeetingAutoExportOverrides: Codable, Equatable, Sendable {
+    public var autoExport: Bool?
+    public var includeTranscript: Bool?
+    public var includeSummary: Bool?
+    public var includeNotes: Bool?
+    public var includeTasks: Bool?
+    public var includeDecisions: Bool?
+    public var includeQuestions: Bool?
+    public var autoGenerateSummary: Bool?
+    public var autoSyncTasks: Bool?
+
+    public init(
+        autoExport: Bool? = nil,
+        includeTranscript: Bool? = nil,
+        includeSummary: Bool? = nil,
+        includeNotes: Bool? = nil,
+        includeTasks: Bool? = nil,
+        includeDecisions: Bool? = nil,
+        includeQuestions: Bool? = nil,
+        autoGenerateSummary: Bool? = nil,
+        autoSyncTasks: Bool? = nil
+    ) {
+        self.autoExport = autoExport
+        self.includeTranscript = includeTranscript
+        self.includeSummary = includeSummary
+        self.includeNotes = includeNotes
+        self.includeTasks = includeTasks
+        self.includeDecisions = includeDecisions
+        self.includeQuestions = includeQuestions
+        self.autoGenerateSummary = autoGenerateSummary
+        self.autoSyncTasks = autoSyncTasks
+    }
+
+    public var isEmpty: Bool {
+        autoExport == nil &&
+            includeTranscript == nil &&
+            includeSummary == nil &&
+            includeNotes == nil &&
+            includeTasks == nil &&
+            includeDecisions == nil &&
+            includeQuestions == nil &&
+            autoGenerateSummary == nil &&
+            autoSyncTasks == nil
+    }
+
+    public func mergingFallback(_ fallback: Self) -> Self {
+        Self(
+            autoExport: autoExport ?? fallback.autoExport,
+            includeTranscript: includeTranscript ?? fallback.includeTranscript,
+            includeSummary: includeSummary ?? fallback.includeSummary,
+            includeNotes: includeNotes ?? fallback.includeNotes,
+            includeTasks: includeTasks ?? fallback.includeTasks,
+            includeDecisions: includeDecisions ?? fallback.includeDecisions,
+            includeQuestions: includeQuestions ?? fallback.includeQuestions,
+            autoGenerateSummary: autoGenerateSummary ?? fallback.autoGenerateSummary,
+            autoSyncTasks: autoSyncTasks ?? fallback.autoSyncTasks
+        )
+    }
+}
+
+public struct SyncedMeetingAutoExportSettings: Codable, Equatable, Sendable {
+    public var autoExport: SyncValue<Bool?>?
+    public var includeTranscript: SyncValue<Bool?>?
+    public var includeSummary: SyncValue<Bool?>?
+    public var includeNotes: SyncValue<Bool?>?
+    public var includeTasks: SyncValue<Bool?>?
+    public var includeDecisions: SyncValue<Bool?>?
+    public var includeQuestions: SyncValue<Bool?>?
+    public var autoGenerateSummary: SyncValue<Bool?>?
+    public var autoSyncTasks: SyncValue<Bool?>?
+
+    public init(
+        autoExport: SyncValue<Bool?>? = nil,
+        includeTranscript: SyncValue<Bool?>? = nil,
+        includeSummary: SyncValue<Bool?>? = nil,
+        includeNotes: SyncValue<Bool?>? = nil,
+        includeTasks: SyncValue<Bool?>? = nil,
+        includeDecisions: SyncValue<Bool?>? = nil,
+        includeQuestions: SyncValue<Bool?>? = nil,
+        autoGenerateSummary: SyncValue<Bool?>? = nil,
+        autoSyncTasks: SyncValue<Bool?>? = nil
+    ) {
+        self.autoExport = autoExport
+        self.includeTranscript = includeTranscript
+        self.includeSummary = includeSummary
+        self.includeNotes = includeNotes
+        self.includeTasks = includeTasks
+        self.includeDecisions = includeDecisions
+        self.includeQuestions = includeQuestions
+        self.autoGenerateSummary = autoGenerateSummary
+        self.autoSyncTasks = autoSyncTasks
+    }
+
+    public var maximumCounter: Int64 {
+        [
+            autoExport?.version.counter,
+            includeTranscript?.version.counter,
+            includeSummary?.version.counter,
+            includeNotes?.version.counter,
+            includeTasks?.version.counter,
+            includeDecisions?.version.counter,
+            includeQuestions?.version.counter,
+            autoGenerateSummary?.version.counter,
+            autoSyncTasks?.version.counter
+        ].compactMap { $0 }.max() ?? 0
+    }
+
+    public var hasAnyExplicitOverride: Bool {
+        autoExport?.value != nil ||
+            includeTranscript?.value != nil ||
+            includeSummary?.value != nil ||
+            includeNotes?.value != nil ||
+            includeTasks?.value != nil ||
+            includeDecisions?.value != nil ||
+            includeQuestions?.value != nil ||
+            autoGenerateSummary?.value != nil ||
+            autoSyncTasks?.value != nil
+    }
+
+    public var overrides: MeetingAutoExportOverrides {
+        MeetingAutoExportOverrides(
+            autoExport: autoExport?.value,
+            includeTranscript: includeTranscript?.value,
+            includeSummary: includeSummary?.value,
+            includeNotes: includeNotes?.value,
+            includeTasks: includeTasks?.value,
+            includeDecisions: includeDecisions?.value,
+            includeQuestions: includeQuestions?.value,
+            autoGenerateSummary: autoGenerateSummary?.value,
+            autoSyncTasks: autoSyncTasks?.value
+        )
+    }
+
+    public func merging(_ other: Self) -> Self {
+        Self(
+            autoExport: mergeOptional(autoExport, other.autoExport),
+            includeTranscript: mergeOptional(includeTranscript, other.includeTranscript),
+            includeSummary: mergeOptional(includeSummary, other.includeSummary),
+            includeNotes: mergeOptional(includeNotes, other.includeNotes),
+            includeTasks: mergeOptional(includeTasks, other.includeTasks),
+            includeDecisions: mergeOptional(includeDecisions, other.includeDecisions),
+            includeQuestions: mergeOptional(includeQuestions, other.includeQuestions),
+            autoGenerateSummary: mergeOptional(autoGenerateSummary, other.autoGenerateSummary),
+            autoSyncTasks: mergeOptional(autoSyncTasks, other.autoSyncTasks)
+        )
+    }
+
+    private func mergeOptional(_ lhs: SyncValue<Bool?>?, _ rhs: SyncValue<Bool?>?) -> SyncValue<Bool?>? {
+        switch (lhs, rhs) {
+        case (.some(let a), .some(let b)): return a.merging(b)
+        case (.some(let a), .none): return a
+        case (.none, .some(let b)): return b
+        case (.none, .none): return nil
+        }
+    }
+}
+
 public struct SyncedMeetingContextSettings: Codable, Equatable, Identifiable, Sendable {
     public enum ScopeKind: String, Codable, Equatable, Sendable {
         case allMeetings
@@ -1132,6 +1289,9 @@ public struct SyncedMeetingContextSettings: Codable, Equatable, Identifiable, Se
     public var defaultReminderOverride: SyncValue<ReminderOverride?>?
     public var autoJoin: SyncValue<Bool?>?
     public var autoFacilitatorSkillID: SyncValue<String?>?
+    public var jiraBoardURL: SyncValue<String?>?
+    public var jiraProjectKeys: SyncValue<[String]?>?
+    public var autoExportSettings: SyncedMeetingAutoExportSettings?
     public var guidanceRules: [UUID: SyncValue<SyncedGuidanceRule>]
 
     public init(
@@ -1149,6 +1309,9 @@ public struct SyncedMeetingContextSettings: Codable, Equatable, Identifiable, Se
         defaultReminderOverride: SyncValue<ReminderOverride?>? = nil,
         autoJoin: SyncValue<Bool?>? = nil,
         autoFacilitatorSkillID: SyncValue<String?>? = nil,
+        jiraBoardURL: SyncValue<String?>? = nil,
+        jiraProjectKeys: SyncValue<[String]?>? = nil,
+        autoExportSettings: SyncedMeetingAutoExportSettings? = nil,
         guidanceRules: [UUID: SyncValue<SyncedGuidanceRule>] = [:]
     ) {
         self.scopeKey = scopeKey
@@ -1165,7 +1328,36 @@ public struct SyncedMeetingContextSettings: Codable, Equatable, Identifiable, Se
         self.defaultReminderOverride = defaultReminderOverride
         self.autoJoin = autoJoin
         self.autoFacilitatorSkillID = autoFacilitatorSkillID
+        self.jiraBoardURL = jiraBoardURL
+        self.jiraProjectKeys = jiraProjectKeys
+        self.autoExportSettings = autoExportSettings
         self.guidanceRules = guidanceRules
+    }
+
+    public static func normalizedJiraProjectKeys(from raw: String) -> [String] {
+        let tokens = raw
+            .components(separatedBy: CharacterSet(charactersIn: ",;\n\t "))
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).uppercased() }
+            .filter { token in
+                !token.isEmpty && token.unicodeScalars.allSatisfy { CharacterSet.alphanumerics.contains($0) || $0 == "_" }
+            }
+        var seen: Set<String> = []
+        var result: [String] = []
+        for token in tokens where seen.insert(token).inserted {
+            result.append(token)
+        }
+        return result
+    }
+
+    public static func normalizedJiraProjectKeys(from rawList: [String]) -> [String] {
+        var seen: Set<String> = []
+        var result: [String] = []
+        for raw in rawList {
+            for token in normalizedJiraProjectKeys(from: raw) where seen.insert(token).inserted {
+                result.append(token)
+            }
+        }
+        return result
     }
 
     public var maximumCounter: Int64 {
@@ -1181,7 +1373,10 @@ public struct SyncedMeetingContextSettings: Codable, Equatable, Identifiable, Se
             people?.version.counter,
             defaultReminderOverride?.version.counter,
             autoJoin?.version.counter,
-            autoFacilitatorSkillID?.version.counter
+            autoFacilitatorSkillID?.version.counter,
+            jiraBoardURL?.version.counter,
+            jiraProjectKeys?.version.counter,
+            autoExportSettings?.maximumCounter
         ]
         let ruleMax = guidanceRules.values.map(\.version.counter).max() ?? 0
         return max(scalars.compactMap { $0 }.max() ?? 0, ruleMax)
@@ -1204,6 +1399,14 @@ public struct SyncedMeetingContextSettings: Codable, Equatable, Identifiable, Se
         result.defaultReminderOverride = mergeOptional(defaultReminderOverride, other.defaultReminderOverride)
         result.autoJoin = mergeOptional(autoJoin, other.autoJoin)
         result.autoFacilitatorSkillID = mergeOptional(autoFacilitatorSkillID, other.autoFacilitatorSkillID)
+        result.jiraBoardURL = mergeOptional(jiraBoardURL, other.jiraBoardURL)
+        result.jiraProjectKeys = mergeOptional(jiraProjectKeys, other.jiraProjectKeys)
+        result.autoExportSettings = switch (autoExportSettings, other.autoExportSettings) {
+        case (.some(let a), .some(let b)): a.merging(b)
+        case (.some(let a), .none): a
+        case (.none, .some(let b)): b
+        case (.none, .none): nil
+        }
         var rules = guidanceRules
         for (ruleID, value) in other.guidanceRules {
             rules[ruleID] = rules[ruleID]?.merging(value) ?? value

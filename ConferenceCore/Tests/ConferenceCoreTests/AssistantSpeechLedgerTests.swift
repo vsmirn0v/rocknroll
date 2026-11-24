@@ -177,4 +177,81 @@ final class AssistantSpeechLedgerTests: XCTestCase {
         XCTAssertTrue(user.contains("Rock Assistant [assistant]: Хорошо, уточни статус по ROCK-42."))
         XCTAssertTrue(user.contains("Мария: ROCK-42 на ревью."))
     }
+
+    func testSanitizeSpokenReplyCollapsesDuplicateParagraphsAndStripsBackticks() {
+        let duplicated = "С тебя начнём. Коротко: что сделал вчера, что планируешь сегодня и есть ли блокеры?\nС тебя начнём. Коротко: что сделал вчера, что планируешь сегодня и есть ли блокеры?"
+        XCTAssertEqual(
+            AssistantSpeechLedger.sanitizeSpokenReply(duplicated),
+            "С тебя начнём. Коротко: что сделал вчера, что планируешь сегодня и есть ли блокеры?"
+        )
+
+        let backticks = "Самые близкие результаты: `SDBPROD-3328`, `SDBPROD-3326`, `SPS-2800`; если скажете точнее **название**, сузим поиск."
+        XCTAssertEqual(
+            AssistantSpeechLedger.sanitizeSpokenReply(backticks),
+            "Самые близкие результаты: SDBPROD-3328, SDBPROD-3326, SPS-2800; если скажете точнее название, сузим поиск."
+        )
+    }
+
+    func testTranscriptExportFormatterPlainTextMarkdownAndFileName() {
+        let start = Date(timeIntervalSince1970: 1_760_000_000)
+        let events = [
+            SyncedTranscriptEvent(
+                id: "1",
+                kind: "transcript",
+                occurredAt: start,
+                speaker: "Vitalii",
+                isOwn: true,
+                speakerRole: AssistantSpeechLedger.speakerRoleUser,
+                text: "Коллеги, начинаем.",
+                deviceID: "ios-1"
+            ),
+            SyncedTranscriptEvent(
+                id: "2",
+                kind: "transcript",
+                occurredAt: start.addingTimeInterval(30),
+                speaker: AssistantSpeechLedger.canonicalSpeakerName,
+                isOwn: false,
+                speakerRole: AssistantSpeechLedger.speakerRoleAssistant,
+                text: "Готов вести стендап.",
+                deviceID: "ios-1"
+            ),
+            SyncedTranscriptEvent(
+                id: "3",
+                kind: "chat",
+                occurredAt: start.addingTimeInterval(60),
+                speaker: "Anna",
+                isOwn: false,
+                text: "Ссылка в треде",
+                deviceID: "mac-1"
+            ),
+        ]
+
+        let plain = TranscriptExportFormatter.formatPlainText(
+            events: events,
+            meetingTitle: "CTO Daily",
+            startedAt: start,
+            youLabel: "You",
+            assistantLabel: "Rock Assistant"
+        )
+        XCTAssertTrue(plain.contains("CTO Daily"))
+        XCTAssertTrue(plain.contains("Vitalii (You): Коллеги, начинаем."))
+        XCTAssertTrue(plain.contains("Rock Assistant: Готов вести стендап."))
+        XCTAssertTrue(plain.contains("Anna [Chat]: Ссылка в треде") || plain.contains("[Чат]"))
+
+        let md = TranscriptExportFormatter.formatMarkdown(
+            events: events,
+            title: "CTO Daily",
+            startedAt: start,
+            endedAt: start.addingTimeInterval(600),
+            youLabel: "You",
+            assistantLabel: "Rock Assistant"
+        )
+        XCTAssertTrue(md.hasPrefix("# CTO Daily"))
+        XCTAssertTrue(md.contains("Vitalii (You):** Коллеги, начинаем."))
+        XCTAssertTrue(md.contains("Rock Assistant:** Готов вести стендап."))
+
+        let fileName = TranscriptExportFormatter.suggestedFileName(title: "CTO Daily / Sprint 12", startedAt: start, extension: "md")
+        XCTAssertTrue(fileName.hasPrefix("2025-10-15-") || fileName.contains(".transcript.md"))
+        XCTAssertTrue(fileName.hasSuffix(".transcript.md"))
+    }
 }

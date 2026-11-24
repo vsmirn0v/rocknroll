@@ -9,3 +9,11 @@
 "Hardware" = "Hardware";
 "Software" = "Software";
 "Sending %@" = "%@ wird gesendet";
+"%ld min" = "%ld Min.";
+"Chat" = "Chat";
+"Date" = "Datum";
+"Meeting" = "Meeting";
+"Participant" = "Teilnehmer";
+"Rock Assistant" = "Rock-Assistent";
+"Transcript" = "Transkript";
+"You" = "Du";

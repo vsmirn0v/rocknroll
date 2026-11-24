@@ -1,6 +1,7 @@
 import AppKit
 import ConferenceCore
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct WorkspaceLiveMeeting: View {
     enum Style { case card, parallel, focused }
@@ -24,6 +25,7 @@ struct WorkspaceLiveMeeting: View {
     @State private var editing: ParticipationCoordinator.WorkspaceDraft?
     @State private var editText = ""
     @State private var feedback: String?
+    @State private var copiedTranscript = false
 
     init(workspace: NativeDesktopWorkspace, state: MeetingWorkspaceViewState,
          model: NativeDesktopMeetingModel, session: MeetingWorkspaceSession?, selected: Bool, style: Style) {
@@ -196,6 +198,24 @@ struct WorkspaceLiveMeeting: View {
                         soundButton()
                         Button(L("Open meeting"), systemImage: "video") { workspace.showMeeting(model) }
                             .buttonStyle(.borderless)
+                        let liveExportEvents = MeetingWorkspaceJournal.syncedTranscriptEvents(from: events)
+                        if !TranscriptExportFormatter.formatPlainText(events: liveExportEvents).isEmpty {
+                            Button {
+                                copyLiveTranscript(liveExportEvents)
+                            } label: {
+                                Label(
+                                    copiedTranscript ? L("Copied") : L("Copy transcript"),
+                                    systemImage: copiedTranscript ? "checkmark" : "doc.on.doc"
+                                )
+                            }
+                            .buttonStyle(.borderless)
+                            Button {
+                                exportLiveTranscript(liveExportEvents)
+                            } label: {
+                                Label(L("Export"), systemImage: "square.and.arrow.up")
+                            }
+                            .buttonStyle(.borderless)
+                        }
                         Spacer(minLength: 4)
                         if followLatest {
                             Toggle(L("Follow latest"), isOn: $followLatest).toggleStyle(.checkbox).font(.caption)
@@ -230,6 +250,35 @@ struct WorkspaceLiveMeeting: View {
                 }
             }
         }
+    }
+
+    private func copyLiveTranscript(_ exportEvents: [SyncedTranscriptEvent]) {
+        let text = TranscriptExportFormatter.formatPlainText(events: exportEvents, meetingTitle: model.title)
+        guard !text.isEmpty else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+        copiedTranscript = true
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(2))
+            copiedTranscript = false
+        }
+    }
+
+    private func exportLiveTranscript(_ exportEvents: [SyncedTranscriptEvent]) {
+        let startedAt = session?.startedAt ?? exportEvents.first?.occurredAt ?? Date()
+        let markdown = TranscriptExportFormatter.formatMarkdown(
+            events: exportEvents,
+            title: model.title,
+            startedAt: startedAt,
+            endedAt: session?.endedAt
+        )
+        guard !markdown.isEmpty else { return }
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = TranscriptExportFormatter.suggestedFileName(title: model.title, startedAt: startedAt)
+        panel.allowedContentTypes = [UTType(filenameExtension: "md") ?? .plainText]
+        panel.canCreateDirectories = true
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        try? Data(markdown.utf8).write(to: url, options: .atomic)
     }
 
     private var captureStatus: some View {

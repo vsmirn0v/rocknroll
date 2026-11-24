@@ -159,4 +159,28 @@ final class MeetingManualExportTests: XCTestCase {
         XCTAssertTrue(text.hasPrefix("# "))
         XCTAssertTrue(text.contains("\n---\n"), "entries are separated")
     }
+
+    func testManualExportRendersTranscriptSectionWhenIncluded() {
+        let session = MeetingSessionRecord(
+            id: UUID(),
+            title: "d2v2",
+            startedAt: Date(timeIntervalSince1970: 1_000)
+        )
+        let itemWithTranscript = MeetingManualExportItem(
+            session: session,
+            note: nil,
+            outcome: nil,
+            outcomeState: .notStarted,
+            isUnsavedDraft: false,
+            transcriptBody: "[08:24] Vitalii: Hello team"
+        )
+        let renderedWithTranscript = MeetingManualExport.render(
+            item: itemWithTranscript,
+            sections: [.notes, .summary, .decisions, .tasks, .questions, .transcript]
+        )
+        XCTAssertTrue(renderedWithTranscript.contains("[08:24] Vitalii: Hello team"))
+
+        let renderedDefaultAll = MeetingManualExport.render(item: itemWithTranscript, sections: .all)
+        XCTAssertFalse(renderedDefaultAll.contains("[08:24] Vitalii: Hello team"))
+    }
 }

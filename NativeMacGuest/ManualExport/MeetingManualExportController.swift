@@ -8,12 +8,15 @@ import Foundation
     private let library: MeetingLibraryController
     private let notes: MeetingNotesController
     private let flushOutcomeWrites: @MainActor () async -> Void
+    private let transcriptLoader: @MainActor (MeetingLibraryCard, MeetingSessionRecord?) async -> String?
 
     init(library: MeetingLibraryController, notes: MeetingNotesController,
-         flushOutcomeWrites: @escaping @MainActor () async -> Void) {
+         flushOutcomeWrites: @escaping @MainActor () async -> Void,
+         transcriptLoader: @escaping @MainActor (MeetingLibraryCard, MeetingSessionRecord?) async -> String? = { _, _ in nil }) {
         self.library = library
         self.notes = notes
         self.flushOutcomeWrites = flushOutcomeWrites
+        self.transcriptLoader = transcriptLoader
     }
 
     func export(cards: [MeetingLibraryCard], options: MeetingManualExportOptions) async {
@@ -60,8 +63,10 @@ import Foundation
                     let session = MeetingSessionRecord(id: card.sessionID, title: card.title, startedAt: card.startedAt,
                         endedAt: card.endedAt, state: card.state, startProvenance: card.startProvenance,
                         outcomeEndFallback: card.outcomeEndFallback)
+                    let transcriptBody = await transcriptLoader(card, session)
                     items.append(.init(session: session, note: Self.draftNote(draft.text, session: session),
-                                       outcome: nil, outcomeState: card.outcomeState, isUnsavedDraft: true))
+                                       outcome: nil, outcomeState: card.outcomeState, isUnsavedDraft: true,
+                                       transcriptBody: transcriptBody))
                 } else {
                     let name = MeetingMarkdownTemplate.meetingFileName(title: card.title, sessionID: card.sessionID)
                     failures.append(.init(name: name, url: nil, error: snapshotError ?? L("The meeting is unavailable.")))
@@ -75,8 +80,10 @@ import Foundation
                 note?.markdown = draft.text
                 if !unsaved, let revision = draft.revision { note?.revision = revision }
             }
+            let transcriptBody = await transcriptLoader(card, snapshot.session)
             items.append(.init(session: snapshot.session, note: note, outcome: snapshot.outcome,
-                               outcomeState: snapshot.outcomeState, isUnsavedDraft: unsaved))
+                               outcomeState: snapshot.outcomeState, isUnsavedDraft: unsaved,
+                               transcriptBody: transcriptBody))
         }
         return (items, failures)
     }

@@ -12,3 +12,11 @@
 "Hardware" = "Аппаратное";
 "Software" = "Программное";
 "Sending %@" = "Отправка %@";
+"%ld min" = "%ld мин";
+"Chat" = "Чат";
+"Date" = "Дата";
+"Meeting" = "Встреча";
+"Participant" = "Участник";
+"Rock Assistant" = "Ассистент Рок";
+"Transcript" = "Расшифровка";
+"You" = "Вы";

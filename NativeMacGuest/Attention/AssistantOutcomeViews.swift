@@ -274,7 +274,7 @@ struct MeetingHistoryView: View {
                 RenameMeetingSheet(library: library, sessionID: value.id, currentTitle: value.title)
             }
             .sheet(item: $exportRequest) { value in
-                MeetingManualExportView(attention: attention, singleSessionID: value.sessionID)
+                MeetingManualExportView(attention: attention, archiveStore: workspace?.workspaceSync.archiveStore, singleSessionID: value.sessionID)
             }
             .sheet(item: $reviewedDraft) { draft in
                 if let selectedCard, selectedCard.sessionID == draft.id {
@@ -391,6 +391,26 @@ struct MeetingHistoryView: View {
                     exportButtons(sessionID: card.sessionID)
                 }
                 if workspace != nil {
+                    Button {
+                        Task { @MainActor in
+                            let record = try? await library.store.session(card.sessionID)
+                            let outcome = card.outcomeID.flatMap { outcomesByID[$0] }
+                            let wsSession = conversation(card.sessionID)
+                            let seriesID = record?.calendarSeriesID ?? outcome?.seriesID ?? wsSession?.calendarSeriesID
+                            let url = record?.invitation ?? outcome?.invitation ?? URL(string: "about:blank")!
+                            attention.editInstructions(
+                                invitation: url,
+                                seriesID: seriesID,
+                                title: card.title
+                            )
+                        }
+                    } label: {
+                        Image(systemName: "gearshape")
+                    }
+                    .buttonStyle(.borderless)
+                    .help(L("Meeting settings…"))
+                    .accessibilityLabel(L("Meeting settings…"))
+
                     Button(L("Participation and calendar"), systemImage: "calendar.badge.clock") { showingContext = true }
                         .labelStyle(.iconOnly).help(L("Participation and calendar"))
                 }
@@ -420,7 +440,12 @@ struct MeetingHistoryView: View {
                                                journal.toggleBookmark(sessionID: source, eventID: event)
                                            })
                 } else if loadedArchiveID == card.sessionID, !archivedEvents.isEmpty {
-                    ArchivedHistoryTranscript(events: archivedEvents)
+                    ArchivedHistoryTranscript(
+                        events: archivedEvents,
+                        title: card.title,
+                        startedAt: card.effectiveDate?.date ?? card.startedAt,
+                        endedAt: card.endedAt
+                    )
                 } else {
                     VStack(spacing: 10) {
                         Text(L("No saved transcript or assistant reply text is available for this meeting."))

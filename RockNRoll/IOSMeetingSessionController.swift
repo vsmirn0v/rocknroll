@@ -47,6 +47,7 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
     var onOpenBoard: (() -> Void)?
     var onOpenAsk: (() -> Void)?
     var onExternalBoardShareStopped: (() -> Void)?
+    var onBoardShareInterrupted: (() -> Void)?
     var canShareBoard: Bool { !leaving && phase == .connected && !isHeld && !quiet }
     var isBoardShareSessionAlive: Bool { !leaving && phase != .idle && phase != .failed && !isHeld && !quiet }
     var onWorkspaceEventsChanged: ((UUID, [SyncedTranscriptEvent], [DateInterval], Set<String>) -> Void)?
@@ -240,6 +241,9 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
             preview: LocalSharePreview()
         )
         weakSelf = self
+        if let initialShare = self.screenShare {
+            bindScreenShareCallbacks(initialShare)
+        }
         localTranscriber.onSegmentsChanged = { [weak self] _ in
             self?.syncCatchUpTranscript()
         }
@@ -352,29 +356,55 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
 
         if let screenShare {
             let rewired = IOSScreenShareCapture(session: session, preview: view.sharePreview)
-            rewired.onSharingChanged = { [weak self] sharing in
-                guard let self else { return }
-                self.isSharingScreen = sharing
-                self.callView?.setSharing(sharing)
-                self.renderSnapshot()
-            }
-            rewired.onEndMessage = { [weak self] message in
-                if let message { self?.reportMediaStatus(message) }
-            }
-            rewired.onExternalEnd = { [weak self] in
-                self?.studio.presenter.sharingEnded()
-                self?.notifyExternalBoardShareStopped()
-            }
-            rewired.onError = { [weak self] error in
-                self?.reportMediaStatus(error.localizedDescription)
-            }
+            bindScreenShareCallbacks(rewired)
             screenShare.onSharingChanged = nil
             screenShare.onExternalEnd = nil
+            screenShare.onError = nil
             self.screenShare = rewired
         }
 
         callView = view
         return view
+    }
+
+    private func bindScreenShareCallbacks(_ capture: IOSScreenShareCapture) {
+        capture.onSharingChanged = { [weak self] sharing in
+            guard let self else { return }
+            let wasSharing = self.isSharingScreen
+            self.isSharingScreen = sharing
+            self.callView?.setSharing(sharing)
+            self.renderSnapshot()
+            if wasSharing, !sharing,
+               self.phase != .connected,
+               self.isBoardShareSessionAlive,
+               self.onBoardShareInterrupted != nil {
+                self.notifyBoardShareInterrupted()
+            }
+        }
+        capture.onEndMessage = { [weak self] message in
+            if let message { self?.reportMediaStatus(message) }
+        }
+        capture.onExternalEnd = { [weak self] in
+            guard let self else { return }
+            self.studio.presenter.sharingEnded()
+            if self.phase != .connected,
+               self.isBoardShareSessionAlive,
+               self.screenShare?.isBroadcastSharing != true,
+               self.onBoardShareInterrupted != nil {
+                self.notifyBoardShareInterrupted()
+            } else {
+                self.notifyExternalBoardShareStopped()
+            }
+        }
+        capture.onError = { [weak self] error in
+            guard let self else { return }
+            self.reportMediaStatus(error.localizedDescription)
+            if self.isBoardShareSessionAlive,
+               self.screenShare?.isBroadcastSharing != true,
+               self.onBoardShareInterrupted != nil {
+                self.notifyBoardShareInterrupted()
+            }
+        }
     }
 
     func start(displayName: String, quiet: Bool, backgroundJoin: Bool = false) {
@@ -754,6 +784,7 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
     }
 
     func stopBoardSharing() async {
+        onBoardShareInterrupted = nil
         onExternalBoardShareStopped = nil
         AppDiagnostics.log("board-share-stop", [
             "provider": kind.rawValue,
@@ -762,7 +793,21 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
         await stopScreenSharing(retirePresenter: false)
     }
 
+    private func notifyBoardShareInterrupted() {
+        onExternalBoardShareStopped = nil
+        let callback = onBoardShareInterrupted
+        onBoardShareInterrupted = nil
+        if callback != nil {
+            AppDiagnostics.log("board-share-interrupted", [
+                "provider": kind.rawValue,
+                "phase": String(describing: phase)
+            ])
+        }
+        callback?()
+    }
+
     private func notifyExternalBoardShareStopped() {
+        onBoardShareInterrupted = nil
         let callback = onExternalBoardShareStopped
         onExternalBoardShareStopped = nil
         if callback != nil {

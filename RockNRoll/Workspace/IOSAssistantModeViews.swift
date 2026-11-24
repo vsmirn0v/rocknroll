@@ -488,7 +488,10 @@ struct IOSAssistantModeSheet: View {
                 if let board {
                     IOSAssistantBoardSheet(
                         controller: board,
-                        defaultBoardURL: skills?.teamContext.defaultJiraBoardURL ?? ""
+                        defaultBoardURL: board.defaultBoardURLForTarget?(controllerID)
+                            ?? board.defaultBoardURLProvider?()
+                            ?? skills?.teamContext.defaultJiraBoardURL
+                            ?? ""
                     )
                 }
             }
@@ -759,19 +762,27 @@ private struct IOSFacilitatorBoardControls: View {
             Label(L("Open Assistant Board"), systemImage: "macwindow")
         }
 
-        if board.isSharing {
+        if board.isSharing || board.isRecoveringShare {
             Button(role: .destructive) {
                 shareError = nil
                 board.stopSharing()
             } label: {
-                Label(L("Stop Sharing Board"), systemImage: "display.trianglebadge.exclamationmark")
+                Label(
+                    board.isRecoveringShare ? L("Stop Board Reconnect") : L("Stop Sharing Board"),
+                    systemImage: "display.trianglebadge.exclamationmark"
+                )
             }
         } else if board.canShareToActiveMeeting {
             Button {
                 shareError = nil
                 Task {
                     do {
-                        _ = try await board.startSharing(targetID: controllerID)
+                        let resolvedURL = board.defaultBoardURLForTarget?(controllerID)
+                            ?? board.defaultBoardURLProvider?()
+                        _ = try await board.startSharing(
+                            targetID: controllerID,
+                            urlOverride: (board.currentURL == nil && !(resolvedURL ?? "").isEmpty) ? resolvedURL : nil
+                        )
                     } catch {
                         shareError = error.localizedDescription
                     }

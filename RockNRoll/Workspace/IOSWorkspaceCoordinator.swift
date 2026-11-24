@@ -595,8 +595,9 @@ final class IOSWorkspaceCoordinator: ObservableObject {
     // MARK: - Outcome Coordination & Generation
 
     private func coordinateOutcomeAfterLeave(sessionID: UUID) async {
-        guard outcomeConfig.autoGenerateOnLeave else { return }
         let sid = replica.workspaceDoc.resolveCanonicalSessionID(for: sessionID)
+        let overrides = resolvedAutoExportOverrides(for: sid)
+        guard overrides.autoGenerateSummary ?? outcomeConfig.autoGenerateOnLeave else { return }
         if outcomesBySession[sid]?.state == "ready" { return }
 
         guard let syncedSession = replica.workspaceDoc.sessions[sid] else { return }
@@ -938,7 +939,8 @@ final class IOSWorkspaceCoordinator: ObservableObject {
             scheduleSync(delayMilliseconds: 150)
             AppDiagnostics.log("meeting-summary-ready", diagnostic)
 
-            if taskSync.preferences.autoSyncAfterMeetingOutcome && taskSync.preferences.anyProviderEnabled {
+            let autoSyncAllowed = resolvedAutoExportOverrides(for: sid).autoSyncTasks ?? taskSync.preferences.autoSyncAfterMeetingOutcome
+            if autoSyncAllowed && taskSync.preferences.anyProviderEnabled {
                 let affectedIDs = Set(mappedTasks.map(\.id))
                     .union(reconciliation.canonicalUpdates.map(\.existingTaskID))
                 if !affectedIDs.isEmpty {
@@ -1417,6 +1419,140 @@ final class IOSWorkspaceCoordinator: ObservableObject {
         return nil
     }
 
+    func resolvedAutoExportOverrides(seriesIDs: [String], roomKeys: [String]) -> MeetingAutoExportOverrides {
+        var resolved = MeetingAutoExportOverrides()
+        for sid in seriesIDs {
+            let trimmed = sid.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty, let export = settings(for: "series:" + trimmed)?.autoExportSettings else { continue }
+            resolved = resolved.mergingFallback(export.overrides)
+        }
+        for key in roomKeys {
+            let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty, let export = settings(for: "room:" + trimmed)?.autoExportSettings else { continue }
+            resolved = resolved.mergingFallback(export.overrides)
+        }
+        return resolved
+    }
+
+    func resolvedAutoExportOverrides(for sessionID: UUID) -> MeetingAutoExportOverrides {
+        let canonical = replica.workspaceDoc.resolveCanonicalSessionID(for: sessionID)
+        guard let session = sessions.first(where: { $0.id == canonical || $0.id == sessionID }) else {
+            return .init()
+        }
+        let seriesIDs = [session.externalSeriesID, session.calendarSeriesID].compactMap { $0 }
+        let roomKeys = [session.invitation?.absoluteString, session.roomIdentity].compactMap { $0 }
+        return resolvedAutoExportOverrides(seriesIDs: seriesIDs, roomKeys: roomKeys)
+    }
+
+    func resolvedJiraBoardConfig(
+        seriesIDs: [String] = [],
+        roomKeys: [String] = [],
+        defaultBoardURL: String,
+        defaultProjectKey: String,
+        lastBoardURL: String? = nil,
+        jiraSettings: JiraConnectionSettings
+    ) -> (boardURL: URL?, projectKeys: [String]) {
+        func validBoardURL(_ raw: String?) -> URL? {
+            guard let clean = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !clean.isEmpty,
+                  let url = URL(string: clean),
+                  let scheme = url.scheme?.lowercased(),
+                  scheme == "http" || scheme == "https",
+                  url.host != nil else { return nil }
+            return url
+        }
+
+        let cleanSeries = seriesIDs
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        let cleanRooms = roomKeys
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        var chosenURL: URL?
+        for sid in cleanSeries {
+            if let url = validBoardURL(settings(for: "series:" + sid)?.jiraBoardURL?.value) {
+                chosenURL = url
+                break
+            }
+        }
+        if chosenURL == nil {
+            for roomKey in cleanRooms {
+                if let url = validBoardURL(settings(for: "room:" + roomKey)?.jiraBoardURL?.value) {
+                    chosenURL = url
+                    break
+                }
+            }
+        }
+        if chosenURL == nil {
+            chosenURL = validBoardURL(defaultBoardURL)
+                ?? validBoardURL(lastBoardURL)
+                ?? jiraSettings.normalizedBaseURL
+        }
+
+        var chosenProjects: [String] = []
+        for sid in cleanSeries {
+            if let keys = settings(for: "series:" + sid)?.jiraProjectKeys?.value {
+                let normalized = SyncedMeetingContextSettings.normalizedJiraProjectKeys(from: keys.joined(separator: ","))
+                if !normalized.isEmpty {
+                    chosenProjects = normalized
+                    break
+                }
+            }
+        }
+        if chosenProjects.isEmpty {
+            for roomKey in cleanRooms {
+                if let keys = settings(for: "room:" + roomKey)?.jiraProjectKeys?.value {
+                    let normalized = SyncedMeetingContextSettings.normalizedJiraProjectKeys(from: keys.joined(separator: ","))
+                    if !normalized.isEmpty {
+                        chosenProjects = normalized
+                        break
+                    }
+                }
+            }
+        }
+        if chosenProjects.isEmpty {
+            let fallbackText = [defaultProjectKey, jiraSettings.cleanProjectKey]
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+                .joined(separator: ",")
+            chosenProjects = SyncedMeetingContextSettings.normalizedJiraProjectKeys(from: fallbackText)
+        }
+
+        return (chosenURL, chosenProjects)
+    }
+
+    func resolvedJiraBoardConfig(
+        for sessionID: UUID?,
+        defaultBoardURL: String,
+        defaultProjectKey: String,
+        lastBoardURL: String? = nil,
+        jiraSettings: JiraConnectionSettings
+    ) -> (boardURL: URL?, projectKeys: [String]) {
+        guard let sessionID else {
+            return resolvedJiraBoardConfig(
+                seriesIDs: [],
+                roomKeys: [],
+                defaultBoardURL: defaultBoardURL,
+                defaultProjectKey: defaultProjectKey,
+                lastBoardURL: lastBoardURL,
+                jiraSettings: jiraSettings
+            )
+        }
+        let canonical = replica.workspaceDoc.resolveCanonicalSessionID(for: sessionID)
+        let session = sessions.first(where: { $0.id == canonical || $0.id == sessionID })
+        let seriesIDs = [session?.externalSeriesID, session?.calendarSeriesID].compactMap { $0 }
+        let roomKeys = [session?.invitation?.absoluteString, session?.roomIdentity].compactMap { $0 }
+        return resolvedJiraBoardConfig(
+            seriesIDs: seriesIDs,
+            roomKeys: roomKeys,
+            defaultBoardURL: defaultBoardURL,
+            defaultProjectKey: defaultProjectKey,
+            lastBoardURL: lastBoardURL,
+            jiraSettings: jiraSettings
+        )
+    }
+
     func saveDefaultTransitionMode(_ mode: IOSSameRoomTransitionMode) async {
         let current = settings(for: "all")
         await saveContextSettings(
@@ -1443,7 +1579,13 @@ final class IOSWorkspaceCoordinator: ObservableObject {
         autoJoin: Bool? = nil,
         updateAutoJoin: Bool = false,
         autoFacilitatorSkillID: String? = nil,
-        updateAutoFacilitatorSkillID: Bool = false
+        updateAutoFacilitatorSkillID: Bool = false,
+        jiraBoardURL: String? = nil,
+        updateJiraBoardURL: Bool = false,
+        jiraProjectKeys: [String]? = nil,
+        updateJiraProjectKeys: Bool = false,
+        autoExportOverrides: MeetingAutoExportOverrides? = nil,
+        updateAutoExportOverrides: Bool = false
     ) async {
         let existing = replica.workspaceDoc.contextSettings[scopeKey]
         func scalar<V: Equatable>(_ value: V, _ prev: SyncValue<V>?) -> SyncValue<V> {
@@ -1472,6 +1614,43 @@ final class IOSWorkspaceCoordinator: ObservableObject {
         let nextAutoSkill = updateAutoFacilitatorSkillID
             ? nullableScalar(sanitizedSkill, existing?.autoFacilitatorSkillID)
             : existing?.autoFacilitatorSkillID
+
+        let cleanedBoard = jiraBoardURL?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedBoard = (cleanedBoard?.isEmpty == false) ? cleanedBoard : nil
+        let nextBoardURL = updateJiraBoardURL
+            ? nullableScalar(normalizedBoard, existing?.jiraBoardURL)
+            : existing?.jiraBoardURL
+
+        let normalizedProjects = jiraProjectKeys.map {
+            SyncedMeetingContextSettings.normalizedJiraProjectKeys(from: $0.joined(separator: ","))
+        }
+        let cleanProjects = (normalizedProjects?.isEmpty == false) ? normalizedProjects : nil
+        let nextProjectKeys = updateJiraProjectKeys
+            ? nullableScalar(cleanProjects, existing?.jiraProjectKeys)
+            : existing?.jiraProjectKeys
+
+        let nextAutoExport: SyncedMeetingAutoExportSettings?
+        if updateAutoExportOverrides, let overrides = autoExportOverrides {
+            let oldExport = existing?.autoExportSettings
+            if overrides.isEmpty && oldExport == nil {
+                nextAutoExport = nil
+            } else {
+                nextAutoExport = SyncedMeetingAutoExportSettings(
+                    autoExport: nullableScalar(overrides.autoExport, oldExport?.autoExport),
+                    includeTranscript: nullableScalar(overrides.includeTranscript, oldExport?.includeTranscript),
+                    includeSummary: nullableScalar(overrides.includeSummary, oldExport?.includeSummary),
+                    includeNotes: nullableScalar(overrides.includeNotes, oldExport?.includeNotes),
+                    includeTasks: nullableScalar(overrides.includeTasks, oldExport?.includeTasks),
+                    includeDecisions: nullableScalar(overrides.includeDecisions, oldExport?.includeDecisions),
+                    includeQuestions: nullableScalar(overrides.includeQuestions, oldExport?.includeQuestions),
+                    autoGenerateSummary: nullableScalar(overrides.autoGenerateSummary, oldExport?.autoGenerateSummary),
+                    autoSyncTasks: nullableScalar(overrides.autoSyncTasks, oldExport?.autoSyncTasks)
+                )
+            }
+        } else {
+            nextAutoExport = existing?.autoExportSettings
+        }
+
         let updated = SyncedMeetingContextSettings(
             scopeKey: scopeKey,
             scopeKind: scopeKind,
@@ -1487,6 +1666,9 @@ final class IOSWorkspaceCoordinator: ObservableObject {
             defaultReminderOverride: existing?.defaultReminderOverride,
             autoJoin: nextAutoJoin,
             autoFacilitatorSkillID: nextAutoSkill,
+            jiraBoardURL: nextBoardURL,
+            jiraProjectKeys: nextProjectKeys,
+            autoExportSettings: nextAutoExport,
             guidanceRules: existing?.guidanceRules ?? [:]
         )
         replica.workspaceDoc.upsertContextSettings(updated)
@@ -1522,6 +1704,9 @@ final class IOSWorkspaceCoordinator: ObservableObject {
             defaultReminderOverride: existing?.defaultReminderOverride,
             autoJoin: existing?.autoJoin,
             autoFacilitatorSkillID: existing?.autoFacilitatorSkillID,
+            jiraBoardURL: existing?.jiraBoardURL,
+            jiraProjectKeys: existing?.jiraProjectKeys,
+            autoExportSettings: existing?.autoExportSettings,
             guidanceRules: existing?.guidanceRules ?? [:]
         )
         replica.workspaceDoc.upsertContextSettings(updated)

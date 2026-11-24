@@ -1,4 +1,5 @@
 import AppKit
+import ConferenceCore
 import SwiftUI
 
 struct MeetingManualExportView: View {
@@ -16,11 +17,25 @@ struct MeetingManualExportView: View {
     @State private var options = MeetingManualExportOptions()
     private let singleSessionID: UUID?
 
-    init(attention: AttentionCoordinator, singleSessionID: UUID? = nil) {
+    init(attention: AttentionCoordinator, archiveStore: TranscriptArchiveStore? = nil, singleSessionID: UUID? = nil) {
         let library = attention.store.meetingLibrary
         _library = ObservedObject(wrappedValue: library)
-        _exporter = StateObject(wrappedValue: MeetingManualExportController(library: library, notes: attention.store.notes,
-            flushOutcomeWrites: { await attention.store.waitForOutcomeWrites() }))
+        _exporter = StateObject(wrappedValue: MeetingManualExportController(
+            library: library,
+            notes: attention.store.notes,
+            flushOutcomeWrites: { await attention.store.waitForOutcomeWrites() },
+            transcriptLoader: { card, sessionRecord in
+                let startedAt = sessionRecord?.startedAt ?? card.startedAt
+                let journalEvents = library.workspaceJournal.exportSyncedEvents(sessionID: card.sessionID, deviceID: "mac")
+                if let body = MeetingMarkdownTemplate.transcriptBody(events: journalEvents, startedAt: startedAt) {
+                    return body
+                }
+                if let archived = await archiveStore?.loadTranscript(sessionID: card.sessionID), !archived.isEmpty {
+                    return MeetingMarkdownTemplate.transcriptBody(events: archived, startedAt: startedAt)
+                }
+                return nil
+            }
+        ))
         self.singleSessionID = singleSessionID
         _selected = State(initialValue: Set(singleSessionID.map { [$0] } ?? []))
     }
@@ -139,6 +154,7 @@ struct MeetingManualExportView: View {
                 sectionToggle(L("Decisions"), section: .decisions)
                 sectionToggle(L("Tasks"), section: .tasks)
                 sectionToggle(L("Open questions"), section: .questions)
+                sectionToggle(L("Transcript"), section: .transcript)
             }
         }.disabled(exporter.exporting)
     }

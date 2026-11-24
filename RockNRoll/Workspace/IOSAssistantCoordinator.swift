@@ -492,6 +492,7 @@ final class IOSAssistantCoordinator: ObservableObject {
     var onBannerAlert: ((IOSAssistantAlertCard) -> Void)?
     var onSessionModeChanged: ((UUID, IOSMeetingAssistantMode, Bool) -> Void)?
     var onTranscriptEvents: ((UUID, String, URL?, [SyncedTranscriptEvent], [String]) -> Void)?
+    var isFacilitatorActive: ((UUID) -> Bool)?
     var attentionPromptProvider: (() -> String?)?
 
     private var eventBuffers: [UUID: [SyncedTranscriptEvent]] = [:]
@@ -783,6 +784,10 @@ final class IOSAssistantCoordinator: ObservableObject {
             let roomURL = bridge.flatMap { URL(string: $0.roomKey) }
             onTranscriptEvents?(controllerID, bridge?.title ?? L("Meeting"), roomURL, freshAllEvents, aliases)
         }
+        if isFacilitatorActive?(controllerID) == true {
+            cancelEvaluation(for: controllerID)
+            return
+        }
 
         guard !freshEvents.isEmpty else { return }
         let mode = resolvedMode(for: controllerID)
@@ -860,6 +865,7 @@ final class IOSAssistantCoordinator: ObservableObject {
         localMention: (event: SyncedTranscriptEvent, alias: String)?,
         recentEvents: [SyncedTranscriptEvent]
     ) async {
+        guard isFacilitatorActive?(controllerID) != true else { return }
         let mode = resolvedMode(for: controllerID)
         guard mode != .off else { return }
         if mode == .participating && isPausedForMicrophone(controllerID: controllerID) { return }

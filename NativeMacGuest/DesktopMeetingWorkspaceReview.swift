@@ -1,5 +1,7 @@
 import AppKit
+import ConferenceCore
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct WorkspaceSessionReview: View {
     enum Filter: CaseIterable, Hashable {
@@ -34,6 +36,7 @@ struct WorkspaceSessionReview: View {
     @State private var replyID: String?
     @State private var confirmDelete = false
     @State private var deleteError: String?
+    @State private var copiedFeedback = false
 
     private var events: [MeetingWorkspaceEvent] { session.visibleEvents }
     private var filteredEvents: [MeetingWorkspaceEvent] {
@@ -114,6 +117,14 @@ struct WorkspaceSessionReview: View {
     @State private var showingReflection = false
     private var selectedReply: MeetingWorkspaceEvent? { events.first { $0.id == replyID && $0.kind == .assistantReply } }
 
+    private var exportableEvents: [SyncedTranscriptEvent] {
+        MeetingWorkspaceJournal.syncedTranscriptEvents(from: events)
+    }
+
+    private var hasTranscriptContent: Bool {
+        !TranscriptExportFormatter.formatPlainText(events: exportableEvents).isEmpty
+    }
+
     private var header: some View {
         HStack(alignment: .top) {
             VStack(alignment: .leading, spacing: 4) {
@@ -122,6 +133,28 @@ struct WorkspaceSessionReview: View {
                     .font(.caption).foregroundStyle(session.interrupted ? .orange : .secondary)
             }
             Spacer(minLength: 7)
+            if hasTranscriptContent {
+                Button {
+                    copyTranscript()
+                } label: {
+                    Label(
+                        copiedFeedback ? L("Copied") : L("Copy transcript"),
+                        systemImage: copiedFeedback ? "checkmark" : "doc.on.doc"
+                    )
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .accessibilityIdentifier("meetingWorkspace.copyTranscript")
+
+                Button {
+                    exportTranscript()
+                } label: {
+                    Label(L("Export transcript…"), systemImage: "square.and.arrow.up")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .accessibilityIdentifier("meetingWorkspace.exportTranscript")
+            }
             if showsDelete {
                 Menu {
                     Button(L("Delete saved conversation"), role: .destructive) { confirmDelete = true }
@@ -130,6 +163,41 @@ struct WorkspaceSessionReview: View {
                 }.menuIndicator(.hidden).fixedSize()
             }
         }
+    }
+
+    private func copyTranscript() {
+        let text = TranscriptExportFormatter.formatPlainText(
+            events: exportableEvents,
+            meetingTitle: session.title,
+            startedAt: session.startedAt
+        )
+        guard !text.isEmpty else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+        copiedFeedback = true
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(2))
+            copiedFeedback = false
+        }
+    }
+
+    private func exportTranscript() {
+        let markdown = TranscriptExportFormatter.formatMarkdown(
+            events: exportableEvents,
+            title: session.title,
+            startedAt: session.startedAt,
+            endedAt: session.endedAt
+        )
+        guard !markdown.isEmpty else { return }
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = TranscriptExportFormatter.suggestedFileName(
+            title: session.title,
+            startedAt: session.startedAt
+        )
+        panel.allowedContentTypes = [UTType(filenameExtension: "md") ?? .plainText]
+        panel.canCreateDirectories = true
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        try? Data(markdown.utf8).write(to: url, options: .atomic)
     }
 
     private var filterPicker: some View {

@@ -83,6 +83,7 @@ extension MeetingLibraryStore {
         }
 
         return try db.transaction {
+            db.setExternalSeriesID(remote.externalSeriesID, for: remote.id)
             let existingRow = try db.one("SELECT * FROM meeting_sessions WHERE session_id=?", bind: {
                 try Self.bindText($0, remote.id.uuidString, at: 1)
             })
@@ -647,21 +648,22 @@ extension MeetingLibraryStore {
         let db = try db()
         return try db.transaction {
             guard let destination = try Self.activeDestination(db),
-                  destination.enabled,
-                  destination.vaultBookmark != nil,
-                  destination.layout.sections.contains(.transcript) else {
+                  destination.vaultBookmark != nil else {
                 return false
             }
             var queuedAny = false
             let nowMs = Date().syncMilliseconds
             for sessionID in sessionIDs {
-                guard let currentRevision = try db.one(
-                    "SELECT export_revision FROM meeting_sessions WHERE session_id=?",
-                    bind: { try Self.bindText($0, sessionID.uuidString, at: 1) }
-                )?.integer(0) else {
+                guard let snapshot = try Self.exportSnapshot(db, sessionID: sessionID) else {
                     continue
                 }
-                let nextRevision = Int(currentRevision) + 1
+                let overrides = db.autoExportOverrides(for: snapshot.session)
+                let effectiveDest = destination.effective(for: overrides)
+                let autoAllowed = overrides.autoExport ?? (destination.enabled && (destination.saveAfterMeeting || destination.syncChanges))
+                guard effectiveDest.layout.sections.contains(.transcript), autoAllowed else {
+                    continue
+                }
+                let nextRevision = snapshot.session.exportRevision + 1
                 try db.run("UPDATE meeting_sessions SET export_revision=?, updated_at=? WHERE session_id=?") {
                     try Self.bindInt($0, Int64(nextRevision), at: 1)
                     try Self.bindInt($0, nowMs, at: 2)

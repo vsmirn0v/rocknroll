@@ -183,6 +183,95 @@ public final class AssistantSpeechLedger: @unchecked Sendable {
         return cleanSpeaker
     }
 
+    /// Strips noisy Markdown formatting (`\`KEY-1\``, `**bold**`, fenced markers) and
+    /// collapses duplicated lines or repeated consecutive sentences before TTS playback.
+    public static func sanitizeSpokenReply(_ raw: String) -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "" }
+
+        var cleaned = trimmed
+            .replacingOccurrences(of: "```[a-zA-Z0-9_-]*\\n?", with: "", options: .regularExpression)
+            .replacingOccurrences(of: "```", with: "")
+            .replacingOccurrences(of: "`", with: "")
+            .replacingOccurrences(of: "\\*\\*([^*]+)\\*\\*", with: "$1", options: .regularExpression)
+            .replacingOccurrences(of: "__([^_]+)__", with: "$1", options: .regularExpression)
+
+        // Collapse duplicated lines/paragraphs (case- and whitespace-normalized).
+        let rawLines = cleaned.components(separatedBy: .newlines)
+        var dedupedLines: [String] = []
+        var seenLineKeys: [String] = []
+        for line in rawLines {
+            let lineTrimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            if lineTrimmed.isEmpty { continue }
+            let key = normalizeForDuplicateCheck(lineTrimmed)
+            if seenLineKeys.last == key || (key.count >= 16 && seenLineKeys.contains(key)) {
+                continue
+            }
+            seenLineKeys.append(key)
+            dedupedLines.append(lineTrimmed)
+        }
+        cleaned = dedupedLines.joined(separator: "\n")
+
+        // Collapse adjacent repeated sentences within a paragraph or line.
+        var finalLines: [String] = []
+        for line in cleaned.components(separatedBy: .newlines) {
+            finalLines.append(collapseRepeatedSentences(in: line))
+        }
+        return finalLines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func normalizeForDuplicateCheck(_ text: String) -> String {
+        text.lowercased()
+            .replacingOccurrences(of: "ё", with: "е")
+            .split(whereSeparator: \.isWhitespace)
+            .joined(separator: " ")
+    }
+
+    private static func collapseRepeatedSentences(in line: String) -> String {
+        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count >= 20 else { return trimmed }
+        var sentences: [String] = []
+        var currentStart = trimmed.startIndex
+        var idx = trimmed.startIndex
+        while idx < trimmed.endIndex {
+            let ch = trimmed[idx]
+            let nextIdx = trimmed.index(after: idx)
+            if (ch == "." || ch == "!" || ch == "?") &&
+                (nextIdx == trimmed.endIndex || trimmed[nextIdx].isWhitespace) {
+                let slice = String(trimmed[currentStart...idx]).trimmingCharacters(in: .whitespacesAndNewlines)
+                if !slice.isEmpty {
+                    sentences.append(slice)
+                }
+                var skip = nextIdx
+                while skip < trimmed.endIndex && trimmed[skip].isWhitespace {
+                    skip = trimmed.index(after: skip)
+                }
+                currentStart = skip
+                idx = skip
+                continue
+            }
+            idx = nextIdx
+        }
+        if currentStart < trimmed.endIndex {
+            let tail = String(trimmed[currentStart...]).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !tail.isEmpty {
+                sentences.append(tail)
+            }
+        }
+        guard sentences.count > 1 else { return trimmed }
+        var kept: [String] = []
+        var seenKeys: [String] = []
+        for sentence in sentences {
+            let key = normalizeForDuplicateCheck(sentence)
+            if seenKeys.last == key || (key.count >= 16 && seenKeys.contains(key)) {
+                continue
+            }
+            seenKeys.append(key)
+            kept.append(sentence)
+        }
+        return kept.joined(separator: " ")
+    }
+
     // MARK: - Private Matching
 
     private func upsert(_ item: Utterance, now: Date) {

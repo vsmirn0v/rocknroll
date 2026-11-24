@@ -1,13 +1,46 @@
+import AppKit
 import ConferenceCore
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct ArchivedHistoryTranscript: View {
     let events: [SyncedTranscriptEvent]
+    var title: String = L("Meeting")
+    var startedAt: Date = .distantPast
+    var endedAt: Date? = nil
     @State private var query = ""
+    @State private var copiedFeedback = false
+
+    private var hasTranscriptContent: Bool {
+        !TranscriptExportFormatter.formatPlainText(events: events).isEmpty
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Label(L("Saved on this Mac"), systemImage: "internaldrive").foregroundStyle(.secondary)
+            HStack {
+                Label(L("Saved on this Mac"), systemImage: "internaldrive").foregroundStyle(.secondary)
+                Spacer()
+                if hasTranscriptContent {
+                    Button {
+                        copyTranscript()
+                    } label: {
+                        Label(
+                            copiedFeedback ? L("Copied") : L("Copy transcript"),
+                            systemImage: copiedFeedback ? "checkmark" : "doc.on.doc"
+                        )
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+
+                    Button {
+                        exportTranscript()
+                    } label: {
+                        Label(L("Export transcript…"), systemImage: "square.and.arrow.up")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
+            }
             TextField(L("Search within this conversation"), text: $query).textFieldStyle(.roundedBorder)
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 12) {
@@ -26,6 +59,41 @@ struct ArchivedHistoryTranscript: View {
     private func matches(_ event: SyncedTranscriptEvent) -> Bool {
         query.isEmpty || event.text.localizedStandardContains(query) ||
             event.speaker?.localizedStandardContains(query) == true
+    }
+
+    private func copyTranscript() {
+        let text = TranscriptExportFormatter.formatPlainText(
+            events: events,
+            meetingTitle: title,
+            startedAt: startedAt == .distantPast ? nil : startedAt
+        )
+        guard !text.isEmpty else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+        copiedFeedback = true
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(2))
+            copiedFeedback = false
+        }
+    }
+
+    private func exportTranscript() {
+        let markdown = TranscriptExportFormatter.formatMarkdown(
+            events: events,
+            title: title,
+            startedAt: startedAt,
+            endedAt: endedAt
+        )
+        guard !markdown.isEmpty else { return }
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = TranscriptExportFormatter.suggestedFileName(
+            title: title,
+            startedAt: startedAt == .distantPast ? nil : startedAt
+        )
+        panel.allowedContentTypes = [UTType(filenameExtension: "md") ?? .plainText]
+        panel.canCreateDirectories = true
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        try? Data(markdown.utf8).write(to: url, options: .atomic)
     }
 }
 
