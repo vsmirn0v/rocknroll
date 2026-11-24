@@ -37,7 +37,7 @@ final class MacWorkspaceSyncCoordinator: ObservableObject {
     private var replica: ReplicaState {
         didSet { replicaRevision &+= 1 }
     }
-    private var replicaRevision: UInt64 = 0
+    private(set) var replicaRevision: UInt64 = 0
     private var cachedVisibleCardIDs: (revision: UInt64, ids: Set<UUID>)?
     private var cachedHistoryMembers: (cardsRevision: UInt64, replicaRevision: UInt64, byRoot: [UUID: [UUID]])?
     private var started = false

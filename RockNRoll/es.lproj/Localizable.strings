@@ -4241,3 +4241,4 @@
 "30 min before" = "30 min antes";
 "%@ · %ld meetings" = "%@ · %ld reuniones";
 "Could not save the meeting to Calendar." = "No se pudo guardar la reunión en el calendario.";
+"Show earlier (%ld)" = "Mostrar anteriores (%ld)";

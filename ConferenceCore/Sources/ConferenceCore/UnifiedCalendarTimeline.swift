@@ -154,43 +154,59 @@ public enum UnifiedCalendarTimelineBuilder {
         var matchedSessionByMeetingID: [String: UnifiedCalendarSessionInput] = [:]
         var claimedSessionIDs: Set<UUID> = []
 
+        // Pre-index sessions once so Pass 1 and Pass 2 run in O(M + S) instead of O(M * S).
+        var sessionsByOccurrenceID: [String: [UnifiedCalendarSessionInput]] = [:]
+        var unlinkedSessionsByRoomKey: [String: [UnifiedCalendarSessionInput]] = [:]
+        for session in uniqueSessions {
+            if let assoc = session.calendarAssociation {
+                sessionsByOccurrenceID[assoc.occurrenceID, default: []].append(session)
+            } else if let sessionKey = resolvedRoomKey(for: session) {
+                unlinkedSessionsByRoomKey[sessionKey, default: []].append(session)
+            }
+        }
+
         // Pass 1: Exact calendar occurrence association match.
         for meeting in uniqueMeetings {
             let meetingOccID = occurrenceID(for: meeting)
-            let candidates = uniqueSessions.filter { session in
-                guard !claimedSessionIDs.contains(session.id),
-                      let assoc = session.calendarAssociation else {
-                    return false
+            guard let bucket = sessionsByOccurrenceID[meetingOccID] else { continue }
+            var best: UnifiedCalendarSessionInput?
+            var bestDelta = Double.greatestFiniteMagnitude
+            for session in bucket where !claimedSessionIDs.contains(session.id) {
+                let delta = abs(session.startedAt.timeIntervalSince(meeting.start))
+                if delta < bestDelta {
+                    bestDelta = delta
+                    best = session
                 }
-                return assoc.occurrenceID == meetingOccID
             }
-            if let best = candidates.min(by: {
-                abs($0.startedAt.timeIntervalSince(meeting.start)) < abs($1.startedAt.timeIntervalSince(meeting.start))
-            }) {
+            if let best {
                 matchedSessionByMeetingID[meeting.id] = best
                 claimedSessionIDs.insert(best.id)
             }
         }
 
         // Pass 2: Room-key + scheduled time-window overlap fallback for unlinked sessions.
-        for meeting in uniqueMeetings where matchedSessionByMeetingID[meeting.id] == nil {
-            guard let meetingRoomKey = resolvedRoomKey(for: meeting) else { continue }
-            let windowStart = meeting.start.addingTimeInterval(-15 * 60)
-            let windowEnd = meeting.end.addingTimeInterval(MeetingCalendarAssociation.rejoinGrace)
-            let candidates = uniqueSessions.filter { session in
-                guard !claimedSessionIDs.contains(session.id),
-                      session.calendarAssociation == nil,
-                      let sessionKey = resolvedRoomKey(for: session),
-                      sessionKey == meetingRoomKey else {
-                    return false
+        if !unlinkedSessionsByRoomKey.isEmpty {
+            for meeting in uniqueMeetings where matchedSessionByMeetingID[meeting.id] == nil {
+                guard let meetingRoomKey = resolvedRoomKey(for: meeting),
+                      let bucket = unlinkedSessionsByRoomKey[meetingRoomKey] else {
+                    continue
                 }
-                return session.startedAt >= windowStart && session.startedAt <= windowEnd
-            }
-            if let best = candidates.min(by: {
-                abs($0.startedAt.timeIntervalSince(meeting.start)) < abs($1.startedAt.timeIntervalSince(meeting.start))
-            }) {
-                matchedSessionByMeetingID[meeting.id] = best
-                claimedSessionIDs.insert(best.id)
+                let windowStart = meeting.start.addingTimeInterval(-15 * 60)
+                let windowEnd = meeting.end.addingTimeInterval(MeetingCalendarAssociation.rejoinGrace)
+                var best: UnifiedCalendarSessionInput?
+                var bestDelta = Double.greatestFiniteMagnitude
+                for session in bucket where !claimedSessionIDs.contains(session.id) {
+                    guard session.startedAt >= windowStart && session.startedAt <= windowEnd else { continue }
+                    let delta = abs(session.startedAt.timeIntervalSince(meeting.start))
+                    if delta < bestDelta {
+                        bestDelta = delta
+                        best = session
+                    }
+                }
+                if let best {
+                    matchedSessionByMeetingID[meeting.id] = best
+                    claimedSessionIDs.insert(best.id)
+                }
             }
         }
 

@@ -2,6 +2,63 @@ import ConferenceCore
 import Foundation
 import SwiftUI
 
+@MainActor
+private final class ScrubberDateFormatterCache {
+    static let shared = ScrubberDateFormatterCache()
+
+    private struct Key: Equatable {
+        let localeID: String
+        let calendarID: Calendar.Identifier
+        let timeZoneID: String
+    }
+
+    private var currentKey: Key?
+    private let monthYearFormatter = DateFormatter()
+    private let fullDayFormatter = DateFormatter()
+    private let weekdayShortFormatter = DateFormatter()
+
+    private func ensureConfigured(locale: Locale, calendar: Calendar) {
+        let key = Key(localeID: locale.identifier, calendarID: calendar.identifier, timeZoneID: calendar.timeZone.identifier)
+        guard currentKey != key else { return }
+        currentKey = key
+
+        var localizedCal = calendar
+        localizedCal.locale = locale
+
+        monthYearFormatter.locale = locale
+        monthYearFormatter.calendar = localizedCal
+        monthYearFormatter.timeZone = calendar.timeZone
+        monthYearFormatter.formattingContext = .standalone
+        monthYearFormatter.setLocalizedDateFormatFromTemplate("LLLLy")
+
+        fullDayFormatter.locale = locale
+        fullDayFormatter.calendar = localizedCal
+        fullDayFormatter.timeZone = calendar.timeZone
+        fullDayFormatter.dateStyle = .long
+        fullDayFormatter.timeStyle = .none
+
+        weekdayShortFormatter.locale = locale
+        weekdayShortFormatter.calendar = localizedCal
+        weekdayShortFormatter.timeZone = calendar.timeZone
+        weekdayShortFormatter.setLocalizedDateFormatFromTemplate("E")
+    }
+
+    func monthYear(_ date: Date, locale: Locale, calendar: Calendar) -> String {
+        ensureConfigured(locale: locale, calendar: calendar)
+        return monthYearFormatter.string(from: date).capitalized(with: locale)
+    }
+
+    func fullDay(_ date: Date, locale: Locale, calendar: Calendar) -> String {
+        ensureConfigured(locale: locale, calendar: calendar)
+        return fullDayFormatter.string(from: date)
+    }
+
+    func weekdayShort(_ date: Date, locale: Locale, calendar: Calendar) -> String {
+        ensureConfigured(locale: locale, calendar: calendar)
+        return weekdayShortFormatter.string(from: date)
+    }
+}
+
 public struct CompactCalendarDayMarker: Equatable, Sendable {
     public var primaryCount: Int
     public var secondaryCount: Int
@@ -94,7 +151,7 @@ public struct CompactMonthScrubberView: View {
                 .buttonStyle(.borderless)
                 .accessibilityLabel(L("Previous month"))
 
-                Text(monthStart.formatted(.dateTime.month(.wide).year().locale(locale)).capitalized)
+                Text(ScrubberDateFormatterCache.shared.monthYear(monthStart, locale: locale, calendar: calendar))
                     .font(.caption.weight(.semibold))
                     .lineLimit(1)
                     .frame(maxWidth: .infinity)
@@ -218,7 +275,7 @@ public struct CompactMonthScrubberView: View {
     }
 
     private func accessibilityLabel(for day: Date, marker: CompactCalendarDayMarker?) -> String {
-        let formatted = day.formatted(.dateTime.day().month(.wide).year().locale(locale))
+        let formatted = ScrubberDateFormatterCache.shared.fullDay(day, locale: locale, calendar: calendar)
         let count = marker?.totalCount ?? 0
         if count == 0 {
             return formatted
@@ -277,7 +334,7 @@ public struct CompactWeekStripView: View {
                     onSelectDay(day)
                 } label: {
                     VStack(spacing: 3) {
-                        Text(day.formatted(.dateTime.weekday(.abbreviated).locale(locale)))
+                        Text(ScrubberDateFormatterCache.shared.weekdayShort(day, locale: locale, calendar: calendar))
                             .font(.caption2)
                             .foregroundStyle(isSelected ? .white.opacity(0.9) : .secondary)
                         Text("\(calendar.component(.day, from: day))")

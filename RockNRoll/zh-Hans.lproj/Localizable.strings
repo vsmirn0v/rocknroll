@@ -4241,3 +4241,4 @@
 "30 min before" = "提前 30 分钟";
 "%@ · %ld meetings" = "%@ · %ld 场会议";
 "Could not save the meeting to Calendar." = "无法将会议保存到日历。";
+"Show earlier (%ld)" = "显示更早内容 (%ld)";

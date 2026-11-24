@@ -667,7 +667,7 @@ struct MeetingHistoryView: View {
     ) -> some View {
             let selectedID = selectedCard?.sessionID
             let activeDate = selectedScrubberDate ?? selectedCard?.effectiveDate.map { calendar.startOfDay(for: $0.date) }
-            let dayMarkers = historyDayMarkers(for: searchSnapshot.groups)
+            let dayMarkers = showCalendarWidget ? historyDayMarkers(for: searchSnapshot.groups) : [:]
             return ScrollViewReader { proxy in
                 VStack(spacing: 0) {
                     HStack(spacing: 6) {

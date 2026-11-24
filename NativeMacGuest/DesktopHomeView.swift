@@ -37,6 +37,7 @@ enum NativeDesktopSettingsSearch {
 struct NativeDesktopHomeView: View {
     @ObservedObject var workspace: NativeDesktopWorkspace
     @ObservedObject var library: NativeDesktopLibrary
+    @StateObject private var calendarCache = CalendarTimelineViewCache()
     @State private var favoritesSearch = ""
     @State private var recentSearch = ""
     @State private var favoriteURL = ""
@@ -170,7 +171,7 @@ struct NativeDesktopHomeView: View {
                         case .settings: settingsView
                         case .favorites: roomList(library.favorites, title: L("Favorites"), search: $favoritesSearch, reorder: true)
                         case .recent: roomList(library.recent, title: L("Recent rooms"), search: $recentSearch)
-                        case .calendar: NativeDesktopCalendarView(workspace: workspace, library: library, suggestedOrigins: suggestedSiteOrigins)
+                        case .calendar: NativeDesktopCalendarView(workspace: workspace, library: library, cache: calendarCache)
                         case .workspace: NativeDesktopMeetingWorkspaceView(workspace: workspace)
                         case .history: MeetingHistoryView(attention: workspace.attention, workspace: workspace)
                             .onAppear { workspace.workspaceSync.scheduleSync(delayMilliseconds: 100, localChanges: false) }

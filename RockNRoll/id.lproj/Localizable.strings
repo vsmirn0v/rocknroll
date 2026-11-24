@@ -4241,3 +4241,4 @@
 "30 min before" = "30 mnt sebelumnya";
 "%@ · %ld meetings" = "%@ · %ld rapat";
 "Could not save the meeting to Calendar." = "Tidak dapat menyimpan rapat ke Kalender.";
+"Show earlier (%ld)" = "Tampilkan sebelumnya (%ld)";

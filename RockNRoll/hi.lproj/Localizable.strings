@@ -4241,3 +4241,4 @@
 "30 min before" = "30 मिनट पहले";
 "%@ · %ld meetings" = "%@ · %ld मीटिंग";
 "Could not save the meeting to Calendar." = "मीटिंग कैलेंडर में सहेजी नहीं जा सकी।";
+"Show earlier (%ld)" = "पहले की मीटिंग दिखाएँ (%ld)";

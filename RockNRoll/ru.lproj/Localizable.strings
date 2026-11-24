@@ -4468,3 +4468,4 @@
 "30 min before" = "За 30 минут";
 "%@ · %ld meetings" = "%@ · %ld встреч";
 "Could not save the meeting to Calendar." = "Не удалось сохранить встречу в Календарь.";
+"Show earlier (%ld)" = "Показать более ранние (%ld)";

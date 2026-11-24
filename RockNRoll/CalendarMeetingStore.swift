@@ -23,24 +23,37 @@ final class CalendarMeetingStore: ObservableObject {
         false
         #endif
     }
-    @Published private(set) var enabled: Bool
+    @Published private(set) var enabled: Bool {
+        didSet { timelineRevision &+= 1 }
+    }
     @Published private(set) var automaticJoin: Bool
     @Published private(set) var automaticJoinMode: CalendarAutomaticJoinMode
     @Published private(set) var keepInMenuBar: Bool
     @Published private(set) var automaticJoinPausedUntil: Date?
-    @Published private(set) var selected: Set<String>
+    @Published private(set) var selected: Set<String> {
+        didSet { timelineRevision &+= 1 }
+    }
     @Published private(set) var calendars: [MeetingCalendar] = []
     @Published private(set) var meetings: [CalendarMeeting] = [] {
-        didSet { rebuildUpcomingCache() }
+        didSet {
+            rebuildUpcomingCache()
+            timelineRevision &+= 1
+        }
     }
-    @Published private(set) var extraRangeMeetings: [CalendarMeeting] = []
+    @Published private(set) var extraRangeMeetings: [CalendarMeeting] = [] {
+        didSet { timelineRevision &+= 1 }
+    }
     @Published private(set) var syncedRemoteMeetings: [CalendarMeeting] = []
-    @Published private(set) var access: CalendarAccess = .notDetermined
+    @Published private(set) var access: CalendarAccess = .notDetermined {
+        didSet { timelineRevision &+= 1 }
+    }
     @Published private(set) var loading = false
     @Published private(set) var error: String?
     @Published private(set) var now = Date() {
         didSet { rebuildUpcomingCache() }
     }
+    private(set) var timelineRevision: UInt64 = 0
+    private var cachedAllTimelineMeetings: (revision: UInt64, items: [CalendarMeeting])?
     private var cachedUpcoming: [CalendarMeeting] = []
     private var cachedUpcomingByIdentity: [MeetingRoomIdentity: CalendarMeeting] = [:]
     @Published private(set) var countdown: Int?
@@ -474,6 +487,9 @@ final class CalendarMeetingStore: ObservableObject {
         return timely.count == 1 ? timely[0] : nil
     }
     var allTimelineMeetings: [CalendarMeeting] {
+        if let cached = cachedAllTimelineMeetings, cached.revision == timelineRevision {
+            return cached.items
+        }
         var byID: [String: CalendarMeeting] = [:]
         for item in extraRangeMeetings where enabled && access == .allowed && selected.contains(item.calendarID) {
             byID[item.id] = item
@@ -481,7 +497,9 @@ final class CalendarMeetingStore: ObservableObject {
         for item in meetings {
             byID[item.id] = item
         }
-        return byID.values.sorted { ($0.start, $0.title, $0.id) < ($1.start, $1.title, $1.id) }
+        let result = byID.values.sorted { ($0.start, $0.title, $0.id) < ($1.start, $1.title, $1.id) }
+        cachedAllTimelineMeetings = (timelineRevision, result)
+        return result
     }
     private func rememberExtraRangeMonth(key: String, start: Date) {
         extraRangeMonths[key] = start
