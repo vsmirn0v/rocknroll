@@ -1,4 +1,5 @@
 import Accelerate
+import CryptoKit
 import Foundation
 #if canImport(CoreAI)
 import CoreAI
@@ -31,6 +32,36 @@ struct VoxVoice: Codable, Equatable, Sendable {
     var patches: Int
 
     static let patchValues = 4 * 64
+
+    var cacheID: String {
+        var hasher = SHA256()
+        func updateString(_ value: String) {
+            let data = Data(value.utf8)
+            var count = UInt32(data.count).littleEndian
+            withUnsafeBytes(of: &count) { hasher.update(bufferPointer: $0) }
+            hasher.update(data: data)
+        }
+        func updateFloats(_ values: [Float]?) {
+            var present: UInt8 = values == nil ? 0 : 1
+            withUnsafeBytes(of: &present) { hasher.update(bufferPointer: $0) }
+            guard let values else { return }
+            var count = UInt32(values.count).littleEndian
+            withUnsafeBytes(of: &count) { hasher.update(bufferPointer: $0) }
+            values.withUnsafeBytes { bytes in
+                if let base = bytes.baseAddress {
+                    hasher.update(bufferPointer: UnsafeRawBufferPointer(start: base, count: bytes.count))
+                }
+            }
+        }
+        updateString(revision)
+        updateString(mode.rawValue)
+        updateString(transcript)
+        var patchCount = UInt32(patches).littleEndian
+        withUnsafeBytes(of: &patchCount) { hasher.update(bufferPointer: $0) }
+        updateFloats(reference)
+        updateFloats(continuation)
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
 }
 
 extension VoxAudioVAE {
@@ -174,9 +205,17 @@ final class VoxCPM2 {
         var minimumPatches = 2
         var maximumPatches = 4096
         var guidance: Float = 2
+        var diffusionSteps = 10
     }
 
-    struct Timing { var neuralEngine = 0.0; var total = 0.0; var patches = 0 }
+    struct Timing { var neuralEngine = 0.0; var total = 0.0; var firstAudioSeconds = 0.0; var patches = 0 }
+
+    private final class CachedVoicePrefix {
+        var referenceEmbeddings: [Float]?
+        var continuationEmbeddings: [Float]?
+        var referenceKV: (base: VoxAsset.Cached.Snapshot, residual: VoxAsset.Cached.Snapshot)?
+        var continuationDecoder: VoxAudioVAE.DecoderSnapshot?
+    }
 
     let manifest: VoxManifest
     let config: VoxCheckpointConfig
@@ -201,7 +240,11 @@ final class VoxCPM2 {
     private let base: VoxAsset.Cached
     private let residual: VoxAsset.Cached
     private var schedule: [(name: String, clocks: [Float16], dts: [Float16])] = []
+    private var schedules: [Int: [(name: String, clocks: [Float16], dts: [Float16])]] = [:]
     private var masks: [String: [String: [Float16]]] = [:]
+    private var voicePrefixes: [String: CachedVoicePrefix] = [:]
+    private var voicePrefixOrder: [String] = []
+    private static let maximumCachedVoicePrefixes = 4
 
     /// Loads a bundle folder holding model.json, the `.aimodelc` assets and `checkpoint/`.
     /// The first load on a Mac compiles the assets for its Neural Engine and can take many minutes.
@@ -277,6 +320,7 @@ final class VoxCPM2 {
         base = try cached(baseStage)
         residual = try cached(residualStage)
         schedule = try makeSchedule(steps: 10)
+        schedules[10] = schedule
     }
 
     /// Loads one inference function from every asset to detect all dangling specializations in one pass.
@@ -339,43 +383,105 @@ final class VoxCPM2 {
         let budget = min(options.maximumPatches, available)
         guard budget > options.minimumPatches + 1 else { throw VoxError.context("The text is too long to speak in one reply.") }
 
-        let embedded = try await encode(inputs.features, count: count)
-        var combined = [Float](repeating: 0, count: count * hidden)
-        for row in 0..<count {
-            if inputs.audio[row] {
-                for index in 0..<hidden { combined[row * hidden + index] = embedded[row * hidden + index] }
+        let activeSchedule = try resolveSchedule(steps: options.diffusionSteps)
+        let prefix = voice.map { cachedVoicePrefix(for: $0) }
+        var referenceEmbeddings: [Float]?
+        if let reference = voice?.reference, let voice {
+            if let existing = prefix?.referenceEmbeddings {
+                referenceEmbeddings = existing
             } else {
-                let id = inputs.ids[row]
-                for index in 0..<hidden {
-                    combined[row * hidden + index] = Float(embeddings.loadUnaligned(fromByteOffset: (id * hidden + index) * 2, as: Float16.self))
+                let encoded = try await encode(reference, count: voice.patches)
+                prefix?.referenceEmbeddings = encoded
+                referenceEmbeddings = encoded
+            }
+        }
+        var continuationEmbeddings: [Float]?
+        if let continuation = voice?.continuation, let voice {
+            if let existing = prefix?.continuationEmbeddings {
+                continuationEmbeddings = existing
+            } else {
+                let encoded = try await encode(continuation, count: voice.patches)
+                prefix?.continuationEmbeddings = encoded
+                continuationEmbeddings = encoded
+            }
+        }
+
+        let referencePatches = (voice?.reference != nil) ? (voice?.patches ?? 0) : 0
+        let continuationPatches = (voice?.continuation != nil) ? (voice?.patches ?? 0) : 0
+        let refPrefixRows = (voice?.reference != nil) ? (referencePatches + 2) : 0
+
+        func audioEmbedding(forRow row: Int, index: Int) -> Float {
+            if voice?.reference != nil, row >= 1, row < 1 + referencePatches, let referenceEmbeddings {
+                return referenceEmbeddings[(row - 1) * hidden + index]
+            }
+            let continuationStart = count - continuationPatches
+            if voice?.continuation != nil, row >= continuationStart, let continuationEmbeddings {
+                return continuationEmbeddings[(row - continuationStart) * hidden + index]
+            }
+            return 0
+        }
+
+        func prefill(range: Range<Int>, reset: Bool) async throws -> (lastHidden: [Float], lastResidual: [Float]) {
+            let chunkCount = range.count
+            precondition(chunkCount > 0)
+            var combined = [Float](repeating: 0, count: chunkCount * hidden)
+            for (localRow, row) in range.enumerated() {
+                if inputs.audio[row] {
+                    for index in 0..<hidden { combined[localRow * hidden + index] = audioEmbedding(forRow: row, index: index) }
+                } else {
+                    let id = inputs.ids[row]
+                    for index in 0..<hidden {
+                        combined[localRow * hidden + index] = Float(embeddings.loadUnaligned(fromByteOffset: (id * hidden + index) * 2, as: Float16.self))
+                    }
                 }
             }
-        }
-        var baseOut = try await run(base, combined, rows: count, reset: true, rope: stages["base-0"]!.config.rope)
-        let quantized = quantize(baseOut, rows: count)
-        var fused = [Float](repeating: 0, count: count * 2 * hidden)
-        for row in 0..<count {
-            let audio = inputs.audio[row]
-            for index in 0..<hidden {
-                if audio { baseOut[row * hidden + index] = quantized[row * hidden + index] }
-                fused[row * 2 * hidden + index] = baseOut[row * hidden + index]
-                fused[row * 2 * hidden + hidden + index] = audio ? embedded[row * hidden + index] : 0
+            var baseOut = try await run(base, combined, rows: chunkCount, reset: reset, rope: stages["base-0"]!.config.rope)
+            let quantized = quantize(baseOut, rows: chunkCount)
+            var fused = [Float](repeating: 0, count: chunkCount * 2 * hidden)
+            for (localRow, row) in range.enumerated() {
+                let isAudio = inputs.audio[row]
+                for index in 0..<hidden {
+                    if isAudio { baseOut[localRow * hidden + index] = quantized[localRow * hidden + index] }
+                    fused[localRow * 2 * hidden + index] = baseOut[localRow * hidden + index]
+                    fused[localRow * 2 * hidden + hidden + index] = isAudio ? audioEmbedding(forRow: row, index: index) : 0
+                }
             }
+            let residualOut = try await run(residual, fusion(fused, rows: chunkCount), rows: chunkCount, reset: reset,
+                                            rope: stages["residual"]!.config.rope)
+            return (
+                lastHidden: Array(baseOut[((chunkCount - 1) * hidden)..<(chunkCount * hidden)]),
+                lastResidual: Array(residualOut[((chunkCount - 1) * hidden)..<(chunkCount * hidden)])
+            )
         }
-        let residualOut = try await run(residual, fusion(fused, rows: count), rows: count, reset: true,
-                                        rope: stages["residual"]!.config.rope)
-        var lastHidden = Array(baseOut[((count - 1) * hidden)..<(count * hidden)])
-        var lastResidual = Array(residualOut[((count - 1) * hidden)..<(count * hidden)])
+
+        var lastHidden: [Float]
+        var lastResidual: [Float]
+        if refPrefixRows > 0, count > refPrefixRows {
+            if let snapshot = prefix?.referenceKV {
+                try base.restore(snapshot.base)
+                try residual.restore(snapshot.residual)
+            } else {
+                _ = try await prefill(range: 0..<refPrefixRows, reset: true)
+                if let bSnap = base.snapshot(), let rSnap = residual.snapshot() {
+                    prefix?.referenceKV = (bSnap, rSnap)
+                }
+            }
+            (lastHidden, lastResidual) = try await prefill(range: refPrefixRows..<count, reset: false)
+        } else {
+            (lastHidden, lastResidual) = try await prefill(range: 0..<count, reset: true)
+        }
         var previous = Array(inputs.features[((count - 1) * VoxVoice.patchValues)..<(count * VoxVoice.patchValues)])
 
-        // Decoder input: 25 Hz latent frames, decoded 16 at a time as generation goes.
-        codec.resetDecoder()
+        // Decoder input: 25 Hz latent frames, decoded early (4 frames for the first two chunks, then 16).
         var pending: [[Float]] = []
         var skip = 0
+        var emittedChunks = 0
         var output: [Float] = []
         func decode(final: Bool) throws {
-            while pending.count >= 16 || (final && !pending.isEmpty) {
-                let frames = min(16, pending.count)
+            while true {
+                let threshold = emittedChunks < 2 ? 4 : 16
+                guard pending.count >= threshold || (final && !pending.isEmpty) else { break }
+                let frames = min(threshold, pending.count)
                 var latent = VoxSignal.zeros(64, frames)
                 for frame in 0..<frames { for channel in 0..<64 { latent.values[channel * frames + frame] = pending[frame][channel] } }
                 pending.removeFirst(frames)
@@ -384,17 +490,44 @@ final class VoxCPM2 {
                 let dropped = min(skip, piece.count)
                 skip -= dropped
                 piece.removeFirst(dropped)
-                if !piece.isEmpty { output += piece; audio?(piece) }
+                if !piece.isEmpty {
+                    if emittedChunks == 0 {
+                        timing.firstAudioSeconds = (ContinuousClock.now - started).voxSeconds
+                    }
+                    emittedChunks += 1
+                    output += piece
+                    audio?(piece)
+                }
             }
         }
         func push(_ patch: [Float]) {
             for frame in 0..<4 { pending.append(Array(patch[(frame * 64)..<((frame + 1) * 64)])) }
         }
         if inputs.audio[count - 1] {
-            // Continuation: decode the reference's last three patches for continuity, then drop them.
-            let audioRows = (0..<count).filter { inputs.audio[$0] }.suffix(3)
-            for row in audioRows { push(Array(inputs.features[(row * VoxVoice.patchValues)..<((row + 1) * VoxVoice.patchValues)])) }
-            skip = audioRows.count * 4 * codec.decodeHop
+            if let snapshot = prefix?.continuationDecoder {
+                codec.restoreDecoder(snapshot)
+            } else {
+                codec.resetDecoder()
+                // Continuation: warm the decoder with the reference's last three patches, then snapshot state.
+                let audioRows = (0..<count).filter { inputs.audio[$0] }.suffix(3)
+                let frames = audioRows.count * 4
+                if frames > 0 {
+                    var warmup = VoxSignal.zeros(64, frames)
+                    for (patchIndex, row) in audioRows.enumerated() {
+                        for frame in 0..<4 {
+                            let frameIndex = patchIndex * 4 + frame
+                            let baseOffset = row * VoxVoice.patchValues + frame * 64
+                            for channel in 0..<64 {
+                                warmup.values[channel * frames + frameIndex] = inputs.features[baseOffset + channel]
+                            }
+                        }
+                    }
+                    _ = codec.decode(warmup)
+                    prefix?.continuationDecoder = codec.snapshotDecoder()
+                }
+            }
+        } else {
+            codec.resetDecoder()
         }
 
         var random = VoxRandom(seed: seed)
@@ -402,7 +535,7 @@ final class VoxCPM2 {
             try Task.checkCancellation()
             let mu = lmToDiT(lastHidden, rows: 1) + residualToDiT(lastResidual, rows: 1)
             let startNoise = noise?(step) ?? (0..<VoxVoice.patchValues).map { _ in voxHalf(random.normal()) }
-            let patch = try await sample(mu: mu, previous: previous, noise: startNoise, guidance: options.guidance)
+            let patch = try await sample(mu: mu, previous: previous, noise: startNoise, guidance: options.guidance, schedule: activeSchedule)
             let stop = stopHead(stopProjection(lastHidden, rows: 1).map { $0 / (1 + exp(-$0)) }, rows: 1)
             timing.patches = step + 1
             if step > options.minimumPatches && stop[1] > stop[0] {
@@ -507,7 +640,7 @@ final class VoxCPM2 {
         while offset < rows {
             let count = min(manifest.prefill_width, rows - offset)
             let columns = count == 1 ? 1 : manifest.prefill_width
-            guard let capacity = manifest.capacities.sorted().first(where: { $0 >= stage.position + count }),
+            guard let capacity = manifest.capacities.sorted().first(where: { $0 >= max(stage.currentCapacity, stage.position + count) }),
                   let function = stage.functions.first(where: { $0.capacity == capacity && $0.width == columns }) else {
                 throw VoxError.unsupported("no cache function for \(stage.position + count) positions")
             }
@@ -565,8 +698,33 @@ final class VoxCPM2 {
         return quantizerOutput(latent, rows: rows)
     }
 
+    private func cachedVoicePrefix(for voice: VoxVoice) -> CachedVoicePrefix {
+        let key = voice.cacheID
+        if let existing = voicePrefixes[key] {
+            voicePrefixOrder.removeAll { $0 == key }
+            voicePrefixOrder.append(key)
+            return existing
+        }
+        let entry = CachedVoicePrefix()
+        voicePrefixes[key] = entry
+        voicePrefixOrder.append(key)
+        while voicePrefixOrder.count > Self.maximumCachedVoicePrefixes {
+            let evicted = voicePrefixOrder.removeFirst()
+            voicePrefixes.removeValue(forKey: evicted)
+        }
+        return entry
+    }
+
+    private func resolveSchedule(steps: Int) throws -> [(name: String, clocks: [Float16], dts: [Float16])] {
+        if let cached = schedules[steps] { return cached }
+        let built = try makeSchedule(steps: steps)
+        schedules[steps] = built
+        return built
+    }
+
     /// One 4 × 64 patch from the diffusion sampler, guided by `mu` and the previous patch.
-    private func sample(mu: [Float], previous: [Float], noise: [Float], guidance: Float) async throws -> [Float] {
+    private func sample(mu: [Float], previous: [Float], noise: [Float], guidance: Float,
+                        schedule activeSchedule: [(name: String, clocks: [Float16], dts: [Float16])]) async throws -> [Float] {
         let width = ditWidth
         guard let pair = stages["dit"]?.local_functions?["pair"], let pairWidth = pair.width else { throw VoxError.unsupported("sampler") }
         // Rows: guided [mu, time, condition, frames] and unguided with mu zeroed; the sampler adds time and frames.
@@ -585,7 +743,7 @@ final class VoxCPM2 {
         values["context"] = context
         values["guidance"] = [Float16(guidance)]
         var x = noise.map { Float16($0) }
-        for call in schedule {
+        for call in activeSchedule {
             values["x"] = x
             values["clocks"] = call.clocks
             values["dts"] = call.dts

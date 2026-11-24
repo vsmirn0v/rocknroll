@@ -777,10 +777,86 @@ final class AutonomousMeetingFacilitator: ObservableObject {
             realtimeSessions[model.sessionID]?.gate.markVoiceDeliveryEnded(at: endedAt)
         }
         do {
+            if attention.canStreamVoiceDelivery, model.supportsVoiceReply, model.snapshot.playoutOn {
+                if !model.ownsMicrophone, let arbiter = model.microphoneArbiter {
+                    _ = await arbiter(model)
+                }
+                let request = UUID()
+                let pre = try await AttentionCoordinator.preparePrepulledStream(
+                    from: attention.streamSynthesize(text, cloneRequest: request),
+                    cloneRequest: request
+                )
+                let utteranceID = UUID().uuidString
+                let startedAt = Date()
+                model.recordAssistantSpokenUtterance(id: utteranceID, text: text, startedAt: startedAt, endedAt: nil)
+                do {
+                    try await attention.deliverVoiceStream(model, pre.replayStream)
+                    model.assistantSpeechLedger.endUtterance(id: utteranceID, endedAt: Date())
+                    lastStatusBySession[model.sessionID] = L("Spoken into “%@”.", model.title)
+                    return
+                } catch {
+                    pre.cancel()
+                    model.assistantSpeechLedger.endUtterance(id: utteranceID, endedAt: Date())
+                    // Fall through to local audition playback if WebRTC send fails before playing.
+                }
+            } else if !model.supportsVoiceReply || !model.snapshot.playoutOn {
+                await playLocalAuditionAndWait(text, attention: attention)
+                lastStatusBySession[model.sessionID] = L("Auditioned locally (meeting audio off).")
+                return
+            }
             let buffer = try await attention.store.voiceConfiguration.synthesize(text)
             await deliverSpokenBuffer(buffer, fallbackText: text, model: model)
         } catch {
             lastStatusBySession[model.sessionID] = error.localizedDescription
+        }
+    }
+
+    private func playLocalAuditionAndWait(_ text: String, attention: AttentionCoordinator) async {
+        final class OnceContinuation: @unchecked Sendable {
+            private let lock = NSLock()
+            private var cont: CheckedContinuation<Void, Never>?
+            private var resumed = false
+            func install(_ c: CheckedContinuation<Void, Never>) {
+                lock.lock()
+                if resumed {
+                    lock.unlock()
+                    c.resume()
+                    return
+                }
+                cont = c
+                lock.unlock()
+            }
+            func resume() {
+                lock.lock()
+                guard !resumed else { lock.unlock(); return }
+                resumed = true
+                let pending = cont
+                cont = nil
+                lock.unlock()
+                pending?.resume()
+            }
+        }
+        let once = OnceContinuation()
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                once.install(continuation)
+                Task { @MainActor in
+                    do {
+                        _ = try await VoiceSynthesis.streamAuditionWithStatus(
+                            text,
+                            selection: attention.store.assistantAuditionVoice,
+                            player: .shared,
+                            onComplete: { once.resume() },
+                            store: attention.store
+                        )
+                    } catch {
+                        once.resume()
+                    }
+                }
+            }
+        } onCancel: {
+            Task { @MainActor in VoicePreviewPlayer.shared.stop() }
+            once.resume()
         }
     }
 
@@ -816,11 +892,7 @@ final class AutonomousMeetingFacilitator: ObservableObject {
             }
         }
         if (try? VoicePreviewPlayer.shared.play(buffer)) == nil, !fallbackText.isEmpty {
-            _ = try? await VoiceSynthesis.auditionWithStatus(
-                fallbackText,
-                selection: attention.store.assistantAuditionVoice,
-                store: attention.store
-            )
+            await playLocalAuditionAndWait(fallbackText, attention: attention)
         }
         lastStatusBySession[model.sessionID] = L("Auditioned locally (meeting audio off).")
     }

@@ -54,6 +54,13 @@ final class VoxCausalConv {
 
     func reset() { history = [Float](repeating: 0, count: input * pad) }
 
+    func snapshot() -> [Float] { history }
+
+    func restore(_ state: [Float]) {
+        precondition(state.count == history.count)
+        history = state
+    }
+
     func callAsFunction(_ x: VoxSignal) -> VoxSignal {
         precondition(x.channels == input)
         let span = pad + x.frames
@@ -136,6 +143,13 @@ final class VoxCausalTransposedConv {
     }
 
     func reset() { history = [Float](repeating: 0, count: input) }
+
+    func snapshot() -> [Float] { history }
+
+    func restore(_ state: [Float]) {
+        precondition(state.count == history.count)
+        history = state
+    }
 
     func callAsFunction(_ x: VoxSignal) -> VoxSignal {
         precondition(x.channels == input)
@@ -221,6 +235,15 @@ final class VoxResidualUnit {
     }
 
     func reset() { depthwise.reset(); pointwise.reset() }
+
+    func snapshot() -> (depthwise: [Float], pointwise: [Float]) {
+        (depthwise.snapshot(), pointwise.snapshot())
+    }
+
+    func restore(_ state: (depthwise: [Float], pointwise: [Float])) {
+        depthwise.restore(state.depthwise)
+        pointwise.restore(state.pointwise)
+    }
 
     func callAsFunction(_ x: VoxSignal) -> VoxSignal {
         var y = pointwise(second(depthwise(first(x))))
@@ -341,10 +364,56 @@ final class VoxAudioVAE {
         return latent
     }
 
+    struct DecoderSnapshot: Sendable {
+        struct UnitState: Sendable {
+            let depthwise: [Float]
+            let pointwise: [Float]
+        }
+        struct BlockState: Sendable {
+            let up: [Float]
+            let units: [UnitState]
+        }
+        fileprivate let depthwise: [Float]
+        fileprivate let input: [Float]
+        fileprivate let output: [Float]
+        fileprivate let blocks: [BlockState]
+    }
+
     /// Starts a new utterance: the next `decode` call has no left context.
     func resetDecoder() {
         decoderDepthwise.reset(); decoderInput.reset(); decoderOutput.reset()
         for block in decoderBlocks { block.up.reset(); block.units.forEach { $0.reset() } }
+    }
+
+    func snapshotDecoder() -> DecoderSnapshot {
+        DecoderSnapshot(
+            depthwise: decoderDepthwise.snapshot(),
+            input: decoderInput.snapshot(),
+            output: decoderOutput.snapshot(),
+            blocks: decoderBlocks.map { block in
+                DecoderSnapshot.BlockState(
+                    up: block.up.snapshot(),
+                    units: block.units.map {
+                        let s = $0.snapshot()
+                        return DecoderSnapshot.UnitState(depthwise: s.depthwise, pointwise: s.pointwise)
+                    }
+                )
+            }
+        )
+    }
+
+    func restoreDecoder(_ snapshot: DecoderSnapshot) {
+        precondition(snapshot.blocks.count == decoderBlocks.count)
+        decoderDepthwise.restore(snapshot.depthwise)
+        decoderInput.restore(snapshot.input)
+        decoderOutput.restore(snapshot.output)
+        for (block, state) in zip(decoderBlocks, snapshot.blocks) {
+            block.up.restore(state.up)
+            precondition(block.units.count == state.units.count)
+            for (unit, unitState) in zip(block.units, state.units) {
+                unit.restore((depthwise: unitState.depthwise, pointwise: unitState.pointwise))
+            }
+        }
     }
 
     /// 48 kHz samples for the next latent frames (64 × n) of the current utterance.

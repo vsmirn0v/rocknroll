@@ -268,6 +268,270 @@ public final class GuestVoiceReplyGraph: @unchecked Sendable {
         if approved?.local == true { monitor.volume = gain }
     }
 
+    public func playStream(_ chunks: AsyncThrowingStream<AVAudioPCMBuffer, Error>,
+                           localGain: Float? = nil,
+                           grace: TimeInterval = 2) async -> Bool {
+        var iterator = chunks.makeAsyncIterator()
+        var firstConverted: AVAudioPCMBuffer?
+        var firstRaw: AVAudioPCMBuffer?
+        do {
+            while let next = try await iterator.next() {
+                if next.frameLength > 0 {
+                    firstRaw = next
+                    break
+                }
+            }
+        } catch {
+            return false
+        }
+        guard !Task.isCancelled, let firstRaw, let engine, engine.isRunning,
+              let format = currentPlayerFormat() else { return false }
+        firstConverted = Self.convert(firstRaw, to: format)
+        guard let firstConverted, Double(firstConverted.frameLength) / format.sampleRate > 0 else { return false }
+
+        let id = UUID()
+        final class StreamSessionBox: @unchecked Sendable {
+            var feedTask: Task<Void, Never>?
+        }
+        let sessionBox = StreamSessionBox()
+
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                playbackLock.lock()
+                guard !Task.isCancelled, engine.isRunning, player.engine === engine, approved == nil, autonomous == nil else {
+                    playbackLock.unlock()
+                    continuation.resume(returning: false)
+                    return
+                }
+                let requiresMirror = (localGain ?? 0) > 0 && !gateOpen
+                let firstMirror = requiresMirror ? localGain.flatMap { _ -> AVAudioPCMBuffer? in
+                    guard let monitorFormat, monitorMixer?.engine === engine else { return nil }
+                    return Self.convert(firstRaw, to: monitorFormat)
+                } : nil
+                guard !requiresMirror || firstMirror != nil else {
+                    playbackLock.unlock()
+                    continuation.resume(returning: false)
+                    return
+                }
+                approved = (id, {
+                    sessionBox.feedTask?.cancel()
+                    continuation.resume(returning: $0)
+                }, true, firstMirror != nil)
+
+                var remainingSeconds = Double(firstConverted.frameLength) / format.sampleRate
+                player.scheduleBuffer(firstConverted, completionHandler: nil)
+                if let firstMirror, let localGain {
+                    monitor.volume = localGain
+                    monitor.scheduleBuffer(firstMirror, completionHandler: nil)
+                    monitor.play()
+                }
+                if !player.isPlaying { player.play() }
+                playbackLock.unlock()
+
+                sessionBox.feedTask = Task { [weak self] in
+                    guard let self else { return }
+                    var lastChunkAt = ContinuousClock.now
+                    do {
+                        while let next = try await iterator.next() {
+                            guard !Task.isCancelled else {
+                                self.finishApproved(id)
+                                return
+                            }
+                            if next.frameLength == 0 { continue }
+                            guard let converted = Self.convert(next, to: format) else {
+                                self.finishApproved(id)
+                                return
+                            }
+                            let chunkSeconds = Double(converted.frameLength) / format.sampleRate
+                            guard chunkSeconds.isFinite, chunkSeconds > 0 else { continue }
+                            var nextMirror: AVAudioPCMBuffer?
+                            if requiresMirror {
+                                guard let monitorFormat, let m = Self.convert(next, to: monitorFormat) else {
+                                    self.finishApproved(id)
+                                    return
+                                }
+                                nextMirror = m
+                            }
+                            guard self.scheduleApprovedStreamChunk(converted, mirror: nextMirror, id: id) else {
+                                self.finishApproved(id)
+                                return
+                            }
+
+                            let now = ContinuousClock.now
+                            let elapsed = lastChunkAt.duration(to: now)
+                            let elapsedSeconds = Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
+                            remainingSeconds = max(0, remainingSeconds - elapsedSeconds) + chunkSeconds
+                            lastChunkAt = now
+                        }
+                    } catch {
+                        self.finishApproved(id)
+                        return
+                    }
+
+                    guard !Task.isCancelled,
+                          let sentinelOut = Self.silentSentinel(format: format) else {
+                        self.finishApproved(id)
+                        return
+                    }
+                    let sentinelMonitor = requiresMirror ? self.monitorFormat.flatMap { Self.silentSentinel(format: $0) } : nil
+                    guard self.scheduleApprovedStreamSentinel(sentinelOut, monitorSentinel: sentinelMonitor, id: id) else {
+                        self.finishApproved(id)
+                        return
+                    }
+
+                    let elapsed = lastChunkAt.duration(to: ContinuousClock.now)
+                    let elapsedSeconds = Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
+                    let tailWait = max(0, remainingSeconds - elapsedSeconds) + max(0, grace)
+                    DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + tailWait) { [weak self] in
+                        self?.finishApproved(id)
+                    }
+                }
+            }
+        } onCancel: { [weak self] in
+            sessionBox.feedTask?.cancel()
+            self?.finishApproved(id)
+        }
+    }
+
+    @MainActor public func playAutonomousStream(
+        firstChunk: AVAudioPCMBuffer,
+        remainingChunks: AsyncThrowingStream<AVAudioPCMBuffer, Error>,
+        maxSeconds: TimeInterval = 18,
+        permit: GuestAutonomousVoicePlayback,
+        canStart: @MainActor () -> Bool = { true },
+        localGain: @MainActor () -> Float? = { nil },
+        captureReady: @MainActor () -> Bool = { true },
+        onStarted: @MainActor () -> Void = {},
+        grace: TimeInterval = 2
+    ) async -> GuestAutonomousVoicePlayback.Outcome {
+        guard !Task.isCancelled, permit.canStart, let engine, engine.isRunning,
+              let format = currentPlayerFormat(), let firstConverted = Self.convert(firstChunk, to: format) else { return .notStarted }
+        let firstSeconds = Double(firstConverted.frameLength) / format.sampleRate
+        guard firstSeconds.isFinite, firstSeconds > 0, firstSeconds <= maxSeconds else { return .notStarted }
+
+        final class AutonomousFeedBox: @unchecked Sendable {
+            var feedTask: Task<Void, Never>?
+        }
+        let feedBox = AutonomousFeedBox()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                guard !Task.isCancelled, permit.canStart, canStart(), engine.isRunning,
+                      player.engine === engine else {
+                    continuation.resume(returning: .notStarted)
+                    return
+                }
+                let gain = localGain(), id = UUID()
+                playbackLock.lock()
+                guard engine.isRunning, player.engine === engine, autonomous == nil, approved == nil, !gateOpen else {
+                    playbackLock.unlock()
+                    continuation.resume(returning: .notStarted)
+                    return
+                }
+                let firstMirror = gain.flatMap { gain -> AVAudioPCMBuffer? in
+                    guard gain > 0, let monitorFormat, monitorMixer?.engine === engine else { return nil }
+                    return Self.convert(firstChunk, to: monitorFormat)
+                }
+                guard (gain ?? 0) <= 0 || firstMirror != nil, permit.openCapture(), captureReady() else {
+                    playbackLock.unlock()
+                    permit.cancel()
+                    continuation.resume(returning: .notStarted)
+                    return
+                }
+                player.stop()
+                autonomous = (id, {
+                    feedBox.feedTask?.cancel()
+                    Task { @MainActor in permit.cancel() }
+                })
+                permit.start(stop: { [weak self] in
+                    feedBox.feedTask?.cancel()
+                    self?.stopAutonomous(id)
+                }, localGain: { [weak self] gain in
+                    self?.updateMonitorGain(gain, id: id)
+                }) {
+                    continuation.resume(returning: $0)
+                }
+                player.scheduleBuffer(firstConverted, completionHandler: nil)
+                if let firstMirror, let gain {
+                    monitor.volume = gain
+                    monitor.scheduleBuffer(firstMirror, completionHandler: nil)
+                    monitor.play()
+                }
+                player.play()
+                playbackLock.unlock()
+                onStarted()
+
+                feedBox.feedTask = Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    var totalSeconds = firstSeconds
+                    var remainingSeconds = firstSeconds
+                    var lastChunkAt = ContinuousClock.now
+                    do {
+                        for try await next in remainingChunks {
+                            guard !Task.isCancelled, self.isAutonomous(id), permit.captureIsOpen else {
+                                permit.cancel()
+                                return
+                            }
+                            if next.frameLength == 0 { continue }
+                            guard let converted = Self.convert(next, to: format) else {
+                                permit.cancel()
+                                return
+                            }
+                            let chunkSeconds = Double(converted.frameLength) / format.sampleRate
+                            guard chunkSeconds.isFinite, chunkSeconds > 0 else { continue }
+                            totalSeconds += chunkSeconds
+                            guard totalSeconds <= maxSeconds else {
+                                permit.cancel()
+                                return
+                            }
+                            let mirror: AVAudioPCMBuffer?
+                            if (gain ?? 0) > 0 {
+                                guard let monitorFormat, let convertedMirror = Self.convert(next, to: monitorFormat) else {
+                                    permit.cancel()
+                                    return
+                                }
+                                mirror = convertedMirror
+                            } else {
+                                mirror = nil
+                            }
+                            guard self.scheduleAutonomousStreamChunk(converted, mirror: mirror, id: id, engine: engine) else {
+                                permit.cancel()
+                                return
+                            }
+
+                            let now = ContinuousClock.now
+                            let elapsed = lastChunkAt.duration(to: now)
+                            let elapsedSeconds = Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
+                            remainingSeconds = max(0, remainingSeconds - elapsedSeconds) + chunkSeconds
+                            lastChunkAt = now
+                        }
+                    } catch {
+                        permit.cancel()
+                        return
+                    }
+
+                    guard !Task.isCancelled, self.isAutonomous(id),
+                          let sentinel = Self.silentSentinel(format: format) else {
+                        permit.cancel()
+                        return
+                    }
+                    guard self.scheduleAutonomousStreamSentinel(sentinel, id: id, engine: engine, permit: permit) else {
+                        permit.cancel()
+                        return
+                    }
+
+                    let elapsed = lastChunkAt.duration(to: ContinuousClock.now)
+                    let elapsedSeconds = Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
+                    let tailWait = max(0, remainingSeconds - elapsedSeconds) + max(0, grace)
+                    try? await Task.sleep(for: .seconds(tailWait))
+                    permit.finish(.unknown, stopping: true)
+                }
+            }
+        } onCancel: {
+            feedBox.feedTask?.cancel()
+            Task { @MainActor in permit.cancel() }
+        }
+    }
+
     @MainActor func playAutonomous(_ buffer: AVAudioPCMBuffer, permit: GuestAutonomousVoicePlayback,
                                   canStart: @MainActor () -> Bool = { true },
                                   localGain: @MainActor () -> Float? = { nil },
@@ -389,6 +653,109 @@ public final class GuestVoiceReplyGraph: @unchecked Sendable {
             supplied = true; status.pointee = .haveData; return buffer
         }
         return error == nil && output.frameLength > 0 ? output : nil
+    }
+
+    private func scheduleApprovedStreamChunk(_ buffer: AVAudioPCMBuffer, mirror: AVAudioPCMBuffer?, id: UUID) -> Bool {
+        playbackLock.lock()
+        defer { playbackLock.unlock() }
+        guard approved?.id == id, engine?.isRunning == true, player.engine === engine else {
+            return false
+        }
+        player.scheduleBuffer(buffer, completionHandler: nil)
+        if let mirror {
+            monitor.scheduleBuffer(mirror, completionHandler: nil)
+        }
+        return true
+    }
+
+    private func scheduleApprovedStreamSentinel(_ sentinelOut: AVAudioPCMBuffer, monitorSentinel: AVAudioPCMBuffer?, id: UUID) -> Bool {
+        playbackLock.lock()
+        defer { playbackLock.unlock() }
+        guard approved?.id == id, engine?.isRunning == true, player.engine === engine else {
+            return false
+        }
+        player.scheduleBuffer(sentinelOut, completionCallbackType: .dataRendered) { [weak self] _ in
+            DispatchQueue.global(qos: .userInitiated).async {
+                self?.finishApproved(id, rendered: .outgoing)
+            }
+        }
+        if let monitorSentinel {
+            monitor.scheduleBuffer(monitorSentinel, completionCallbackType: .dataRendered) { [weak self] _ in
+                DispatchQueue.global(qos: .userInitiated).async {
+                    self?.finishApproved(id, rendered: .local)
+                }
+            }
+        }
+        return true
+    }
+
+    private func scheduleAutonomousStreamChunk(_ buffer: AVAudioPCMBuffer, mirror: AVAudioPCMBuffer?, id: UUID, engine: AVAudioEngine) -> Bool {
+        playbackLock.lock()
+        defer { playbackLock.unlock() }
+        guard autonomous?.id == id, engine.isRunning, player.engine === engine else {
+            return false
+        }
+        player.scheduleBuffer(buffer, completionHandler: nil)
+        if let mirror {
+            monitor.scheduleBuffer(mirror, completionHandler: nil)
+        }
+        return true
+    }
+
+    private func scheduleAutonomousStreamSentinel(_ sentinel: AVAudioPCMBuffer, id: UUID, engine: AVAudioEngine, permit: GuestAutonomousVoicePlayback) -> Bool {
+        playbackLock.lock()
+        defer { playbackLock.unlock() }
+        guard autonomous?.id == id, engine.isRunning, player.engine === engine else {
+            return false
+        }
+        player.scheduleBuffer(sentinel, completionCallbackType: .dataRendered) { [weak self] _ in
+            Task { @MainActor in
+                guard let self else { return }
+                let outcome: GuestAutonomousVoicePlayback.Outcome = if !self.isAutonomous(id) || !permit.captureIsOpen { .interrupted }
+                    else if engine.isRunning, self.player.engine === engine { .completed }
+                    else { .unknown }
+                permit.finish(outcome, stopping: true)
+            }
+        }
+        return true
+    }
+
+    private static func silentSentinel(format: AVAudioFormat) -> AVAudioPCMBuffer? {
+        guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 1) else { return nil }
+        buffer.frameLength = 1
+        if let channel = buffer.floatChannelData?[0] {
+            channel[0] = 0
+        }
+        return buffer
+    }
+
+    public static func combine(_ buffers: [AVAudioPCMBuffer]) -> AVAudioPCMBuffer? {
+        guard let first = buffers.first else { return nil }
+        if buffers.count == 1 { return first }
+        let format = first.format
+        var converted: [AVAudioPCMBuffer] = []
+        converted.reserveCapacity(buffers.count)
+        var totalFrames: AVAudioFrameCount = 0
+        for item in buffers {
+            guard item.frameLength > 0 else { continue }
+            guard let normalized = convert(item, to: format) else { return nil }
+            totalFrames += normalized.frameLength
+            converted.append(normalized)
+        }
+        guard totalFrames > 0, let combined = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: totalFrames) else { return nil }
+        combined.frameLength = totalFrames
+        let channels = Int(format.channelCount)
+        var frameOffset = 0
+        for item in converted {
+            let count = Int(item.frameLength)
+            if let dst = combined.floatChannelData, let src = item.floatChannelData {
+                for ch in 0..<channels {
+                    dst[ch].advanced(by: frameOffset).update(from: src[ch], count: count)
+                }
+            }
+            frameOffset += count
+        }
+        return combined
     }
 
 }

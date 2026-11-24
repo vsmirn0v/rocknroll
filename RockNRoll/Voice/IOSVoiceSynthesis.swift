@@ -571,6 +571,9 @@ final class IOSVoicePreviewPlayer: ObservableObject {
                 }
             }
         }
+        if !player.isPlaying {
+            player.play()
+        }
     }
 
     func finishStreaming(token: UUID) {
@@ -826,6 +829,118 @@ final class IOSVoiceStore: ObservableObject {
         }
     }
 
+    var supportsStreaming: Bool { engine == .voxCPM2 }
+
+    @MainActor
+    func streamPlayAssistantResponse(
+        _ text: String,
+        player: IOSVoicePreviewPlayer = .shared,
+        sessionSetup: (@MainActor (AVAudioFormat) throws -> UUID)? = nil,
+        onFirstAudio: (@MainActor () -> Void)? = nil,
+        onComplete: (@MainActor () -> Void)? = nil
+    ) async throws {
+        let clean = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty else { throw IOSVoiceSynthesisError.empty }
+        let fallbackVoiceID = systemVoiceIdentifier.isEmpty ? nil : systemVoiceIdentifier
+
+        let streamEngineName: String
+        let stream: AsyncThrowingStream<AVAudioPCMBuffer, Error>?
+        switch assistantAuditionVoice {
+        case .voxPreset(let preset):
+            streamEngineName = "voxPreset"
+            stream = resolvedVoxStore.streamSpeakPreset(clean, preset: preset)
+        case .clonedVoice:
+            streamEngineName = "clonedVoice"
+            stream = resolvedVoxStore.streamSpeakClonedForAssistant(clean)
+        case .personalVoice, .systemVoice, .yandexLiveTTS:
+            streamEngineName = ""
+            stream = nil
+        }
+
+        if let stream {
+            AppDiagnostics.log("voice-synthesis-start", [
+                "engine": streamEngineName,
+                "provider": "local"
+            ])
+            let startedAt = ProcessInfo.processInfo.systemUptime
+            var sessionToken: UUID?
+            do {
+                for try await chunk in stream {
+                    try Task.checkCancellation()
+                    guard chunk.frameLength > 0 else { continue }
+                    if sessionToken == nil {
+                        let elapsedMs = Int(((ProcessInfo.processInfo.systemUptime - startedAt) * 1000).rounded())
+                        AppDiagnostics.log("voice-synthesis-ready", [
+                            "engine": streamEngineName,
+                            "ms": elapsedMs,
+                            "frames": Int(chunk.frameLength),
+                            "sampleRate": Int(chunk.format.sampleRate),
+                            "streaming": true
+                        ])
+                        let token = try sessionSetup?(chunk.format) ?? player.beginStreaming(format: chunk.format, onFinish: onComplete)
+                        sessionToken = token
+                        onFirstAudio?()
+                    }
+                    if let token = sessionToken {
+                        player.enqueueStreamBuffer(chunk, token: token)
+                    }
+                }
+                try Task.checkCancellation()
+                guard let token = sessionToken else { throw IOSVoiceSynthesisError.audio }
+                player.finishStreaming(token: token)
+                return
+            } catch is CancellationError {
+                if sessionToken != nil { player.stop() }
+                throw CancellationError()
+            } catch {
+                let ns = error as NSError
+                AppDiagnostics.log("voice-synthesis-error", [
+                    "engine": streamEngineName,
+                    "errorType": String(describing: type(of: error)),
+                    "errorCode": ns.code
+                ])
+                if sessionToken != nil {
+                    player.stop()
+                    throw error
+                }
+                AppDiagnostics.log("voice-synthesis-fallback", [
+                    "from": streamEngineName,
+                    "to": "systemVoice",
+                    "reason": String(describing: type(of: error))
+                ])
+                let fallback = try await IOSVoiceSynthesis.system(clean, voiceIdentifier: fallbackVoiceID)
+                try Task.checkCancellation()
+                let elapsedMs = Int(((ProcessInfo.processInfo.systemUptime - startedAt) * 1000).rounded())
+                AppDiagnostics.log("voice-synthesis-ready", [
+                    "engine": "systemVoice",
+                    "ms": elapsedMs,
+                    "frames": Int(fallback.frameLength),
+                    "sampleRate": Int(fallback.format.sampleRate)
+                ])
+                onFirstAudio?()
+                if let sessionSetup {
+                    let token = try sessionSetup(fallback.format)
+                    player.enqueueStreamBuffer(fallback, token: token)
+                    player.finishStreaming(token: token)
+                } else {
+                    try player.play(fallback, onComplete: onComplete)
+                }
+                return
+            }
+        }
+
+        let buffer = try await synthesizeAssistantResponse(clean)
+        try Task.checkCancellation()
+        onFirstAudio?()
+        if let sessionSetup {
+            let token = try sessionSetup(buffer.format)
+            player.enqueueStreamBuffer(buffer, token: token)
+            player.finishStreaming(token: token)
+        } else {
+            try player.play(buffer, onComplete: onComplete)
+        }
+    }
+
     func synthesizeAssistantResponse(_ text: String) async throws -> AVAudioPCMBuffer {
         let clean = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !clean.isEmpty else { throw IOSVoiceSynthesisError.empty }
@@ -999,6 +1114,71 @@ final class IOSVoiceStore: ObservableObject {
                 "errorCode": ns.code
             ])
             throw error
+        }
+    }
+
+    func streamSynthesize(_ text: String, session: URLSession = .shared) -> AsyncThrowingStream<AVAudioPCMBuffer, Error> {
+        guard engine == .voxCPM2 else {
+            return AsyncThrowingStream { continuation in
+                let producer = Task { @MainActor [weak self] in
+                    guard let self else {
+                        continuation.finish(throwing: CancellationError())
+                        return
+                    }
+                    do {
+                        continuation.yield(try await self.synthesize(text, session: session))
+                        continuation.finish()
+                    } catch {
+                        continuation.finish(throwing: error)
+                    }
+                }
+                continuation.onTermination = { termination in
+                    if case .cancelled = termination { producer.cancel() }
+                }
+            }
+        }
+
+        AppDiagnostics.log("voice-synthesis-start", [
+            "engine": engine.rawValue,
+            "provider": "local"
+        ])
+        let startedAt = ProcessInfo.processInfo.systemUptime
+        let voxStore = resolvedVoxStore
+        return AsyncThrowingStream { continuation in
+            let producer = Task { @MainActor in
+                var yieldedAny = false
+                do {
+                    for try await chunk in voxStore.streamSpeak(text) {
+                        try Task.checkCancellation()
+                        guard chunk.frameLength > 0 else { continue }
+                        if !yieldedAny {
+                            yieldedAny = true
+                            let elapsedMs = Int(((ProcessInfo.processInfo.systemUptime - startedAt) * 1000).rounded())
+                            AppDiagnostics.log("voice-synthesis-ready", [
+                                "engine": IOSVoiceEngine.voxCPM2.rawValue,
+                                "ms": elapsedMs,
+                                "frames": Int(chunk.frameLength),
+                                "sampleRate": Int(chunk.format.sampleRate),
+                                "streaming": true
+                            ])
+                        }
+                        continuation.yield(chunk)
+                    }
+                    guard yieldedAny else { throw IOSVoiceSynthesisError.audio }
+                    continuation.finish()
+                } catch {
+                    let ns = error as NSError
+                    AppDiagnostics.log("voice-synthesis-error", [
+                        "engine": IOSVoiceEngine.voxCPM2.rawValue,
+                        "errorType": String(describing: type(of: error)),
+                        "errorCode": ns.code
+                    ])
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { termination in
+                if case .cancelled = termination { producer.cancel() }
+            }
         }
     }
 

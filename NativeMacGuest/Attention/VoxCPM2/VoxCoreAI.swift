@@ -324,6 +324,12 @@ final class VoxAsset {
     /// A causal stage: grows its key/value cache here and returns only the new hidden rows.
     final class Cached {
         struct Function { let name: String; let capacity: Int; let width: Int }
+        struct Snapshot {
+            let flat: [Float16]
+            let capacity: Int
+            let position: Int
+            let functionName: String
+        }
         let asset: VoxAsset
         let hidden: Int
         let channels: Int
@@ -331,15 +337,51 @@ final class VoxAsset {
         private var cache: NDArray?
         private var capacity = 0
         private(set) var position = 0
+        var currentCapacity: Int { capacity }
+        private var lastFunctionName: String?
+        private var singleMaskCache: (array: NDArray, capacity: Int, filled: Int)?
 
         init(asset: VoxAsset, hidden: Int, channels: Int, functions: [Function]) {
             self.asset = asset; self.hidden = hidden; self.channels = channels; self.functions = functions
         }
 
-        func reset() { cache = nil; capacity = 0; position = 0 }
+        func reset() {
+            cache = nil
+            capacity = 0
+            position = 0
+            lastFunctionName = nil
+            singleMaskCache = nil
+        }
+
+        func snapshot(functionName: String? = nil) -> Snapshot? {
+            guard let cache, position > 0, capacity > 0,
+                  let resolvedName = functionName ?? lastFunctionName else { return nil }
+            return Snapshot(flat: VoxCoreAI.flatten(cache), capacity: capacity, position: position, functionName: resolvedName)
+        }
+
+        func restore(_ snapshot: Snapshot) throws {
+            let function = try asset.function(snapshot.functionName)
+            var restored = NDArray(descriptor: try VoxCoreAI.descriptor(function.descriptor.inputDescriptor(of: "cache"), "cache"))
+            var matches = false
+            VoxCoreAI.write(&restored) { pointer, shape, strides in
+                matches = shape.reduce(1, *) == snapshot.flat.count
+                guard matches else { return }
+                snapshot.flat.withUnsafeBufferPointer { source in
+                    VoxCoreAI.forEachBlock(shape, strides) { linear, offset, count in
+                        pointer.advanced(by: offset).update(from: source.baseAddress!.advanced(by: linear), count: count)
+                    }
+                }
+            }
+            guard matches else { throw VoxError.engine("wrong element count for restored cache") }
+            cache = restored
+            capacity = snapshot.capacity
+            position = snapshot.position
+            lastFunctionName = snapshot.functionName
+            singleMaskCache = nil
+        }
 
         private func grow(to next: Int, function: InferenceFunction) throws {
-            if next == capacity { return }
+            if next <= capacity { return }
             var grown = NDArray(descriptor: try VoxCoreAI.descriptor(function.descriptor.inputDescriptor(of: "cache"), "cache"))
             let filled = position, channels = channels
             VoxCoreAI.write(&grown) { target, shape, ts in
@@ -354,6 +396,30 @@ final class VoxAsset {
             }
             cache = grown
             capacity = next
+            singleMaskCache = nil
+        }
+
+        private func singleTokenMask(function: InferenceFunction, filled: Int, capacity: Int) throws -> NDArray {
+            if var cached = singleMaskCache, cached.capacity == capacity, filled >= cached.filled {
+                VoxCoreAI.write(&cached.array) { target, _, strides in
+                    let offset = 0
+                    for index in cached.filled..<filled { target[offset + index * strides[3]] = 0 }
+                    target[offset + capacity * strides[3]] = 0
+                }
+                cached.filled = filled
+                singleMaskCache = cached
+                return cached.array
+            }
+            var mask = NDArray(descriptor: try VoxCoreAI.descriptor(function.descriptor.inputDescriptor(of: "mask"), "mask"))
+            VoxCoreAI.write(&mask) { target, shape, strides in
+                VoxCoreAI.forEachBlock(shape, strides) { _, offset, count in
+                    target.advanced(by: offset).update(repeating: Float16(-30000), count: count)
+                }
+                for index in 0..<filled { target[index * strides[3]] = 0 }
+                target[capacity * strides[3]] = 0
+            }
+            singleMaskCache = (mask, capacity, filled)
+            return mask
         }
 
         /// Runs `name` on `values` whose first `count` columns are real; returns hidden × count row-major.
@@ -363,17 +429,23 @@ final class VoxAsset {
             try grow(to: spec.capacity, function: function)
             var inputs: [String: NDArray] = [:]
             for (key, value) in values { inputs[key] = try VoxCoreAI.input(function, key, value) }
-            var mask = NDArray(descriptor: try VoxCoreAI.descriptor(function.descriptor.inputDescriptor(of: "mask"), "mask"))
             let filled = position, capacity = capacity
-            VoxCoreAI.write(&mask) { target, shape, strides in
-                VoxCoreAI.forEachBlock(shape, strides) { _, offset, count in
-                    target.advanced(by: offset).update(repeating: Float16(-30000), count: count)
+            let mask: NDArray
+            if spec.width == 1 && count == 1 {
+                mask = try singleTokenMask(function: function, filled: filled, capacity: capacity)
+            } else {
+                var built = NDArray(descriptor: try VoxCoreAI.descriptor(function.descriptor.inputDescriptor(of: "mask"), "mask"))
+                VoxCoreAI.write(&built) { target, shape, strides in
+                    VoxCoreAI.forEachBlock(shape, strides) { _, offset, count in
+                        target.advanced(by: offset).update(repeating: Float16(-30000), count: count)
+                    }
+                    for row in 0..<spec.width {
+                        let offset = row * strides[2]
+                        for index in 0..<filled { target[offset + index * strides[3]] = 0 }
+                        for index in 0..<min(row + 1, count) { target[offset + (capacity + index) * strides[3]] = 0 }
+                    }
                 }
-                for row in 0..<spec.width {
-                    let offset = row * strides[2]
-                    for index in 0..<filled { target[offset + index * strides[3]] = 0 }
-                    for index in 0..<min(row + 1, count) { target[offset + (capacity + index) * strides[3]] = 0 }
-                }
+                mask = built
             }
             inputs["mask"] = mask
             inputs["cache"] = cache
@@ -394,6 +466,7 @@ final class VoxAsset {
                 }
             }
             position += count
+            lastFunctionName = name
             return rows
         }
     }

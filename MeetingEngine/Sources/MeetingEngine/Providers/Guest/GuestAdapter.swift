@@ -648,6 +648,22 @@ public enum NativeDesktopGuestError: LocalizedError {
         return await native.playNonTalkVoiceReply(buffer, localGain: localGain)
     }
 
+    func playVoiceReplyStream(_ chunks: AsyncThrowingStream<AVAudioPCMBuffer, Error>) async -> Bool {
+#if os(macOS)
+        if inputPermitted {
+            return await systemAudio?.playVoiceReplyStream(chunks) ?? false
+        }
+        guard snapshot.phase == .connected, snapshot.playoutOn, meetingVolume > 0,
+              let native = currentNativeEngine else { return false }
+#else
+        guard snapshot.phase == .connected,
+              inputPermitted || (snapshot.playoutOn && meetingVolume > 0),
+              let native = currentNativeEngine else { return false }
+#endif
+        let localGain: Float? = (snapshot.playoutOn && meetingVolume > 0) ? Float(meetingVolume) : nil
+        return await native.playNonTalkVoiceReplyStream(chunks, localGain: localGain)
+    }
+
     func setParticipationVoiceGate(open: Bool) -> Bool {
         systemAudio?.setMicrophoneGate(open: open) == true
     }
@@ -657,6 +673,18 @@ public enum NativeDesktopGuestError: LocalizedError {
                                 onStarted: @escaping @MainActor () -> Void) async -> GuestAutonomousVoicePlayback.Outcome {
         await systemAudio?.playParticipationVoice(buffer, permit: permit, canStart: canStart,
                                                    localGain: localGain, onStarted: onStarted) ?? .notStarted
+    }
+
+    func playParticipationVoiceStream(firstChunk: AVAudioPCMBuffer,
+                                      remainingChunks: AsyncThrowingStream<AVAudioPCMBuffer, Error>,
+                                      maxSeconds: TimeInterval,
+                                      permit: GuestAutonomousVoicePlayback,
+                                      canStart: @escaping @MainActor () -> Bool,
+                                      localGain: @escaping @MainActor () -> Float?,
+                                      onStarted: @escaping @MainActor () -> Void) async -> GuestAutonomousVoicePlayback.Outcome {
+        await systemAudio?.playParticipationVoiceStream(firstChunk: firstChunk, remainingChunks: remainingChunks,
+                                                         maxSeconds: maxSeconds, permit: permit,
+                                                         canStart: canStart, localGain: localGain, onStarted: onStarted) ?? .notStarted
     }
 
     private var leaveTask: Task<Bool, Never>?

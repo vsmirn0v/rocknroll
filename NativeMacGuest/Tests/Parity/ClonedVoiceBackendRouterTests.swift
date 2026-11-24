@@ -201,6 +201,44 @@ final class ClonedVoiceBackendRouterTests: XCTestCase {
         XCTAssertTrue(finished)
     }
 
+    func testStreamingChunksAreDeliveredWhileActiveAndSuppressedOnInvalidation() async throws {
+        let ane = StreamChunkBackendFixture()
+        defer { Task { await ane.resumeSecondChunk() } }
+        let router = ClonedVoiceBackendRouter(
+            neuralEngineStream: { text, voice, onChunk in
+                try await ane.speak(text, voice, onChunk: onChunk)
+            },
+            gpuStream: { _, _, _ in Array(repeating: Float(0.2), count: 4_800) },
+            now: { Date(timeIntervalSince1970: 1) }
+        )
+        await router.setReadiness(.ready, for: .neuralEngine)
+        let voice = self.voice, deadline = self.deadline
+
+        actor ChunkCollector {
+            var chunks: [[Float]] = []
+            func append(_ c: [Float]) { chunks.append(c) }
+        }
+        let collector = ChunkCollector()
+        let speech = Task {
+            try await router.speak("streamed", voice: voice, expiresAt: deadline) { chunk in
+                Task { await collector.append(chunk) }
+            }
+        }
+        try await waitUntil { await ane.isPausedAtSecond }
+        try await waitUntil { await collector.chunks.count == 1 }
+
+        // Invalidating mid-stream must block the second chunk from reaching the caller
+        // and discard the late result.
+        await router.invalidatePending()
+        await ane.resumeSecondChunk()
+        do {
+            _ = try await speech.value
+            XCTFail("invalidated streaming utterance returned a result")
+        } catch ClonedVoiceBackendRouter.Failure.invalidated {}
+        let delivered = await collector.chunks
+        XCTAssertEqual(delivered.count, 1)
+    }
+
     private func waitUntil(_ condition: () async -> Bool) async throws {
         for _ in 0..<100 {
             if await condition() { return }
@@ -239,4 +277,24 @@ private actor BackendStopFixture {
         await withCheckedContinuation { continuation = $0 }
     }
     func release() { continuation?.resume(); continuation = nil }
+}
+
+private actor StreamChunkBackendFixture {
+    private(set) var isPausedAtSecond = false
+    private var resumeContinuation: CheckedContinuation<Void, Never>?
+
+    func speak(_ text: String, _ voice: VoxVoice, onChunk: ClonedVoiceBackendRouter.ChunkHandler?) async throws -> [Float] {
+        let first = Array(repeating: Float(0.1), count: 4_800)
+        onChunk?(first)
+        isPausedAtSecond = true
+        await withCheckedContinuation { resumeContinuation = $0 }
+        let second = Array(repeating: Float(0.2), count: 4_800)
+        onChunk?(second)
+        return first + second
+    }
+
+    func resumeSecondChunk() {
+        resumeContinuation?.resume()
+        resumeContinuation = nil
+    }
 }

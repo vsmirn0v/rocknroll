@@ -1349,23 +1349,71 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
             let engine = voiceStore.engine.rawValue
             AppDiagnostics.log("voice-reply-start", ["engine": engine, "provider": kind.rawValue])
             do {
-                let buffer = try await voiceStore.synthesize(text)
-                try Task.checkCancellation()
-                guard !leaving, phase == .connected, !isHeld else { throw MeetingSessionError.notConnected }
-                stage = "send"
-                AppDiagnostics.log("voice-reply-prepared", ["frames": Int(buffer.frameLength), "sampleRate": buffer.format.sampleRate])
-                let utteranceID = UUID().uuidString
-                let startedAt = Date()
-                self.recordAssistantSpokenUtterance(id: utteranceID, text: text, startedAt: startedAt)
-                voiceReplyEchoGate.begin()
-                defer {
-                    voiceReplyEchoGate.end()
-                    self.assistantSpeechLedger.endUtterance(id: utteranceID, endedAt: Date())
+                if voiceStore.supportsStreaming {
+                    let stream = voiceStore.streamSynthesize(text)
+                    var iterator = stream.makeAsyncIterator()
+                    var firstChunk: AVAudioPCMBuffer?
+                    while let candidate = try await iterator.next() {
+                        try Task.checkCancellation()
+                        if candidate.frameLength > 0 {
+                            firstChunk = candidate
+                            break
+                        }
+                    }
+                    guard let firstChunk else { throw IOSVoiceSynthesisError.audio }
+                    try Task.checkCancellation()
+                    guard !leaving, phase == .connected, !isHeld else { throw MeetingSessionError.notConnected }
+                    stage = "send"
+                    AppDiagnostics.log("voice-reply-prepared", ["frames": Int(firstChunk.frameLength), "sampleRate": firstChunk.format.sampleRate, "streaming": true])
+                    let utteranceID = UUID().uuidString
+                    let startedAt = Date()
+                    self.recordAssistantSpokenUtterance(id: utteranceID, text: text, startedAt: startedAt)
+                    voiceReplyEchoGate.begin()
+                    defer {
+                        voiceReplyEchoGate.end()
+                        self.assistantSpeechLedger.endUtterance(id: utteranceID, endedAt: Date())
+                    }
+                    let playbackStream = AsyncThrowingStream<AVAudioPCMBuffer, Error> { continuation in
+                        let feeder = Task {
+                            var remaining = iterator
+                            continuation.yield(firstChunk)
+                            do {
+                                while let next = try await remaining.next() {
+                                    try Task.checkCancellation()
+                                    if next.frameLength > 0 { continuation.yield(next) }
+                                }
+                                continuation.finish()
+                            } catch {
+                                continuation.finish(throwing: error)
+                            }
+                        }
+                        continuation.onTermination = { termination in
+                            if case .cancelled = termination { feeder.cancel() }
+                        }
+                    }
+                    let played = await session.playVoiceReplyStream(playbackStream)
+                    try Task.checkCancellation()
+                    guard played else { throw MeetingSessionError.unavailable(L("Could not send the voice reply into this meeting.")) }
+                    AppDiagnostics.log("voice-reply-finished", ["provider": kind.rawValue])
+                } else {
+                    let buffer = try await voiceStore.synthesize(text)
+                    try Task.checkCancellation()
+                    guard !leaving, phase == .connected, !isHeld else { throw MeetingSessionError.notConnected }
+                    stage = "send"
+                    AppDiagnostics.log("voice-reply-prepared", ["frames": Int(buffer.frameLength), "sampleRate": buffer.format.sampleRate])
+                    let utteranceID = UUID().uuidString
+                    let startedAt = Date()
+                    self.recordAssistantSpokenUtterance(id: utteranceID, text: text, startedAt: startedAt)
+                    voiceReplyEchoGate.begin()
+                    defer {
+                        voiceReplyEchoGate.end()
+                        self.assistantSpeechLedger.endUtterance(id: utteranceID, endedAt: Date())
+                    }
+                    let played = await session.playVoiceReply(buffer)
+                    try Task.checkCancellation()
+                    guard played else { throw MeetingSessionError.unavailable(L("Could not send the voice reply into this meeting.")) }
+                    AppDiagnostics.log("voice-reply-finished", ["provider": kind.rawValue])
                 }
-                let played = await session.playVoiceReply(buffer)
-                try Task.checkCancellation()
-                guard played else { throw MeetingSessionError.unavailable(L("Could not send the voice reply into this meeting.")) }
-                AppDiagnostics.log("voice-reply-finished", ["provider": kind.rawValue])
             } catch {
                 AppDiagnostics.log("voice-reply-error", ["stage": stage, "engine": engine, "cancelled": Task.isCancelled])
                 throw error

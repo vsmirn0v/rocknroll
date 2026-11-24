@@ -81,6 +81,8 @@ struct AssistantVoiceConfiguration: Equatable, Sendable {
         }
     }
 
+    var supportsStreaming: Bool { engine == .cloned }
+
     func synthesize(_ text: String, language: String? = nil, session: URLSession = .shared,
                     cloneRequest: UUID = UUID(), cloneDeadline: Date? = nil) async throws -> AVAudioPCMBuffer {
         switch engine {
@@ -101,6 +103,38 @@ struct AssistantVoiceConfiguration: Equatable, Sendable {
                 role: yandexRole,
                 endpointOverride: yandexEndpoint
             )
+        }
+    }
+
+    func streamSynthesize(_ text: String, language: String? = nil, session: URLSession = .shared,
+                          cloneRequest: UUID = UUID(), cloneDeadline: Date? = nil) -> AsyncThrowingStream<AVAudioPCMBuffer, Error> {
+        if engine == .cloned {
+            guard let cloneRecordedAt else {
+                return AsyncThrowingStream { $0.finish(throwing: VoiceSynthesisError.cloneVoiceMissing) }
+            }
+            return VoiceSynthesis.streamCloned(text, recordedAt: cloneRecordedAt, request: cloneRequest, expiresAt: cloneDeadline)
+        }
+        return AsyncThrowingStream { continuation in
+            let producer = Task {
+                do {
+                    let buffer = try await self.synthesize(
+                        text,
+                        language: language,
+                        session: session,
+                        cloneRequest: cloneRequest,
+                        cloneDeadline: cloneDeadline
+                    )
+                    continuation.yield(buffer)
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { termination in
+                if case .cancelled = termination {
+                    producer.cancel()
+                }
+            }
         }
     }
 }
@@ -326,12 +360,78 @@ enum VoiceSynthesis {
         return buffer
     }
 
+    private final class StreamChunkFlag: @unchecked Sendable {
+        private let lock = NSLock()
+        private var emitted = false
+        func mark() {
+            lock.lock()
+            emitted = true
+            lock.unlock()
+        }
+        var didEmit: Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return emitted
+        }
+    }
+
+    private static func makePCMChunkStream(
+        cancelRequest: UUID? = nil,
+        produce: @escaping @Sendable (@escaping @Sendable ([Float]) -> Void) async throws -> [Float]
+    ) -> AsyncThrowingStream<AVAudioPCMBuffer, Error> {
+        AsyncThrowingStream { continuation in
+            let producer = Task {
+                do {
+                    let tracker = StreamChunkFlag()
+                    let fullSamples = try await produce { chunkSamples in
+                        guard !chunkSamples.isEmpty,
+                              let buffer = try? VoiceSampleAudio.buffer(chunkSamples, rate: 48_000) else { return }
+                        tracker.mark()
+                        continuation.yield(buffer)
+                    }
+                    if !tracker.didEmit {
+                        let fullBuffer = try VoiceSampleAudio.buffer(fullSamples, rate: 48_000)
+                        continuation.yield(fullBuffer)
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { termination in
+                if case .cancelled = termination {
+                    producer.cancel()
+                    if let cancelRequest {
+                        Task { @MainActor in await VoiceCloneStore.shared.cancelRequest(cancelRequest) }
+                    }
+                }
+            }
+        }
+    }
+
     /// Your cloned voice, generated on this Mac's Neural Engine.
     static func cloned(_ text: String, recordedAt: Date? = nil, request: UUID = UUID(), expiresAt: Date? = nil) async throws -> AVAudioPCMBuffer {
         let clean = text.trimmed
         guard !clean.isEmpty else { throw VoiceSynthesisError.empty }
         let samples = try await VoiceCloneStore.shared.speak(clean, recordedAt: recordedAt, request: request, expiresAt: expiresAt)
         return try VoiceSampleAudio.buffer(samples, rate: 48_000)
+    }
+
+    static func streamCloned(_ text: String, recordedAt: Date? = nil, request: UUID = UUID(),
+                             expiresAt: Date? = nil) -> AsyncThrowingStream<AVAudioPCMBuffer, Error> {
+        let clean = text.trimmed
+        guard !clean.isEmpty else {
+            return AsyncThrowingStream { $0.finish(throwing: VoiceSynthesisError.empty) }
+        }
+        return makePCMChunkStream(cancelRequest: request) { @MainActor onChunk in
+            try await VoiceCloneStore.shared.speak(
+                clean,
+                recordedAt: recordedAt,
+                request: request,
+                expiresAt: expiresAt,
+                onChunk: onChunk
+            )
+        }
     }
 
     /// OpenAI-style `/audio/speech` on Rapid-MLX: WAV back, read into one buffer.
@@ -412,6 +512,92 @@ enum VoiceSynthesis {
     @MainActor
     static func audition(_ text: String, selection: AssistantAuditionVoiceSelection, store: AttentionStore? = nil) async throws -> AVAudioPCMBuffer {
         try await auditionWithStatus(text, selection: selection, store: store).buffer
+    }
+
+    @MainActor
+    static func streamAuditionWithStatus(
+        _ text: String,
+        selection: AssistantAuditionVoiceSelection,
+        player: VoicePreviewPlayer? = nil,
+        sessionSetup: (@MainActor (AVAudioFormat) throws -> UUID)? = nil,
+        onFirstAudio: (@MainActor () -> Void)? = nil,
+        onComplete: (@MainActor () -> Void)? = nil,
+        store: AttentionStore? = nil
+    ) async throws -> (usedSystemFallback: Bool, failureReason: String?) {
+        let player = player ?? .shared
+        let clean = text.trimmed
+        guard !clean.isEmpty else { throw VoiceSynthesisError.empty }
+
+        let streamRequest = UUID()
+        let stream: AsyncThrowingStream<AVAudioPCMBuffer, Error>?
+        switch selection {
+        case .voxPreset(let preset):
+            stream = makePCMChunkStream(cancelRequest: nil) { @MainActor onChunk in
+                try await VoiceCloneStore.shared.speakPreset(clean, preset: preset, request: streamRequest, onChunk: onChunk)
+            }
+        case .clonedVoice:
+            stream = streamCloned(clean, request: streamRequest)
+        case .personalVoice, .systemVoice, .yandexLiveTTS:
+            stream = nil
+        }
+
+        if let stream {
+            var sessionToken: UUID?
+            do {
+                for try await chunk in stream {
+                    try Task.checkCancellation()
+                    guard chunk.frameLength > 0 else { continue }
+                    if sessionToken == nil {
+                        let token: UUID
+                        if let sessionSetup {
+                            token = try sessionSetup(chunk.format)
+                        } else {
+                            token = try player.beginStreaming(format: chunk.format, onComplete: onComplete)
+                        }
+                        sessionToken = token
+                        onFirstAudio?()
+                    }
+                    if let token = sessionToken {
+                        player.enqueueStreamBuffer(chunk, sessionToken: token)
+                    }
+                }
+                try Task.checkCancellation()
+                guard let token = sessionToken else { throw VoiceSynthesisError.audio }
+                player.finishStreaming(sessionToken: token)
+                return (false, nil)
+            } catch is CancellationError {
+                if sessionToken != nil { player.stop() }
+                throw CancellationError()
+            } catch {
+                if sessionToken != nil {
+                    player.stop()
+                    throw error
+                }
+                let fallback = try await system(clean)
+                try Task.checkCancellation()
+                onFirstAudio?()
+                if let sessionSetup {
+                    let token = try sessionSetup(fallback.format)
+                    player.enqueueStreamBuffer(fallback, sessionToken: token)
+                    player.finishStreaming(sessionToken: token)
+                } else {
+                    try player.play(fallback, onComplete: onComplete)
+                }
+                return (true, error.localizedDescription)
+            }
+        }
+
+        let result = try await auditionWithStatus(clean, selection: selection, store: store)
+        try Task.checkCancellation()
+        onFirstAudio?()
+        if let sessionSetup {
+            let token = try sessionSetup(result.buffer.format)
+            player.enqueueStreamBuffer(result.buffer, sessionToken: token)
+            player.finishStreaming(sessionToken: token)
+        } else {
+            try player.play(result.buffer, onComplete: onComplete)
+        }
+        return (result.usedSystemFallback, result.failureReason)
     }
 
     @MainActor

@@ -203,6 +203,55 @@ final class ParticipationVoiceGraphTests: XCTestCase {
         XCTAssertEqual(outcome, .interrupted)
         XCTAssertEqual(try audio.renderRMS(), 0, accuracy: 0)
     }
+
+    func testPlayStreamSchedulesMultipleChunksAndStopsCleanlyOnError() async throws {
+        let audio = try OfflineVoiceGraph(connectMonitor: true)
+        defer { audio.engine.stop() }
+        let chunk = audio.tone(seconds: 0.4, amplitude: 0.3)
+        let stream = AsyncThrowingStream<AVAudioPCMBuffer, Error> { continuation in
+            continuation.yield(chunk)
+            continuation.yield(chunk)
+            continuation.finish()
+        }
+        let playback = Task { await audio.graph.playStream(stream, localGain: 0.5) }
+        for _ in 0..<100 where !audio.graph.player.isPlaying { try await Task.sleep(for: .milliseconds(5)) }
+        XCTAssertTrue(audio.graph.player.isPlaying)
+        try audio.checkRouteLevels(local: 0.15, outgoing: 0.3)
+        playback.cancel()
+        let cancelled = await playback.value
+        XCTAssertFalse(cancelled)
+        XCTAssertFalse(audio.graph.player.isPlaying)
+        XCTAssertEqual(try audio.renderRMS(), 0, accuracy: 0)
+
+        // Mid-stream failure must stop playback immediately and return false.
+        let failing = AsyncThrowingStream<AVAudioPCMBuffer, Error> { continuation in
+            continuation.yield(chunk)
+            continuation.finish(throwing: CancellationError())
+        }
+        let failed = await audio.graph.playStream(failing, localGain: 0.5)
+        XCTAssertFalse(failed)
+        XCTAssertFalse(audio.graph.player.isPlaying)
+    }
+
+    func testPlayAutonomousStreamRespectsMaxSecondsAndCancellation() async throws {
+        let audio = try OfflineVoiceGraph()
+        defer { audio.engine.stop() }
+        let first = audio.tone(seconds: 0.15, amplitude: 0.25)
+        let oversized = audio.tone(seconds: 0.25, amplitude: 0.25)
+        let permit = GuestAutonomousVoicePlayback(deadline: .distantFuture)
+        let stream = AsyncThrowingStream<AVAudioPCMBuffer, Error> { continuation in
+            continuation.yield(oversized)
+            continuation.finish()
+        }
+        let outcome = await audio.graph.playAutonomousStream(
+            firstChunk: first,
+            remainingChunks: stream,
+            maxSeconds: 0.30,
+            permit: permit
+        )
+        XCTAssertEqual(outcome, .interrupted)
+        XCTAssertFalse(audio.graph.player.isPlaying)
+    }
 }
 
 @MainActor

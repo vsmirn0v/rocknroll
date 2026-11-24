@@ -294,6 +294,11 @@ import LiveKitWebRTC
         return await adapter.playVoiceReply(buffer)
     }
 
+    public func playVoiceReplyStream(_ chunks: AsyncThrowingStream<AVAudioPCMBuffer, Error>) async -> Bool {
+        guard !leaving else { return false }
+        return await adapter.playVoiceReplyStream(chunks)
+    }
+
     public func selectedCameraDeviceIDForTesting() async -> String? {
         await adapter.selectedCameraDeviceIDForTesting()
     }

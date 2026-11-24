@@ -78,6 +78,7 @@ import LiveKitWebRTC
 
     func setMicrophoneGate(open: Bool) async -> Bool
     func playVoiceReply(_ buffer: AVAudioPCMBuffer) async -> Bool
+    func playVoiceReplyStream(_ chunks: AsyncThrowingStream<AVAudioPCMBuffer, Error>) async -> Bool
 
     func selectedCameraDeviceIDForTesting() async -> String?
     func outboundVideoStatisticsForTesting(screenOnly: Bool) async -> [[String: Any]]
@@ -110,6 +111,18 @@ public extension MeetingProviderAdapter {
     var transcriptService: (any MeetingTranscriptService)? { nil }
     var participationService: (any MeetingParticipationService)? { nil }
     func abortPendingStartup() {}
+    func playVoiceReplyStream(_ chunks: AsyncThrowingStream<AVAudioPCMBuffer, Error>) async -> Bool {
+        var collected: [AVAudioPCMBuffer] = []
+        do {
+            for try await chunk in chunks {
+                if chunk.frameLength > 0 { collected.append(chunk) }
+            }
+        } catch {
+            return false
+        }
+        guard !Task.isCancelled, let combined = GuestVoiceReplyGraph.combine(collected) else { return false }
+        return await playVoiceReply(combined)
+    }
     func setAudioProfile(_ profile: GuestAudioProfile) async throws { _ = profile }
     func startScreenShare(_ request: MeetingScreenShareRequest) async throws {
         throw MeetingSessionError.unavailable(L("Dedicated screen capture publication is unavailable in this meeting."))

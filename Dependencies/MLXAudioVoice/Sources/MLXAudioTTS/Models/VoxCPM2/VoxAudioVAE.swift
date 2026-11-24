@@ -16,6 +16,7 @@ import MLXNN
 class VoxCausalConv1d: Module {
     @ModuleInfo var conv: Conv1d
     let padVal: Int
+    private var streamCache: MLXArray?
 
     init(
         inChannels: Int,
@@ -41,6 +42,23 @@ class VoxCausalConv1d: Module {
         super.init()
     }
 
+    func resetStream() {
+        streamCache = nil
+    }
+
+    func appendStreamCache(to arrays: inout [MLXArray]) {
+        if let streamCache { arrays.append(streamCache) }
+    }
+
+    func stepStream(_ x: MLXArray) -> MLXArray {
+        guard padVal > 0 else { return conv(x) }
+        let padLeft = padVal * 2
+        let left = streamCache ?? MLXArray.zeros([x.dim(0), padLeft, x.dim(2)], dtype: x.dtype)
+        let padded = MLX.concatenated([left, x], axis: 1)
+        streamCache = padded[0..., (padded.dim(1) - padLeft)..., 0...]
+        return conv(padded)
+    }
+
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         if padVal > 0 {
             let padded = MLX.padded(x, widths: [IntOrPair((0, 0)), IntOrPair((padVal * 2, 0)), IntOrPair((0, 0))])
@@ -56,6 +74,7 @@ class VoxCausalTransposeConv1d: Module {
     @ModuleInfo var conv: ConvTransposed1d
     let padVal: Int
     let outputPadding: Int
+    private var streamCache: MLXArray?
 
     init(
         inChannels: Int,
@@ -79,6 +98,24 @@ class VoxCausalTransposeConv1d: Module {
             bias: bias
         )
         super.init()
+    }
+
+    func resetStream() {
+        streamCache = nil
+    }
+
+    func appendStreamCache(to arrays: inout [MLXArray]) {
+        if let streamCache { arrays.append(streamCache) }
+    }
+
+    func stepStream(_ x: MLXArray) -> MLXArray {
+        let frames = x.dim(1)
+        let s = conv.stride
+        let prev = streamCache ?? MLXArray.zeros([x.dim(0), 1, x.dim(2)], dtype: x.dtype)
+        let span = MLX.concatenated([prev, x], axis: 1)
+        streamCache = x[0..., (frames - 1)..., 0...]
+        let y = conv(span)
+        return y[0..., s ..< ((frames + 1) * s), 0...]
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
@@ -127,6 +164,25 @@ class VoxCausalResidualUnit: Module {
             inChannels: dim, outChannels: dim, kernelSize: 1
         )
         super.init()
+    }
+
+    func resetStream() {
+        conv1.resetStream()
+        conv2.resetStream()
+    }
+
+    func appendStreamCache(to arrays: inout [MLXArray]) {
+        conv1.appendStreamCache(to: &arrays)
+        conv2.appendStreamCache(to: &arrays)
+    }
+
+    func stepStream(_ x: MLXArray) -> MLXArray {
+        let res = x
+        var h = snake1(x)
+        h = conv1.stepStream(h)
+        h = snake2(h)
+        h = conv2.stepStream(h)
+        return res + h
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
@@ -277,6 +333,32 @@ class VoxCausalDecoderBlock: Module {
         self._res3.wrappedValue = VoxCausalResidualUnit(dim: outputDim, dilation: 9, groups: groups)
 
         super.init()
+    }
+
+    func resetStream() {
+        convT.resetStream()
+        res1.resetStream()
+        res2.resetStream()
+        res3.resetStream()
+    }
+
+    func appendStreamCache(to arrays: inout [MLXArray]) {
+        convT.appendStreamCache(to: &arrays)
+        res1.appendStreamCache(to: &arrays)
+        res2.appendStreamCache(to: &arrays)
+        res3.appendStreamCache(to: &arrays)
+    }
+
+    func stepStream(_ x: MLXArray) -> MLXArray {
+        var h = snake(x)
+        h = convT.stepStream(h)
+        if let noise {
+            h = noise(h)
+        }
+        h = res1.stepStream(h)
+        h = res2.stepStream(h)
+        h = res3.stepStream(h)
+        return h
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
@@ -445,6 +527,61 @@ class VoxCausalDecoder: Module {
         return MLX.sum(sr .>= boundaries).asType(.int32).reshaped([1])
     }
 
+    func resetStream() {
+        if let seq = convIn as? VoxSequential {
+            seq.resetStream()
+        } else if let conv = convIn as? VoxCausalConv1d {
+            conv.resetStream()
+        }
+        for block in blocks {
+            block.resetStream()
+        }
+        convOut.resetStream()
+    }
+
+    func streamCacheArrays() -> [MLXArray] {
+        var arrays: [MLXArray] = []
+        if let seq = convIn as? VoxSequential {
+            seq.appendStreamCache(to: &arrays)
+        } else if let conv = convIn as? VoxCausalConv1d {
+            conv.appendStreamCache(to: &arrays)
+        }
+        for block in blocks {
+            block.appendStreamCache(to: &arrays)
+        }
+        convOut.appendStreamCache(to: &arrays)
+        return arrays
+    }
+
+    func decodeStream(_ x: MLXArray, srCond: MLXArray? = nil) -> MLXArray {
+        var h: MLXArray
+        if let seq = convIn as? VoxSequential {
+            h = seq.stepStream(x)
+        } else if let conv = convIn as? VoxCausalConv1d {
+            h = conv.stepStream(x)
+        } else {
+            fatalError("Unexpected conv_in type")
+        }
+
+        if let srCond, srBoundaries != nil {
+            let srIdx = getSRIdx(srCond)
+            for (block, condLayer) in zip(blocks, srCondLayers) {
+                if let condLayer {
+                    h = condLayer(h, srCond: srIdx)
+                }
+                h = block.stepStream(h)
+            }
+        } else {
+            for block in blocks {
+                h = block.stepStream(h)
+            }
+        }
+
+        h = snakeOut(h)
+        h = convOut.stepStream(h)
+        return MLX.tanh(h)
+    }
+
     func callAsFunction(_ x: MLXArray, srCond: MLXArray? = nil) -> MLXArray {
         var h: MLXArray
         if let seq = convIn as? VoxSequential {
@@ -483,6 +620,32 @@ class VoxSequential: Module {
     init(_ layers: Module...) {
         self.layers = layers
         super.init()
+    }
+
+    func resetStream() {
+        for layer in layers {
+            if let conv = layer as? VoxCausalConv1d {
+                conv.resetStream()
+            }
+        }
+    }
+
+    func appendStreamCache(to arrays: inout [MLXArray]) {
+        for layer in layers {
+            if let conv = layer as? VoxCausalConv1d {
+                conv.appendStreamCache(to: &arrays)
+            }
+        }
+    }
+
+    func stepStream(_ x: MLXArray) -> MLXArray {
+        var h = x
+        for layer in layers {
+            if let conv = layer as? VoxCausalConv1d {
+                h = conv.stepStream(h)
+            }
+        }
+        return h
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
@@ -562,6 +725,19 @@ class VoxAudioVAE: Module {
         let sr = srCond ?? MLXArray([Int32(outSampleRate)])
         let out = decoder(z, srCond: sr)
         return out.squeezed(axis: -1)
+    }
+
+    func resetDecoderStream() {
+        decoder.resetStream()
+    }
+
+    func decodeStream(_ z: MLXArray, srCond: MLXArray? = nil) -> MLXArray {
+        let sr = srCond ?? MLXArray([Int32(outSampleRate)])
+        let out = decoder.decodeStream(z, srCond: sr).squeezed(axis: -1)
+        var toEval = decoder.streamCacheArrays()
+        toEval.append(out)
+        eval(toEval)
+        return out
     }
 
     private func preprocess(_ audioData: MLXArray, sampleRate: Int?) -> MLXArray {

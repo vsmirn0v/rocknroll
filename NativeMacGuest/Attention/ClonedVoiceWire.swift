@@ -52,17 +52,20 @@ struct ClonedVoiceFailure: Codable, Equatable, Sendable {
 /// Requests carry only the installed model path and an optional text/voice pair.
 enum ClonedVoiceWire {
     struct Request: Codable, Equatable, Sendable {
-        enum Operation: String, Codable, Sendable { case ping, cacheScope, verify, prepare, speak }
+        enum Operation: String, Codable, Sendable { case ping, cacheScope, verify, prepare, speak, cancel }
         var operation: Operation
         var folder: URL?
         var text: String?
         var voice: VoxVoice?
+        var voiceID: String? = nil
+        var binaryVoiceFollows: Bool = false
+        var streamPCM: Bool = false
         var repairAsset: String?
         var repairAssets: [String]? = nil
     }
 
     struct Response: Codable, Sendable {
-        enum Failure: String, Codable, Sendable { case busy, context, runtime }
+        enum Failure: String, Codable, Sendable { case busy, context, runtime, cancelled }
         enum Stage: String, Codable, Sendable { case load, validate, synthesize }
         struct Progress: Codable, Equatable, Sendable {
             var stage: Stage
@@ -80,6 +83,8 @@ enum ClonedVoiceWire {
         /// A cache entry actually removed during this request, even if later work failed.
         var repairedAsset: String?
         var pcm: Bool = false
+        var pcmChunk: Bool = false
+        var streamedPCM: Bool = false
         var memoryBytes: UInt64?
     }
 
@@ -113,6 +118,16 @@ enum ClonedVoiceWire {
         return bytes
     }
 
+    static func hasAudibleEnergy(_ samples: [Float]) -> Bool {
+        guard samples.count >= 4_800 else { return false }
+        var sum = 0.0
+        for sample in samples {
+            guard sample.isFinite else { return false }
+            sum += Double(sample) * Double(sample)
+        }
+        return sum / Double(samples.count) > 0.000_000_01
+    }
+
     static func validatePCM(_ samples: [Float]) throws {
         guard samples.count >= 4_800 else { throw VoxError.audio("less than 100 ms of PCM") }
         var sum = 0.0
@@ -121,6 +136,48 @@ enum ClonedVoiceWire {
             sum += Double(sample) * Double(sample)
         }
         guard sum / Double(samples.count) > 0.000_000_01 else { throw VoxError.audio("silent PCM") }
+    }
+
+    static func encodeBinaryVoiceFloats(_ voice: VoxVoice) -> Data {
+        var flags: UInt8 = 0
+        if voice.reference != nil { flags |= 1 }
+        if voice.continuation != nil { flags |= 2 }
+        let refBytes = (voice.reference?.count ?? 0) * MemoryLayout<Float>.size
+        let contBytes = (voice.continuation?.count ?? 0) * MemoryLayout<Float>.size
+        var data = Data(capacity: 1 + refBytes + contBytes)
+        data.append(flags)
+        if let reference = voice.reference {
+            reference.withUnsafeBytes { data.append(contentsOf: $0) }
+        }
+        if let continuation = voice.continuation {
+            continuation.withUnsafeBytes { data.append(contentsOf: $0) }
+        }
+        return data
+    }
+
+    static func attachBinaryVoiceFloats(_ skeleton: VoxVoice, data: Data) throws -> VoxVoice {
+        guard !data.isEmpty else { throw ClonedVoiceWorkerError.protocolFailure }
+        let flags = data[0]
+        let hasRef = (flags & 1) != 0
+        let hasCont = (flags & 2) != 0
+        let expectedPerBuffer = skeleton.patches * VoxVoice.patchValues
+        let bytesPerBuffer = expectedPerBuffer * MemoryLayout<Float>.size
+        let expectedTotal = 1 + (hasRef ? bytesPerBuffer : 0) + (hasCont ? bytesPerBuffer : 0)
+        guard data.count == expectedTotal else { throw ClonedVoiceWorkerError.protocolFailure }
+        var offset = 1
+        func readFloats() throws -> [Float] {
+            let slice = data[offset..<(offset + bytesPerBuffer)]
+            offset += bytesPerBuffer
+            let values = slice.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
+            guard values.count == expectedPerBuffer, values.allSatisfy(\.isFinite) else {
+                throw ClonedVoiceWorkerError.protocolFailure
+            }
+            return values
+        }
+        var updated = skeleton
+        updated.reference = hasRef ? try readFloats() : nil
+        updated.continuation = hasCont ? try readFloats() : nil
+        return updated
     }
 }
 

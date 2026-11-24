@@ -28,6 +28,10 @@ protocol ClonedVoiceWorkerConnection: Sendable {
     func execute(_ request: ClonedVoiceWire.Request, timeout: TimeInterval) async throws -> ClonedVoiceWorkerOutput
     func execute(_ request: ClonedVoiceWire.Request, timeout: TimeInterval,
                  onProgress: (@Sendable (ClonedVoiceWire.Response.Progress) -> Void)?) async throws -> ClonedVoiceWorkerOutput
+    func execute(_ request: ClonedVoiceWire.Request, timeout: TimeInterval,
+                 onProgress: (@Sendable (ClonedVoiceWire.Response.Progress) -> Void)?,
+                 onPCMChunk: (@Sendable ([Float]) -> Void)?) async throws -> ClonedVoiceWorkerOutput
+    func cancelActiveSpeak()
     func stop() async
 }
 
@@ -36,6 +40,18 @@ extension ClonedVoiceWorkerConnection {
                  onProgress: (@Sendable (ClonedVoiceWire.Response.Progress) -> Void)?) async throws -> ClonedVoiceWorkerOutput {
         try await execute(request, timeout: timeout)
     }
+
+    func execute(_ request: ClonedVoiceWire.Request, timeout: TimeInterval,
+                 onProgress: (@Sendable (ClonedVoiceWire.Response.Progress) -> Void)?,
+                 onPCMChunk: (@Sendable ([Float]) -> Void)?) async throws -> ClonedVoiceWorkerOutput {
+        let output = try await execute(request, timeout: timeout, onProgress: onProgress)
+        if let onPCMChunk, let samples = output.samples, !samples.isEmpty {
+            onPCMChunk(samples)
+        }
+        return output
+    }
+
+    func cancelActiveSpeak() {}
 }
 
 /// Owns one child, one operation, and its idle timer. Identical callers share the
@@ -134,16 +150,25 @@ actor ClonedVoiceEngine {
         }
     }
 
-    func speak(_ text: String, voice: VoxVoice, folder: URL) async throws -> [Float] {
-        let result = try await execute(.init(operation: .speak, folder: folder.standardizedFileURL, text: text, voice: voice))
+    func speak(_ text: String, voice: VoxVoice, folder: URL,
+               onChunk: (@Sendable ([Float]) -> Void)? = nil) async throws -> [Float] {
+        let result = try await execute(.init(operation: .speak, folder: folder.standardizedFileURL, text: text, voice: voice),
+                                       onPCMChunk: onChunk)
         guard let samples = result.samples else { throw ClonedVoiceWorkerError.protocolFailure }
         return samples
     }
 
-    func speakZeroShot(_ text: String, folder: URL) async throws -> [Float] {
-        let result = try await execute(.init(operation: .speak, folder: folder.standardizedFileURL, text: text, voice: nil))
+    func speakZeroShot(_ text: String, folder: URL,
+                       onChunk: (@Sendable ([Float]) -> Void)? = nil) async throws -> [Float] {
+        let result = try await execute(.init(operation: .speak, folder: folder.standardizedFileURL, text: text, voice: nil),
+                                       onPCMChunk: onChunk)
         guard let samples = result.samples else { throw ClonedVoiceWorkerError.protocolFailure }
         return samples
+    }
+
+    func cancelCurrentSpeakIfActive() {
+        guard operation?.request.operation == .speak else { return }
+        worker?.cancelActiveSpeak()
     }
 
     func unload() async {
@@ -178,11 +203,12 @@ actor ClonedVoiceEngine {
     }
 
     private func execute(_ request: ClonedVoiceWire.Request,
-                         onProgress: (@Sendable (ClonedVoiceWire.Response.Progress) -> Void)? = nil) async throws -> ClonedVoiceWorkerOutput {
+                         onProgress: (@Sendable (ClonedVoiceWire.Response.Progress) -> Void)? = nil,
+                         onPCMChunk: (@Sendable ([Float]) -> Void)? = nil) async throws -> ClonedVoiceWorkerOutput {
         try Task.checkCancellation()
         if let stopping {
             await stopping.value
-            return try await execute(request, onProgress: onProgress)
+            return try await execute(request, onProgress: onProgress, onPCMChunk: onPCMChunk)
         }
         if let operation {
             guard operation.request == request else { throw ClonedVoiceWorkerError.busy }
@@ -190,7 +216,7 @@ actor ClonedVoiceEngine {
         }
         if worker != nil, runtimeState.folder != request.folder {
             await unload()
-            return try await execute(request, onProgress: onProgress)
+            return try await execute(request, onProgress: onProgress, onPCMChunk: onPCMChunk)
         }
 
         idle?.cancel()
@@ -211,7 +237,7 @@ actor ClonedVoiceEngine {
                 if worker == nil { worker = try connect() }
                 guard let worker else { throw ClonedVoiceWorkerError.unavailable }
                 let timeout: TimeInterval = request.operation == .prepare ? 65 * 60 : (isCold ? 10 * 60 : 3 * 60)
-                let output = try await worker.execute(request, timeout: timeout, onProgress: onProgress)
+                let output = try await worker.execute(request, timeout: timeout, onProgress: onProgress, onPCMChunk: onPCMChunk)
                 guard runtimeState.generation == generation else { throw ClonedVoiceWorkerError.stopped }
                 operation = nil
                 runtimeState.phase = .loaded
@@ -221,7 +247,12 @@ actor ClonedVoiceEngine {
                 return output
             } catch {
                 guard runtimeState.generation == generation else { throw ClonedVoiceWorkerError.stopped }
-                if case ClonedVoiceWorkerError.context = error {
+                if error is CancellationError {
+                    operation = nil
+                    runtimeState.activeSpeeches = 0
+                    runtimeState.phase = .loaded
+                    scheduleIdleUnload(generation: generation)
+                } else if case ClonedVoiceWorkerError.context = error {
                     operation = nil
                     runtimeState.activeSpeeches = 0
                     runtimeState.phase = .loaded
@@ -270,7 +301,12 @@ final class ClonedVoiceWorkerProcess: ClonedVoiceWorkerConnection, @unchecked Se
     private let output: FileHandle
     private let io = DispatchQueue(label: "attention.voice-worker.io", qos: .utility)
     private let state = NSLock()
+    private let inputLock = NSLock()
     private var current: UUID?
+    private var activeOperation: ClonedVoiceWire.Request.Operation?
+    private var canCooperativeCancel = false
+    private var workerWarm = false
+    private var cachedVoiceID: String?
     private var interruption: ClonedVoiceWorkerError?
 
     init(executable: URL? = Bundle.main.url(forAuxiliaryExecutable: name)) throws {
@@ -301,24 +337,34 @@ final class ClonedVoiceWorkerProcess: ClonedVoiceWorkerConnection, @unchecked Se
     var pid: Int32 { process.processIdentifier }
 
     func execute(_ request: ClonedVoiceWire.Request, timeout: TimeInterval) async throws -> ClonedVoiceWorkerOutput {
-        try await execute(request, timeout: timeout, onProgress: nil)
+        try await execute(request, timeout: timeout, onProgress: nil, onPCMChunk: nil)
     }
 
     func execute(_ request: ClonedVoiceWire.Request, timeout: TimeInterval,
                  onProgress: (@Sendable (ClonedVoiceWire.Response.Progress) -> Void)?) async throws -> ClonedVoiceWorkerOutput {
+        try await execute(request, timeout: timeout, onProgress: onProgress, onPCMChunk: nil)
+    }
+
+    func execute(_ request: ClonedVoiceWire.Request, timeout: TimeInterval,
+                 onProgress: (@Sendable (ClonedVoiceWire.Response.Progress) -> Void)?,
+                 onPCMChunk: (@Sendable ([Float]) -> Void)?) async throws -> ClonedVoiceWorkerOutput {
         try await withCheckedThrowingContinuation { continuation in
             io.async {
                 let id = UUID()
                 self.state.lock()
                 let previous = self.interruption
                 self.current = id
+                self.activeOperation = request.operation
+                self.canCooperativeCancel = self.workerWarm && request.operation == .speak
                 self.state.unlock()
                 if let previous { continuation.resume(throwing: previous); return }
                 let watchdog = DispatchWorkItem { [weak self] in self?.interrupt(.timeout, operation: id) }
                 DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeout, execute: watchdog)
-                let result = Result { try self.exchange(request, onProgress: onProgress) }
+                let result = Result { try self.exchange(request, onProgress: onProgress, onPCMChunk: onPCMChunk) }
                 self.state.lock()
                 self.current = nil
+                self.activeOperation = nil
+                self.canCooperativeCancel = false
                 let interruption = self.interruption
                 self.state.unlock()
                 watchdog.cancel()
@@ -326,6 +372,16 @@ final class ClonedVoiceWorkerProcess: ClonedVoiceWorkerConnection, @unchecked Se
                 else { continuation.resume(with: result) }
             }
         }
+    }
+
+    func cancelActiveSpeak() {
+        state.lock()
+        let allowed = current != nil && activeOperation == .speak && canCooperativeCancel && interruption == nil && process.isRunning
+        state.unlock()
+        guard allowed, let data = try? JSONEncoder().encode(ClonedVoiceWire.Request(operation: .cancel)) else { return }
+        inputLock.lock()
+        defer { inputLock.unlock() }
+        try? ClonedVoiceWire.write(data, to: input, limit: ClonedVoiceWire.controlLimit)
     }
 
     func stop() async {
@@ -349,14 +405,72 @@ final class ClonedVoiceWorkerProcess: ClonedVoiceWorkerConnection, @unchecked Se
     }
 
     private func exchange(_ request: ClonedVoiceWire.Request,
-                          onProgress: (@Sendable (ClonedVoiceWire.Response.Progress) -> Void)?) throws -> ClonedVoiceWorkerOutput {
+                          onProgress: (@Sendable (ClonedVoiceWire.Response.Progress) -> Void)?,
+                          onPCMChunk: (@Sendable ([Float]) -> Void)?) throws -> ClonedVoiceWorkerOutput {
         let wire = ClonedVoiceWire.self
         do {
-            try wire.write(JSONEncoder().encode(request), to: input, limit: wire.controlLimit)
-            let response = try readResponse(request: request.operation, onProgress: onProgress)
+            var wireRequest = request
+            var binaryVoiceData: Data?
+            var sentVoiceID: String?
+            if request.operation == .speak, let voice = request.voice {
+                let voiceID = voice.cacheID
+                sentVoiceID = voiceID
+                wireRequest.voiceID = voiceID
+                state.lock()
+                let alreadyCached = (cachedVoiceID == voiceID)
+                state.unlock()
+                if alreadyCached {
+                    wireRequest.voice = nil
+                    wireRequest.binaryVoiceFollows = false
+                } else {
+                    wireRequest.voice = VoxVoice(
+                        revision: voice.revision,
+                        mode: voice.mode,
+                        transcript: voice.transcript,
+                        reference: nil,
+                        continuation: nil,
+                        patches: voice.patches
+                    )
+                    wireRequest.binaryVoiceFollows = true
+                    binaryVoiceData = wire.encodeBinaryVoiceFloats(voice)
+                }
+            }
+            if request.operation == .speak, onPCMChunk != nil {
+                wireRequest.streamPCM = true
+            }
+            let requestData = try JSONEncoder().encode(wireRequest)
+            inputLock.lock()
+            do {
+                try wire.write(requestData, to: input, limit: wire.controlLimit)
+                if let binaryVoiceData {
+                    try wire.write(binaryVoiceData, to: input, limit: wire.pcmLimit)
+                }
+                inputLock.unlock()
+            } catch {
+                inputLock.unlock()
+                throw error
+            }
+
+            var streamedSamples: [Float] = []
+            let response = try readResponse(
+                request: request.operation,
+                onProgress: onProgress,
+                onPCMChunk: onPCMChunk,
+                streamedSamples: &streamedSamples
+            )
+
+            state.lock()
+            if let sentVoiceID {
+                cachedVoiceID = sentVoiceID
+            }
+            if request.operation == .prepare || request.operation == .speak {
+                workerWarm = true
+            }
+            state.unlock()
 
             switch response.failure {
             case .busy: throw ClonedVoiceWorkerError.busy
+            case .cancelled: throw CancellationError()
             case .context: throw ClonedVoiceWorkerError.context(response.message ?? "")
             case .runtime:
                 if let failure = response.failureInfo {
@@ -366,7 +480,15 @@ final class ClonedVoiceWorkerProcess: ClonedVoiceWorkerConnection, @unchecked Se
                 throw ClonedVoiceWorkerError.runtime(response.message ?? "", repairAsset: response.repairAsset)
             case nil: break
             }
-            guard response.pcm == (request.operation == .speak) else { throw ClonedVoiceWorkerError.protocolFailure }
+            if response.streamedPCM {
+                guard !response.pcm, request.operation == .speak else { throw ClonedVoiceWorkerError.protocolFailure }
+                try wire.validatePCM(streamedSamples)
+                return .init(samples: streamedSamples, memoryBytes: response.memoryBytes, message: response.message,
+                             repairedAsset: response.repairedAsset, repairedAssets: response.repairedAssets)
+            }
+            guard response.pcm == (request.operation == .speak), streamedSamples.isEmpty else {
+                throw ClonedVoiceWorkerError.protocolFailure
+            }
             let samples: [Float]?
             if response.pcm {
                 guard let data = try wire.read(from: output, limit: wire.pcmLimit), data.count.isMultiple(of: 4) else {
@@ -378,6 +500,8 @@ final class ClonedVoiceWorkerProcess: ClonedVoiceWorkerConnection, @unchecked Se
             }
             return .init(samples: samples, memoryBytes: response.memoryBytes, message: response.message,
                          repairedAsset: response.repairedAsset, repairedAssets: response.repairedAssets)
+        } catch let error as CancellationError {
+            throw error
         } catch let error as ClonedVoiceWorkerError {
             throw error
         } catch {
@@ -386,16 +510,41 @@ final class ClonedVoiceWorkerProcess: ClonedVoiceWorkerConnection, @unchecked Se
     }
 
     private func readResponse(request: ClonedVoiceWire.Request.Operation,
-                              onProgress: (@Sendable (ClonedVoiceWire.Response.Progress) -> Void)?) throws -> ClonedVoiceWire.Response {
+                              onProgress: (@Sendable (ClonedVoiceWire.Response.Progress) -> Void)?,
+                              onPCMChunk: (@Sendable ([Float]) -> Void)?,
+                              streamedSamples: inout [Float]) throws -> ClonedVoiceWire.Response {
         let wire = ClonedVoiceWire.self
         let identifierCharacters = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
-        for _ in 0..<32 {
+        var stageMessages = 0
+        while true {
             guard let control = try wire.read(from: output, limit: wire.controlLimit) else {
                 throw ClonedVoiceWorkerError.stopped
             }
             let response = try JSONDecoder().decode(wire.Response.self, from: control)
+            if response.pcmChunk {
+                guard let onPCMChunk,
+                      let data = try wire.read(from: output, limit: wire.pcmLimit),
+                      data.count.isMultiple(of: 4) else {
+                    throw ClonedVoiceWorkerError.protocolFailure
+                }
+                let sampleCount = data.count / MemoryLayout<Float>.size
+                guard streamedSamples.count + sampleCount <= wire.pcmLimit / MemoryLayout<Float>.size else {
+                    throw ClonedVoiceWorkerError.protocolFailure
+                }
+                let chunk = data.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
+                streamedSamples.append(contentsOf: chunk)
+                onPCMChunk(chunk)
+                continue
+            }
             guard let stage = response.stage ?? response.progress?.stage else { return response }
+            stageMessages += 1
+            guard stageMessages <= 32 else { throw ClonedVoiceWorkerError.protocolFailure }
             let progress = response.progress ?? .init(stage: stage)
+            if progress.stage == .synthesize {
+                state.lock()
+                canCooperativeCancel = true
+                state.unlock()
+            }
             var fields: [String: Any] = ["operation": request.rawValue, "stage": progress.stage.rawValue, "pid": pid]
             if let asset = progress.asset, !asset.isEmpty, asset.count <= 64,
                asset.unicodeScalars.allSatisfy(identifierCharacters.contains), !asset.contains("..") {
@@ -406,7 +555,6 @@ final class ClonedVoiceWorkerProcess: ClonedVoiceWorkerConnection, @unchecked Se
             probeLog("voice-worker-stage", fields)
             onProgress?(progress)
         }
-        throw ClonedVoiceWorkerError.protocolFailure
     }
 
 }

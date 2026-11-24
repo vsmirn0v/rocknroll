@@ -1,8 +1,11 @@
 import AVFoundation
 import ConferenceCore
 import Foundation
+#if !targetEnvironment(simulator)
+import MLX
+#endif
 import MLXAudioCore
-import MLXAudioTTS
+@testable import MLXAudioTTS
 import UIKit
 import XCTest
 @testable import RockNRoll
@@ -368,5 +371,43 @@ final class IOSVoxCPM2ResilienceTests: XCTestCase {
         XCTAssertEqual(trailingResult, "trailing-ok")
         let stillBusy = await gate.isBusy
         XCTAssertFalse(stillBusy)
+    }
+
+    func testMLXAudioVAEDecodeStreamMatchesBatchDecodeParity() throws {
+        #if targetEnvironment(simulator)
+        throw XCTSkip("MLX runtime cannot initialize in iOS Simulator")
+        #else
+        Device.withDefaultDevice(.cpu) {
+            let vaeConfig = VoxCPM2AudioVAEConfig(
+                encoderDim: 4,
+                encoderRates: [2],
+                latentDim: 4,
+                decoderDim: 8,
+                decoderRates: [2, 2],
+                depthwise: true,
+                sampleRate: 16_000,
+                outSampleRate: 48_000,
+                useNoiseBlock: false,
+                srBinBoundaries: [20_000, 30_000, 40_000],
+                condType: "scale_bias",
+                condDim: 8,
+                condOutLayer: false
+            )
+            let vae = VoxAudioVAE(vaeConfig)
+            let latents = MLXRandom.normal([1, 24, 4])
+            let batchOut = vae.decode(latents).asArray(Float.self)
+
+            vae.resetDecoderStream()
+            var streamedOut: [Float] = []
+            streamedOut.append(contentsOf: vae.decodeStream(latents[0..., 0..<4, 0...]).asArray(Float.self))
+            streamedOut.append(contentsOf: vae.decodeStream(latents[0..., 4..<8, 0...]).asArray(Float.self))
+            streamedOut.append(contentsOf: vae.decodeStream(latents[0..., 8..<24, 0...]).asArray(Float.self))
+
+            XCTAssertEqual(streamedOut.count, batchOut.count)
+            XCTAssertGreaterThan(batchOut.count, 0)
+            let maxDiff = zip(streamedOut, batchOut).reduce(Float(0)) { max($0, abs($1.0 - $1.1)) }
+            XCTAssertLessThan(maxDiff, 1e-4)
+        }
+        #endif
     }
 }

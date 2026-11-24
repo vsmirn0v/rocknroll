@@ -7,6 +7,7 @@
 //  Ported from mlx-audio Python: voxcpm2/voxcpm2.py
 //
 
+import CryptoKit
 import Foundation
 import HuggingFace
 @preconcurrency import MLX
@@ -67,6 +68,17 @@ public final class VoxCPM2Model: Module, SpeechGenerationModel, @unchecked Senda
     // MARK: - State
 
     public let tokenizer: Tokenizers.Tokenizer?
+
+    private final class CachedSavedVoice {
+        var refBaseCache: [(MLXArray, MLXArray)]?
+        var refResCache: [(MLXArray, MLXArray)]?
+        var contEmbedProj: MLXArray?
+    }
+
+    private let savedVoiceCacheLock = NSLock()
+    private var savedVoiceCache: [String: CachedSavedVoice] = [:]
+    private var savedVoiceCacheOrder: [String] = []
+    private static let maximumSavedVoiceCacheEntries = 2
 
     // MARK: - Special tokens (defined in VoxCPM2 tokenizer config, ids 101-104)
 
@@ -284,21 +296,66 @@ public final class VoxCPM2Model: Module, SpeechGenerationModel, @unchecked Senda
     /// Local-only adapter for revision-pinned saved VoxCPM2 prompt latents.
     public func generateSavedVoice(text: String, transcript: String, patches: Int,
         reference: [Float]?, continuation: [Float]?, tokenIDs: [Int]? = nil, generationParameters: GenerateParameters,
-        shouldContinue: (@Sendable () -> Bool)? = nil) async throws -> MaterializedArray {
+        shouldContinue: (@Sendable () -> Bool)? = nil,
+        onAudioChunk: ((@Sendable ([Float]) -> Void))? = nil) async throws -> MaterializedArray {
         guard patches > 0, patches <= 8192, reference != nil || continuation != nil,
               reference.map({ $0.count == patches * patchSize * featDim && $0.allSatisfy(\.isFinite) }) ?? true,
               continuation.map({ $0.count == patches * patchSize * featDim && $0.allSatisfy(\.isFinite) }) ?? true else {
             throw AudioGenerationError.invalidInput("Invalid saved voice features")
         }
         return try await generateInternal(text: text, refAudio: nil, generationParameters: generationParameters,
-            reference: reference, continuation: continuation, patches: patches, transcript: transcript, savedTokenIDs: tokenIDs, shouldContinue: shouldContinue)
+            reference: reference, continuation: continuation, patches: patches, transcript: transcript, savedTokenIDs: tokenIDs, shouldContinue: shouldContinue, onAudioChunk: onAudioChunk)
     }
 
     /// Zero-shot speech synthesis using explicit BPE token IDs without a saved voice reference.
     public func generateZeroShot(text: String, tokenIDs: [Int]? = nil,
                                  generationParameters: GenerateParameters,
-                                 shouldContinue: (@Sendable () -> Bool)? = nil) async throws -> MaterializedArray {
-        return try await generateInternal(text: text, refAudio: nil, generationParameters: generationParameters, savedTokenIDs: tokenIDs, shouldContinue: shouldContinue)
+                                 shouldContinue: (@Sendable () -> Bool)? = nil,
+                                 onAudioChunk: ((@Sendable ([Float]) -> Void))? = nil) async throws -> MaterializedArray {
+        return try await generateInternal(text: text, refAudio: nil, generationParameters: generationParameters, savedTokenIDs: tokenIDs, shouldContinue: shouldContinue, onAudioChunk: onAudioChunk)
+    }
+
+    public func clearSavedVoiceCache() {
+        savedVoiceCacheLock.lock()
+        savedVoiceCache.removeAll()
+        savedVoiceCacheOrder.removeAll()
+        savedVoiceCacheLock.unlock()
+    }
+
+    private static func savedVoiceCacheKey(patches: Int, reference: [Float]?, continuation: [Float]?) -> String {
+        var hasher = SHA256()
+        var p = UInt32(patches).littleEndian
+        withUnsafeBytes(of: &p) { hasher.update(bufferPointer: $0) }
+        for array in [reference, continuation] {
+            var present: UInt8 = array == nil ? 0 : 1
+            withUnsafeBytes(of: &present) { hasher.update(bufferPointer: $0) }
+            if let array {
+                array.withUnsafeBytes { bytes in
+                    if let base = bytes.baseAddress {
+                        hasher.update(bufferPointer: UnsafeRawBufferPointer(start: base, count: bytes.count))
+                    }
+                }
+            }
+        }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    private func cachedSavedVoice(key: String) -> CachedSavedVoice {
+        savedVoiceCacheLock.lock()
+        defer { savedVoiceCacheLock.unlock() }
+        if let existing = savedVoiceCache[key] {
+            savedVoiceCacheOrder.removeAll { $0 == key }
+            savedVoiceCacheOrder.append(key)
+            return existing
+        }
+        let entry = CachedSavedVoice()
+        savedVoiceCache[key] = entry
+        savedVoiceCacheOrder.append(key)
+        while savedVoiceCacheOrder.count > Self.maximumSavedVoiceCacheEntries {
+            let evicted = savedVoiceCacheOrder.removeFirst()
+            savedVoiceCache.removeValue(forKey: evicted)
+        }
+        return entry
     }
 
     public static func swaySchedule(nTimesteps: Int) -> [Float] {
@@ -318,13 +375,15 @@ public final class VoxCPM2Model: Module, SpeechGenerationModel, @unchecked Senda
         text: String,
         tokenIDs: [Int]? = nil,
         maxTokens: Int = 256,
-        shouldContinue: (@Sendable () -> Bool)? = nil
+        shouldContinue: (@Sendable () -> Bool)? = nil,
+        onAudioChunk: ((@Sendable ([Float]) -> Void))? = nil
     ) async throws -> [Float] {
         let output = try await generateZeroShot(
             text: text,
             tokenIDs: tokenIDs,
             generationParameters: GenerateParameters(maxTokens: maxTokens),
-            shouldContinue: shouldContinue
+            shouldContinue: shouldContinue,
+            onAudioChunk: onAudioChunk
         )
         return try MLX.withError { mlxError in
             if let shouldContinue, !shouldContinue() {
@@ -344,7 +403,8 @@ public final class VoxCPM2Model: Module, SpeechGenerationModel, @unchecked Senda
         continuation: [Float]?,
         tokenIDs: [Int]? = nil,
         maxTokens: Int = 256,
-        shouldContinue: (@Sendable () -> Bool)? = nil
+        shouldContinue: (@Sendable () -> Bool)? = nil,
+        onAudioChunk: ((@Sendable ([Float]) -> Void))? = nil
     ) async throws -> [Float] {
         let output = try await generateSavedVoice(
             text: text,
@@ -354,7 +414,8 @@ public final class VoxCPM2Model: Module, SpeechGenerationModel, @unchecked Senda
             continuation: continuation,
             tokenIDs: tokenIDs,
             generationParameters: GenerateParameters(maxTokens: maxTokens),
-            shouldContinue: shouldContinue
+            shouldContinue: shouldContinue,
+            onAudioChunk: onAudioChunk
         )
         return try MLX.withError { mlxError in
             if let shouldContinue, !shouldContinue() {
@@ -414,7 +475,8 @@ public final class VoxCPM2Model: Module, SpeechGenerationModel, @unchecked Senda
     private func generateInternal(text: String, refAudio: MaterializedArray?, generationParameters: GenerateParameters,
         reference: [Float]? = nil, continuation: [Float]? = nil, patches: Int = 0,
         transcript: String = "", savedTokenIDs: [Int]? = nil,
-        shouldContinue: (@Sendable () -> Bool)? = nil) async throws -> MaterializedArray {
+        shouldContinue: (@Sendable () -> Bool)? = nil,
+        onAudioChunk: ((@Sendable ([Float]) -> Void))? = nil) async throws -> MaterializedArray {
         var maxTokens = generationParameters.maxTokens ?? config.maxLength
         let minTokens = 2
         let inferenceTimesteps = config.inferenceTimesteps
@@ -446,91 +508,236 @@ public final class VoxCPM2Model: Module, SpeechGenerationModel, @unchecked Senda
 
             try checkAbort()
 
-            // Determine mode: reference cloning vs zero-shot
-            var textToken: MLXArray
-            var audioFeat: MLXArray
-            var textMask: MLXArray
-            var audioMask: MLXArray
+            var lmHidden: MLXArray
+            var lmCache: [(MLXArray, MLXArray)]
+            var residualHidden: MLXArray
+            var resCache: [(MLXArray, MLXArray)]
+            var prefixFeatCond: MLXArray
+            let dtype: DType
 
-            if refAudio != nil || reference != nil {
-                // Saved reference features have already been encoded by the same VoxCPM2 revision.
+            if refAudio == nil, let reference {
+                let cacheKey = Self.savedVoiceCacheKey(patches: patches, reference: reference, continuation: continuation)
+                let cached = cachedSavedVoice(key: cacheKey)
                 let tokenArray = MLXArray((textIds + [Int(audioStartToken)]).map { Int32($0) })
                 let textLength = tokenArray.dim(0)
+                let suffixTextEmbed = baseLM.embedTokens!(tokenArray.expandedDimensions(axis: 0)) * scaleEmb
+                dtype = suffixTextEmbed.dtype
 
-                let refFeat = try reference.map { MLXArray($0).reshaped(patches, patchSize, latentDim) } ?? encodeWav(refAudio!)
-                let (refTokens, refFeats, refTMask, refAMask) = makeRefPrefix(refFeat)
+                if cached.refBaseCache == nil || cached.refResCache == nil {
+                    let refFeat = MLXArray(reference).reshaped(patches, patchSize, latentDim)
+                    let (refTokens, refFeats, refTMask, refAMask) = makeRefPrefix(refFeat)
+                    let bRefTokens = refTokens.expandedDimensions(axis: 0)
+                    let bRefFeats = refFeats.expandedDimensions(axis: 0)
+                    let refTextEmbed = baseLM.embedTokens!(bRefTokens) * scaleEmb
+                    let bRefTMask = refTMask.expandedDimensions(axis: 0).asType(dtype)
+                    let bRefAMask = refAMask.expandedDimensions(axis: 0).asType(dtype)
+                    let refFeatEmbed = encToLmProj(featEncoder(bRefFeats.asType(dtype)))
+                    let refCombined = bRefTMask[0..., 0..., .newAxis] * refTextEmbed
+                        + bRefAMask[0..., 0..., .newAxis] * refFeatEmbed
+                    var (refEncOutputs, computedBaseCache) = baseLM(inputsEmbeds: refCombined)
+                    refEncOutputs = fsqLayer(refEncOutputs) * bRefAMask[0..., 0..., .newAxis]
+                        + refEncOutputs * bRefTMask[0..., 0..., .newAxis]
+                    let refResidualInput = fusionConcatProj(
+                        MLX.concatenated([refEncOutputs, bRefAMask[0..., 0..., .newAxis] * refFeatEmbed], axis: -1)
+                    )
+                    let (_, computedResCache) = residualLM(inputsEmbeds: refResidualInput)
+                    var toEval: [MLXArray] = []
+                    toEval.reserveCapacity((computedBaseCache.count + computedResCache.count) * 2)
+                    for pair in computedBaseCache { toEval.append(pair.0); toEval.append(pair.1) }
+                    for pair in computedResCache { toEval.append(pair.0); toEval.append(pair.1) }
+                    eval(toEval)
+                    cached.refBaseCache = computedBaseCache
+                    cached.refResCache = computedResCache
+                }
 
-                let textPadFeat = MLXArray.zeros([textLength, patchSize, latentDim])
+                let suffixCombined: MLXArray
+                let suffixFeatEmbed: MLXArray
+                let suffixTMask: MLXArray
+                let suffixAMask: MLXArray
+                if let continuation {
+                    let contFeat = MLXArray(continuation).reshaped(1, patches, patchSize, latentDim)
+                    let contProj: MLXArray
+                    if let existing = cached.contEmbedProj {
+                        contProj = existing
+                    } else {
+                        let encoded = encToLmProj(featEncoder(contFeat.asType(dtype)))
+                        eval(encoded)
+                        cached.contEmbedProj = encoded
+                        contProj = encoded
+                    }
+                    suffixCombined = MLX.concatenated([suffixTextEmbed, contProj], axis: 1)
+                    suffixFeatEmbed = MLX.concatenated([
+                        MLXArray.zeros([1, textLength, suffixTextEmbed.dim(-1)], dtype: dtype),
+                        contProj
+                    ], axis: 1)
+                    suffixTMask = MLX.concatenated([MLXArray.ones([textLength]), MLXArray.zeros([patches])]).expandedDimensions(axis: 0).asType(dtype)
+                    suffixAMask = MLX.concatenated([MLXArray.zeros([textLength]), MLXArray.ones([patches])]).expandedDimensions(axis: 0).asType(dtype)
+                    prefixFeatCond = contFeat[0..., -1, 0..., 0...]
+                } else {
+                    suffixCombined = suffixTextEmbed
+                    suffixFeatEmbed = MLXArray.zeros([1, textLength, suffixTextEmbed.dim(-1)], dtype: dtype)
+                    suffixTMask = MLXArray.ones([1, textLength], dtype: dtype)
+                    suffixAMask = MLXArray.zeros([1, textLength], dtype: dtype)
+                    prefixFeatCond = MLXArray.zeros([1, patchSize, latentDim])
+                }
 
-                textToken = MLX.concatenated([refTokens, tokenArray])
-                audioFeat = MLX.concatenated([refFeats, textPadFeat], axis: 0)
-                textMask = MLX.concatenated([
-                    refTMask,
-                    MLXArray.ones([textLength]),
-                ])
-                audioMask = MLX.concatenated([
-                    refAMask,
-                    MLXArray.zeros([textLength]),
-                ])
+                var encOutputs: MLXArray
+                (encOutputs, lmCache) = baseLM(inputsEmbeds: suffixCombined, cache: cached.refBaseCache)
+                encOutputs = fsqLayer(encOutputs) * suffixAMask[0..., 0..., .newAxis]
+                    + encOutputs * suffixTMask[0..., 0..., .newAxis]
+                lmHidden = encOutputs[0..., -1, 0...]
+                let residualInput = fusionConcatProj(
+                    MLX.concatenated([encOutputs, suffixAMask[0..., 0..., .newAxis] * suffixFeatEmbed], axis: -1)
+                )
+                let residualOutputs: MLXArray
+                (residualOutputs, resCache) = residualLM(inputsEmbeds: residualInput, cache: cached.refResCache)
+                residualHidden = residualOutputs[0..., -1, 0...]
             } else {
-                // Zero-shot mode
-                let tokenArray = MLXArray((textIds + [Int(audioStartToken)]).map { Int32($0) })
-                let textLength = tokenArray.dim(0)
+                // Determine mode: reference cloning vs zero-shot
+                var textToken: MLXArray
+                var audioFeat: MLXArray
+                var textMask: MLXArray
+                var audioMask: MLXArray
 
-                textToken = tokenArray
-                audioFeat = MLXArray.zeros([textLength, patchSize, latentDim])
-                textMask = MLXArray.ones([textLength])
-                audioMask = MLXArray.zeros([textLength])
+                if refAudio != nil || reference != nil {
+                    // Saved reference features have already been encoded by the same VoxCPM2 revision.
+                    let tokenArray = MLXArray((textIds + [Int(audioStartToken)]).map { Int32($0) })
+                    let textLength = tokenArray.dim(0)
+
+                    let refFeat = try reference.map { MLXArray($0).reshaped(patches, patchSize, latentDim) } ?? encodeWav(refAudio!)
+                    let (refTokens, refFeats, refTMask, refAMask) = makeRefPrefix(refFeat)
+
+                    let textPadFeat = MLXArray.zeros([textLength, patchSize, latentDim])
+
+                    textToken = MLX.concatenated([refTokens, tokenArray])
+                    audioFeat = MLX.concatenated([refFeats, textPadFeat], axis: 0)
+                    textMask = MLX.concatenated([
+                        refTMask,
+                        MLXArray.ones([textLength]),
+                    ])
+                    audioMask = MLX.concatenated([
+                        refAMask,
+                        MLXArray.zeros([textLength]),
+                    ])
+                } else {
+                    // Zero-shot mode
+                    let tokenArray = MLXArray((textIds + [Int(audioStartToken)]).map { Int32($0) })
+                    let textLength = tokenArray.dim(0)
+
+                    textToken = tokenArray
+                    audioFeat = MLXArray.zeros([textLength, patchSize, latentDim])
+                    textMask = MLXArray.ones([textLength])
+                    audioMask = MLXArray.zeros([textLength])
+                }
+
+                if let continuation {
+                    let contFeat = MLXArray(continuation).reshaped(patches, patchSize, latentDim)
+                    textToken = MLX.concatenated([textToken, MLXArray.zeros([patches]).asType(.int32)])
+                    audioFeat = MLX.concatenated([audioFeat, contFeat], axis: 0)
+                    textMask = MLX.concatenated([textMask, MLXArray.zeros([patches])])
+                    audioMask = MLX.concatenated([audioMask, MLXArray.ones([patches])])
+                }
+
+                // Add batch dimension
+                let bTextToken = textToken.expandedDimensions(axis: 0)
+                let bAudioFeat = audioFeat.expandedDimensions(axis: 0)
+
+                // Text embedding with scale
+                let textEmbed = baseLM.embedTokens!(bTextToken) * scaleEmb
+
+                dtype = textEmbed.dtype
+                let bTextMask = textMask.expandedDimensions(axis: 0).asType(dtype)
+                let bAudioMask = audioMask.expandedDimensions(axis: 0).asType(dtype)
+
+                // Encode audio features
+                var featEmbed = featEncoder(bAudioFeat.asType(dtype))
+                featEmbed = encToLmProj(featEmbed)
+
+                // Combine text and audio embeddings
+                let combinedEmbed = bTextMask[0..., 0..., .newAxis] * textEmbed
+                    + bAudioMask[0..., 0..., .newAxis] * featEmbed
+
+                prefixFeatCond = bAudioFeat[0..., -1, 0..., 0...] // (1, P, D)
+
+                // Initial forward pass
+                var encOutputs: MLXArray
+                (encOutputs, lmCache) = baseLM(inputsEmbeds: combinedEmbed)
+
+                // Apply FSQ to audio positions
+                encOutputs = fsqLayer(encOutputs) * bAudioMask[0..., 0..., .newAxis]
+                    + encOutputs * bTextMask[0..., 0..., .newAxis]
+
+                lmHidden = encOutputs[0..., -1, 0...] // (1, H)
+
+                // V2: fusion_concat_proj for residual input
+                let residualInput = fusionConcatProj(
+                    MLX.concatenated([encOutputs, bAudioMask[0..., 0..., .newAxis] * featEmbed], axis: -1)
+                )
+
+                let residualOutputs: MLXArray
+                (residualOutputs, resCache) = residualLM(inputsEmbeds: residualInput)
+                residualHidden = residualOutputs[0..., -1, 0...]
             }
-
-            if let continuation {
-                let contFeat = MLXArray(continuation).reshaped(patches, patchSize, latentDim)
-                textToken = MLX.concatenated([textToken, MLXArray.zeros([patches]).asType(.int32)])
-                audioFeat = MLX.concatenated([audioFeat, contFeat], axis: 0)
-                textMask = MLX.concatenated([textMask, MLXArray.zeros([patches])])
-                audioMask = MLX.concatenated([audioMask, MLXArray.ones([patches])])
-            }
-
-            // Add batch dimension
-            let bTextToken = textToken.expandedDimensions(axis: 0)
-            let bAudioFeat = audioFeat.expandedDimensions(axis: 0)
-
-            // Text embedding with scale
-            let textEmbed = baseLM.embedTokens!(bTextToken) * scaleEmb
-
-            let dtype = textEmbed.dtype
-            let bTextMask = textMask.expandedDimensions(axis: 0).asType(dtype)
-            let bAudioMask = audioMask.expandedDimensions(axis: 0).asType(dtype)
-
-            // Encode audio features
-            var featEmbed = featEncoder(bAudioFeat.asType(dtype))
-            featEmbed = encToLmProj(featEmbed)
-
-            // Combine text and audio embeddings
-            let combinedEmbed = bTextMask[0..., 0..., .newAxis] * textEmbed
-                + bAudioMask[0..., 0..., .newAxis] * featEmbed
-
-            var prefixFeatCond = bAudioFeat[0..., -1, 0..., 0...] // (1, P, D)
-
-            // Initial forward pass
-            var (encOutputs, lmCache) = baseLM(inputsEmbeds: combinedEmbed)
-
-            // Apply FSQ to audio positions
-            encOutputs = fsqLayer(encOutputs) * bAudioMask[0..., 0..., .newAxis]
-                + encOutputs * bTextMask[0..., 0..., .newAxis]
-
-            var lmHidden = encOutputs[0..., -1, 0...] // (1, H)
-
-            // V2: fusion_concat_proj for residual input
-            let residualInput = fusionConcatProj(
-                MLX.concatenated([encOutputs, bAudioMask[0..., 0..., .newAxis] * featEmbed], axis: -1)
-            )
-
-            var (residualOutputs, resCache) = residualLM(inputsEmbeds: residualInput)
-            var residualHidden = residualOutputs[0..., -1, 0...]
 
             var predFeatSeq: [MLXArray] = []
             predFeatSeq.reserveCapacity(maxTokens)
+
+            let streaming = onAudioChunk != nil
+            var pendingStreamPatches: [MLXArray] = []
+            var streamedChunks = 0
+            var startupBuffer: [Float] = []
+            var startupConfirmed = false
+            var allStreamedSamples: [Float] = []
+
+            if streaming {
+                audioVAE.resetDecoderStream()
+                if let continuation {
+                    let contextPatches = min(3, patches)
+                    if contextPatches > 0 {
+                        let offset = (patches - contextPatches) * patchSize * latentDim
+                        let context = MLXArray(Array(continuation[offset...])).reshaped(1, contextPatches * patchSize, featDim)
+                        _ = audioVAE.decodeStream(context)
+                    }
+                }
+            }
+
+            func emitStreamChunk(_ raw: [Float]) throws {
+                guard !raw.isEmpty else { return }
+                guard raw.allSatisfy(\.isFinite) else {
+                    throw AudioGenerationError.generationFailed("AudioVAE produced non-finite samples")
+                }
+                allStreamedSamples.append(contentsOf: raw)
+                if startupConfirmed {
+                    onAudioChunk?(raw)
+                    return
+                }
+                startupBuffer.append(contentsOf: raw)
+                if startupBuffer.count >= 4_800 {
+                    var sum = 0.0
+                    for sample in startupBuffer { sum += Double(sample) * Double(sample) }
+                    if sum / Double(startupBuffer.count) > 0.000_000_01 {
+                        startupConfirmed = true
+                        let initial = startupBuffer
+                        startupBuffer.removeAll(keepingCapacity: false)
+                        onAudioChunk?(initial)
+                    }
+                }
+            }
+
+            func decodeStreamPending(final: Bool) throws {
+                guard streaming, !pendingStreamPatches.isEmpty else { return }
+                let threshold = streamedChunks < 2 ? 1 : 4
+                guard final || pendingStreamPatches.count >= threshold else { return }
+                let combined = pendingStreamPatches.count == 1
+                    ? pendingStreamPatches[0]
+                    : MLX.concatenated(pendingStreamPatches, axis: 1)
+                pendingStreamPatches.removeAll(keepingCapacity: true)
+                let decoded = audioVAE.decodeStream(combined).flattened()
+                let chunkSamples = decoded.asArray(Float.self)
+                try mlxError.check()
+                streamedChunks += 1
+                try emitStreamChunk(chunkSamples)
+            }
 
             // Generation loop
             var reachedStop = false
@@ -554,7 +761,11 @@ public final class VoxCPM2Model: Module, SpeechGenerationModel, @unchecked Senda
 
                 predFeat = predFeat.transposed(0, 2, 1) // (B, P, D)
 
-                predFeatSeq.append(predFeat[0..., .newAxis, 0..., 0...]) // (B, 1, P, D)
+                if streaming {
+                    pendingStreamPatches.append(predFeat)
+                } else {
+                    predFeatSeq.append(predFeat[0..., .newAxis, 0..., 0...]) // (B, 1, P, D)
+                }
 
                 let currEmbed = featEncoder(predFeat[0..., .newAxis, 0..., 0...].asType(dtype))
                 let currEmbedProj = encToLmProj(currEmbed)
@@ -570,6 +781,8 @@ public final class VoxCPM2Model: Module, SpeechGenerationModel, @unchecked Senda
                     reachedStop = true
                     break
                 }
+
+                try decodeStreamPending(final: false)
 
                 // Autoregressive step
                 let newLmOut: MLXArray
@@ -596,6 +809,27 @@ public final class VoxCPM2Model: Module, SpeechGenerationModel, @unchecked Senda
             }
 
             guard reachedStop else { throw AudioGenerationError.invalidInput("Speech exceeded the generation limit") }
+
+            if streaming {
+                try decodeStreamPending(final: true)
+                try checkAbort()
+                guard !allStreamedSamples.isEmpty else {
+                    throw AudioGenerationError.invalidInput("Model generated no audio patches")
+                }
+                if !startupConfirmed && !startupBuffer.isEmpty && allStreamedSamples.count >= 4_800 {
+                    var sum = 0.0
+                    for sample in allStreamedSamples { sum += Double(sample) * Double(sample) }
+                    if sum / Double(allStreamedSamples.count) > 0.000_000_01 {
+                        onAudioChunk?(startupBuffer)
+                    }
+                    startupBuffer.removeAll(keepingCapacity: false)
+                }
+                let result = MLXArray(allStreamedSamples)
+                eval(result)
+                try mlxError.check()
+                return result.materialized()
+            }
+
             guard !predFeatSeq.isEmpty else {
                 throw AudioGenerationError.invalidInput("Model generated no audio patches")
             }
@@ -641,10 +875,13 @@ public final class VoxCPM2Model: Module, SpeechGenerationModel, @unchecked Senda
             }
             do {
                 let startTime = Date()
-                let audio = try await self.generate(
-                    text: text, voice: voice, refAudio: refAudio,
-                    refText: refText, language: language,
-                    generationParameters: generationParameters
+                let audio = try await self.generateInternal(
+                    text: text,
+                    refAudio: refAudio,
+                    generationParameters: generationParameters,
+                    onAudioChunk: { chunk in
+                        continuation.yield(.audio(MLXArray(chunk).materialized()))
+                    }
                 )
                 let generateTime = Date().timeIntervalSince(startTime)
 
@@ -656,7 +893,6 @@ public final class VoxCPM2Model: Module, SpeechGenerationModel, @unchecked Senda
                     tokensPerSecond: Double(audio.dim(audio.ndim - 1)) / max(generateTime, 0.001),
                     peakMemoryUsage: 0
                 )
-                continuation.yield(.audio(audio))
                 continuation.yield(.info(info))
                 continuation.finish()
             } catch {

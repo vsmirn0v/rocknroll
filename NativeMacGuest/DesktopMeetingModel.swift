@@ -928,6 +928,150 @@ import UniformTypeIdentifiers
         guard played else { throw Task.isCancelled ? VoiceReplyError.interrupted : VoiceReplyError.playback }
     }
 
+    /// Streams synthesized chunks into the meeting with minimal time-to-first-audio,
+    /// closing the microphone gate while the first chunk synthesizes.
+    func speakStream(_ chunks: AsyncThrowingStream<AVAudioPCMBuffer, Error>) async throws {
+        await participation.stopVoiceAndWait()
+        try Task.checkCancellation()
+        guard supportsVoiceReply, !voiceReplyActive, !assistantCaptureActive, !closed, !transferHeld,
+              participationMeetingSoundOn else { throw VoiceReplyError.unavailable }
+
+        func pullFirstChunk(
+            from iterator: inout AsyncThrowingStream<AVAudioPCMBuffer, Error>.AsyncIterator
+        ) async throws -> AVAudioPCMBuffer {
+            while let chunk = try await iterator.next() {
+                try Task.checkCancellation()
+                if chunk.frameLength > 0 { return chunk }
+            }
+            throw VoiceSynthesisError.audio
+        }
+
+        func makePlaybackStream(
+            firstChunk: AVAudioPCMBuffer,
+            remainingIterator: AsyncThrowingStream<AVAudioPCMBuffer, Error>.AsyncIterator
+        ) -> AsyncThrowingStream<AVAudioPCMBuffer, Error> {
+            AsyncThrowingStream { continuation in
+                let feeder = Task {
+                    var iterator = remainingIterator
+                    continuation.yield(firstChunk)
+                    do {
+                        while let next = try await iterator.next() {
+                            try Task.checkCancellation()
+                            if next.frameLength > 0 { continuation.yield(next) }
+                        }
+                        continuation.finish()
+                    } catch {
+                        continuation.finish(throwing: error)
+                    }
+                }
+                continuation.onTermination = { termination in
+                    if case .cancelled = termination { feeder.cancel() }
+                }
+            }
+        }
+
+        if !ownsMicrophone {
+            var iterator = chunks.makeAsyncIterator()
+            let firstChunk = try await pullFirstChunk(from: &iterator)
+            try Task.checkCancellation()
+            guard participationMeetingSoundOn, !closed else { throw VoiceReplyError.unavailable }
+            voiceReplyActive = true; voiceReplyUserChoice = nil; updateLocalMicrophoneCapture()
+            defer { voiceReplyActive = false; voiceReplyUserChoice = nil; updateLocalMicrophoneCapture() }
+            probeLog("voice-reply-start", [
+                "service": kind.rawValue,
+                "seconds": Double(firstChunk.frameLength) / firstChunk.format.sampleRate,
+                "wasLive": false,
+                "nonTalk": true,
+                "streaming": true,
+            ])
+            participation.beginVoiceEchoWindow()
+            let playbackStream = makePlaybackStream(firstChunk: firstChunk, remainingIterator: iterator)
+            let played = await engine.playVoiceReplyStream(playbackStream)
+            participation.endVoiceEchoWindow()
+            probeLog("voice-reply-end", ["service": kind.rawValue, "played": played, "nonTalk": true, "streaming": true])
+            guard played else { throw Task.isCancelled ? VoiceReplyError.interrupted : VoiceReplyError.playback }
+            return
+        }
+
+        try Task.checkCancellation()
+        guard participationMeetingSoundOn, ownsMicrophone, !closed else { throw VoiceReplyError.unavailable }
+        voiceReplyActive = true; voiceReplyUserChoice = nil; updateLocalMicrophoneCapture()
+        defer { voiceReplyActive = false; voiceReplyUserChoice = nil; updateLocalMicrophoneCapture() }
+        let wasLive = snapshot.microphoneOn
+
+        let firstChunkTask = Task { () -> (AVAudioPCMBuffer, AsyncThrowingStream<AVAudioPCMBuffer, Error>.AsyncIterator) in
+            var iterator = chunks.makeAsyncIterator()
+            let firstChunk = try await pullFirstChunk(from: &iterator)
+            return (firstChunk, iterator)
+        }
+
+        guard await engine.setMicrophoneGate(open: false) else {
+            firstChunkTask.cancel()
+            if !voiceReplyGateHeld { _ = await engine.setMicrophoneGate(open: true) }
+            throw VoiceReplyError.gate
+        }
+        do {
+            try await Task.sleep(for: .milliseconds(GuestVoiceReplyGraph.gateSettleMilliseconds))
+            guard participationMeetingSoundOn, ownsMicrophone, !closed else { throw CancellationError() }
+            guard engine.voiceMicrophoneGateIsClosed else { throw VoiceReplyError.gate }
+        } catch {
+            firstChunkTask.cancel()
+            if !wasLive && voiceReplyUserChoice == nil && !snapshot.microphoneOn {
+                if !voiceReplyGateHeld { _ = await engine.setMicrophoneGate(open: true) }
+            } else {
+                try? await finishVoiceReply(wasLive: wasLive)
+            }
+            throw error
+        }
+
+        let firstChunk: AVAudioPCMBuffer
+        let remainingIterator: AsyncThrowingStream<AVAudioPCMBuffer, Error>.AsyncIterator
+        do {
+            (firstChunk, remainingIterator) = try await withTaskCancellationHandler {
+                try await firstChunkTask.value
+            } onCancel: {
+                firstChunkTask.cancel()
+            }
+        } catch {
+            if !wasLive && voiceReplyUserChoice == nil && !snapshot.microphoneOn {
+                if !voiceReplyGateHeld { _ = await engine.setMicrophoneGate(open: true) }
+            } else {
+                try? await finishVoiceReply(wasLive: wasLive)
+            }
+            throw error
+        }
+
+        probeLog("voice-reply-start", [
+            "service": kind.rawValue,
+            "seconds": Double(firstChunk.frameLength) / firstChunk.format.sampleRate,
+            "wasLive": wasLive,
+            "streaming": true,
+        ])
+        if !wasLive {
+            setMicrophoneEnabled(true); await microphoneControl?.value
+            guard snapshot.microphoneOn else { try await finishVoiceReply(wasLive: false); throw VoiceReplyError.microphone }
+        }
+        guard !Task.isCancelled, participationMeetingSoundOn, ownsMicrophone, !closed else {
+            try await finishVoiceReply(wasLive: wasLive)
+            throw CancellationError()
+        }
+        guard engine.voiceMicrophoneGateIsClosed else {
+            try await finishVoiceReply(wasLive: wasLive)
+            throw VoiceReplyError.gate
+        }
+        participation.beginVoiceEchoWindow()
+        let playbackStream = makePlaybackStream(firstChunk: firstChunk, remainingIterator: remainingIterator)
+        let played = await engine.playVoiceReplyStream(playbackStream)
+        participation.endVoiceEchoWindow()
+        do { try await finishVoiceReply(wasLive: wasLive) }
+        catch {
+            if played, workspaceApprovedVoice != nil { throw VoiceReplyError.playedMute }
+            throw error
+        }
+        probeLog("voice-reply-end", ["service": kind.rawValue, "played": played, "streaming": true])
+        guard played else { throw Task.isCancelled ? VoiceReplyError.interrupted : VoiceReplyError.playback }
+    }
+
     func startWorkspaceApprovedVoice<Result: Sendable>(_ action: @escaping @MainActor () async -> Result) -> Task<Result, Never>? {
         guard workspaceApprovedVoice == nil, !closed else { return nil }
         let task = Task { @MainActor [weak self] in
@@ -965,20 +1109,29 @@ import UniformTypeIdentifiers
         }
         _ = await engine.setMicrophoneGate(open: true)
     }
+    private var hasCustomSynthesizeVoiceReply = false
     /// The workspace installs the same configured synthesizer used by Assistant replies.
     /// Standalone meeting fixtures retain the system voice as their default.
-    var synthesizeVoiceReply: (String) async throws -> AVAudioPCMBuffer = { try await VoiceSynthesis.system($0) }
+    var synthesizeVoiceReply: (String) async throws -> AVAudioPCMBuffer = { try await VoiceSynthesis.system($0) } {
+        didSet { hasCustomSynthesizeVoiceReply = true }
+    }
+    var streamVoiceReply: ((String) -> AsyncThrowingStream<AVAudioPCMBuffer, Error>)?
     /// Speaks a short sentence with the selected voice into this meeting.
     func playTestVoiceReply() {
         guard participationMeetingSoundOn, canSpeakApprovedWorkspaceReply else {
             error = VoiceReplyError.unavailable.localizedDescription
             return
         }
-        startWorkspaceApprovedVoice { [weak self] in
+        let sample = L("This is a test voice reply from Rock'N'Roll for Mac.")
+        _ = startWorkspaceApprovedVoice { [weak self] in
             guard let self else { return }
             do {
-                let buffer = try await synthesizeVoiceReply(L("This is a test voice reply from Rock'N'Roll for Mac."))
-                try await speak(buffer)
+                if !self.hasCustomSynthesizeVoiceReply, let streamVoiceReply = self.streamVoiceReply {
+                    try await self.speakStream(streamVoiceReply(sample))
+                } else {
+                    let buffer = try await self.synthesizeVoiceReply(sample)
+                    try await self.speak(buffer)
+                }
             } catch is CancellationError { return }
             catch { self.error = error.localizedDescription }
         }
@@ -1313,6 +1466,35 @@ import UniformTypeIdentifiers
                                 permit: GuestAutonomousVoicePlayback, preflight: @MainActor () async -> Bool,
                                 canStart: @escaping @MainActor () -> Bool,
                                 onStarted: @escaping @MainActor () -> Void) async -> GuestAutonomousVoicePlayback.Outcome {
+        await performParticipationVoice(audience: audience, permit: permit, preflight: preflight) { service in
+            await service.playVoice(buffer, permit: permit, canStart: {
+                self.participationVoiceEligible && self.participationAudience == audience
+                    && !self.participationRemoteSpeaking && canStart()
+            }, localGain: { self.participationVoiceLocalGain }, onStarted: onStarted)
+        }
+    }
+    func playParticipationVoiceStream(firstChunk: AVAudioPCMBuffer,
+                                      remainingChunks: AsyncThrowingStream<AVAudioPCMBuffer, Error>,
+                                      maxSeconds: TimeInterval,
+                                      audience: ParticipationAudience,
+                                      permit: GuestAutonomousVoicePlayback,
+                                      preflight: @MainActor () async -> Bool,
+                                      canStart: @escaping @MainActor () -> Bool,
+                                      onStarted: @escaping @MainActor () -> Void) async -> GuestAutonomousVoicePlayback.Outcome {
+        await performParticipationVoice(audience: audience, permit: permit, preflight: preflight) { service in
+            await service.playVoiceStream(firstChunk: firstChunk, remainingChunks: remainingChunks, maxSeconds: maxSeconds,
+                                          permit: permit, canStart: {
+                self.participationVoiceEligible && self.participationAudience == audience
+                    && !self.participationRemoteSpeaking && canStart()
+            }, localGain: { self.participationVoiceLocalGain }, onStarted: onStarted)
+        }
+    }
+    private func performParticipationVoice(
+        audience: ParticipationAudience,
+        permit: GuestAutonomousVoicePlayback,
+        preflight: @MainActor () async -> Bool,
+        run: @MainActor (MeetingParticipationService) async -> GuestAutonomousVoicePlayback.Outcome
+    ) async -> GuestAutonomousVoicePlayback.Outcome {
         guard permit.canStart, participationVoiceEligible, !voiceReplyActive, !participationSomeoneSpeaking,
               participationAudience == audience,
               let service = (engine as? MeetingSession)?.participationService else { return .notStarted }
@@ -1347,10 +1529,7 @@ import UniformTypeIdentifiers
         var ready = true
         if borrowsMutedSender { ready = await service.borrowVoiceSender(permit) }
         let outcome = if ready, permit.canStart, await preflight() {
-            await service.playVoice(buffer, permit: permit, canStart: {
-                self.participationVoiceEligible && self.participationAudience == audience
-                    && !self.participationRemoteSpeaking && canStart()
-            }, localGain: { self.participationVoiceLocalGain }, onStarted: onStarted)
+            await run(service)
         } else { GuestAutonomousVoicePlayback.Outcome.notStarted }
         if borrowsMutedSender {
             restoredMutedSender = await Task { @MainActor in await service.restoreVoiceSender(permit) }.value

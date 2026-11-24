@@ -28,12 +28,20 @@ import LiveKitWebRTC
     func setMicrophoneGate(open: Bool) -> Bool
     func playVoiceReply(_ buffer: AVAudioPCMBuffer) async -> Bool
     func playVoiceReply(_ buffer: AVAudioPCMBuffer, localGain: Float) async -> Bool
+    func playVoiceReplyStream(_ chunks: AsyncThrowingStream<AVAudioPCMBuffer, Error>) async -> Bool
+    func playVoiceReplyStream(_ chunks: AsyncThrowingStream<AVAudioPCMBuffer, Error>, localGain: Float) async -> Bool
     func setVoiceReplyMonitorGain(_ gain: Float)
     var hasParticipationVoiceGraph: Bool { get }
     var participationVoiceGateClosed: Bool { get }
     func playParticipationVoice(_ buffer: AVAudioPCMBuffer, permit: GuestAutonomousVoicePlayback,
                                 canStart: @escaping @MainActor () -> Bool, localGain: @escaping @MainActor () -> Float?,
                                 onStarted: @escaping @MainActor () -> Void) async -> GuestAutonomousVoicePlayback.Outcome
+    func playParticipationVoiceStream(firstChunk: AVAudioPCMBuffer,
+                                      remainingChunks: AsyncThrowingStream<AVAudioPCMBuffer, Error>,
+                                      maxSeconds: TimeInterval,
+                                      permit: GuestAutonomousVoicePlayback,
+                                      canStart: @escaping @MainActor () -> Bool, localGain: @escaping @MainActor () -> Float?,
+                                      onStarted: @escaping @MainActor () -> Void) async -> GuestAutonomousVoicePlayback.Outcome
     func shutdown(timeout: TimeInterval) async -> Bool
     /// Engine stops/starts the owner did not ask for (device or route change); any thread.
     var onSpontaneousEngineChange: ((GuestEngineChange) -> Void)? { get set }
@@ -44,12 +52,55 @@ extension GuestSystemAudio: SharedAudioModule {}
 public extension SharedAudioModule {
     func ensureAssistantMutedInput(timeout: TimeInterval) async -> Bool { false }
     func playVoiceReply(_ buffer: AVAudioPCMBuffer, localGain: Float) async -> Bool { await playVoiceReply(buffer) }
+    func playVoiceReplyStream(_ chunks: AsyncThrowingStream<AVAudioPCMBuffer, Error>) async -> Bool {
+        var collected: [AVAudioPCMBuffer] = []
+        do {
+            for try await chunk in chunks {
+                if chunk.frameLength > 0 { collected.append(chunk) }
+            }
+        } catch {
+            return false
+        }
+        guard !Task.isCancelled, let combined = GuestVoiceReplyGraph.combine(collected) else { return false }
+        return await playVoiceReply(combined)
+    }
+    func playVoiceReplyStream(_ chunks: AsyncThrowingStream<AVAudioPCMBuffer, Error>, localGain: Float) async -> Bool {
+        var collected: [AVAudioPCMBuffer] = []
+        do {
+            for try await chunk in chunks {
+                if chunk.frameLength > 0 { collected.append(chunk) }
+            }
+        } catch {
+            return false
+        }
+        guard !Task.isCancelled, let combined = GuestVoiceReplyGraph.combine(collected) else { return false }
+        return await playVoiceReply(combined, localGain: localGain)
+    }
     func setVoiceReplyMonitorGain(_ gain: Float) {}
     var hasParticipationVoiceGraph: Bool { false }
     var participationVoiceGateClosed: Bool { false }
     func playParticipationVoice(_ buffer: AVAudioPCMBuffer, permit: GuestAutonomousVoicePlayback,
                                 canStart: @escaping @MainActor () -> Bool, localGain: @escaping @MainActor () -> Float?,
                                 onStarted: @escaping @MainActor () -> Void) async -> GuestAutonomousVoicePlayback.Outcome { .notStarted }
+    func playParticipationVoiceStream(firstChunk: AVAudioPCMBuffer,
+                                      remainingChunks: AsyncThrowingStream<AVAudioPCMBuffer, Error>,
+                                      maxSeconds: TimeInterval,
+                                      permit: GuestAutonomousVoicePlayback,
+                                      canStart: @escaping @MainActor () -> Bool, localGain: @escaping @MainActor () -> Float?,
+                                      onStarted: @escaping @MainActor () -> Void) async -> GuestAutonomousVoicePlayback.Outcome {
+        var collected: [AVAudioPCMBuffer] = [firstChunk]
+        do {
+            for try await chunk in remainingChunks {
+                if !permit.canStart || Task.isCancelled { return .notStarted }
+                if chunk.frameLength > 0 { collected.append(chunk) }
+            }
+        } catch {
+            return .notStarted
+        }
+        guard let combined = GuestVoiceReplyGraph.combine(collected),
+              Double(combined.frameLength) / combined.format.sampleRate <= maxSeconds else { return .notStarted }
+        return await playParticipationVoice(combined, permit: permit, canStart: canStart, localGain: localGain, onStarted: onStarted)
+    }
 }
 
 /// A meeting's microphone sender. Disabled, it sends silence whatever the module does.
@@ -625,6 +676,13 @@ public enum SharedAudioEngineError: LocalizedError, Equatable {
         return await module.playVoiceReply(buffer, localGain: Float(attachment.meetingVolume))
     }
 
+    func playVoiceReplyStream(_ chunks: AsyncThrowingStream<AVAudioPCMBuffer, Error>,
+                              for attachment: MeetingAudioAttachment) async -> Bool {
+        guard talkMeetingID == attachment.meetingID, attachment.soundOn, attachment.meetingVolume > 0,
+              let module else { return false }
+        return await module.playVoiceReplyStream(chunks, localGain: Float(attachment.meetingVolume))
+    }
+
     func setVoiceReplyMonitorGain(for attachment: MeetingAudioAttachment) {
         guard attachments[attachment.meetingID] === attachment, talkMeetingID == attachment.meetingID else { return }
         module?.setVoiceReplyMonitorGain(attachment.soundOn ? Float(attachment.meetingVolume) : 0)
@@ -682,6 +740,26 @@ public enum SharedAudioEngineError: LocalizedError, Equatable {
         participationPlayback = permit
         defer { if participationPlayback === permit { participationPlayback = nil } }
         return await module.playParticipationVoice(buffer, permit: permit, canStart: {
+            self.participationPlayback === permit && self.permitsParticipationVoice(attachment, epoch: epoch, permit: permit) && canStart()
+        }, localGain: localGain, onStarted: onStarted)
+    }
+
+    func playParticipationVoiceStream(firstChunk: AVAudioPCMBuffer,
+                                      remainingChunks: AsyncThrowingStream<AVAudioPCMBuffer, Error>,
+                                      maxSeconds: TimeInterval,
+                                      for attachment: MeetingAudioAttachment,
+                                      permit: GuestAutonomousVoicePlayback,
+                                      canStart: @escaping @MainActor () -> Bool,
+                                      localGain: @escaping @MainActor () -> Float?,
+                                      onStarted: @escaping @MainActor () -> Void) async -> GuestAutonomousVoicePlayback.Outcome {
+        let epoch = talkEpoch
+        guard let module, participationPlayback == nil, permitsParticipationVoice(attachment, epoch: epoch, permit: permit) else {
+            return .notStarted
+        }
+        participationPlayback = permit
+        defer { if participationPlayback === permit { participationPlayback = nil } }
+        return await module.playParticipationVoiceStream(firstChunk: firstChunk, remainingChunks: remainingChunks, maxSeconds: maxSeconds,
+                                                         permit: permit, canStart: {
             self.participationPlayback === permit && self.permitsParticipationVoice(attachment, epoch: epoch, permit: permit) && canStart()
         }, localGain: localGain, onStarted: onStarted)
     }
@@ -916,6 +994,9 @@ public enum SharedAudioEngineError: LocalizedError, Equatable {
     }
     public func setMicrophoneGate(open: Bool) -> Bool { engine?.setMicrophoneGate(open: open, for: self) ?? false }
     public func playVoiceReply(_ buffer: AVAudioPCMBuffer) async -> Bool { await engine?.playVoiceReply(buffer, for: self) ?? false }
+    public func playVoiceReplyStream(_ chunks: AsyncThrowingStream<AVAudioPCMBuffer, Error>) async -> Bool {
+        await engine?.playVoiceReplyStream(chunks, for: self) ?? false
+    }
     public var hasParticipationVoiceGraph: Bool { engine?.hasParticipationVoiceGraph(for: self) == true }
     public var participationVoiceGateClosed: Bool { engine?.participationVoiceGateClosed(for: self) == true }
     public func setParticipationSenderMuted(_ muted: Bool, permit: GuestAutonomousVoicePlayback) async -> Bool {
@@ -926,6 +1007,16 @@ public enum SharedAudioEngineError: LocalizedError, Equatable {
                                 onStarted: @escaping @MainActor () -> Void) async -> GuestAutonomousVoicePlayback.Outcome {
         await engine?.playParticipationVoice(buffer, for: self, permit: permit, canStart: canStart,
                                              localGain: localGain, onStarted: onStarted) ?? .notStarted
+    }
+    public func playParticipationVoiceStream(firstChunk: AVAudioPCMBuffer,
+                                             remainingChunks: AsyncThrowingStream<AVAudioPCMBuffer, Error>,
+                                             maxSeconds: TimeInterval,
+                                             permit: GuestAutonomousVoicePlayback,
+                                             canStart: @escaping @MainActor () -> Bool,
+                                             localGain: @escaping @MainActor () -> Float?,
+                                             onStarted: @escaping @MainActor () -> Void) async -> GuestAutonomousVoicePlayback.Outcome {
+        await engine?.playParticipationVoiceStream(firstChunk: firstChunk, remainingChunks: remainingChunks, maxSeconds: maxSeconds,
+                                                   for: self, permit: permit, canStart: canStart, localGain: localGain, onStarted: onStarted) ?? .notStarted
     }
     @discardableResult public func detach() async -> Bool { await engine?.detach(self) ?? true }
 

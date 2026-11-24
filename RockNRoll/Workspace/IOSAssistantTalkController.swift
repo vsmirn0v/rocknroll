@@ -342,16 +342,21 @@ import FoundationModels
         auditionTask = Task { @MainActor [weak self] in
             guard let self else { return }
             do {
-                let buffer = try await self.voiceStore.synthesizeAssistantResponse(clean)
-                guard !Task.isCancelled, self.auditioningMessageID == messageID else { return }
-                try IOSVoicePreviewPlayer.shared.play(buffer) { [weak self] in
-                    Task { @MainActor [weak self] in
-                        guard let self, self.auditioningMessageID == messageID else { return }
-                        self.auditioningMessageID = nil
-                        self.speech?.setSpeakingResponse(false)
+                try await self.voiceStore.streamPlayAssistantResponse(
+                    clean,
+                    player: .shared,
+                    onComplete: { [weak self] in
+                        Task { @MainActor [weak self] in
+                            guard let self, self.auditioningMessageID == messageID else { return }
+                            self.auditioningMessageID = nil
+                            self.speech?.setSpeakingResponse(false)
+                        }
                     }
-                }
+                )
             } catch is CancellationError {
+                if self.auditioningMessageID == messageID {
+                    self.auditioningMessageID = nil
+                }
                 self.speech?.setSpeakingResponse(false)
             } catch {
                 if self.auditioningMessageID == messageID {

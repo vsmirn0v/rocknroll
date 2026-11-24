@@ -257,6 +257,142 @@ final class ClonedVoiceLifecycleTests: XCTestCase {
         XCTAssertThrowsError(try ClonedVoiceWire.validatePCM([0.1, 0.2]))
     }
 
+    func testBinaryVoiceWireFramingAndCacheIDDeterminism() throws {
+        let patchCount = 2
+        let valueCount = patchCount * VoxVoice.patchValues
+        let ref = (0..<valueCount).map { Float(($0 % 23) - 11) * 0.015 }
+        let cont = (0..<valueCount).map { Float((($0 * 3) % 19) - 9) * 0.02 }
+        let original = VoxVoice(mode: .cloneContinuation, transcript: "Привет, мир", reference: ref, continuation: cont, patches: patchCount)
+        let id1 = original.cacheID
+        let id2 = original.cacheID
+        XCTAssertEqual(id1, id2)
+        XCTAssertFalse(id1.isEmpty)
+
+        let binary = ClonedVoiceWire.encodeBinaryVoiceFloats(original)
+        var stripped = original
+        stripped.reference = nil
+        stripped.continuation = nil
+        let restored = try ClonedVoiceWire.attachBinaryVoiceFloats(stripped, data: binary)
+        XCTAssertEqual(restored, original)
+
+        // Truncated float buffer must be rejected loudly as a protocol error.
+        let truncated = Data(binary.dropLast(4))
+        XCTAssertThrowsError(try ClonedVoiceWire.attachBinaryVoiceFloats(stripped, data: truncated))
+    }
+
+    func testVoxAudioVAESnapshotRestoreAnd4FrameChunkParity() throws {
+        let dir = try temporaryFolder()
+        let vaeURL = dir.appendingPathComponent("tiny-vae.safetensors")
+        let config = VoxAudioVAE.Config(
+            encoder_dim: 2,
+            encoder_rates: [2],
+            latent_dim: 4,
+            decoder_dim: 8,
+            decoder_rates: [2],
+            sr_bin_boundaries: [20_000, 30_000, 40_000],
+            sample_rate: 16_000,
+            out_sample_rate: 48_000
+        )
+
+        var entries: [(name: String, dtype: String, shape: [Int], data: Data)] = []
+        var seed: UInt32 = 17
+        func nextWeight(_ i: Int, scale: Float = 0.08) -> Float {
+            seed = seed &* 1664525 &+ 1013904223
+            let normalized = Float(seed % 2001) / 1000.0 - 1.0
+            return normalized * scale + Float((i % 5) - 2) * 0.005
+        }
+        func addF32(_ name: String, shape: [Int], value: ((Int) -> Float)? = nil) {
+            let count = shape.reduce(1, *)
+            var values = [Float](repeating: 0, count: count)
+            for i in 0..<count {
+                values[i] = value?(i) ?? nextWeight(i)
+            }
+            entries.append((name, "F32", shape, values.withUnsafeBytes { Data($0) }))
+        }
+        func addI32(_ name: String, shape: [Int], values: [Int32]) {
+            entries.append((name, "I32", shape, values.withUnsafeBytes { Data($0) }))
+        }
+        func addResUnit(_ prefix: String, channels: Int) {
+            addF32(prefix + ".block.0.alpha", shape: [1, channels, 1]) { _ in 1.0 }
+            addF32(prefix + ".block.1.weight", shape: [channels, 1, 7])
+            addF32(prefix + ".block.1.bias", shape: [channels])
+            addF32(prefix + ".block.2.alpha", shape: [1, channels, 1]) { _ in 1.0 }
+            addF32(prefix + ".block.3.weight", shape: [channels, channels, 1])
+            addF32(prefix + ".block.3.bias", shape: [channels])
+        }
+
+        // Minimal encoder weights
+        addF32("encoder.block.0.weight", shape: [2, 1, 7])
+        addF32("encoder.block.0.bias", shape: [2])
+        for u in 0..<3 { addResUnit("encoder.block.1.block.\(u)", channels: 2) }
+        addF32("encoder.block.1.block.3.alpha", shape: [1, 2, 1]) { _ in 1.0 }
+        addF32("encoder.block.1.block.4.weight", shape: [4, 2, 4])
+        addF32("encoder.block.1.block.4.bias", shape: [4])
+        addF32("encoder.fc_mu.weight", shape: [4, 4, 3])
+        addF32("encoder.fc_mu.bias", shape: [4])
+
+        // Minimal decoder weights
+        addF32("decoder.model.0.weight", shape: [4, 1, 7])
+        addF32("decoder.model.0.bias", shape: [4])
+        addF32("decoder.model.1.weight", shape: [8, 4, 1])
+        addF32("decoder.model.1.bias", shape: [8])
+        addI32("decoder.sr_bin_boundaries", shape: [3], values: [20_000, 30_000, 40_000])
+        addF32("decoder.sr_cond_model.2.scale_embed.weight", shape: [4, 8]) { _ in 1.05 }
+        addF32("decoder.sr_cond_model.2.bias_embed.weight", shape: [4, 8]) { $0 % 2 == 0 ? 0.02 : -0.02 }
+        addF32("decoder.model.2.block.0.alpha", shape: [1, 8, 1]) { _ in 1.0 }
+        addF32("decoder.model.2.block.1.weight", shape: [8, 4, 4])
+        addF32("decoder.model.2.block.1.bias", shape: [4])
+        for u in 2..<5 { addResUnit("decoder.model.2.block.\(u)", channels: 4) }
+        addF32("decoder.model.3.alpha", shape: [1, 4, 1]) { _ in 1.0 }
+        addF32("decoder.model.4.weight", shape: [1, 4, 7])
+        addF32("decoder.model.4.bias", shape: [1])
+
+        var offset = 0
+        var header: [String: Any] = [:]
+        var body = Data()
+        for entry in entries {
+            let end = offset + entry.data.count
+            header[entry.name] = ["dtype": entry.dtype, "shape": entry.shape, "data_offsets": [offset, end]]
+            body.append(entry.data)
+            offset = end
+        }
+        let headerData = try JSONSerialization.data(withJSONObject: header)
+        var fileData = Data()
+        var headerCount = UInt64(headerData.count).littleEndian
+        withUnsafeBytes(of: &headerCount) { fileData.append(contentsOf: $0) }
+        fileData.append(headerData)
+        fileData.append(body)
+        try fileData.write(to: vaeURL)
+
+        let codec = try VoxAudioVAE(url: vaeURL, config: config)
+        let warmup = VoxSignal(channels: 4, frames: 12, values: (0..<(4 * 12)).map { sin(Float($0) * 0.21) * 0.5 })
+        let uttFrames = 24
+        let utterance = VoxSignal(channels: 4, frames: uttFrames, values: (0..<(4 * uttFrames)).map { cos(Float($0) * 0.17) * 0.6 })
+        let noise = VoxSignal(channels: 4, frames: 12, values: [Float](repeating: 0.9, count: 4 * 12))
+
+        // Reference: continuous warmup + full batch decode of utterance.
+        codec.resetDecoder()
+        _ = codec.decode(warmup)
+        let expected = codec.decode(utterance)
+        let expectedRMS = (expected.reduce(0) { $0 + $1 * $1 } / Float(expected.count)).squareRoot()
+        XCTAssertGreaterThan(expectedRMS, 1e-3)
+
+        // Streaming path: snapshot after warmup, pollute decoder state, restore snapshot, decode 4 + 4 + 16 frames.
+        codec.resetDecoder()
+        _ = codec.decode(warmup)
+        let snapshot = codec.snapshotDecoder()
+        _ = codec.decode(noise)
+        codec.restoreDecoder(snapshot)
+        var streamed: [Float] = []
+        streamed += codec.decode(utterance.slice(0..<4))
+        streamed += codec.decode(utterance.slice(4..<8))
+        streamed += codec.decode(utterance.slice(8..<24))
+
+        XCTAssertEqual(streamed.count, expected.count)
+        let maxDiff = zip(streamed, expected).reduce(Float(0)) { max($0, abs($1.0 - $1.1)) }
+        XCTAssertLessThan(maxDiff, 1e-4)
+    }
+
     func testRetryRepairsSuccessiveStaleAssetsAndPreservesUserFiles() async throws {
         let encoder = "encoder.h16g.aimodelc", base = "base-0.h16g.aimodelc"
         let fixtures = try modelFixture(assets: [encoder, base])

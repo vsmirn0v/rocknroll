@@ -298,7 +298,11 @@ class VoxMiniCPMModel: Module {
         var attnMask = mask
         if attnMask == nil && isCausal && L > 1 {
             let ones = MLXArray.ones([L, L])
-            let causalMask = triu(ones, k: 1) * Float(-1e9)
+            var causalMask = triu(ones, k: 1) * Float(-1e9)
+            if offset > 0 {
+                let prefixZeros = MLXArray.zeros([L, offset])
+                causalMask = MLX.concatenated([prefixZeros, causalMask], axis: -1)
+            }
             attnMask = causalMask.expandedDimensions(axes: [0, 1]).asType(h.dtype)
         }
 

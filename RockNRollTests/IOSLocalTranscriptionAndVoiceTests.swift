@@ -429,6 +429,132 @@ final class IOSLocalTranscriptionAndVoiceTests: XCTestCase {
         XCTAssertNil(reloaded.storedVoice)
     }
 
+    func testVoiceStoreStreamingAssistantAuditionAndPreFirstChunkFallback() async throws {
+        let tempRoot = FileManager.default.temporaryDirectory.appendingPathComponent("VoxStreamTest-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: tempRoot) }
+        let suiteName = "IOSVoiceStreamTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        func installFiles(in voxStore: IOSVoxCPM2Store) throws {
+            for spec in IOSVoxCPM2Store.modelFiles {
+                let fileURL = voxStore.modelDirectory.appendingPathComponent(spec.relativePath)
+                try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try Data([0]).write(to: fileURL)
+            }
+            voxStore.refreshInstallState()
+            voxStore.useClonedVoice = false
+        }
+
+        // 1. Multi-chunk streaming emits chunks live and triggers onFirstAudio on the first chunk.
+        actor StreamGate {
+            var releaseSecond: CheckedContinuation<Void, Never>?
+            func waitForSecond() async {
+                await withCheckedContinuation { releaseSecond = $0 }
+            }
+            func resumeSecond() {
+                releaseSecond?.resume()
+                releaseSecond = nil
+            }
+        }
+        let gate = StreamGate()
+        defer { Task { await gate.resumeSecond() } }
+        let chunk1 = [Float](repeating: 0.1, count: 4_800)
+        let chunk2 = [Float](repeating: 0.2, count: 4_800)
+        let voxStream = IOSVoxCPM2Store(
+            modelsDirectory: tempRoot.appendingPathComponent("ok"),
+            preferences: defaults,
+            hardwareSupportedProvider: { true },
+            freeDiskBytesProvider: { _ in 20_000_000_000 },
+            foregroundActiveProvider: { true },
+            streamSynthesizeOverride: { _, _, _, _, onChunk in
+                onChunk(chunk1)
+                await gate.waitForSecond()
+                onChunk(chunk2)
+                return chunk1 + chunk2
+            }
+        )
+        try installFiles(in: voxStream)
+        let voiceStore = IOSVoiceStore(preferences: defaults, voxStore: voxStream)
+        voiceStore.engine = .voxCPM2
+        var receivedFrames: [AVAudioFrameCount] = []
+        let stream = voiceStore.streamSynthesize("Stream test")
+        var iterator = stream.makeAsyncIterator()
+        let first = try await iterator.next()
+        XCTAssertEqual(first?.frameLength, 4_800)
+        if let first { receivedFrames.append(first.frameLength) }
+        await gate.resumeSecond()
+        while let next = try await iterator.next() {
+            receivedFrames.append(next.frameLength)
+        }
+        XCTAssertEqual(receivedFrames, [4_800, 4_800])
+
+        // 2. streamPlayAssistantResponse emits onFirstAudio and stops cleanly if error happens post-first-chunk.
+        let player = IOSVoicePreviewPlayer()
+        let postChunkFailVox = IOSVoxCPM2Store(
+            modelsDirectory: tempRoot.appendingPathComponent("postfail"),
+            preferences: defaults,
+            hardwareSupportedProvider: { true },
+            freeDiskBytesProvider: { _ in 20_000_000_000 },
+            foregroundActiveProvider: { true },
+            streamSynthesizeOverride: { _, _, _, _, onChunk in
+                onChunk(chunk1)
+                throw NSError(domain: "VoxStreamTest", code: 42, userInfo: [NSLocalizedDescriptionKey: "mid-stream fail"])
+            }
+        )
+        try installFiles(in: postChunkFailVox)
+        let postFailStore = IOSVoiceStore(preferences: defaults, voxStore: postChunkFailVox)
+        postFailStore.assistantAuditionVoice = .voxPreset(.warmFemale)
+        var sawFirstAudio = false
+        do {
+            try await postFailStore.streamPlayAssistantResponse(
+                "Post-chunk error test",
+                player: player,
+                sessionSetup: { format in
+                    try player.beginStreaming(format: format)
+                },
+                onFirstAudio: { sawFirstAudio = true }
+            )
+            XCTFail("Expected post-first-chunk error to propagate without system fallback")
+        } catch let error as IOSVoiceSynthesisError {
+            XCTAssertEqual(error, .voxRuntimeFailed("mid-stream fail"))
+        }
+        XCTAssertTrue(sawFirstAudio)
+        XCTAssertFalse(player.isPlaying)
+
+        // 3. Pre-first-chunk error falls back cleanly to system voice.
+        let preChunkFailVox = IOSVoxCPM2Store(
+            modelsDirectory: tempRoot.appendingPathComponent("prefail"),
+            preferences: defaults,
+            hardwareSupportedProvider: { true },
+            freeDiskBytesProvider: { _ in 20_000_000_000 },
+            foregroundActiveProvider: { true },
+            streamSynthesizeOverride: { _, _, _, _, _ in
+                throw NSError(domain: "VoxStreamTest", code: 7, userInfo: [NSLocalizedDescriptionKey: "pre-chunk fail"])
+            }
+        )
+        try installFiles(in: preChunkFailVox)
+        let preFailStore = IOSVoiceStore(preferences: defaults, voxStore: preChunkFailVox)
+        preFailStore.assistantAuditionVoice = .voxPreset(.warmFemale)
+        var fallbackFirstAudio = false
+        do {
+            try await preFailStore.streamPlayAssistantResponse(
+                "Fallback test",
+                player: player,
+                sessionSetup: { format in
+                    try player.beginStreaming(format: format)
+                },
+                onFirstAudio: { fallbackFirstAudio = true }
+            )
+            XCTAssertTrue(fallbackFirstAudio)
+            player.stop()
+        } catch let error as IOSVoiceSynthesisError {
+            // Bare simulator images without TTS voices may fail with `.system`, never `.voxRuntimeFailed`.
+            XCTAssertEqual(error, .system)
+        }
+    }
+
     func testVoxTokenizerAndSampleAudioProcessing() throws {
         let tokenizerURL = FileManager.default.temporaryDirectory.appendingPathComponent("vox-tok-\(UUID().uuidString).json")
         defer { try? FileManager.default.removeItem(at: tokenizerURL) }

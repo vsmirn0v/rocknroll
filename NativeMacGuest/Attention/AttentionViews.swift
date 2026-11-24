@@ -1536,27 +1536,57 @@ struct NativeDesktopIntelligenceSettings: View {
             let started = ProcessInfo.processInfo.systemUptime
             do {
                 let text = L("I'm in another meeting right now, I'll answer in a couple of minutes.")
-                let buffer: AVAudioPCMBuffer
-                if store.voiceEngine == .cloned {
+                if store.voiceEngine == .cloned && attention.synthesizeOverride == nil {
+                    let stream = attention.store.voiceConfiguration.streamSynthesize(text)
+                    var iterator = stream.makeAsyncIterator()
                     // ANE specialization can ignore cancellation; a GPU worker can
                     // be stopped safely when its preview expires.
-                    let synthesis = Task { try await attention.synthesize(text) }
+                    let firstChunkTask = Task<AVAudioPCMBuffer?, Error> {
+                        try await iterator.next()
+                    }
                     // GPU fallback can take substantially longer than the
                     // warm Neural Engine for the same saved-voice utterance.
                     let seconds: UInt64 = clone.preparation != .ready && clone.gpuReady ? 120 : 30
-                    guard let result = await VoicePreviewWait.result(of: synthesis, timeoutNanoseconds: seconds * 1_000_000_000) else {
-                        if clone.activeSpeechBackend == .gpu { synthesis.cancel() }
+                    guard let result = await VoicePreviewWait.result(of: firstChunkTask, timeoutNanoseconds: seconds * 1_000_000_000) else {
+                        if clone.activeSpeechBackend == .gpu { firstChunkTask.cancel() }
                         probeLog("voice-preview-deadline", ["seconds": seconds])
                         throw VoiceSynthesisError.clonePreviewWaiting
                     }
-                    buffer = try result.get()
+                    guard let firstChunk = try result.get() else {
+                        throw VoiceSynthesisError.audio
+                    }
+                    guard generation == voicePreviewGeneration else { return }
+                    let token = try VoicePreviewPlayer.shared.beginStreaming(format: firstChunk.format)
+                    VoicePreviewPlayer.shared.enqueueStreamBuffer(firstChunk, sessionToken: token)
+                    previewing = false
+                    voiceFailed = false
+                    voiceMessage = L("Ready in %.1f s.", ProcessInfo.processInfo.systemUptime - started)
+                    do {
+                        while let nextChunk = try await iterator.next() {
+                            guard generation == voicePreviewGeneration else {
+                                VoicePreviewPlayer.shared.stop()
+                                return
+                            }
+                            if nextChunk.frameLength > 0 {
+                                VoicePreviewPlayer.shared.enqueueStreamBuffer(nextChunk, sessionToken: token)
+                            }
+                        }
+                        guard generation == voicePreviewGeneration else {
+                            VoicePreviewPlayer.shared.stop()
+                            return
+                        }
+                        VoicePreviewPlayer.shared.finishStreaming(sessionToken: token)
+                    } catch {
+                        VoicePreviewPlayer.shared.stop()
+                        throw error
+                    }
                 } else {
-                    buffer = try await attention.synthesize(text)
+                    let buffer = try await attention.synthesize(text)
+                    guard generation == voicePreviewGeneration else { return }
+                    try VoicePreviewPlayer.shared.play(buffer)
+                    voiceFailed = false
+                    voiceMessage = L("Ready in %.1f s.", ProcessInfo.processInfo.systemUptime - started)
                 }
-                guard generation == voicePreviewGeneration else { return }
-                try VoicePreviewPlayer.shared.play(buffer)
-                voiceFailed = false
-                voiceMessage = L("Ready in %.1f s.", ProcessInfo.processInfo.systemUptime - started)
             } catch {
                 guard generation == voicePreviewGeneration else { return }
                 // The model row already owns its actionable, localized failure.
@@ -1595,8 +1625,13 @@ struct NativeDesktopIntelligenceSettings: View {
             defer { auditionPreviewing = false }
             do {
                 let sample = L("Hello! This is how Assistant answers sound on this Mac.")
-                let result = try await VoiceSynthesis.auditionWithStatus(sample, selection: selection, store: store)
-                try VoicePreviewPlayer.shared.play(result.buffer)
+                let result = try await VoiceSynthesis.streamAuditionWithStatus(
+                    sample,
+                    selection: selection,
+                    player: .shared,
+                    onFirstAudio: { auditionPreviewing = false },
+                    store: store
+                )
                 auditionUsedFallback = result.usedSystemFallback
                 if result.usedSystemFallback {
                     auditionMessage = L("Using macOS voice fallback: %@", result.failureReason ?? L("selected voice unavailable"))

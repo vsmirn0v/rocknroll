@@ -143,6 +143,7 @@ public protocol NativeDesktopMeetingEngine: AnyObject {
     var voiceMicrophoneGateIsClosed: Bool { get }
     /// Plays one buffer into what the meeting receives; true when it finished playing.
     func playVoiceReply(_ buffer: AVAudioPCMBuffer) async -> Bool
+    func playVoiceReplyStream(_ chunks: AsyncThrowingStream<AVAudioPCMBuffer, Error>) async -> Bool
     func leave() async -> Bool
 }
 public extension NativeDesktopMeetingEngine {
@@ -179,6 +180,18 @@ public extension NativeDesktopMeetingEngine {
     func setMicrophoneGate(open: Bool) async -> Bool { open }
     var voiceMicrophoneGateIsClosed: Bool { false }
     func playVoiceReply(_ buffer: AVAudioPCMBuffer) async -> Bool { false }
+    func playVoiceReplyStream(_ chunks: AsyncThrowingStream<AVAudioPCMBuffer, Error>) async -> Bool {
+        var collected: [AVAudioPCMBuffer] = []
+        do {
+            for try await chunk in chunks {
+                if chunk.frameLength > 0 { collected.append(chunk) }
+            }
+        } catch {
+            return false
+        }
+        guard !Task.isCancelled, let combined = GuestVoiceReplyGraph.combine(collected) else { return false }
+        return await playVoiceReply(combined)
+    }
 }
 public enum NativeDesktopPrivateAudioError: LocalizedError {
     case unavailable

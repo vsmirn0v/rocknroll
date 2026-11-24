@@ -435,14 +435,57 @@ import SwiftUI
         guard headphoneRoute() else { audioError = L("Talk-back needs headphones selected as the Mac's output."); return }
         attention.speech.setSpeakingResponse(true)
         do {
-            let buffer = try await attention.synthesize(text)
-            guard headphoneRoute() else {
-                attention.speech.setSpeakingResponse(false)
-                audioError = L("Talk-back stopped because headphones are no longer the output.")
-                return
-            }
-            try VoicePreviewPlayer.shared.play(buffer) { [weak self] in
-                self?.attention?.speech.setSpeakingResponse(false)
+            if attention.synthesizeOverride == nil, attention.store.voiceConfiguration.supportsStreaming {
+                var sessionToken: UUID?
+                var playbackFinished = false
+                let stream = attention.store.voiceConfiguration.streamSynthesize(text)
+                do {
+                    for try await chunk in stream {
+                        try Task.checkCancellation()
+                        guard chunk.frameLength > 0 else { continue }
+                        guard headphoneRoute() else {
+                            if sessionToken != nil { VoicePreviewPlayer.shared.stop() }
+                            attention.speech.setSpeakingResponse(false)
+                            audioError = L("Talk-back stopped because headphones are no longer the output.")
+                            return
+                        }
+                        if sessionToken == nil {
+                            sessionToken = try VoicePreviewPlayer.shared.beginStreaming(format: chunk.format) { [weak self] in
+                                self?.attention?.speech.setSpeakingResponse(false)
+                            }
+                        }
+                        if let token = sessionToken {
+                            VoicePreviewPlayer.shared.enqueueStreamBuffer(chunk, sessionToken: token)
+                        }
+                    }
+                    guard headphoneRoute() else {
+                        if sessionToken != nil { VoicePreviewPlayer.shared.stop() }
+                        attention.speech.setSpeakingResponse(false)
+                        audioError = L("Talk-back stopped because headphones are no longer the output.")
+                        return
+                    }
+                    if let token = sessionToken {
+                        VoicePreviewPlayer.shared.finishStreaming(sessionToken: token)
+                        playbackFinished = true
+                    } else {
+                        attention.speech.setSpeakingResponse(false)
+                    }
+                } catch {
+                    if sessionToken != nil && !playbackFinished {
+                        VoicePreviewPlayer.shared.stop()
+                    }
+                    throw error
+                }
+            } else {
+                let buffer = try await attention.synthesize(text)
+                guard headphoneRoute() else {
+                    attention.speech.setSpeakingResponse(false)
+                    audioError = L("Talk-back stopped because headphones are no longer the output.")
+                    return
+                }
+                try VoicePreviewPlayer.shared.play(buffer) { [weak self] in
+                    self?.attention?.speech.setSpeakingResponse(false)
+                }
             }
         } catch {
             attention.speech.setSpeakingResponse(false)
@@ -542,9 +585,19 @@ import SwiftUI
         auditionTask = Task { @MainActor [weak self] in
             guard let self else { return }
             do {
-                let buffer = try await VoiceSynthesis.audition(clean, selection: selection, store: attention.store)
-                guard !Task.isCancelled, self.auditioningItemID == id else { return }
-                try self.playAuditionBuffer(buffer, id: id)
+                _ = try await VoiceSynthesis.streamAuditionWithStatus(
+                    clean,
+                    selection: selection,
+                    player: .shared,
+                    onComplete: { [weak self] in
+                        Task { @MainActor [weak self] in
+                            guard let self, self.auditioningItemID == id else { return }
+                            self.auditioningItemID = nil
+                            self.attention?.speech.setSpeakingResponse(false)
+                        }
+                    },
+                    store: attention.store
+                )
             } catch is CancellationError {
                 if self.auditioningItemID == id {
                     self.auditioningItemID = nil

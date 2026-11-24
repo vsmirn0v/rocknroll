@@ -32,13 +32,33 @@ actor ClonedVoiceBackendRouter {
     /// noncooperative worker on deadline. Router expiry checks reject late
     /// results; they do not interrupt a framework that ignores cancellation.
     typealias Synthesize = @Sendable (_ text: String, _ voice: VoxVoice) async throws -> [Float]
-    private let neuralEngine: Synthesize
-    private let gpu: Synthesize
+    typealias ChunkHandler = @Sendable ([Float]) -> Void
+    typealias StreamSynthesize = @Sendable (_ text: String, _ voice: VoxVoice, _ onChunk: ChunkHandler?) async throws -> [Float]
+
+    private final class ChunkGate: @unchecked Sendable {
+        private let lock = NSLock()
+        private var active = true
+        func invalidate() {
+            lock.lock()
+            active = false
+            lock.unlock()
+        }
+        var isActive: Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return active
+        }
+    }
+
+    private let neuralEngineStream: StreamSynthesize
+    private let gpuStream: StreamSynthesize
+    private let stopANE: @Sendable () async -> Void
     private let stopGPU: @Sendable () async -> Void
     private let now: @Sendable () -> Date
     private var readiness: [Backend: Readiness] = [.neuralEngine: .unavailable, .gpu: .unavailable]
     private var active: Backend?
     private var activeRequest: UUID?
+    private var activeChunkGate: ChunkGate?
     private var cancellingRequest: UUID?
     private var cancelledRequests: Set<UUID> = []
     private var gpuIdleWaiters: [UUID: CheckedContinuation<Void, Error>] = [:]
@@ -48,8 +68,20 @@ actor ClonedVoiceBackendRouter {
     init(neuralEngine: @escaping Synthesize, gpu: @escaping Synthesize,
          stopGPU: @escaping @Sendable () async -> Void = {},
          now: @escaping @Sendable () -> Date = { Date() }) {
-        self.neuralEngine = neuralEngine
-        self.gpu = gpu
+        self.neuralEngineStream = { text, voice, _ in try await neuralEngine(text, voice) }
+        self.gpuStream = { text, voice, _ in try await gpu(text, voice) }
+        self.stopANE = {}
+        self.stopGPU = stopGPU
+        self.now = now
+    }
+
+    init(neuralEngineStream: @escaping StreamSynthesize, gpuStream: @escaping StreamSynthesize,
+         stopANE: @escaping @Sendable () async -> Void = {},
+         stopGPU: @escaping @Sendable () async -> Void = {},
+         now: @escaping @Sendable () -> Date = { Date() }) {
+        self.neuralEngineStream = neuralEngineStream
+        self.gpuStream = gpuStream
+        self.stopANE = stopANE
         self.stopGPU = stopGPU
         self.now = now
     }
@@ -59,13 +91,31 @@ actor ClonedVoiceBackendRouter {
         readiness[backend] = value
         // Losing the active backend invalidates its eventual output. A different
         // backend becoming ready must not interrupt an utterance already running.
-        if active == backend && value != .ready { generation &+= 1 }
+        if active == backend && value != .ready {
+            generation &+= 1
+            activeChunkGate?.invalidate()
+        }
         changes.send(snapshot)
     }
 
     /// Invoke when approval, audience, voice enrollment or the caller's request
     /// changes. A noncooperative worker remains busy until it actually exits.
-    func invalidatePending() { generation &+= 1 }
+    func invalidatePending() {
+        generation &+= 1
+        activeChunkGate?.invalidate()
+    }
+
+    func cancelRequest(_ request: UUID) async {
+        guard activeRequest == request else { return }
+        if active == .gpu {
+            await cancelGPURequest(request)
+        } else if active == .neuralEngine {
+            cancelledRequests.insert(request)
+            generation &+= 1
+            activeChunkGate?.invalidate()
+            await stopANE()
+        }
+    }
 
     /// Stop only the matching GPU operation; the reservation prevents a late
     /// cancellation from interrupting the next utterance while the helper exits.
@@ -74,6 +124,7 @@ actor ClonedVoiceBackendRouter {
         cancellingRequest = request
         cancelledRequests.insert(request)
         generation &+= 1
+        activeChunkGate?.invalidate()
         await stopGPU()
         if cancellingRequest == request { cancellingRequest = nil }
         resumeGPUIdleWaiters()
@@ -127,7 +178,8 @@ actor ClonedVoiceBackendRouter {
         return .init(neuralEngine: state(.neuralEngine), gpu: state(.gpu), active: active)
     }
 
-    func speak(_ text: String, voice: VoxVoice, expiresAt: Date, request: UUID = UUID()) async throws -> Output {
+    func speak(_ text: String, voice: VoxVoice, expiresAt: Date, request: UUID = UUID(),
+               onChunk: ChunkHandler? = nil) async throws -> Output {
         try Task.checkCancellation()
         guard now() < expiresAt else { throw Failure.expired }
         guard active == nil, cancellingRequest == nil else { throw Failure.busy }
@@ -137,20 +189,32 @@ actor ClonedVoiceBackendRouter {
         else { throw Failure.unavailable }
 
         let operationGeneration = generation
+        let chunkGate = ChunkGate()
         active = selected
         activeRequest = request
+        activeChunkGate = chunkGate
         changes.send(snapshot)
         defer {
+            chunkGate.invalidate()
             active = nil
             activeRequest = nil
+            activeChunkGate = nil
             cancelledRequests.remove(request)
             changes.send(snapshot)
             resumeGPUIdleWaiters()
         }
+        let nowProvider = self.now
+        let chunkForwarder: ChunkHandler? = onChunk.map { handler in
+            { @Sendable chunk in
+                guard chunkGate.isActive, !Task.isCancelled, nowProvider() < expiresAt,
+                      !chunk.isEmpty, chunk.allSatisfy(\.isFinite) else { return }
+                handler(chunk)
+            }
+        }
         // A failure is returned to the caller. Retrying it on the other backend
         // could replay an expired or already-authorized meeting utterance.
         let samples: [Float]
-        do { samples = try await (selected == .neuralEngine ? neuralEngine : gpu)(text, voice) }
+        do { samples = try await (selected == .neuralEngine ? neuralEngineStream : gpuStream)(text, voice, chunkForwarder) }
         catch is CancellationError { throw CancellationError() }
         catch {
             // Stopping a helper to honor caller cancellation may surface as a

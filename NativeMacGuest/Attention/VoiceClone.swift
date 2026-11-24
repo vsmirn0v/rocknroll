@@ -128,13 +128,13 @@ struct StoredClonedVoice: Codable, Equatable {
         self.engine = engine
         self.gpuEngine = gpuEngine
         let aneFolder = model.map(listen.folder), gpuFolder = gpu.map(listen.folder)
-        self.router = ClonedVoiceBackendRouter(neuralEngine: { text, voice in
+        self.router = ClonedVoiceBackendRouter(neuralEngineStream: { text, voice, onChunk in
             guard let aneFolder else { throw ClonedVoiceWorkerError.unavailable }
-            return try await engine.speak(text, voice: voice, folder: aneFolder)
-        }, gpu: { text, voice in
+            return try await engine.speak(text, voice: voice, folder: aneFolder, onChunk: onChunk)
+        }, gpuStream: { text, voice, onChunk in
             guard let gpuFolder else { throw ClonedVoiceWorkerError.unavailable }
-            return try await gpuEngine.speak(text, voice: voice, folder: gpuFolder)
-        }, stopGPU: { await gpuEngine.unload() })
+            return try await gpuEngine.speak(text, voice: voice, folder: gpuFolder, onChunk: onChunk)
+        }, stopANE: { await engine.cancelCurrentSpeakIfActive() }, stopGPU: { await gpuEngine.unload() })
         self.currentTime = now
         self.removeVoiceFile = removeVoiceFile
         self.preparationStorage = preparationStorage
@@ -669,31 +669,62 @@ struct StoredClonedVoice: Codable, Equatable {
 
     func cancelGPURequest(_ request: UUID) async { await router.cancelGPURequest(request) }
 
-    func speakPreset(_ text: String, preset: AssistantVoxVoicePreset, request: UUID = UUID()) async throws -> [Float] {
+    func cancelRequest(_ request: UUID) async { await router.cancelRequest(request) }
+
+    private final class ClonedChunkEmitFlag: @unchecked Sendable {
+        private let lock = NSLock()
+        private var emitted = false
+        func mark() {
+            lock.lock()
+            emitted = true
+            lock.unlock()
+        }
+        var didEmit: Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return emitted
+        }
+    }
+
+    private static func trackChunkEmission(
+        _ onChunk: (@Sendable ([Float]) -> Void)?
+    ) -> (flag: ClonedChunkEmitFlag, handler: (@Sendable ([Float]) -> Void)?) {
+        let flag = ClonedChunkEmitFlag()
+        guard let onChunk else { return (flag, nil) }
+        return (flag, { samples in
+            guard !samples.isEmpty else { return }
+            flag.mark()
+            onChunk(samples)
+        })
+    }
+
+    func speakPreset(_ text: String, preset: AssistantVoxVoicePreset, request: UUID = UUID(),
+                     onChunk: (@Sendable ([Float]) -> Void)? = nil) async throws -> [Float] {
         try Task.checkCancellation()
         defer { retireGPUIfANEReady() }
         let prompt = preset.formattedPrompt(for: text)
         guard !prompt.isEmpty else { throw VoiceSynthesisError.empty }
         restorePreparation()
         prepareGPUIfNeeded()
+        let chunkTracking = Self.trackChunkEmission(onChunk)
         let aneReady = !deleting && installed && preparation == .ready
         if aneReady, let folder = bundleFolder {
             do {
                 let samples = try await withTaskCancellationHandler {
-                    try await engine.speakZeroShot(prompt, folder: folder)
+                    try await engine.speakZeroShot(prompt, folder: folder, onChunk: chunkTracking.handler)
                 } onCancel: {
-                    Task { await engine.unload() }
+                    Task { await engine.cancelCurrentSpeakIfActive() }
                 }
                 try ClonedVoiceWire.validatePCM(samples)
                 return samples
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
-                if self.gpuReady, !Task.isCancelled, let gpuFolder = gpuModel.map(listen.folder) {
+                if self.gpuReady, !Task.isCancelled, !chunkTracking.flag.didEmit, let gpuFolder = gpuModel.map(listen.folder) {
                     let samples = try await withTaskCancellationHandler {
-                        try await gpuEngine.speakZeroShot(prompt, folder: gpuFolder)
+                        try await gpuEngine.speakZeroShot(prompt, folder: gpuFolder, onChunk: chunkTracking.handler)
                     } onCancel: {
-                        Task { await gpuEngine.unload() }
+                        Task { await gpuEngine.cancelCurrentSpeakIfActive() }
                     }
                     try ClonedVoiceWire.validatePCM(samples)
                     return samples
@@ -703,9 +734,9 @@ struct StoredClonedVoice: Codable, Equatable {
         }
         if self.gpuReady, let gpuFolder = gpuModel.map(listen.folder) {
             let samples = try await withTaskCancellationHandler {
-                try await gpuEngine.speakZeroShot(prompt, folder: gpuFolder)
+                try await gpuEngine.speakZeroShot(prompt, folder: gpuFolder, onChunk: chunkTracking.handler)
             } onCancel: {
-                Task { await gpuEngine.unload() }
+                Task { await gpuEngine.cancelCurrentSpeakIfActive() }
             }
             try ClonedVoiceWire.validatePCM(samples)
             return samples
@@ -716,7 +747,8 @@ struct StoredClonedVoice: Codable, Equatable {
         throw installed ? VoiceSynthesisError.clonePreparing : VoiceSynthesisError.cloneModelMissing
     }
 
-    func speak(_ text: String, recordedAt: Date? = nil, request: UUID = UUID(), expiresAt: Date? = nil) async throws -> [Float] {
+    func speak(_ text: String, recordedAt: Date? = nil, request: UUID = UUID(), expiresAt: Date? = nil,
+               onChunk: (@Sendable ([Float]) -> Void)? = nil) async throws -> [Float] {
         try Task.checkCancellation()
         defer { retireGPUIfANEReady() }
         guard let enrolled = stored, recordedAt == nil || enrolled.recordedAt == recordedAt else {
@@ -739,13 +771,14 @@ struct StoredClonedVoice: Codable, Equatable {
             if case .failed = preparation { throw VoiceSynthesisError.clonePreparationFailed }
             throw installed ? VoiceSynthesisError.clonePreparing : VoiceSynthesisError.cloneModelMissing
         }
+        let chunkTracking = Self.trackChunkEmission(onChunk)
         let folder = bundleFolder
         let receipt = folder.flatMap { folder in identity.flatMap { ClonedVoicePreparation.read(folder, identity: $0) } }
         let deadline = expiresAt ?? currentTime().addingTimeInterval(180)
         do {
             await router.setReadiness(aneReady ? .ready : .unavailable, for: .neuralEngine)
             await router.setReadiness(gpuReady ? .ready : .unavailable, for: .gpu)
-            let output = try await invokeRouterSpeak(text, voice: enrolled.voice, deadline: deadline, request: request)
+            let output = try await invokeRouterSpeak(text, voice: enrolled.voice, deadline: deadline, request: request, onChunk: chunkTracking.handler)
             try Task.checkCancellation()
             guard stored == enrolled else { throw VoiceSynthesisError.cloneVoiceMissing }
             return output.samples
@@ -758,12 +791,12 @@ struct StoredClonedVoice: Codable, Equatable {
                 let diagnosis = diagnose(error)
                 if diagnosis.kind == .cache {
                     await router.setReadiness(.unavailable, for: .neuralEngine)
-                    if self.gpuReady, !Task.isCancelled, currentTime() < deadline, stored == enrolled {
+                    if self.gpuReady, !Task.isCancelled, !chunkTracking.flag.didEmit, currentTime() < deadline, stored == enrolled {
                         probeLog("voice-clone-gpu-failover", ["asset": diagnosis.asset ?? diagnosis.repairAsset ?? ""])
                         defer { startAutomaticCacheRecovery() }
                         await router.setReadiness(.ready, for: .gpu)
                         do {
-                            let gpuOutput = try await invokeRouterSpeak(text, voice: enrolled.voice, deadline: deadline, request: request)
+                            let gpuOutput = try await invokeRouterSpeak(text, voice: enrolled.voice, deadline: deadline, request: request, onChunk: chunkTracking.handler)
                             try Task.checkCancellation()
                             guard stored == enrolled else { throw VoiceSynthesisError.cloneVoiceMissing }
                             return gpuOutput.samples
@@ -782,12 +815,13 @@ struct StoredClonedVoice: Codable, Equatable {
         }
     }
 
-    private func invokeRouterSpeak(_ text: String, voice: VoxVoice, deadline: Date, request: UUID) async throws -> ClonedVoiceBackendRouter.Output {
+    private func invokeRouterSpeak(_ text: String, voice: VoxVoice, deadline: Date, request: UUID,
+                                   onChunk: (@Sendable ([Float]) -> Void)? = nil) async throws -> ClonedVoiceBackendRouter.Output {
         do {
             return try await withTaskCancellationHandler {
-                try await router.speak(text, voice: voice, expiresAt: deadline, request: request)
+                try await router.speak(text, voice: voice, expiresAt: deadline, request: request, onChunk: onChunk)
             } onCancel: { [router] in
-                Task { await router.cancelGPURequest(request) }
+                Task { await router.cancelRequest(request) }
             }
         } catch ClonedVoiceBackendRouter.Failure.busy {
             throw ClonedVoiceWorkerError.busy

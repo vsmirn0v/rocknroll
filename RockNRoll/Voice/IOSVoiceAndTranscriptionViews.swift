@@ -655,10 +655,16 @@ struct TranscriptionAndVoiceSettingsView: View {
         Task { @MainActor in
             defer { generatingPreview = nil }
             do {
-                let buffer = try await voiceStore.synthesizeAssistantResponse(L("Hello! This is how Assistant answers sound on your iPhone."))
-                playingPreview = .assistantAudition
-                try previewPlayer.play(buffer)
+                try await voiceStore.streamPlayAssistantResponse(
+                    L("Hello! This is how Assistant answers sound on your iPhone."),
+                    player: previewPlayer,
+                    onFirstAudio: {
+                        generatingPreview = nil
+                        playingPreview = .assistantAudition
+                    }
+                )
             } catch is CancellationError {
+                playingPreview = nil
                 return
             } catch {
                 playingPreview = nil
@@ -776,13 +782,42 @@ struct TranscriptionAndVoiceSettingsView: View {
         let sample = L("Hello everyone, this is a voice reply check from Rock'N'Roll.")
         Task { @MainActor in
             defer { generatingPreview = nil }
-            do {
-                let buffer = try await voiceStore.synthesize(sample)
-                playingPreview = .voiceReply
-                try previewPlayer.play(buffer)
-            } catch {
-                playingPreview = nil
-                previewError = error.localizedDescription
+            if voiceStore.supportsStreaming {
+                var sessionToken: UUID?
+                do {
+                    for try await chunk in voiceStore.streamSynthesize(sample) {
+                        try Task.checkCancellation()
+                        guard chunk.frameLength > 0 else { continue }
+                        if sessionToken == nil {
+                            sessionToken = try previewPlayer.beginStreaming(format: chunk.format)
+                            generatingPreview = nil
+                            playingPreview = .voiceReply
+                        }
+                        if let token = sessionToken {
+                            previewPlayer.enqueueStreamBuffer(chunk, token: token)
+                        }
+                    }
+                    guard let token = sessionToken else { throw IOSVoiceSynthesisError.audio }
+                    previewPlayer.finishStreaming(token: token)
+                } catch is CancellationError {
+                    if sessionToken != nil { previewPlayer.stop() }
+                    playingPreview = nil
+                } catch {
+                    if sessionToken != nil { previewPlayer.stop() }
+                    playingPreview = nil
+                    previewError = error.localizedDescription
+                }
+            } else {
+                do {
+                    let buffer = try await voiceStore.synthesize(sample)
+                    playingPreview = .voiceReply
+                    try previewPlayer.play(buffer)
+                } catch is CancellationError {
+                    playingPreview = nil
+                } catch {
+                    playingPreview = nil
+                    previewError = error.localizedDescription
+                }
             }
         }
     }

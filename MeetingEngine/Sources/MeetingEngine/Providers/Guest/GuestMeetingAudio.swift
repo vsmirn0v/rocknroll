@@ -45,6 +45,7 @@ import LiveKitWebRTC
     func setPrivateInputMeterEnabled(_ enabled: Bool)
     func setMicrophoneGate(open: Bool) -> Bool
     func playVoiceReply(_ buffer: AVAudioPCMBuffer) async -> Bool
+    func playVoiceReplyStream(_ chunks: AsyncThrowingStream<AVAudioPCMBuffer, Error>) async -> Bool
     var hasParticipationVoiceGraph: Bool { get }
     var participationVoiceGateClosed: Bool { get }
     var participationSenderPhysicallyMuted: Bool { get }
@@ -52,6 +53,12 @@ import LiveKitWebRTC
     func playParticipationVoice(_ buffer: AVAudioPCMBuffer, permit: GuestAutonomousVoicePlayback,
                                 canStart: @escaping @MainActor () -> Bool, localGain: @escaping @MainActor () -> Float?,
                                 onStarted: @escaping @MainActor () -> Void) async -> GuestAutonomousVoicePlayback.Outcome
+    func playParticipationVoiceStream(firstChunk: AVAudioPCMBuffer,
+                                      remainingChunks: AsyncThrowingStream<AVAudioPCMBuffer, Error>,
+                                      maxSeconds: TimeInterval,
+                                      permit: GuestAutonomousVoicePlayback,
+                                      canStart: @escaping @MainActor () -> Bool, localGain: @escaping @MainActor () -> Float?,
+                                      onStarted: @escaping @MainActor () -> Void) async -> GuestAutonomousVoicePlayback.Outcome
     func shutdown(timeout: TimeInterval) async -> Bool
 }
 
@@ -62,9 +69,40 @@ public extension GuestMeetingAudio {
     var participationVoiceGateClosed: Bool { false }
     var participationSenderPhysicallyMuted: Bool { false }
     func setParticipationSenderMuted(_ muted: Bool, permit: GuestAutonomousVoicePlayback) async -> Bool { false }
+    func playVoiceReplyStream(_ chunks: AsyncThrowingStream<AVAudioPCMBuffer, Error>) async -> Bool {
+        var collected: [AVAudioPCMBuffer] = []
+        do {
+            for try await chunk in chunks {
+                if chunk.frameLength > 0 { collected.append(chunk) }
+            }
+        } catch {
+            return false
+        }
+        guard !Task.isCancelled, let combined = GuestVoiceReplyGraph.combine(collected) else { return false }
+        return await playVoiceReply(combined)
+    }
     func playParticipationVoice(_ buffer: AVAudioPCMBuffer, permit: GuestAutonomousVoicePlayback,
                                 canStart: @escaping @MainActor () -> Bool, localGain: @escaping @MainActor () -> Float?,
                                 onStarted: @escaping @MainActor () -> Void) async -> GuestAutonomousVoicePlayback.Outcome { .notStarted }
+    func playParticipationVoiceStream(firstChunk: AVAudioPCMBuffer,
+                                      remainingChunks: AsyncThrowingStream<AVAudioPCMBuffer, Error>,
+                                      maxSeconds: TimeInterval,
+                                      permit: GuestAutonomousVoicePlayback,
+                                      canStart: @escaping @MainActor () -> Bool, localGain: @escaping @MainActor () -> Float?,
+                                      onStarted: @escaping @MainActor () -> Void) async -> GuestAutonomousVoicePlayback.Outcome {
+        var collected: [AVAudioPCMBuffer] = [firstChunk]
+        do {
+            for try await chunk in remainingChunks {
+                if !permit.canStart || Task.isCancelled { return .notStarted }
+                if chunk.frameLength > 0 { collected.append(chunk) }
+            }
+        } catch {
+            return .notStarted
+        }
+        guard let combined = GuestVoiceReplyGraph.combine(collected),
+              Double(combined.frameLength) / combined.format.sampleRate <= maxSeconds else { return .notStarted }
+        return await playParticipationVoice(combined, permit: permit, canStart: canStart, localGain: localGain, onStarted: onStarted)
+    }
     func activateMicrophone() async -> Bool { await activateMicrophone(timeout: nil) }
     func setMicrophoneMuted(_ muted: Bool) async -> Bool { await setMicrophoneMuted(muted, timeout: 2) }
     func setInputPermitted(_ permitted: Bool, keepWarm: Bool = false) async -> Bool {

@@ -157,6 +157,17 @@ import Foundation
         await adapter?.playParticipationVoice(buffer, permit: permit, canStart: canStart, localGain: localGain, onStarted: onStarted) ?? .notStarted
     }
 
+    func playVoiceStream(firstChunk: AVAudioPCMBuffer,
+                         remainingChunks: AsyncThrowingStream<AVAudioPCMBuffer, Error>,
+                         maxSeconds: TimeInterval,
+                         permit: GuestAutonomousVoicePlayback,
+                         canStart: @escaping @MainActor () -> Bool,
+                         localGain: @escaping @MainActor () -> Float?,
+                         onStarted: @escaping @MainActor () -> Void) async -> GuestAutonomousVoicePlayback.Outcome {
+        await adapter?.playParticipationVoiceStream(firstChunk: firstChunk, remainingChunks: remainingChunks, maxSeconds: maxSeconds,
+                                                    permit: permit, canStart: canStart, localGain: localGain, onStarted: onStarted) ?? .notStarted
+    }
+
     func sendAttributedChat(_ text: String, id: String, permit: GuestChatDispatchPermit) async throws {
         guard let native = adapter?.currentNativeEngine else {
             throw MeetingSessionError.unavailable(L("Chat is unavailable before connecting."))

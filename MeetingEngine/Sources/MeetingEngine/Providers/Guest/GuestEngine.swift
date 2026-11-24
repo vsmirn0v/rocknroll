@@ -1539,6 +1539,49 @@ public final class NativeGuestEngine {
     /// Plays a voice reply into a non-talk simultaneous Guest room through a synthetic WebRTC
     /// audio track without opening hardware capture or stealing active talk ownership.
     func playNonTalkVoiceReply(_ buffer: AVAudioPCMBuffer, localGain: Float?) async -> Bool {
+        await playNonTalkVoiceReply(localGain: localGain) { synthSource, canContinue in
+            await SyntheticVoiceReplyPlayer.play(buffer, into: synthSource, localGain: localGain, canContinue: canContinue)
+        }
+    }
+
+    func playNonTalkVoiceReplyStream(_ chunks: AsyncThrowingStream<AVAudioPCMBuffer, Error>, localGain: Float?) async -> Bool {
+        var iterator = chunks.makeAsyncIterator()
+        var firstChunk: AVAudioPCMBuffer?
+        do {
+            while let next = try await iterator.next() {
+                if next.frameLength > 0 {
+                    firstChunk = next
+                    break
+                }
+            }
+        } catch {
+            return false
+        }
+        guard let firstChunk, !Task.isCancelled else { return false }
+        let remaining = AsyncThrowingStream<AVAudioPCMBuffer, Error> { continuation in
+            let task = Task {
+                continuation.yield(firstChunk)
+                do {
+                    while let next = try await iterator.next() {
+                        if Task.isCancelled { break }
+                        continuation.yield(next)
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+        return await playNonTalkVoiceReply(localGain: localGain) { synthSource, canContinue in
+            await SyntheticVoiceReplyPlayer.playStream(remaining, into: synthSource, localGain: localGain, canContinue: canContinue)
+        }
+    }
+
+    private func playNonTalkVoiceReply(
+        localGain: Float?,
+        deliver: (LKRTCAudioSource, @escaping @MainActor @Sendable () -> Bool) async -> Bool
+    ) async -> Bool {
         func failed(_ stage: String) -> Bool {
             probeLog("guest-voice-reply-failed", ["stage": stage])
             return false
@@ -1616,7 +1659,7 @@ public final class NativeGuestEngine {
             return failed("senderChanged")
         }
 
-        let played = await SyntheticVoiceReplyPlayer.play(buffer, into: synthSource, localGain: localGain) { [weak self, weak publisher] in
+        let played = await deliver(synthSource) { [weak self, weak publisher] in
             guard let self, let publisher, !self.closing, self.failure == nil, !self.outputSuppressed,
                   self.publisher === publisher, !self.forcedMuteSIDs.contains(sid),
                   self.published["audio"] == sid else { return false }

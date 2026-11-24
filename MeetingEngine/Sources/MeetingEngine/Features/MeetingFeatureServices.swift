@@ -103,7 +103,37 @@ public extension MeetingTranscriptService {
     func playVoice(_ buffer: AVAudioPCMBuffer, permit: GuestAutonomousVoicePlayback,
                    canStart: @escaping @MainActor () -> Bool, localGain: @escaping @MainActor () -> Float?,
                    onStarted: @escaping @MainActor () -> Void) async -> GuestAutonomousVoicePlayback.Outcome
+    func playVoiceStream(firstChunk: AVAudioPCMBuffer,
+                         remainingChunks: AsyncThrowingStream<AVAudioPCMBuffer, Error>,
+                         maxSeconds: TimeInterval,
+                         permit: GuestAutonomousVoicePlayback,
+                         canStart: @escaping @MainActor () -> Bool,
+                         localGain: @escaping @MainActor () -> Float?,
+                         onStarted: @escaping @MainActor () -> Void) async -> GuestAutonomousVoicePlayback.Outcome
     func sendAttributedChat(_ text: String, id: String, permit: GuestChatDispatchPermit) async throws
+}
+
+public extension MeetingParticipationService {
+    func playVoiceStream(firstChunk: AVAudioPCMBuffer,
+                         remainingChunks: AsyncThrowingStream<AVAudioPCMBuffer, Error>,
+                         maxSeconds: TimeInterval,
+                         permit: GuestAutonomousVoicePlayback,
+                         canStart: @escaping @MainActor () -> Bool,
+                         localGain: @escaping @MainActor () -> Float?,
+                         onStarted: @escaping @MainActor () -> Void) async -> GuestAutonomousVoicePlayback.Outcome {
+        var collected: [AVAudioPCMBuffer] = [firstChunk]
+        do {
+            for try await chunk in remainingChunks {
+                if !permit.canStart || Task.isCancelled { return .notStarted }
+                if chunk.frameLength > 0 { collected.append(chunk) }
+            }
+        } catch {
+            return .notStarted
+        }
+        guard let combined = GuestVoiceReplyGraph.combine(collected),
+              Double(combined.frameLength) / combined.format.sampleRate <= maxSeconds else { return .notStarted }
+        return await playVoice(combined, permit: permit, canStart: canStart, localGain: localGain, onStarted: onStarted)
+    }
 }
 
 /// Default `.unavailable` feature service used when a provider does not expose an optional capability.

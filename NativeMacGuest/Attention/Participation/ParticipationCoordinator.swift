@@ -1189,61 +1189,144 @@ final class ParticipationCoordinator: ObservableObject {
             if permit.started { endVoiceEchoWindow() }
         }
         let language = VoiceSynthesis.language(of: draft) ?? Locale.preferredLanguages.first ?? "en-US"
-        let buffer: AVAudioPCMBuffer
         noteDecision(.checking, at: .synthesis, trace)
         guard Date() < expiry else {
             noteDecision(.expired, at: .synthesis, trace)
             setVoiceStatus(.textOnly, for: id)
             return
         }
+        enum SynthesizedVoice {
+            case single(AVAudioPCMBuffer)
+            case stream(firstChunk: AVAudioPCMBuffer, remaining: AsyncThrowingStream<AVAudioPCMBuffer, Error>, cancel: @Sendable () -> Void)
+        }
         let synthesisRequest = UUID()
-        let synthesisTask = Task {
-            try await grant.setup.voice.synthesize(draft, language: language, session: ParticipationNoRedirect.session,
-                                                 cloneRequest: synthesisRequest, cloneDeadline: expiry)
-        }
-        let synthesisExpiry = GuestVoiceSynthesisDeadline.schedule(expiry) { [weak self, weak permit] in
-            guard let self, let permit, self.voicePlayback === permit, !permit.started else { return }
-            synthesisTask.cancel()
-            if grant.setup.voice.engine == .cloned {
-                Task { await VoiceCloneStore.shared.cancelGPURequest(synthesisRequest) }
+        let synthesized: SynthesizedVoice
+        if grant.setup.voice.supportsStreaming {
+            let stream = grant.setup.voice.streamSynthesize(
+                draft,
+                language: language,
+                session: ParticipationNoRedirect.session,
+                cloneRequest: synthesisRequest,
+                cloneDeadline: expiry
+            )
+            var streamIterator = stream.makeAsyncIterator()
+            let firstChunkTask = Task { () -> (AVAudioPCMBuffer, AsyncThrowingStream<AVAudioPCMBuffer, Error>.AsyncIterator)? in
+                while let chunk = try await streamIterator.next() {
+                    try Task.checkCancellation()
+                    if chunk.frameLength > 0 { return (chunk, streamIterator) }
+                }
+                return nil
             }
-        }
-        do {
-            defer { synthesisExpiry.cancel() }
-            buffer = try await withTaskCancellationHandler {
-                try await synthesisTask.value
-            } onCancel: {
+            let synthesisExpiry = GuestVoiceSynthesisDeadline.schedule(expiry) { [weak self, weak permit] in
+                guard let self, let permit, self.voicePlayback === permit, !permit.started else { return }
+                firstChunkTask.cancel()
+                Task { await VoiceCloneStore.shared.cancelRequest(synthesisRequest) }
+            }
+            do {
+                defer { synthesisExpiry.cancel() }
+                let firstResult = try await withTaskCancellationHandler {
+                    try await firstChunkTask.value
+                } onCancel: {
+                    firstChunkTask.cancel()
+                    Task { await VoiceCloneStore.shared.cancelRequest(synthesisRequest) }
+                }
+                try Task.checkCancellation()
+                guard let (firstChunk, remainingIterator) = firstResult else { throw VoiceSynthesisError.audio }
+                let cancelSynthesis: @Sendable () -> Void = {
+                    Task { await VoiceCloneStore.shared.cancelRequest(synthesisRequest) }
+                }
+                let remaining = AsyncThrowingStream<AVAudioPCMBuffer, Error> { continuation in
+                    let feeder = Task {
+                        var iterator = remainingIterator
+                        do {
+                            while let next = try await iterator.next() {
+                                try Task.checkCancellation()
+                                if next.frameLength > 0 { continuation.yield(next) }
+                            }
+                            continuation.finish()
+                        } catch {
+                            continuation.finish(throwing: error)
+                        }
+                    }
+                    continuation.onTermination = { termination in
+                        if case .cancelled = termination {
+                            feeder.cancel()
+                            cancelSynthesis()
+                        }
+                    }
+                }
+                synthesized = .stream(firstChunk: firstChunk, remaining: remaining, cancel: cancelSynthesis)
+            } catch {
+                if Task.isCancelled || !permit.canStart {
+                    noteDecision(Date() >= expiry ? .expired : .superseded, at: .synthesis, trace)
+                    setVoiceStatus(.textOnly, for: id)
+                } else {
+                    archiveTerminal = .failed
+                    probeLog("participation-voice", ["voice": grant.setup.voice.engine.rawValue, "result": "synthesisFailed"])
+                    noteDecision(.synthesisFailed, at: .synthesis, trace)
+                    setVoiceStatus(.synthesisFailed, for: id)
+                }
+                return
+            }
+        } else {
+            let synthesisTask = Task {
+                try await grant.setup.voice.synthesize(draft, language: language, session: ParticipationNoRedirect.session,
+                                                       cloneRequest: synthesisRequest, cloneDeadline: expiry)
+            }
+            let synthesisExpiry = GuestVoiceSynthesisDeadline.schedule(expiry) { [weak self, weak permit] in
+                guard let self, let permit, self.voicePlayback === permit, !permit.started else { return }
                 synthesisTask.cancel()
                 if grant.setup.voice.engine == .cloned {
                     Task { await VoiceCloneStore.shared.cancelGPURequest(synthesisRequest) }
                 }
             }
-            try Task.checkCancellation()
-        } catch {
-            if Task.isCancelled || !permit.canStart {
-                noteDecision(Date() >= expiry ? .expired : .superseded, at: .synthesis, trace)
-                setVoiceStatus(.textOnly, for: id)
-            } else {
-                archiveTerminal = .failed
-                probeLog("participation-voice", ["voice": grant.setup.voice.engine.rawValue, "result": "synthesisFailed"])
-                noteDecision(.synthesisFailed, at: .synthesis, trace)
-                setVoiceStatus(.synthesisFailed, for: id)
+            do {
+                defer { synthesisExpiry.cancel() }
+                let buffer = try await withTaskCancellationHandler {
+                    try await synthesisTask.value
+                } onCancel: {
+                    synthesisTask.cancel()
+                    if grant.setup.voice.engine == .cloned {
+                        Task { await VoiceCloneStore.shared.cancelGPURequest(synthesisRequest) }
+                    }
+                }
+                try Task.checkCancellation()
+                synthesized = .single(buffer)
+            } catch {
+                if Task.isCancelled || !permit.canStart {
+                    noteDecision(Date() >= expiry ? .expired : .superseded, at: .synthesis, trace)
+                    setVoiceStatus(.textOnly, for: id)
+                } else {
+                    archiveTerminal = .failed
+                    probeLog("participation-voice", ["voice": grant.setup.voice.engine.rawValue, "result": "synthesisFailed"])
+                    noteDecision(.synthesisFailed, at: .synthesis, trace)
+                    setVoiceStatus(.synthesisFailed, for: id)
+                }
+                return
             }
-            return
+        }
+        func cancelStreamIfNeeded() {
+            if case .stream(_, _, let cancel) = synthesized { cancel() }
         }
         guard await context.revalidate(model: model, store: grant.attentionStore) else {
+            cancelStreamIfNeeded()
             noteDecision(.sourceUnavailable, at: .synthesis, trace)
             setVoiceStatus(.textOnly, for: id)
             return
         }
+        let leadingBuffer: AVAudioPCMBuffer = switch synthesized {
+        case .single(let buffer): buffer
+        case .stream(let firstChunk, _, _): firstChunk
+        }
         let failure: DecisionReason?
-        if Double(buffer.frameLength) / buffer.format.sampleRate > 18 { failure = .voiceTooLong }
+        if Double(leadingBuffer.frameLength) / leadingBuffer.format.sampleRate > 18 { failure = .voiceTooLong }
         else if current(grant.id, revision: trace.revision, turn: turn) == nil || !permit.canStart {
             failure = Date() >= expiry ? .expired : .superseded
         } else if !model.participationVoiceEligible { failure = .voiceUnavailable }
         else if model.participationSomeoneSpeaking { failure = .someoneSpeaking }
         else { failure = nil }
         if let failure {
+            cancelStreamIfNeeded()
             noteDecision(failure, at: .synthesis, trace)
             setVoiceStatus(.textOnly, for: id)
             return
@@ -1253,6 +1336,7 @@ final class ParticipationCoordinator: ObservableObject {
             createdAt: now, updatedAt: Date(), state: .reserved, providerMessageID: nil, output: .voice)
         if let journal, !journal.recordAssistantReply(sessionID: journalID, id: archiveID, text: draft,
                 source: "voice", status: .sending, sourceSnapshots: archiveSources) {
+            cancelStreamIfNeeded()
             archiveTerminal = .cancelled
             setVoiceStatus(.textOnly, for: id)
             storageFailed(grantID: grant.id)
@@ -1260,6 +1344,7 @@ final class ParticipationCoordinator: ObservableObject {
         }
         do { try grant.store.reserve(receipt) }
         catch {
+            cancelStreamIfNeeded()
             archiveTerminal = .cancelled
             setVoiceStatus(.textOnly, for: id)
             storageFailed(grantID: grant.id)
@@ -1272,22 +1357,34 @@ final class ParticipationCoordinator: ObservableObject {
 
         var recordedUtterance = false
         let utteranceStartedAt = Date()
-        let outcome = await model.playParticipationVoice(buffer, audience: grant.setup.audience, permit: permit,
-            preflight: {
-                guard self.decisionGrant(trace, turn: turn, stage: .playback) != nil else { return false }
-                guard await self.decisionSources(grant, trace, turn: turn, stage: .playback) != nil else { return false }
-                if !context.hasVaultSources { return true }
-                return await ParticipationSourceBinding.withReadDeadline { context.validateVaultSources() } == true
-            }, canStart: {
-                self.current(grant.id, revision: trace.revision, turn: turn) != nil
-                    && context.validates(model: model, store: grant.attentionStore)
-            }, onStarted: {
-                recordedUtterance = true
-                model.recordAssistantSpokenUtterance(id: id, text: draft, startedAt: utteranceStartedAt, endedAt: nil)
-                self.beginVoiceEchoWindow()
-                self.setVoiceStatus(.speaking, for: id)
-                self.noteDecision(.audioStarted, at: .playback, trace)
-            })
+        let preflightCheck: @MainActor () async -> Bool = {
+            guard self.decisionGrant(trace, turn: turn, stage: .playback) != nil else { return false }
+            guard await self.decisionSources(grant, trace, turn: turn, stage: .playback) != nil else { return false }
+            if !context.hasVaultSources { return true }
+            return await ParticipationSourceBinding.withReadDeadline { context.validateVaultSources() } == true
+        }
+        let canStartCheck: @MainActor () -> Bool = {
+            self.current(grant.id, revision: trace.revision, turn: turn) != nil
+                && context.validates(model: model, store: grant.attentionStore)
+        }
+        let onStartedAction: @MainActor () -> Void = {
+            recordedUtterance = true
+            model.recordAssistantSpokenUtterance(id: id, text: draft, startedAt: utteranceStartedAt, endedAt: nil)
+            self.beginVoiceEchoWindow()
+            self.setVoiceStatus(.speaking, for: id)
+            self.noteDecision(.audioStarted, at: .playback, trace)
+        }
+        let outcome: GuestAutonomousVoicePlayback.Outcome
+        switch synthesized {
+        case .single(let buffer):
+            outcome = await model.playParticipationVoice(buffer, audience: grant.setup.audience, permit: permit,
+                preflight: preflightCheck, canStart: canStartCheck, onStarted: onStartedAction)
+        case .stream(let firstChunk, let remaining, let cancel):
+            outcome = await model.playParticipationVoiceStream(firstChunk: firstChunk, remainingChunks: remaining,
+                maxSeconds: 18, audience: grant.setup.audience, permit: permit,
+                preflight: preflightCheck, canStart: canStartCheck, onStarted: onStartedAction)
+            if outcome != .completed { cancel() }
+        }
         if recordedUtterance {
             model.assistantSpeechLedger.endUtterance(id: id, endedAt: Date())
         }

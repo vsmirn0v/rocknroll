@@ -224,11 +224,17 @@ final class AttentionMemoryPressure: @unchecked Sendable {
     /// Sends through the meeting's own chat; false when it did not accept the text.
     var deliverChat: (NativeDesktopMeetingModel, String) -> Bool = { $0.chat.send($1) }
     var deliverReaction: (NativeDesktopMeetingModel, MeetingReaction) -> Void = { $0.sendReaction($1) }
+    private var hasCustomDeliverVoice = false
     /// The meeting can take a spoken reply (voice replies are on and it joined with them).
     var voiceAvailable: (NativeDesktopMeetingModel) -> Bool = { $0.supportsVoiceReply }
-    var deliverVoice: (NativeDesktopMeetingModel, AVAudioPCMBuffer) async throws -> Void = { try await $0.speak($1) }
+    var deliverVoice: (NativeDesktopMeetingModel, AVAudioPCMBuffer) async throws -> Void = { try await $0.speak($1) } {
+        didSet { hasCustomDeliverVoice = true }
+    }
     /// Replaces the configured voice, for tests.
     var synthesizeOverride: ((String) async throws -> AVAudioPCMBuffer)?
+    var canStreamVoiceDelivery: Bool {
+        !hasCustomDeliverVoice && synthesizeOverride == nil && store.voiceConfiguration.supportsStreaming
+    }
     var now: () -> Date = Date.init
     var language: String = Localization.preferredAppLanguageCode()
     lazy var talk = AssistantTalkController(attention: self)
@@ -2088,20 +2094,47 @@ final class AttentionMemoryPressure: @unchecked Sendable {
             do {
                 try Task.checkCancellation()
                 try beforeSynthesis()
-                let buffer = try await synthesize(text)
-                try Task.checkCancellation()
-                guard model.participationMeetingSoundOn, model.canSpeakApprovedWorkspaceReply,
-                      workspaceFollowingPauses[model.sessionID] == nil else { throw CancellationError() }
-                if let journal, !journal.recordAssistantReply(sessionID: journalID, id: id, text: text,
-                    source: source, status: .sending, sourceSnapshots: evidence) {
-                    throw MeetingLibraryError.persistenceFailed(L("The meeting conversation could not be read."))
+                if canStreamVoiceDelivery {
+                    let request = UUID()
+                    let pre = try await Self.preparePrepulledStream(from: streamSynthesize(text, cloneRequest: request), cloneRequest: request)
+                    try Task.checkCancellation()
+                    guard model.participationMeetingSoundOn, model.canSpeakApprovedWorkspaceReply,
+                          workspaceFollowingPauses[model.sessionID] == nil else {
+                        pre.cancel()
+                        throw CancellationError()
+                    }
+                    if let journal, !journal.recordAssistantReply(sessionID: journalID, id: id, text: text,
+                        source: source, status: .sending, sourceSnapshots: evidence) {
+                        pre.cancel()
+                        throw MeetingLibraryError.persistenceFailed(L("The meeting conversation could not be read."))
+                    }
+                    attempted = true
+                    model.recordAssistantSpokenUtterance(id: id, text: text, startedAt: Date(), endedAt: nil)
+                    defer { model.assistantSpeechLedger.endUtterance(id: id, endedAt: Date()) }
+                    do {
+                        try await deliverVoiceStream(model, pre.replayStream)
+                    } catch {
+                        pre.cancel()
+                        throw error
+                    }
+                    journal?.updateReplyStatus(sessionID: journalID, id: id, status: .spoken)
+                    return .success(())
+                } else {
+                    let buffer = try await synthesize(text)
+                    try Task.checkCancellation()
+                    guard model.participationMeetingSoundOn, model.canSpeakApprovedWorkspaceReply,
+                          workspaceFollowingPauses[model.sessionID] == nil else { throw CancellationError() }
+                    if let journal, !journal.recordAssistantReply(sessionID: journalID, id: id, text: text,
+                        source: source, status: .sending, sourceSnapshots: evidence) {
+                        throw MeetingLibraryError.persistenceFailed(L("The meeting conversation could not be read."))
+                    }
+                    attempted = true
+                    model.recordAssistantSpokenUtterance(id: id, text: text, startedAt: Date(), endedAt: nil)
+                    defer { model.assistantSpeechLedger.endUtterance(id: id, endedAt: Date()) }
+                    try await deliverVoice(model, buffer)
+                    journal?.updateReplyStatus(sessionID: journalID, id: id, status: .spoken)
+                    return .success(())
                 }
-                attempted = true
-                model.recordAssistantSpokenUtterance(id: id, text: text, startedAt: Date(), endedAt: nil)
-                defer { model.assistantSpeechLedger.endUtterance(id: id, endedAt: Date()) }
-                try await deliverVoice(model, buffer)
-                journal?.updateReplyStatus(sessionID: journalID, id: id, status: .spoken)
-                return .success(())
             } catch {
                 let status = workspaceVoiceStatus(error, attempted: attempted)
                 journal?.updateReplyStatus(sessionID: journalID, id: id, status: status,
@@ -2164,37 +2197,72 @@ final class AttentionMemoryPressure: @unchecked Sendable {
             let started = ProcessInfo.processInfo.systemUptime
             var playbackAttempted = false
             do {
-                let buffer = try await synthesize(clean)
-                let synthesized = ProcessInfo.processInfo.systemUptime
-                guard !Task.isCancelled, workspacePauseRevisions[model.sessionID] == pauseRevision,
-                      workspaceFollowingPauses[model.sessionID] == nil, !model.isClosed,
-                      current.workspaceGuidance == workspaceInstructions(for: model),
-                      current.workspaceGuidanceRevisions == workspaceGuidanceRevisions(for: model),
-                      model.canSpeakApprovedWorkspaceReply, model.participationMeetingSoundOn,
-                      model.workspaceSoundRevision == soundRevision else {
-                    journal?.updateReplyStatus(sessionID: journalID, id: id, status: .held)
-                    throw CancellationError()
+                if self.canStreamVoiceDelivery {
+                    let request = UUID()
+                    let pre = try await Self.preparePrepulledStream(from: self.streamSynthesize(clean, cloneRequest: request), cloneRequest: request)
+                    let synthesized = ProcessInfo.processInfo.systemUptime
+                    guard !Task.isCancelled, self.workspacePauseRevisions[model.sessionID] == pauseRevision,
+                          self.workspaceFollowingPauses[model.sessionID] == nil, !model.isClosed,
+                          current.workspaceGuidance == self.workspaceInstructions(for: model),
+                          current.workspaceGuidanceRevisions == self.workspaceGuidanceRevisions(for: model),
+                          model.canSpeakApprovedWorkspaceReply, model.participationMeetingSoundOn,
+                          model.workspaceSoundRevision == soundRevision else {
+                        pre.cancel()
+                        journal?.updateReplyStatus(sessionID: journalID, id: id, status: .held)
+                        throw CancellationError()
+                    }
+                    if let journal, !journal.recordAssistantReply(sessionID: journalID, id: id, text: clean,
+                        source: "approvedVoice", status: .sending, sourceSnapshots: evidence) {
+                        pre.cancel()
+                        throw MeetingLibraryError.persistenceFailed(L("The meeting conversation could not be read."))
+                    }
+                    playbackAttempted = true
+                    model.recordAssistantSpokenUtterance(id: id, text: clean, startedAt: Date(), endedAt: nil)
+                    defer { model.assistantSpeechLedger.endUtterance(id: id, endedAt: Date()) }
+                    do {
+                        try await self.deliverVoiceStream(model, pre.replayStream)
+                    } catch {
+                        pre.cancel()
+                        throw error
+                    }
+                    journal?.updateReplyStatus(sessionID: journalID, id: id, status: .spoken)
+                    probeLog("attention-spoken", ["voice": self.store.voiceEngine.rawValue,
+                        "seconds": Double(pre.firstChunk.frameLength) / pre.firstChunk.format.sampleRate,
+                        "synthesisMs": Int((synthesized - started) * 1000),
+                        "streaming": true])
+                } else {
+                    let buffer = try await self.synthesize(clean)
+                    let synthesized = ProcessInfo.processInfo.systemUptime
+                    guard !Task.isCancelled, self.workspacePauseRevisions[model.sessionID] == pauseRevision,
+                          self.workspaceFollowingPauses[model.sessionID] == nil, !model.isClosed,
+                          current.workspaceGuidance == self.workspaceInstructions(for: model),
+                          current.workspaceGuidanceRevisions == self.workspaceGuidanceRevisions(for: model),
+                          model.canSpeakApprovedWorkspaceReply, model.participationMeetingSoundOn,
+                          model.workspaceSoundRevision == soundRevision else {
+                        journal?.updateReplyStatus(sessionID: journalID, id: id, status: .held)
+                        throw CancellationError()
+                    }
+                    if let journal, !journal.recordAssistantReply(sessionID: journalID, id: id, text: clean,
+                        source: "approvedVoice", status: .sending, sourceSnapshots: evidence) {
+                        throw MeetingLibraryError.persistenceFailed(L("The meeting conversation could not be read."))
+                    }
+                    playbackAttempted = true
+                    model.recordAssistantSpokenUtterance(id: id, text: clean, startedAt: Date(), endedAt: nil)
+                    defer { model.assistantSpeechLedger.endUtterance(id: id, endedAt: Date()) }
+                    try await self.deliverVoice(model, buffer)
+                    journal?.updateReplyStatus(sessionID: journalID, id: id, status: .spoken)
+                    probeLog("attention-spoken", ["voice": self.store.voiceEngine.rawValue, "seconds": Double(buffer.frameLength) / buffer.format.sampleRate,
+                        "synthesisMs": Int((synthesized - started) * 1000)])
                 }
-                if let journal, !journal.recordAssistantReply(sessionID: journalID, id: id, text: clean,
-                    source: "approvedVoice", status: .sending, sourceSnapshots: evidence) {
-                    throw MeetingLibraryError.persistenceFailed(L("The meeting conversation could not be read."))
-                }
-                playbackAttempted = true
-                model.recordAssistantSpokenUtterance(id: id, text: clean, startedAt: Date(), endedAt: nil)
-                defer { model.assistantSpeechLedger.endUtterance(id: id, endedAt: Date()) }
-                try await deliverVoice(model, buffer)
-                journal?.updateReplyStatus(sessionID: journalID, id: id, status: .spoken)
-                probeLog("attention-spoken", ["voice": store.voiceEngine.rawValue, "seconds": Double(buffer.frameLength) / buffer.format.sampleRate,
-                    "synthesisMs": Int((synthesized - started) * 1000)])
                 // Playback already happened. If the card was closed or dismissed while it played,
                 // still record the spoken reply and clear `speaking`.
-                if let finished = actionableCard(current) {
-                    feedback(finished, decision: .approved, reason: nil, note: nil, outcome: .spoken,
+                if let finished = self.actionableCard(current) {
+                    self.feedback(finished, decision: .approved, reason: nil, note: nil, outcome: .spoken,
                              sent: clean, reaction: nil, edited: clean != finished.draft?.chat.trimmed)
                 } else {
-                    let finished = currentCard(card.id) ?? current
-                    updateCard(finished.id) { $0.speaking = false }
-                    log(finished, outcome: .spoken, reason: nil, sent: clean, reaction: nil,
+                    let finished = self.currentCard(card.id) ?? current
+                    self.updateCard(finished.id) { $0.speaking = false }
+                    self.log(finished, outcome: .spoken, reason: nil, sent: clean, reaction: nil,
                         edited: clean != finished.draft?.chat.trimmed)
                 }
             } catch {
@@ -2248,6 +2316,72 @@ final class AttentionMemoryPressure: @unchecked Sendable {
     func synthesize(_ text: String) async throws -> AVAudioPCMBuffer {
         if let synthesizeOverride { return try await synthesizeOverride(text) }
         return try await store.voiceConfiguration.synthesize(text)
+    }
+
+    func streamSynthesize(_ text: String, cloneRequest: UUID = UUID(),
+                          cloneDeadline: Date? = nil) -> AsyncThrowingStream<AVAudioPCMBuffer, Error> {
+        if let synthesizeOverride {
+            return AsyncThrowingStream { continuation in
+                let task = Task {
+                    do {
+                        continuation.yield(try await synthesizeOverride(text))
+                        continuation.finish()
+                    } catch {
+                        continuation.finish(throwing: error)
+                    }
+                }
+                continuation.onTermination = { termination in
+                    if case .cancelled = termination { task.cancel() }
+                }
+            }
+        }
+        return store.voiceConfiguration.streamSynthesize(text, cloneRequest: cloneRequest, cloneDeadline: cloneDeadline)
+    }
+
+    func deliverVoiceStream(_ model: NativeDesktopMeetingModel,
+                            _ chunks: AsyncThrowingStream<AVAudioPCMBuffer, Error>) async throws {
+        try await model.speakStream(chunks)
+    }
+
+    static func preparePrepulledStream(
+        from stream: AsyncThrowingStream<AVAudioPCMBuffer, Error>,
+        cloneRequest: UUID
+    ) async throws -> (firstChunk: AVAudioPCMBuffer, replayStream: AsyncThrowingStream<AVAudioPCMBuffer, Error>, cancel: @Sendable () -> Void) {
+        var iterator = stream.makeAsyncIterator()
+        var firstChunk: AVAudioPCMBuffer?
+        while let candidate = try await iterator.next() {
+            try Task.checkCancellation()
+            if candidate.frameLength > 0 {
+                firstChunk = candidate
+                break
+            }
+        }
+        guard let firstChunk else { throw VoiceSynthesisError.audio }
+        let cancel: @Sendable () -> Void = {
+            Task { await VoiceCloneStore.shared.cancelRequest(cloneRequest) }
+        }
+        let replayStream = AsyncThrowingStream<AVAudioPCMBuffer, Error> { continuation in
+            let feeder = Task {
+                var it = iterator
+                continuation.yield(firstChunk)
+                do {
+                    while let next = try await it.next() {
+                        try Task.checkCancellation()
+                        if next.frameLength > 0 { continuation.yield(next) }
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { termination in
+                if case .cancelled = termination {
+                    feeder.cancel()
+                    cancel()
+                }
+            }
+        }
+        return (firstChunk, replayStream, cancel)
     }
 
     private func setDraftError(_ message: String, card: Card) { updateCard(card.id) { $0.draftError = message } }

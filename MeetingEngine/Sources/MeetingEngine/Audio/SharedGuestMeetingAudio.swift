@@ -127,6 +127,9 @@ import LiveKitWebRTC
     /// Voice replies reach only the talk meeting: they share its input graph and sender.
     func setMicrophoneGate(open: Bool) -> Bool { attachment.setMicrophoneGate(open: open) }
     func playVoiceReply(_ buffer: AVAudioPCMBuffer) async -> Bool { await attachment.playVoiceReply(buffer) }
+    func playVoiceReplyStream(_ chunks: AsyncThrowingStream<AVAudioPCMBuffer, Error>) async -> Bool {
+        await attachment.playVoiceReplyStream(chunks)
+    }
     var hasParticipationVoiceGraph: Bool { attachment.hasParticipationVoiceGraph }
     var participationVoiceGateClosed: Bool { attachment.participationVoiceGateClosed }
     var participationSenderPhysicallyMuted: Bool {
@@ -139,6 +142,16 @@ import LiveKitWebRTC
                                 canStart: @escaping @MainActor () -> Bool, localGain: @escaping @MainActor () -> Float?,
                                 onStarted: @escaping @MainActor () -> Void) async -> GuestAutonomousVoicePlayback.Outcome {
         await attachment.playParticipationVoice(buffer, permit: permit, canStart: canStart, localGain: localGain, onStarted: onStarted)
+    }
+    func playParticipationVoiceStream(firstChunk: AVAudioPCMBuffer,
+                                      remainingChunks: AsyncThrowingStream<AVAudioPCMBuffer, Error>,
+                                      maxSeconds: TimeInterval,
+                                      permit: GuestAutonomousVoicePlayback,
+                                      canStart: @escaping @MainActor () -> Bool,
+                                      localGain: @escaping @MainActor () -> Float?,
+                                      onStarted: @escaping @MainActor () -> Void) async -> GuestAutonomousVoicePlayback.Outcome {
+        await attachment.playParticipationVoiceStream(firstChunk: firstChunk, remainingChunks: remainingChunks, maxSeconds: maxSeconds,
+                                                      permit: permit, canStart: canStart, localGain: localGain, onStarted: onStarted)
     }
     /// Leaves the shared engine; the last meeting out releases the device.
     func shutdown(timeout: TimeInterval) async -> Bool { await attachment.detach() }

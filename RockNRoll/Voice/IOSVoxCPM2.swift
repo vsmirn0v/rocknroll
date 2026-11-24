@@ -625,11 +625,16 @@ private actor IOSVoxCPM2Runtime {
 #endif
     }
 
+    func clearSavedVoiceCache() {
+        loadedModel?.clearSavedVoiceCache()
+    }
+
     func synthesize(
         text: String,
         voice: VoxVoice?,
         in directory: URL,
-        shouldContinue: @escaping @Sendable () -> Bool = { true }
+        shouldContinue: @escaping @Sendable () -> Bool = { true },
+        onAudioChunk: (@Sendable ([Float]) -> Void)? = nil
     ) async throws -> [Float] {
 #if targetEnvironment(simulator)
         throw IOSVoiceSynthesisError.voxUnsupportedDevice(IOSVoxCPM2Store.sharedUnsupportedMessage)
@@ -659,7 +664,8 @@ private actor IOSVoxCPM2Runtime {
                         continuation: voice.continuation,
                         tokenIDs: ids,
                         maxTokens: 256,
-                        shouldContinue: shouldContinue
+                        shouldContinue: shouldContinue,
+                        onAudioChunk: onAudioChunk
                     )
                 } else {
                     let ids = tokenizer.encode(clean)
@@ -667,7 +673,8 @@ private actor IOSVoxCPM2Runtime {
                         text: clean,
                         tokenIDs: ids,
                         maxTokens: 256,
-                        shouldContinue: shouldContinue
+                        shouldContinue: shouldContinue,
+                        onAudioChunk: onAudioChunk
                     )
                 }
                 VoxCPM2Model.clearMemoryCache()
@@ -679,6 +686,22 @@ private actor IOSVoxCPM2Runtime {
             }
         }
 #endif
+    }
+
+    func streamSynthesize(
+        text: String,
+        voice: VoxVoice?,
+        in directory: URL,
+        shouldContinue: @escaping @Sendable () -> Bool = { true },
+        onChunk: @escaping @Sendable ([Float]) -> Void
+    ) async throws -> [Float] {
+        try await synthesize(
+            text: text,
+            voice: voice,
+            in: directory,
+            shouldContinue: shouldContinue,
+            onAudioChunk: onChunk
+        )
     }
 
     func unloadIfIdle() async {
@@ -707,6 +730,7 @@ private actor IOSVoxCPM2Runtime {
         let hadModel = loadedModel != nil
         idleUnloadTask?.cancel()
         idleUnloadTask = nil
+        loadedModel?.clearSavedVoiceCache()
         loadedModel = nil
         loadedTokenizer = nil
         loadedDirectory = nil
@@ -818,6 +842,7 @@ final class IOSVoxCPM2Store: ObservableObject {
     private let freeDiskBytesProvider: (URL) -> Int64?
     private let foregroundActiveProvider: (@Sendable () -> Bool)?
     private let synthesizeOverride: (@Sendable (String, VoxVoice?, URL, @escaping @Sendable () -> Bool) async throws -> [Float])?
+    private let streamSynthesizeOverride: (@Sendable (String, VoxVoice?, URL, @escaping @Sendable () -> Bool, @escaping @Sendable ([Float]) -> Void) async throws -> [Float])?
     private let runtime = IOSVoxCPM2Runtime()
     private let foregroundGate: IOSVoxForegroundGate
     private var downloadTask: Task<Void, Never>?
@@ -832,7 +857,8 @@ final class IOSVoxCPM2Store: ObservableObject {
         hardwareSupportedProvider: (() -> Bool)? = nil,
         freeDiskBytesProvider: ((URL) -> Int64?)? = nil,
         foregroundActiveProvider: (@Sendable () -> Bool)? = nil,
-        synthesizeOverride: (@Sendable (String, VoxVoice?, URL, @escaping @Sendable () -> Bool) async throws -> [Float])? = nil
+        synthesizeOverride: (@Sendable (String, VoxVoice?, URL, @escaping @Sendable () -> Bool) async throws -> [Float])? = nil,
+        streamSynthesizeOverride: (@Sendable (String, VoxVoice?, URL, @escaping @Sendable () -> Bool, @escaping @Sendable ([Float]) -> Void) async throws -> [Float])? = nil
     ) {
         self.modelsDirectory = modelsDirectory ?? IOSListenModelStore.defaultModelsDirectory
         self.preferences = preferences
@@ -841,6 +867,7 @@ final class IOSVoxCPM2Store: ObservableObject {
         self.freeDiskBytesProvider = freeDiskBytesProvider ?? Self.defaultFreeDiskBytes
         self.foregroundActiveProvider = foregroundActiveProvider
         self.synthesizeOverride = synthesizeOverride
+        self.streamSynthesizeOverride = streamSynthesizeOverride
         self.foregroundGate = IOSVoxForegroundGate(isActive: UIApplication.shared.applicationState == .active)
 
         if preferences.object(forKey: Keys.useClonedVoice) != nil {
@@ -1005,14 +1032,58 @@ final class IOSVoxCPM2Store: ObservableObject {
         try data.write(to: savedVoiceURL, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
         IOSListenModelStore.excludeFromBackup(savedVoiceURL)
         storedVoice = value
+        Task { await runtime.clearSavedVoiceCache() }
     }
 
     func deleteSavedVoice() {
         try? FileManager.default.removeItem(at: savedVoiceURL)
         storedVoice = nil
+        Task { await runtime.clearSavedVoiceCache() }
     }
 
     func speak(_ text: String) async throws -> AVAudioPCMBuffer {
+        let (clean, activeVoice) = try validateSpeakRequest(text)
+        return try await synthesizeAudioBuffer(text: clean, voice: activeVoice, stage: "speak")
+    }
+
+    func streamSpeak(_ text: String) -> AsyncThrowingStream<AVAudioPCMBuffer, Error> {
+        do {
+            let (clean, activeVoice) = try validateSpeakRequest(text)
+            return streamAudioBuffer(text: clean, voice: activeVoice, stage: "speak")
+        } catch {
+            return AsyncThrowingStream { $0.finish(throwing: error) }
+        }
+    }
+
+    func speakPreset(_ text: String, preset: AssistantVoxVoicePreset) async throws -> AVAudioPCMBuffer {
+        let prompt = try validatePresetRequest(text, preset: preset)
+        return try await synthesizeAudioBuffer(text: prompt, voice: nil, stage: "preset")
+    }
+
+    func streamSpeakPreset(_ text: String, preset: AssistantVoxVoicePreset) -> AsyncThrowingStream<AVAudioPCMBuffer, Error> {
+        do {
+            let prompt = try validatePresetRequest(text, preset: preset)
+            return streamAudioBuffer(text: prompt, voice: nil, stage: "preset")
+        } catch {
+            return AsyncThrowingStream { $0.finish(throwing: error) }
+        }
+    }
+
+    func speakClonedForAssistant(_ text: String) async throws -> AVAudioPCMBuffer {
+        let (clean, voice) = try validateClonedAssistantRequest(text)
+        return try await synthesizeAudioBuffer(text: clean, voice: voice, stage: "cloned")
+    }
+
+    func streamSpeakClonedForAssistant(_ text: String) -> AsyncThrowingStream<AVAudioPCMBuffer, Error> {
+        do {
+            let (clean, voice) = try validateClonedAssistantRequest(text)
+            return streamAudioBuffer(text: clean, voice: voice, stage: "cloned")
+        } catch {
+            return AsyncThrowingStream { $0.finish(throwing: error) }
+        }
+    }
+
+    private func validateSpeakRequest(_ text: String) throws -> (String, VoxVoice?) {
         let clean = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !clean.isEmpty else { throw IOSVoiceSynthesisError.empty }
         guard isDeviceSupported else {
@@ -1024,12 +1095,10 @@ final class IOSVoxCPM2Store: ObservableObject {
         if useClonedVoice && storedVoice == nil {
             throw IOSVoiceSynthesisError.voxVoiceNotRecorded
         }
-
-        let activeVoice = useClonedVoice ? storedVoice?.voice : nil
-        return try await synthesizeAudioBuffer(text: clean, voice: activeVoice, stage: "speak")
+        return (clean, useClonedVoice ? storedVoice?.voice : nil)
     }
 
-    func speakPreset(_ text: String, preset: AssistantVoxVoicePreset) async throws -> AVAudioPCMBuffer {
+    private func validatePresetRequest(_ text: String, preset: AssistantVoxVoicePreset) throws -> String {
         let clean = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !clean.isEmpty else { throw IOSVoiceSynthesisError.empty }
         guard isDeviceSupported else {
@@ -1040,11 +1109,10 @@ final class IOSVoxCPM2Store: ObservableObject {
         }
         let prompt = preset.formattedPrompt(for: clean)
         guard !prompt.isEmpty else { throw IOSVoiceSynthesisError.empty }
-
-        return try await synthesizeAudioBuffer(text: prompt, voice: nil, stage: "preset")
+        return prompt
     }
 
-    func speakClonedForAssistant(_ text: String) async throws -> AVAudioPCMBuffer {
+    private func validateClonedAssistantRequest(_ text: String) throws -> (String, VoxVoice) {
         let clean = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !clean.isEmpty else { throw IOSVoiceSynthesisError.empty }
         guard isDeviceSupported else {
@@ -1056,8 +1124,133 @@ final class IOSVoxCPM2Store: ObservableObject {
         guard let voice = storedVoice?.voice else {
             throw IOSVoiceSynthesisError.voxVoiceNotRecorded
         }
+        return (clean, voice)
+    }
 
-        return try await synthesizeAudioBuffer(text: clean, voice: voice, stage: "cloned")
+    private final class StreamChunkTracker: @unchecked Sendable {
+        private let lock = NSLock()
+        private var emitted = false
+        private var cancelled = false
+        func markEmitted() {
+            lock.lock()
+            emitted = true
+            lock.unlock()
+        }
+        var didEmit: Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return emitted
+        }
+        func cancel() {
+            lock.lock()
+            cancelled = true
+            lock.unlock()
+        }
+        var isCancelled: Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return cancelled
+        }
+    }
+
+    private func streamAudioBuffer(text: String, voice: VoxVoice?, stage: String) -> AsyncThrowingStream<AVAudioPCMBuffer, Error> {
+        let shouldContinueBase = currentForegroundCheck
+        guard shouldContinueBase() else {
+            AppDiagnostics.log("voxcpm2-synthesis-skipped", ["reason": "background", "stage": stage])
+            return AsyncThrowingStream {
+                $0.finish(throwing: IOSVoiceSynthesisError.voxRuntimeFailed("App is not active for on-device GPU speech synthesis."))
+            }
+        }
+        if streamSynthesizeOverride == nil, synthesizeOverride != nil {
+            return AsyncThrowingStream { continuation in
+                let producer = Task { @MainActor [weak self] in
+                    guard let self else {
+                        continuation.finish(throwing: CancellationError())
+                        return
+                    }
+                    do {
+                        let buffer = try await self.synthesizeAudioBuffer(text: text, voice: voice, stage: stage)
+                        continuation.yield(buffer)
+                        continuation.finish()
+                    } catch {
+                        continuation.finish(throwing: error)
+                    }
+                }
+                continuation.onTermination = { termination in
+                    if case .cancelled = termination { producer.cancel() }
+                }
+            }
+        }
+
+        let directory = modelDirectory
+        let runtime = self.runtime
+        let streamOverride = self.streamSynthesizeOverride
+        let rate = Double(IOSVoiceSampleAudio.outputSampleRate)
+        let tracker = StreamChunkTracker()
+        return AsyncThrowingStream { continuation in
+            let producer = Task { @MainActor [weak self] in
+                guard let self else {
+                    continuation.finish(throwing: CancellationError())
+                    return
+                }
+                self.activeWorkCount += 1
+                self.isWorking = true
+                defer {
+                    self.activeWorkCount = max(0, self.activeWorkCount - 1)
+                    self.isWorking = self.activeWorkCount > 0
+                }
+                let guardedShouldContinue: @Sendable () -> Bool = {
+                    !tracker.isCancelled && shouldContinueBase()
+                }
+                do {
+                    let onChunk: @Sendable ([Float]) -> Void = { chunkSamples in
+                        guard !chunkSamples.isEmpty,
+                              let buffer = try? IOSVoiceSampleAudio.buffer(chunkSamples, rate: rate) else { return }
+                        tracker.markEmitted()
+                        continuation.yield(buffer)
+                    }
+                    let samples: [Float]
+                    if let streamOverride {
+                        samples = try await streamOverride(text, voice, directory, guardedShouldContinue, onChunk)
+                    } else {
+                        samples = try await runtime.streamSynthesize(
+                            text: text,
+                            voice: voice,
+                            in: directory,
+                            shouldContinue: guardedShouldContinue,
+                            onChunk: onChunk
+                        )
+                    }
+                    if !tracker.didEmit {
+                        let full = try IOSVoiceSampleAudio.buffer(samples, rate: rate)
+                        continuation.yield(full)
+                    }
+                    continuation.finish()
+                } catch let error as IOSVoiceSynthesisError {
+                    AppDiagnostics.log("voxcpm2-synthesis-failed", [
+                        "reason": IOSVoxCPM2ErrorClassifier.reasonCode(for: error),
+                        "stage": stage,
+                        "foreground": shouldContinueBase()
+                    ])
+                    continuation.finish(throwing: error)
+                } catch is CancellationError {
+                    continuation.finish(throwing: CancellationError())
+                } catch {
+                    AppDiagnostics.log("voxcpm2-synthesis-failed", [
+                        "reason": IOSVoxCPM2ErrorClassifier.reasonCode(for: error),
+                        "stage": stage,
+                        "foreground": shouldContinueBase()
+                    ])
+                    continuation.finish(throwing: IOSVoiceSynthesisError.voxRuntimeFailed(error.localizedDescription))
+                }
+            }
+            continuation.onTermination = { termination in
+                if case .cancelled = termination {
+                    tracker.cancel()
+                    producer.cancel()
+                }
+            }
+        }
     }
 
     private func synthesizeAudioBuffer(text: String, voice: VoxVoice?, stage: String) async throws -> AVAudioPCMBuffer {

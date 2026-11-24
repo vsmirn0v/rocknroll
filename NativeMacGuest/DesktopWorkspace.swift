@@ -734,9 +734,16 @@ import UserNotifications
                 ]
                 model.meetingLibrary = attention.store.meetingLibrary
                 model.notes = attention.store.notes
-                model.synthesizeVoiceReply = { [weak attention] text in
-                    guard let attention else { throw CancellationError() }
-                    return try await attention.synthesize(text)
+                let coordinatorAttention = attention
+                model.synthesizeVoiceReply = { [weak coordinatorAttention] text in
+                    guard let coordinatorAttention else { throw CancellationError() }
+                    return try await coordinatorAttention.synthesize(text)
+                }
+                model.streamVoiceReply = { [weak coordinatorAttention] text in
+                    guard let coordinatorAttention else {
+                        return AsyncThrowingStream { $0.finish(throwing: CancellationError()) }
+                    }
+                    return coordinatorAttention.streamSynthesize(text)
                 }
                 let initialSessionID = model.workspaceSessionID
                 let initialSessionTitle = model.title

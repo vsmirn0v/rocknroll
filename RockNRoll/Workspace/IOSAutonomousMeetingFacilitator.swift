@@ -1477,10 +1477,55 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
                 // Fall back to local voice auditioning when call audio is off/disconnected.
             }
         }
-        if let buffer = try? await IOSVoiceStore.shared.synthesizeAssistantResponse(clean) {
-            try? IOSVoicePreviewPlayer.shared.play(buffer)
-        }
+        await playLocalAuditionAndWait(clean)
         lastStatusBySession[controllerID] = L("Auditioned locally (meeting audio off).")
+    }
+
+    private func playLocalAuditionAndWait(_ text: String) async {
+        final class OnceContinuation: @unchecked Sendable {
+            private let lock = NSLock()
+            private var cont: CheckedContinuation<Void, Never>?
+            private var resumed = false
+            func install(_ c: CheckedContinuation<Void, Never>) {
+                lock.lock()
+                if resumed {
+                    lock.unlock()
+                    c.resume()
+                    return
+                }
+                cont = c
+                lock.unlock()
+            }
+            func resume() {
+                lock.lock()
+                guard !resumed else { lock.unlock(); return }
+                resumed = true
+                let pending = cont
+                cont = nil
+                lock.unlock()
+                pending?.resume()
+            }
+        }
+        let once = OnceContinuation()
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                once.install(continuation)
+                Task { @MainActor in
+                    do {
+                        try await IOSVoiceStore.shared.streamPlayAssistantResponse(
+                            text,
+                            player: .shared,
+                            onComplete: { once.resume() }
+                        )
+                    } catch {
+                        once.resume()
+                    }
+                }
+            }
+        } onCancel: {
+            Task { @MainActor in IOSVoicePreviewPlayer.shared.stop() }
+            once.resume()
+        }
     }
 
     private func deliverSpokenBuffer(_ buffer: AVAudioPCMBuffer, fallbackText: String, controllerID: UUID) async {

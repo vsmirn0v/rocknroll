@@ -726,6 +726,32 @@ public final class GuestSystemAudio: NSObject, LKRTCAudioDeviceModuleDelegate, @
             return !active.isGateOpen()
         }
     }
+    public func playVoiceReplyStream(_ chunks: AsyncThrowingStream<AVAudioPCMBuffer, Error>) async -> Bool {
+        await playVoiceReplyStream(chunks, localGain: 1)
+    }
+    public func playVoiceReplyStream(_ chunks: AsyncThrowingStream<AVAudioPCMBuffer, Error>, localGain: Float) async -> Bool {
+        if let graph = assistantVoiceGraph(), !graph.gateOpen {
+            return await graph.playStream(chunks, localGain: localGain)
+        }
+        guard forwardedAssistantVoiceController().map({ !$0.isGateOpen() }) == true else { return false }
+        var collected: [AVAudioPCMBuffer] = []
+        do {
+            for try await chunk in chunks {
+                if chunk.frameLength > 0 { collected.append(chunk) }
+            }
+        } catch {
+            return false
+        }
+        guard !Task.isCancelled, let buffer = GuestVoiceReplyGraph.combine(collected) else { return false }
+        guard let activeController = forwardedAssistantVoiceController(), !activeController.isGateOpen() else {
+            return false
+        }
+        let effectiveGain: Float? = (locked({ manualRenderingMode }) || localGain <= 0) ? nil : localGain
+        return await activeController.play(buffer, effectiveGain) { [weak self] in
+            guard let self, let active = self.forwardedAssistantVoiceController() else { return false }
+            return !active.isGateOpen()
+        }
+    }
     public func setVoiceReplyMonitorGain(_ gain: Float) {
         if let graph = assistantVoiceGraph() {
             graph.setApprovedLocalGain(gain)
@@ -777,6 +803,61 @@ public final class GuestSystemAudio: NSObject, LKRTCAudioDeviceModuleDelegate, @
     @MainActor public func playParticipationVoice(_ buffer: AVAudioPCMBuffer, permit: GuestAutonomousVoicePlayback,
                                                   canStart: @escaping @MainActor () -> Bool, localGain: @escaping @MainActor () -> Float?,
                                                   onStarted: @escaping @MainActor () -> Void) async -> GuestAutonomousVoicePlayback.Outcome {
+        await playParticipationWithGuard(permit: permit, onGraph: { graph, meter in
+            await graph.playAutonomous(buffer, permit: permit, canStart: {
+                self.assistantVoiceGraph() === graph && graph.isConnected && !graph.gateOpen
+                    && (self.snapshot["microphoneMuted"] as? Bool) == false
+                    && (meter.level.map { $0 < 0.025 } ?? false) && canStart()
+            }, localGain: localGain, captureReady: { LKRTCApplicationCaptureMuted() == 0 }, onStarted: {
+                probeLog("participation-voice-capture", ["stage": "playback-started",
+                    "processMuted": LKRTCApplicationCaptureMuted() != 0, "voiceProcessing": self.snapshot["voiceProcessingActive"] as? Bool == true])
+                onStarted()
+            })
+        }, onForwarded: { forwarded, meter in
+            await self.playParticipationForwarded(buffer, forwarded: forwarded, meter: meter, permit: permit, canStart: canStart, localGain: localGain, onStarted: onStarted)
+        })
+    }
+
+    @MainActor public func playParticipationVoiceStream(
+        firstChunk: AVAudioPCMBuffer,
+        remainingChunks: AsyncThrowingStream<AVAudioPCMBuffer, Error>,
+        maxSeconds: TimeInterval,
+        permit: GuestAutonomousVoicePlayback,
+        canStart: @escaping @MainActor () -> Bool,
+        localGain: @escaping @MainActor () -> Float?,
+        onStarted: @escaping @MainActor () -> Void
+    ) async -> GuestAutonomousVoicePlayback.Outcome {
+        await playParticipationWithGuard(permit: permit, onGraph: { graph, meter in
+            await graph.playAutonomousStream(firstChunk: firstChunk, remainingChunks: remainingChunks, maxSeconds: maxSeconds, permit: permit, canStart: {
+                self.assistantVoiceGraph() === graph && graph.isConnected && !graph.gateOpen
+                    && (self.snapshot["microphoneMuted"] as? Bool) == false
+                    && (meter.level.map { $0 < 0.025 } ?? false) && canStart()
+            }, localGain: localGain, captureReady: { LKRTCApplicationCaptureMuted() == 0 }, onStarted: {
+                probeLog("participation-voice-capture", ["stage": "playback-started",
+                    "processMuted": LKRTCApplicationCaptureMuted() != 0, "voiceProcessing": self.snapshot["voiceProcessingActive"] as? Bool == true])
+                onStarted()
+            })
+        }, onForwarded: { forwarded, meter in
+            var collected: [AVAudioPCMBuffer] = [firstChunk]
+            do {
+                for try await chunk in remainingChunks {
+                    if !permit.canStart || Task.isCancelled { return .notStarted }
+                    if chunk.frameLength > 0 { collected.append(chunk) }
+                }
+            } catch {
+                return .notStarted
+            }
+            guard let combined = GuestVoiceReplyGraph.combine(collected),
+                  Double(combined.frameLength) / combined.format.sampleRate <= maxSeconds else { return .notStarted }
+            return await self.playParticipationForwarded(combined, forwarded: forwarded, meter: meter, permit: permit, canStart: canStart, localGain: localGain, onStarted: onStarted)
+        })
+    }
+
+    @MainActor private func playParticipationWithGuard(
+        permit: GuestAutonomousVoicePlayback,
+        onGraph: @MainActor (GuestVoiceReplyGraph, GuestPCMMeter) async -> GuestAutonomousVoicePlayback.Outcome,
+        onForwarded: @MainActor (ForwardedVoiceReplyController, GuestPCMMeter) async -> GuestAutonomousVoicePlayback.Outcome
+    ) async -> GuestAutonomousVoicePlayback.Outcome {
         let graph = assistantVoiceGraph()
         let forwarded = graph == nil ? forwardedAssistantVoiceController() : nil
         if let graph {
@@ -790,14 +871,8 @@ public final class GuestSystemAudio: NSObject, LKRTCAudioDeviceModuleDelegate, @
         // participant's outgoing WebRTC level includes the assistant itself.
         let meter = participationInputMeter
         meter.reset()
-        inputCallbackLock.lock()
-        participationInputMeterEnabled = true
-        inputCallbackLock.unlock()
-        defer {
-            inputCallbackLock.lock()
-            participationInputMeterEnabled = false
-            inputCallbackLock.unlock()
-        }
+        setParticipationInputMeterEnabled(true)
+        defer { setParticipationInputMeterEnabled(false) }
         do { try await Task.sleep(for: .milliseconds(80)) } catch { return .notStarted }
         let monitor = Task { @MainActor in
             while !Task.isCancelled {
@@ -820,17 +895,27 @@ public final class GuestSystemAudio: NSObject, LKRTCAudioDeviceModuleDelegate, @
         }
         defer { monitor.cancel() }
         if let graph {
-            return await graph.playAutonomous(buffer, permit: permit, canStart: {
-                self.assistantVoiceGraph() === graph && graph.isConnected && !graph.gateOpen
-                    && (self.snapshot["microphoneMuted"] as? Bool) == false
-                    && (meter.level.map { $0 < 0.025 } ?? false) && canStart()
-            }, localGain: localGain, captureReady: { LKRTCApplicationCaptureMuted() == 0 }, onStarted: {
-                probeLog("participation-voice-capture", ["stage": "playback-started",
-                    "processMuted": LKRTCApplicationCaptureMuted() != 0, "voiceProcessing": self.snapshot["voiceProcessingActive"] as? Bool == true])
-                onStarted()
-            })
+            return await onGraph(graph, meter)
         }
         guard let forwarded else { return .notStarted }
+        return await onForwarded(forwarded, meter)
+    }
+
+    private func setParticipationInputMeterEnabled(_ enabled: Bool) {
+        inputCallbackLock.lock()
+        participationInputMeterEnabled = enabled
+        inputCallbackLock.unlock()
+    }
+
+    @MainActor private func playParticipationForwarded(
+        _ buffer: AVAudioPCMBuffer,
+        forwarded: ForwardedVoiceReplyController,
+        meter: GuestPCMMeter,
+        permit: GuestAutonomousVoicePlayback,
+        canStart: @escaping @MainActor () -> Bool,
+        localGain: @escaping @MainActor () -> Float?,
+        onStarted: @escaping @MainActor () -> Void
+    ) async -> GuestAutonomousVoicePlayback.Outcome {
         return await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
                 guard !Task.isCancelled, permit.canStart,
