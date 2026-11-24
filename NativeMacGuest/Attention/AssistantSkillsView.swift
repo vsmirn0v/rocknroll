@@ -658,15 +658,22 @@ struct AssistantSkillsView: View {
                                         .fixedSize(horizontal: false, vertical: true)
                                 }
                                 HStack(spacing: 8) {
-                                    Menu {
-                                        ForEach(skills.filter(\.enabled)) { skill in
-                                            Button(skill.name) {
-                                                facilitator.enable(for: model, skillID: skill.id)
-                                            }
+                                    let enabledSkills = skills.filter(\.enabled)
+                                    Picker(L("Skill Role"), selection: Binding(
+                                        get: { boundSkill },
+                                        set: { chosen in
+                                            facilitator.enable(for: model, skillID: chosen)
                                         }
-                                    } label: {
-                                        Text(skills.first(where: { $0.id == boundSkill })?.name ?? boundSkill)
+                                    )) {
+                                        if !enabledSkills.contains(where: { $0.id == boundSkill }) {
+                                            Text(boundSkill).tag(boundSkill)
+                                        }
+                                        ForEach(enabledSkills) { skill in
+                                            Text(skill.name).tag(skill.id)
+                                        }
                                     }
+                                    .labelsHidden()
+                                    .frame(maxWidth: 220)
 
                                     Button(isActive ? L("Stop Voice Facilitator") : L("Start Voice Facilitator")) {
                                         if isActive {
@@ -784,16 +791,17 @@ struct AssistantSkillsView: View {
     }
 }
 
-/// Compact toolbar menu inside a live meeting window to control voice facilitation,
+/// Compact toolbar trigger inside a live meeting window to control voice facilitation,
 /// active skill role, proactive kickoff, and in-meeting Assistant Board screen sharing.
+/// Uses a popover rather than nested SwiftUI `Menu` submenus so live meeting updates
+/// do not rebuild and dismiss the role chooser while open.
 struct NativeMeetingAssistantMenu: View {
-    @ObservedObject var meeting: NativeDesktopMeetingModel
-    @ObservedObject var attention: AttentionCoordinator
+    let meeting: NativeDesktopMeetingModel
+    let attention: AttentionCoordinator
     var compactChrome: Bool = false
 
     @ObservedObject private var facilitator: AutonomousMeetingFacilitator
-    @ObservedObject private var board: AssistantBoardWindowController
-    @State private var skills: [AssistantSkill] = []
+    @State private var open = false
 
     init(
         meeting: NativeDesktopMeetingModel,
@@ -804,100 +812,246 @@ struct NativeMeetingAssistantMenu: View {
         self.attention = attention
         self.compactChrome = compactChrome
         self._facilitator = ObservedObject(wrappedValue: attention.facilitator ?? AutonomousMeetingFacilitator(attention: attention))
-        self._board = ObservedObject(wrappedValue: attention.boardController)
     }
 
     private var isFacilitatorActive: Bool {
         facilitator.activeSessionSkills[meeting.sessionID] != nil
     }
 
-    private var activeSkillID: String {
-        facilitator.activeSessionSkills[meeting.sessionID] ?? skills.first?.id ?? "scrum-master"
+    var body: some View {
+        Button { open.toggle() } label: {
+            Image(systemName: isFacilitatorActive ? "sparkles.rectangle.stack.fill" : "sparkles")
+                .font(.system(size: compactChrome ? 16 : 15, weight: .semibold))
+                .foregroundStyle(isFacilitatorActive ? Color.accentColor : Color.primary)
+                .frame(width: compactChrome ? 36 : 28, height: compactChrome ? 36 : 28)
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(L("Rock Assistant"))
+        .accessibilityIdentifier("meeting.assistant.menu")
+        .help(L("Facilitate this meeting with Rock skills & Jira Board"))
+        .popover(isPresented: $open, arrowEdge: .bottom) {
+            NativeMeetingAssistantPopover(
+                meeting: meeting,
+                attention: attention,
+                facilitator: facilitator,
+                board: attention.boardController,
+                close: { open = false }
+            )
+        }
+    }
+}
+
+private struct NativeMeetingAssistantPopover: View {
+    let meeting: NativeDesktopMeetingModel
+    let attention: AttentionCoordinator
+    @ObservedObject var facilitator: AutonomousMeetingFacilitator
+    @ObservedObject var board: AssistantBoardWindowController
+    let close: () -> Void
+
+    @State private var skills: [AssistantSkill] = []
+    @State private var loadedSkills = false
+
+    private var activeSkillID: String? {
+        facilitator.activeSessionSkills[meeting.sessionID]
+    }
+
+    private var isFacilitatorActive: Bool {
+        activeSkillID != nil
+    }
+
+    private var enabledSkills: [AssistantSkill] {
+        skills.filter(\.enabled)
+    }
+
+    private var resolvedActiveSkillID: String {
+        activeSkillID ?? enabledSkills.first?.id ?? "scrum-master"
+    }
+
+    private var boardSharing: Bool {
+        board.sharingMeetingID == meeting.sessionID || board.isRecoveringShare
     }
 
     var body: some View {
-        let menu = Menu {
-            Button(isFacilitatorActive ? L("Stop Voice Facilitator") : L("Start Voice Facilitator")) {
-                if isFacilitatorActive {
-                    facilitator.disable(for: meeting.sessionID)
-                } else {
-                    facilitator.enable(for: meeting, skillID: nil)
+        VStack(alignment: .leading, spacing: 10) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(L("Rock Assistant"))
+                    .font(.headline)
+                if let status = facilitator.lastStatusBySession[meeting.sessionID], !status.isEmpty {
+                    Text(status)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
-            if isFacilitatorActive {
-                Button(L("Kick off skill now")) {
-                    Task { await facilitator.kickOffSkill(for: meeting, skillID: activeSkillID) }
-                }
-            }
-            Menu(L("Skill Role")) {
-                ForEach(skills.filter(\.enabled)) { skill in
-                    Button {
-                        facilitator.enable(for: meeting, skillID: skill.id)
-                    } label: {
-                        if skill.id == activeSkillID && isFacilitatorActive {
-                            Label(skill.name, systemImage: "checkmark")
-                        } else {
-                            Text(skill.name)
-                        }
-                    }
-                }
-            }
-            Divider()
-            Button(L("Open Assistant Board")) {
-                Task {
-                    do {
-                        let resolved = await attention.resolvedJiraBoardConfig(for: meeting).boardURL?.absoluteString ?? ""
-                        if board.currentURL == nil && !resolved.isEmpty {
-                            _ = try await board.open(urlString: resolved)
-                        } else {
-                            board.showWindow()
-                        }
-                    } catch {
-                        meeting.error = error.localizedDescription
-                    }
-                }
-            }
-            Button((board.sharingMeetingID == meeting.sessionID || board.isRecoveringShare) ? L("Stop Board Share") : L("Share Board to Meeting")) {
-                Task {
-                    if board.sharingMeetingID == meeting.sessionID || board.isRecoveringShare {
-                        board.stopSharing()
+
+            VStack(spacing: 2) {
+                actionRow(
+                    title: isFacilitatorActive ? L("Stop Voice Facilitator") : L("Start Voice Facilitator"),
+                    symbol: isFacilitatorActive ? "stop.circle" : "waveform",
+                    accessibilityID: "meeting.facilitator.toggle"
+                ) {
+                    if isFacilitatorActive {
+                        facilitator.disable(for: meeting.sessionID)
                     } else {
+                        facilitator.enable(for: meeting, skillID: nil)
+                    }
+                }
+
+                if isFacilitatorActive {
+                    actionRow(
+                        title: L("Kick off skill now"),
+                        symbol: "play.circle",
+                        accessibilityID: "meeting.facilitator.kickoff"
+                    ) {
+                        let targetSkillID = resolvedActiveSkillID
+                        close()
+                        Task { await facilitator.kickOffSkill(for: meeting, skillID: targetSkillID) }
+                    }
+                }
+            }
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text(L("Skill Role"))
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+
+                if !loadedSkills && enabledSkills.isEmpty {
+                    ProgressView()
+                        .controlSize(.small)
+                        .padding(.vertical, 4)
+                } else if enabledSkills.count > 6 {
+                    ScrollView {
+                        skillList
+                    }
+                    .frame(maxHeight: 220)
+                } else {
+                    skillList
+                }
+            }
+
+            Divider()
+
+            VStack(spacing: 2) {
+                actionRow(
+                    title: L("Open Assistant Board"),
+                    symbol: "macwindow"
+                ) {
+                    close()
+                    Task {
                         do {
-                            let resolved = await attention.resolvedJiraBoardConfig(for: meeting).boardURL?.absoluteString ?? ""
-                            if board.currentURL == nil && !resolved.isEmpty {
-                                _ = try await board.open(urlString: resolved)
+                            if !(try await openBoardIfUnloaded()) {
+                                board.showWindow()
                             }
-                            _ = try await board.startSharing(to: meeting)
                         } catch {
                             meeting.error = error.localizedDescription
                         }
                     }
                 }
-            }
-        } label: {
-            if compactChrome {
-                Image(systemName: isFacilitatorActive ? "sparkles.rectangle.stack.fill" : "sparkles")
-                    .font(.system(size: 16, weight: .semibold))
-                    .foregroundStyle(isFacilitatorActive ? Color.accentColor : Color.primary)
-                    .frame(width: 36, height: 36)
-                    .contentShape(Circle())
-            } else {
-                Label(
-                    L("Rock Assistant"),
-                    systemImage: isFacilitatorActive ? "sparkles.rectangle.stack.fill" : "sparkles"
-                )
+
+                actionRow(
+                    title: boardSharing ? L("Stop Board Share") : L("Share Board to Meeting"),
+                    symbol: boardSharing ? "stop.circle" : "rectangle.on.rectangle"
+                ) {
+                    close()
+                    Task {
+                        if board.sharingMeetingID == meeting.sessionID || board.isRecoveringShare {
+                            board.stopSharing()
+                        } else {
+                            do {
+                                _ = try await openBoardIfUnloaded()
+                                _ = try await board.startSharing(to: meeting)
+                            } catch {
+                                meeting.error = error.localizedDescription
+                            }
+                        }
+                    }
+                }
             }
         }
-        .accessibilityLabel(L("Rock Assistant"))
-        .help(L("Facilitate this meeting with Rock skills & Jira Board"))
-        .task { skills = await attention.listAssistantSkills() }
+        .padding(12)
+        .frame(width: 290)
+        .foregroundStyle(.primary)
+        .task {
+            skills = await attention.listAssistantSkills()
+            loadedSkills = true
+        }
+    }
 
-        if compactChrome {
-            menu
-                .menuStyle(.borderlessButton)
-                .menuIndicator(.hidden)
+    private func openBoardIfUnloaded() async throws -> Bool {
+        let resolved = await attention.resolvedJiraBoardConfig(for: meeting).boardURL?.absoluteString ?? ""
+        guard board.currentURL == nil, !resolved.isEmpty else { return false }
+        _ = try await board.open(urlString: resolved)
+        return true
+    }
+
+    private var skillList: some View {
+        VStack(spacing: 2) {
+            ForEach(enabledSkills) { skill in
+                let selected = skill.id == activeSkillID && isFacilitatorActive
+                let trimmedRole = skill.role.trimmingCharacters(in: .whitespacesAndNewlines)
+                Button {
+                    facilitator.enable(for: meeting, skillID: skill.id)
+                    close()
+                } label: {
+                    HStack(spacing: 8) {
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(skill.name)
+                                .font(.callout.weight(selected ? .semibold : .regular))
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                            if !trimmedRole.isEmpty {
+                                Text(trimmedRole)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(2)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                        }
+                        if selected {
+                            Image(systemName: "checkmark")
+                                .font(.caption.weight(.bold))
+                                .foregroundStyle(Color.accentColor)
+                        }
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 6)
+                    .contentShape(Rectangle())
+                    .background(selected ? Color.accentColor.opacity(0.12) : .clear, in: RoundedRectangle(cornerRadius: 8))
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("meeting.facilitator.skill.\(skill.id)")
+                .accessibilityAddTraits(selected ? .isSelected : [])
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func actionRow(
+        title: String,
+        symbol: String,
+        accessibilityID: String? = nil,
+        action: @escaping () -> Void
+    ) -> some View {
+        let button = Button(action: action) {
+            HStack(spacing: 8) {
+                Image(systemName: symbol)
+                    .font(.system(size: 13, weight: .semibold))
+                    .frame(width: 18)
+                Text(title)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+
+        if let accessibilityID {
+            button.accessibilityIdentifier(accessibilityID)
         } else {
-            menu
+            button
         }
     }
 }

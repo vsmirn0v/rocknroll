@@ -1140,6 +1140,96 @@ import XCTest
         }
     }
 
+    /// Regression: opening the facilitator role chooser inside a live meeting must keep
+    /// the popover and skill choices open across incoming transcript, speaking, and workspace ticks.
+    func testMeetingFacilitatorRoleChooserStaysOpenAcrossLiveUpdates() async throws {
+        let store = store()
+        let coordinator = AttentionCoordinator(store: store)
+        let prefsName = "assistant-menu-ui-\(UUID())"
+        let preferences = try XCTUnwrap(UserDefaults(suiteName: prefsName))
+        addTeardownBlock { preferences.removePersistentDomain(forName: prefsName) }
+        let library = NativeDesktopLibrary(
+            preferences: preferences,
+            history: RoomHistoryStore(storage: OutcomeFixtureCalendarStorage()),
+            syncStorage: OutcomeFixtureCalendarStorage()
+        )
+        let engine = AssistantUIEngine()
+        let model = NativeDesktopMeetingModel(
+            destination: try .verified(URL(string: "https://example.test/calls/\(UUID().uuidString)")!, engine: .guest),
+            name: "Vitalii",
+            title: "Facilitator chooser stability",
+            engine: engine
+        )
+        try await model.connect()
+        let workspace = NativeDesktopWorkspace(
+            library: library,
+            detect: { .verified(.guest(endpoint: $0)) },
+            makeMeeting: { _, _, _, _ in model },
+            attention: coordinator
+        )
+        workspace.join(model.invitation, engine: .guest, title: model.title, nameOverride: "Vitalii")
+        try await wait { workspace.selectedMeeting === model && !workspace.preparing }
+        workspace.show()
+        await settle()
+        addTeardownBlock {
+            await MainActor.run {
+                coordinator.facilitator?.disable(for: model.sessionID)
+            }
+            _ = await workspace.leave()
+            _ = await model.leave()
+            await MainActor.run { coordinator.stop() }
+        }
+
+        let app = AXUIElementCreateApplication(getpid())
+        func findElement(_ identifier: String) -> AXUIElement? {
+            children(app).flatMap(nodes).first {
+                (attribute($0, kAXIdentifierAttribute) as? String) == identifier
+            }
+        }
+        func hasPopoverWindow() -> Bool {
+            NSApp.windows.contains { $0.isVisible && $0.className.localizedCaseInsensitiveContains("Popover") }
+        }
+
+        let assistantButton = try XCTUnwrap(
+            findElement("meeting.assistant.menu"),
+            "Main-window toolbar must expose the Rock Assistant button"
+        )
+        XCTAssertEqual(AXUIElementPerformAction(assistantButton, kAXPressAction as CFString), .success)
+        await settle()
+        XCTAssertTrue(hasPopoverWindow(), "Rock Assistant popover must open on click")
+
+        try await wait { findElement("meeting.facilitator.skill.task-manager") != nil }
+
+        for index in 1...4 {
+            model.receiveLocalLineForTesting(.init(
+                id: "local-fac-\(index)",
+                trackID: "anna",
+                text: "Facilitator update line \(index)",
+                start: Date(),
+                end: Date()
+            ))
+            var snap = engine.snapshot
+            snap.participants = [
+                .init(id: "me", name: "Vitalii", isLocal: true),
+                .init(id: "anna", name: "Anna", speaking: index % 2 == 1)
+            ]
+            engine.onState?(snap)
+            workspace.objectWillChange.send()
+            coordinator.objectWillChange.send()
+            await settle()
+            XCTAssertTrue(hasPopoverWindow(), "Rock Assistant role popover must stay open on live update \(index)")
+            XCTAssertNotNil(
+                findElement("meeting.facilitator.skill.task-manager"),
+                "Skill role button must remain available during live update \(index)"
+            )
+        }
+
+        let taskManagerButton = try XCTUnwrap(findElement("meeting.facilitator.skill.task-manager"))
+        XCTAssertEqual(AXUIElementPerformAction(taskManagerButton, kAXPressAction as CFString), .success)
+        try await wait { coordinator.facilitator?.activeSessionSkills[model.sessionID] == "task-manager" }
+        try await wait { !hasPopoverWindow() }
+    }
+
     /// Regression: an embedded meeting suppressed the in-stage header (the detached
     /// window's Notes icon) and the main-window toolbar had no Notes button, so the
     /// notes panel was unreachable in the default configuration.

@@ -337,6 +337,13 @@ struct NativeDesktopHomeView: View {
                 NativeDesktopTranscriptionPill(model: meeting, compact: true)
             }
         }
+        if let meeting = embeddedMeeting {
+            // Own ToolbarItem so ToolbarItemGroup refreshes during live speaking/transcript
+            // updates do not dismiss the open facilitator role chooser popover.
+            ToolbarItem(placement: .primaryAction) {
+                NativeMeetingAssistantMenu(meeting: meeting, attention: workspace.attention)
+            }
+        }
         // The chip sits in its own toolbar item: sharing the button group's
         // capsule clips the chip's outline. Shown on every home screen (not only
         // the Assistant) so the status is always one tap away.
@@ -350,7 +357,6 @@ struct NativeDesktopHomeView: View {
         ToolbarItemGroup(placement: .primaryAction) {
             if let meeting = embeddedMeeting {
                 NativeDesktopMeetingsButton(workspace: workspace, current: meeting)
-                NativeMeetingAssistantMenu(meeting: meeting, attention: workspace.attention)
                 Button { meeting.panel = meeting.panel == .participants ? nil : .participants } label: { Label(L("Participants"), systemImage: "person.2") }
                     .help(L("Participants"))
                 Button { meeting.panel = meeting.panel == .conversation ? nil : .conversation } label: { Label(L("Conversation"), systemImage: "bubble.left") }
