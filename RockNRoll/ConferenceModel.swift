@@ -225,6 +225,9 @@ final class ConferenceModel: ObservableObject {
         coordinator.attentionPromptProvider = { [weak self] in
             self?.assistantSkills.promptText(for: .attentionJudge)
         }
+        coordinator.onTranscriptPartialActivity = { [weak self] controllerID, partialIDs in
+            self?.assistantFacilitator.updatePartialActivity(controllerID: controllerID, partialEventIDs: partialIDs)
+        }
         coordinator.onTranscriptEvents = { [weak self] controllerID, title, invitation, events, localNames in
             self?.assistantFacilitator.observeEvents(
                 controllerID: controllerID,
@@ -1060,6 +1063,15 @@ final class ConferenceModel: ObservableObject {
             isVoiceReplyInFlightNonisolated: { [weak controller] in
                 controller?.isVoiceReplyInFlightThreadSafe() ?? false
             },
+            isConnected: { [weak controller] in
+                controller?.isConnectedForAssistant ?? false
+            },
+            isHumanSpeaking: { [weak controller] in
+                controller?.isHumanSpeakingNow ?? false
+            },
+            cancelVoiceReplyForBargeIn: { [weak controller] in
+                controller?.cancelVoiceReply(forBargeIn: true)
+            },
             setRealtimeAudioTap: { [weak controller] handler in
                 controller?.setRealtimeAudioTap(handler)
             },
@@ -1642,6 +1654,9 @@ final class ConferenceModel: ObservableObject {
                     )
                 }
                 controller.configureAssistantHUD(talk: self.assistantTalk, speech: self.assistantSpeech)
+                controller.onVoiceReplyBargeIn = { [weak self, controllerID] in
+                    self?.assistantFacilitator.handleExternalVoiceBargeIn(controllerID: controllerID)
+                }
                 controller.onMicrophoneStateChanged = { [weak self] id, unmuted in
                     self?.assistant.handleMicrophoneChange(controllerID: id, unmuted: unmuted)
                     self?.assistantSpeech.refreshState()

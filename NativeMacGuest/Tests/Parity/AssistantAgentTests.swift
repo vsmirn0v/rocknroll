@@ -1157,6 +1157,7 @@ final class AssistantAgentTests: XCTestCase {
             var onLocalCamera: ((LKRTCVideoTrack?) -> Void)?
             var onTitle: ((String) -> Void)?
             var factory: LKRTCPeerConnectionFactory? { nil }
+            var supportsVoiceReply: Bool { true }
             private(set) var snapshot = NativeDesktopExternalSnapshot()
             var incomingVideo: [NativeDesktopExternalVideo] { [] }
             func connect(invitation: URL, name: String, quiet: Bool) async throws {
@@ -1403,5 +1404,234 @@ final class AssistantAgentTests: XCTestCase {
             ),
             "Виталий"
         )
+    }
+
+    func testMacMultiParticipantImperfectDailyStandupParity() {
+        final class MockStandupEngine: NativeDesktopMeetingEngine {
+            var onState: ((NativeDesktopExternalSnapshot) -> Void)?
+            var onVideo: (([NativeDesktopExternalVideo]) -> Void)?
+            var onLocalCamera: ((LKRTCVideoTrack?) -> Void)?
+            var onTitle: ((String) -> Void)?
+            var factory: LKRTCPeerConnectionFactory? { nil }
+            var supportsVoiceReply: Bool { true }
+            private(set) var snapshot = NativeDesktopExternalSnapshot()
+            var incomingVideo: [NativeDesktopExternalVideo] { [] }
+            func connect(invitation: URL, name: String, quiet: Bool) async throws {
+                snapshot = .init(
+                    phase: .connected,
+                    playoutOn: !quiet,
+                    participants: [
+                        .init(id: "vitalii", name: name, isLocal: true, speaking: false),
+                        .init(id: "anna", name: "Анна Иванова", isLocal: false, speaking: false),
+                        .init(id: "guest", name: "Guest Bob", isLocal: false, speaking: false),
+                    ]
+                )
+                onState?(snapshot)
+            }
+            func setSpeaking(participantID: String, speaking: Bool) {
+                for idx in snapshot.participants.indices where snapshot.participants[idx].id == participantID {
+                    snapshot.participants[idx].speaking = speaking
+                }
+                onState?(snapshot)
+            }
+            func reconnect() async throws {}
+            func setMicrophone(_ enabled: Bool) async throws { snapshot.microphoneOn = enabled; onState?(snapshot) }
+            func setCamera(_ enabled: Bool) async throws {}
+            func setPlayout(_ enabled: Bool) async throws { snapshot.playoutOn = enabled; onState?(snapshot) }
+            func setScreenTrack(_ track: LKRTCVideoTrack?) async throws {}
+            func leave() async -> Bool { snapshot.phase = .left; onState?(snapshot); return true }
+        }
+
+        final class MockJiraCreatorConnector: JiraTaskConnecting, @unchecked Sendable {
+            private let lock = NSLock()
+            var createdPayloads: [JiraIssueWritePayload] = []
+            func verifyMyself() async throws -> JiraUserContact {
+                JiraUserContact(identifier: "v.smirnov", username: "v.smirnov", displayName: "Vitalii", isServerOrDC: true)
+            }
+            func fetchProjectMetadata(projectKey: String) async throws -> JiraProjectMetadata {
+                let data = Data("{\"key\":\"\(projectKey)\",\"name\":\"\(projectKey)\",\"issueTypes\":[\"Task\"]}".utf8)
+                return try JSONDecoder().decode(JiraProjectMetadata.self, from: data)
+            }
+            func fetchAssignableUsers(projectKey: String, query: String) async throws -> [JiraUserContact] { [] }
+            func searchIssues(jql: String, maxResults: Int) async throws -> [JiraRemoteIssue] { [] }
+            func createIssue(_ payload: JiraIssueWritePayload) async throws -> JiraRemoteIssue {
+                lock.lock()
+                createdPayloads.append(payload)
+                let num = 300 + createdPayloads.count
+                lock.unlock()
+                return JiraRemoteIssue(
+                    id: "\(num)",
+                    key: "\(payload.projectKey)-\(num)",
+                    summary: payload.summary,
+                    description: payload.description,
+                    statusName: "To Do",
+                    workflowStatus: .todo,
+                    issueTypeName: "Task",
+                    issueKind: .task
+                )
+            }
+            func updateIssue(key: String, payload: JiraIssueWritePayload, targetStatus: TaskWorkflowStatus?, comment: String?) async throws -> JiraRemoteIssue {
+                JiraRemoteIssue(id: key, key: key, summary: payload.summary, description: payload.description, statusName: "To Do", workflowStatus: .todo)
+            }
+        }
+
+        let defaults = UserDefaults(suiteName: "mac-standup-parity-\(UUID().uuidString)")!
+        let keychain = AttentionKeychain(service: "dev.vsmirn0v.conferenceguest.standupparity.\(UUID().uuidString)")
+        let tempRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mac-standup-parity-\(UUID().uuidString)", isDirectory: true)
+        addTeardownBlock {
+            keychain.deleteAll()
+            try? FileManager.default.removeItem(at: tempRoot)
+        }
+
+        let exp = expectation(description: "mac-standup-parity")
+        Task { @MainActor in
+            let store = AttentionStore(root: tempRoot, defaults: defaults, keychain: keychain)
+            let coordinator = AttentionCoordinator(store: store)
+            coordinator.synthesizeOverride = { _ in
+                let fmt = AVAudioFormat(standardFormatWithSampleRate: 24_000, channels: 1)!
+                let buf = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: 1024)!
+                buf.frameLength = 1024
+                return buf
+            }
+            defer { coordinator.stop() }
+            let jiraConnector = MockJiraCreatorConnector()
+            coordinator.taskSync.jiraConnectorForTesting = jiraConnector
+            var taskPrefs = TaskSyncPreferences()
+            taskPrefs.jira = JiraConnectionSettings(
+                enabled: true,
+                baseURL: "https://tasks.sberdevices.ru/jira",
+                projectKey: "",
+                authMode: .personalAccessToken
+            )
+            coordinator.taskSync.preferences = taskPrefs
+            defer {
+                coordinator.taskSync.jiraConnectorForTesting = nil
+                coordinator.taskSync.preferences = TaskSyncPreferences()
+            }
+
+            let engine = MockStandupEngine()
+            let invite = URL(string: "https://meet.example.com/mac-cto-daily")!
+            let model = NativeDesktopMeetingModel(
+                destination: try .verified(invite, engine: .guest),
+                name: "Виталий Смирнов",
+                title: "CTO Daily",
+                engine: engine
+            )
+            try await model.connect()
+            coordinator.meetings = { [model] }
+
+            // 1. Store task deduplication across createAssistantTask + updateMeetingArtifacts
+            let first = try await coordinator.createTaskAction(
+                sessionID: model.sessionID,
+                title: "Доработка по итогам CTO Daily",
+                owner: "Виталий Смирнов"
+            )
+            let dupMeta = try await coordinator.createTaskAction(
+                sessionID: model.sessionID,
+                title: "Завести задачу на доработку по итогам CTO Daily",
+                owner: "Виталий Смирнов"
+            )
+            XCTAssertEqual(first.task.id, dupMeta.task.id)
+            let updatedOutcome = try await coordinator.updateMeetingArtifactsAction(
+                outcomeID: first.outcomeID,
+                sessionID: model.sessionID,
+                summaryAppend: "Итоги стендапа",
+                addTasks: [("Доработка по итогам CTO Daily", "Виталий Смирнов", nil)]
+            )
+            XCTAssertEqual(updatedOutcome?.tasks.count, 1, "Duplicate/meta standup tasks must merge into 1 task on macOS")
+
+            // 2. Board-derived Jira project key ("Sdp ситио" -> "SDBCTO")
+            @MainActor final class MockMacBoardEvaluator: JiraBoardWebEvaluating {
+                var currentBoardURL: URL? = URL(string: "https://tasks.sberdevices.ru/jira/secure/RapidBoard.jspa?rapidView=42")
+                func callBoardAsyncJS(_ functionBody: String, arguments: [String: Any]) async throws -> String {
+                    let endpoint = (arguments["endpoint"] as? String) ?? ""
+                    if endpoint.contains("/rest/api/2/myself") || endpoint.contains("/rest/api/3/myself") {
+                        return "{\"status\":200,\"body\":\"{\\\"name\\\":\\\"v.smirnov\\\",\\\"displayName\\\":\\\"Vitalii\\\"}\"}"
+                    }
+                    if endpoint.contains("/rest/agile/1.0/board/42/project") {
+                        return "{\"status\":200,\"body\":\"{\\\"values\\\":[{\\\"key\\\":\\\"SDBCTO\\\"}]}\"}"
+                    }
+                    return "{\"status\":404,\"body\":\"{}\"}"
+                }
+                func cookiesForBoard(matching origin: URL) async -> [HTTPCookie] { [] }
+                func refreshBoardAfterJiraMutation(highlightIssueKey: String?) async {}
+            }
+            await coordinator.taskSync.adoptJiraSessionFromBoardIfAvailable(MockMacBoardEvaluator())
+            let derivedBoardKeys = await coordinator.taskSync.resolveBoardDerivedProjectKeys(forceRefresh: true)
+            XCTAssertEqual(derivedBoardKeys, ["SDBCTO"])
+            let resolvedSpoken = WorkspaceTaskSyncController.resolveSpokenProjectKey("Sdp ситио", candidates: derivedBoardKeys + ["SPS"])
+            XCTAssertEqual(resolvedSpoken, "SDBCTO")
+
+            let snapshot = fixture()
+            let registry = self.registry(snapshot: snapshot)
+            AssistantSkillToolRegistrar.registerTools(
+                into: registry,
+                attention: coordinator,
+                talk: coordinator.talk,
+                snapshot: snapshot,
+                allowPrivilegedActions: true,
+                allowedToolGroups: [.jira, .tasks]
+            )
+            let callCreate = try registry.validate(call("rocknroll_jira_action", .object([
+                "operation": .string("create"),
+                "project_key": .string("Sdp ситио"),
+                "summary": .string("Verify RapidBoard scroll on Mac")
+            ])))
+            let res = try await registry.tool(named: "rocknroll_jira_action")!.execute(callCreate, arguments: callCreate.arguments)
+            XCTAssertEqual(res.json["issue"]?["key"]?.stringValue, "SDBCTO-301")
+
+            // 3. Phonetic echo filtering + active-TTS barge-in + closed/disconnected silence
+            XCTAssertTrue(AssistantWakePhraseMatcher.isLikelySelfEcho(
+                candidate: "цито Дели",
+                recentAssistantUtterances: ["Привет! Веду CTO Daily"],
+                isLocal: true,
+                withinEchoWindow: true
+            ))
+
+            var deliveryStarted = false
+            var deliveryCancelled = false
+            coordinator.deliverVoice = { _, _ in
+                deliveryStarted = true
+                do {
+                    try await Task.sleep(for: .milliseconds(500))
+                } catch {
+                    deliveryCancelled = true
+                    throw error
+                }
+            }
+            coordinator.facilitator?.enable(for: model, skillID: "scrum-master", suppressAutoGreet: true, trigger: "test")
+            let longSpeakTask = Task { @MainActor in
+                await coordinator.facilitator?.speakIntoMeeting("Длинная сводка задач за неделю...", model: model)
+            }
+            for _ in 0..<80 where !deliveryStarted {
+                try? await Task.sleep(for: .milliseconds(10))
+            }
+            XCTAssertTrue(deliveryStarted)
+            engine.setSpeaking(participantID: "vitalii", speaking: true)
+            XCTAssertTrue(model.participationSomeoneSpeaking)
+            XCTAssertFalse(model.participationRemoteSpeaking)
+            coordinator.facilitator?.processTick(models: [model])
+            XCTAssertFalse(deliveryCancelled, "Local speaking indicator from assistant's own TTS must not self-barge-in")
+            engine.setSpeaking(participantID: "vitalii", speaking: false)
+
+            engine.setSpeaking(participantID: "anna", speaking: true)
+            XCTAssertTrue(model.participationRemoteSpeaking)
+            coordinator.facilitator?.processTick(models: [model])
+            await longSpeakTask.value
+            XCTAssertTrue(deliveryCancelled, "Remote human speaking during TTS must trigger barge-in via processTick")
+            XCTAssertEqual(coordinator.facilitator?.lastStatusBySession[model.sessionID], L("Listening…"))
+            engine.setSpeaking(participantID: "anna", speaking: false)
+
+            var deliveredWhileClosed = false
+            coordinator.deliverVoice = { _, _ in deliveredWhileClosed = true }
+            _ = await model.leave()
+            await coordinator.facilitator?.speakIntoMeeting("Не должно озвучиваться после закрытия", model: model)
+            XCTAssertFalse(deliveredWhileClosed)
+
+            await store.meetingLibrary.store.close()
+            exp.fulfill()
+        }
+        wait(for: [exp], timeout: 10.0)
     }
 }

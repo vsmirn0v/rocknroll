@@ -53,6 +53,17 @@ enum AssistantSkillToolRegistrar {
             }
         }
         let jiraConfig = await attention.resolvedJiraBoardConfig(for: activeMeeting)
+        let boardDerivedKeys = await attention.taskSync.resolveBoardDerivedProjectKeys()
+        let teamDefaultKeys = SyncedMeetingContextSettings.normalizedJiraProjectKeys(from: rendered.teamContext.defaultJiraProjectKey)
+        let globalProjectKey = await MainActor.run { attention.taskSync.preferences.jira.cleanProjectKey }
+        let globalFallbackKeys = SyncedMeetingContextSettings.normalizedJiraProjectKeys(
+            from: (teamDefaultKeys + [globalProjectKey]).filter { !$0.isEmpty }.joined(separator: ",")
+        )
+        let effectiveProjectKeys = WorkspaceTaskSyncController.resolvedEffectiveJiraProjectKeys(
+            configured: jiraConfig.projectKeys,
+            globalFallback: globalFallbackKeys,
+            boardDerived: boardDerivedKeys
+        )
         let resolvedBoardURLString = jiraConfig.boardURL?.absoluteString ?? rendered.teamContext.defaultJiraBoardURL
         let boardState = await MainActor.run {
             let board = attention.boardController
@@ -68,7 +79,8 @@ enum AssistantSkillToolRegistrar {
         Live Board & Voice Facilitation Rules:
         - board_open: \(boardState.open), board_current_url: \(boardState.url), board_sharing: \(boardState.sharing), board_recovering: \(boardState.recovering)
         - effective_jira_board_url: \(resolvedBoardURLString.isEmpty ? "none" : resolvedBoardURLString)
-        - effective_jira_project_keys: \(jiraConfig.projectKeys.isEmpty ? "none" : jiraConfig.projectKeys.joined(separator: ", "))
+        - effective_jira_project_keys: \(effectiveProjectKeys.isEmpty ? "none" : effectiveProjectKeys.joined(separator: ", "))
+        - board_derived_project_keys: \(boardDerivedKeys.isEmpty ? "none" : boardDerivedKeys.joined(separator: ", "))
         - Keep spoken replies crisp (1-3 sentences) in the meeting language. Never repeat a sentence/paragraph or read Markdown syntax such as backticks (`KEY-1`) aloud.
         - Conduct standups step-by-step across participants (yesterday, today, blockers) using the meeting transcript and move cleanly to the next person without repeating previous prompts.
         - For board person/quick filters, call rocknroll_control_board(command="select_person_filter", query="<name>") or clear_filters; for screen sharing, call share_to_meeting or stop_share.
@@ -599,9 +611,22 @@ enum AssistantSkillToolRegistrar {
                 }
                 let jiraConfig = await attention.resolvedJiraBoardConfig(for: activeMeeting)
                 let team = await attention.loadTeamContext()
+                let boardDerivedKeys = await attention.taskSync.resolveBoardDerivedProjectKeys()
+                let globalProjectKey = await MainActor.run { attention.taskSync.preferences.jira.cleanProjectKey }
+                let globalFallbackKeys = SyncedMeetingContextSettings.normalizedJiraProjectKeys(
+                    from: [team.defaultJiraProjectKey, globalProjectKey].filter { !$0.isEmpty }.joined(separator: ",")
+                )
+                let effectiveProjects = WorkspaceTaskSyncController.resolvedEffectiveJiraProjectKeys(
+                    configured: jiraConfig.projectKeys,
+                    globalFallback: globalFallbackKeys,
+                    boardDerived: boardDerivedKeys
+                )
+                let candidateKeys = effectiveProjects + boardDerivedKeys.filter { !effectiveProjects.contains($0) }
                 let explicitProject = args["project_key"]?.stringValue?.trimmed ?? ""
-                let teamProject = jiraConfig.projectKeys.first ?? team.defaultJiraProjectKey.trimmed
-                let projectKey = explicitProject.isEmpty ? (teamProject.isEmpty ? nil : teamProject) : explicitProject
+                let projectKey = WorkspaceTaskSyncController.resolveSpokenProjectKey(
+                    explicitProject,
+                    candidates: candidateKeys
+                ) ?? effectiveProjects.first ?? (team.defaultJiraProjectKey.trimmed.isEmpty ? nil : team.defaultJiraProjectKey.trimmed)
                 let kind = args["issue_kind"]?.stringValue.flatMap(TaskIssueKind.init(rawValue:)) ?? .task
                 let priority = args["priority"]?.stringValue.flatMap(TaskPriorityLevel.init(rawValue:))
                 let created = try await attention.taskSync.createJiraIssueDirect(
@@ -628,7 +653,16 @@ enum AssistantSkillToolRegistrar {
                 let jiraConfig = await attention.resolvedJiraBoardConfig(for: activeMeeting)
                 let team = await attention.loadTeamContext()
                 let configuredProject = await MainActor.run { attention.taskSync.preferences.jira.cleanProjectKey }
-                let fallbackProject = jiraConfig.projectKeys.first ?? team.defaultJiraProjectKey
+                let boardDerivedKeys = await attention.taskSync.resolveBoardDerivedProjectKeys()
+                let globalFallbackKeys = SyncedMeetingContextSettings.normalizedJiraProjectKeys(
+                    from: [team.defaultJiraProjectKey, configuredProject].filter { !$0.isEmpty }.joined(separator: ",")
+                )
+                let effectiveSearchKeys = WorkspaceTaskSyncController.resolvedEffectiveJiraProjectKeys(
+                    configured: jiraConfig.projectKeys,
+                    globalFallback: globalFallbackKeys,
+                    boardDerived: boardDerivedKeys
+                )
+                let fallbackProject = effectiveSearchKeys.first ?? team.defaultJiraProjectKey
                 var resolvedAssigneeID: String?
                 let rawAssignee = args["assignee"]?.stringValue?.trimmed ?? ""
                 if !rawAssignee.isEmpty {
@@ -659,7 +693,7 @@ enum AssistantSkillToolRegistrar {
                     query: rawQuery,
                     teamProjectKey: team.defaultJiraProjectKey,
                     jiraProjectKey: configuredProject,
-                    projectKeys: jiraConfig.projectKeys
+                    projectKeys: effectiveSearchKeys
                 )
                 let jql = resolvedAssigneeID.map {
                     WorkspaceTaskSyncController.injectAssignee($0, intoJQL: baseJQL)

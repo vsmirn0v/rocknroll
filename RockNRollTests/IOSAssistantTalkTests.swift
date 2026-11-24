@@ -939,7 +939,7 @@ final class IOSAssistantTalkTests: XCTestCase {
         }
     }
 
-    private func makeSolidBoardCGImage(width: Int = 1440, height: Int = 810) -> CGImage {
+    private func makeSolidBoardCGImage(width: Int = 1280, height: Int = 720) -> CGImage {
         let colorSpace = CGColorSpaceCreateDeviceRGB()
         let bitmapInfo = CGBitmapInfo.byteOrder32Little.rawValue | CGImageAlphaInfo.premultipliedFirst.rawValue
         let ctx = CGContext(
@@ -962,18 +962,18 @@ final class IOSAssistantTalkTests: XCTestCase {
         <!doctype html>
         <html>
           <head><title>Jira Desktop Board</title></head>
-          <body style="margin:0"><div id="cols" style="width:1440px;height:810px">Sprint Columns</div></body>
+          <body style="margin:0"><div id="cols" style="width:1280px;height:720px">Sprint Columns</div></body>
         </html>
         """
         await board.loadHTMLForTesting(html)
 
         XCTAssertEqual(board.webView.configuration.defaultWebpagePreferences.preferredContentMode, .desktop)
         XCTAssertTrue((board.webView.customUserAgent ?? "").contains("Macintosh"))
-        XCTAssertEqual(board.webView.bounds.size, CGSize(width: 1440, height: 810))
+        XCTAssertEqual(board.webView.bounds.size, CGSize(width: 1280, height: 720))
 
         let dims = try await board.webView.evaluateJavaScript("[window.innerWidth, window.innerHeight]") as? [NSNumber]
-        XCTAssertEqual(dims?.first?.intValue, 1440)
-        XCTAssertEqual(dims?.last?.intValue, 810)
+        XCTAssertEqual(dims?.first?.intValue, 1280)
+        XCTAssertEqual(dims?.last?.intValue, 720)
     }
 
     func testIOSAssistantBoardShares1080pDesktopFramesAndHandlesStop() async throws {
@@ -1886,5 +1886,439 @@ final class IOSAssistantTalkTests: XCTestCase {
             try await Task.sleep(for: .milliseconds(20))
         }
         await store.close()
+    }
+
+    func testIOSMultiParticipantImperfectDailyStandupEdgeCases() async throws {
+        final class MockJiraConnectorForStandup: JiraTaskConnecting, @unchecked Sendable {
+            private let lock = NSLock()
+            private var created: [JiraIssueWritePayload] = []
+
+            func recordedPayloads() -> [JiraIssueWritePayload] {
+                lock.lock()
+                defer { lock.unlock() }
+                return created
+            }
+
+            func verifyMyself() async throws -> JiraUserContact {
+                JiraUserContact(identifier: "v.smirnov", username: "v.smirnov", displayName: "Vitalii", isServerOrDC: true)
+            }
+
+            func fetchProjectMetadata(projectKey: String) async throws -> JiraProjectMetadata {
+                let data = Data("{\"key\":\"\(projectKey)\",\"name\":\"\(projectKey)\",\"issueTypes\":[\"Task\"]}".utf8)
+                return try JSONDecoder().decode(JiraProjectMetadata.self, from: data)
+            }
+
+            func fetchAssignableUsers(projectKey: String, query: String) async throws -> [JiraUserContact] { [] }
+            func searchIssues(jql: String, maxResults: Int) async throws -> [JiraRemoteIssue] { [] }
+
+            func createIssue(_ payload: JiraIssueWritePayload) async throws -> JiraRemoteIssue {
+                lock.lock()
+                created.append(payload)
+                let num = 200 + created.count
+                lock.unlock()
+                return JiraRemoteIssue(
+                    id: "\(num)",
+                    key: "\(payload.projectKey)-\(num)",
+                    summary: payload.summary,
+                    description: payload.description,
+                    statusName: "To Do",
+                    workflowStatus: .todo,
+                    issueTypeName: "Task",
+                    issueKind: .task
+                )
+            }
+
+            func updateIssue(
+                key: String,
+                payload: JiraIssueWritePayload,
+                targetStatus: TaskWorkflowStatus?,
+                comment: String?
+            ) async throws -> JiraRemoteIssue {
+                JiraRemoteIssue(
+                    id: key,
+                    key: key,
+                    summary: payload.summary,
+                    description: payload.description,
+                    statusName: "In Progress",
+                    workflowStatus: .inProgress
+                )
+            }
+        }
+
+        let suite = SuiteBox()
+        let tempRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ios-imperfect-standup-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempRoot) }
+        let (workspace, store) = try await makeTestWorkspace(
+            tempRoot: tempRoot.appendingPathComponent("ws", isDirectory: true),
+            prefs: suite.defaults
+        )
+
+        let jiraConnector = MockJiraConnectorForStandup()
+        workspace.taskSync.jiraConnectorForTesting = jiraConnector
+        defer { workspace.taskSync.jiraConnectorForTesting = nil }
+        var taskPrefs = TaskSyncPreferences()
+        taskPrefs.jira = JiraConnectionSettings(
+            enabled: true,
+            baseURL: "https://tasks.sberdevices.ru/jira",
+            projectKey: "",
+            authMode: .personalAccessToken
+        )
+        workspace.taskSync.preferences = taskPrefs
+
+        let skills = IOSAssistantSkillsController(
+            workspace: workspace,
+            preferences: suite.defaults,
+            keychain: WorkspaceAPIKeychain(service: "dev.vsmirn0v.ios.standup.\(UUID().uuidString)"),
+            customRootURL: tempRoot.appendingPathComponent("skills", isDirectory: true)
+        )
+        defer { skills.stopWatcher() }
+
+        // Save 2 approved participants (Vitalii local lead + Anna teammate); Guest Bob is unapproved.
+        try skills.upsertPerson(AssistantPersonEntry(
+            id: "vitalii",
+            displayName: "Виталий Смирнов",
+            aliases: ["Виталий", "Vitalii"],
+            jiraUsername: "v.smirnov",
+            approvedVoiceCommander: true
+        ))
+        try skills.upsertPerson(AssistantPersonEntry(
+            id: "anna",
+            displayName: "Анна Иванова",
+            aliases: ["Анна", "Аня", "Anna"],
+            jiraUsername: "a.ivanova",
+            approvedVoiceCommander: true
+        ))
+
+        let cid = UUID()
+        let inviteURL = URL(string: "https://meet.example.com/cto-daily-\(cid.uuidString)")!
+        let sid = workspace.beginSession(
+            controllerID: cid,
+            requestedWorkspaceID: nil,
+            title: "CTO Daily",
+            invitation: inviteURL,
+            roomIdentity: "meet.example.com/cto-daily",
+            calendarMeeting: nil,
+            engine: .guest
+        )
+
+        // Real WKWebView RapidBoard HTML (with NO ?projectKey= param!) containing #ghx-pool and SDBCTO-101 card.
+        let board = IOSAssistantBoardController()
+        board.taskSync = workspace.taskSync
+        let boardHTML = """
+        <!doctype html>
+        <html>
+          <head><title>CTO Daily Board</title></head>
+          <body style="margin:0">
+            <div id="ghx-header" style="height:120px">Header</div>
+            <div id="ghx-pool" style="height:240px;overflow-y:auto;">
+              <div style="height:1000px">
+                <div class="ghx-issue" data-issue-key="SDBCTO-101">Поддержка 1</div>
+              </div>
+            </div>
+          </body>
+        </html>
+        """
+        let server = LoopbackHTTPBoardServer(html: boardHTML)
+        let port = try await server.start()
+        defer { server.stop() }
+        let boardURL = "http://127.0.0.1:\(port)/secure/RapidBoard.jspa?rapidView=42"
+        _ = try await board.open(urlString: boardURL, presentSheet: false)
+
+        // Verify Presentation Mode CSS + #ghx-pool real scrolling + DOM project key derivation (SDBCTO)
+        await board.setPresentationMode(true)
+        let hasStyle = try await board.webView.evaluateJavaScript("!!document.getElementById('__rnr-board-presentation-style')") as? Bool
+        XCTAssertEqual(hasStyle, true)
+
+        _ = try await board.scroll(deltaY: 320)
+        let poolScrollTop = try await board.webView.evaluateJavaScript("document.getElementById('ghx-pool').scrollTop") as? NSNumber
+        XCTAssertGreaterThan(poolScrollTop?.doubleValue ?? 0, 0)
+
+        let derivedKeys = await workspace.taskSync.resolveBoardDerivedProjectKeys(forceRefresh: true)
+        XCTAssertEqual(derivedKeys, ["SDBCTO"])
+
+        // 1. Task deduplication across rocknroll_create_task + rocknroll_update_meeting_artifacts
+        let create1 = await IOSAutonomousMeetingFacilitator.executeSharedTool(
+            name: "rocknroll_create_task",
+            argumentsJSON: "{\"title\":\"Доработка по итогам CTO Daily\",\"owner\":\"Виталий\"}",
+            sessionID: sid,
+            controllerID: cid,
+            allowWrites: true,
+            allowedGroups: [.tasks, .meetingSummary, .jira, .boardShare],
+            skills: skills,
+            workspace: workspace,
+            board: board
+        )
+        let create2 = await IOSAutonomousMeetingFacilitator.executeSharedTool(
+            name: "rocknroll_create_task",
+            argumentsJSON: "{\"title\":\"Завести задачу на доработку по итогам CTO Daily\",\"owner\":\"Виталий\"}",
+            sessionID: sid,
+            controllerID: cid,
+            allowWrites: true,
+            allowedGroups: [.tasks, .meetingSummary, .jira, .boardShare],
+            skills: skills,
+            workspace: workspace,
+            board: board
+        )
+        let artResult = await IOSAutonomousMeetingFacilitator.executeSharedTool(
+            name: "rocknroll_update_meeting_artifacts",
+            argumentsJSON: "{\"summary_append\":\"Обсудили статус\", \"action_items\":[{\"text\":\"Доработка по итогам CTO Daily\",\"owner\":\"Виталий Смирнов\"}]}",
+            sessionID: sid,
+            controllerID: cid,
+            allowWrites: true,
+            allowedGroups: [.tasks, .meetingSummary, .jira, .boardShare],
+            skills: skills,
+            workspace: workspace,
+            board: board
+        )
+        XCTAssertTrue(create1.contains("\"created\":true"))
+        XCTAssertTrue(create2.contains("\"already_existed\":true"))
+        XCTAssertTrue(artResult.contains("\"action_items_deduplicated\":1"))
+        let ctoTasks = workspace.tasks.filter { $0.sessionID == sid && !$0.done }
+        XCTAssertEqual(ctoTasks.count, 1, "Duplicate/meta tasks must merge cleanly into 1 open task")
+
+        // 2. Spoken project key resolution ("Sdp ситио" -> "SDBCTO") using derived board key
+        let jiraCreateJSON = await IOSAutonomousMeetingFacilitator.executeSharedTool(
+            name: "rocknroll_jira_action",
+            argumentsJSON: "{\"operation\":\"create\",\"project_key\":\"Sdp ситио\",\"summary\":\"Fix RapidBoard scroll\"}",
+            sessionID: sid,
+            controllerID: cid,
+            allowWrites: true,
+            allowedGroups: [.jira, .tasks],
+            skills: skills,
+            workspace: workspace,
+            board: board
+        )
+        XCTAssertTrue(jiraCreateJSON.contains("SDBCTO-201"), "Got: \(jiraCreateJSON)")
+        XCTAssertEqual(jiraConnector.recordedPayloads().last?.projectKey, "SDBCTO")
+
+        // Unapproved guest write block
+        let guestCreateBlocked = await IOSAutonomousMeetingFacilitator.executeSharedTool(
+            name: "rocknroll_jira_action",
+            argumentsJSON: "{\"operation\":\"create\",\"summary\":\"Unauthorized ticket\"}",
+            sessionID: sid,
+            controllerID: cid,
+            allowWrites: false,
+            allowedGroups: [.jira, .tasks],
+            skills: skills,
+            workspace: workspace,
+            board: board
+        )
+        XCTAssertTrue(guestCreateBlocked.contains("\"error\""))
+
+        // 3. Partial ASR deferral + silence wait + barge-in cancellation + post-leave silence
+        var connectedFlag = true
+        var humanSpeakingFlag = false
+        var bargeInCancelCount = 0
+        var spokenReplies: [String] = []
+        let bridge = IOSAssistantSessionBridge(
+            controllerID: cid,
+            title: "CTO Daily",
+            roomKey: inviteURL.absoluteString,
+            localDisplayName: "Виталий Смирнов",
+            participantNames: ["Анна Иванова", "Guest Bob"],
+            canSendChat: true,
+            isMicUnmuted: true,
+            isForeground: true,
+            isMeetingSoundEnabled: true,
+            canDeliverAutomaticReplies: true,
+            ensureTranscription: {},
+            isConnected: { connectedFlag },
+            isHumanSpeaking: { humanSpeakingFlag },
+            cancelVoiceReplyForBargeIn: { bargeInCancelCount += 1 },
+            sendChat: { _ in },
+            speakVoice: { text in
+                spokenReplies.append(text)
+                try? await Task.sleep(for: .milliseconds(200))
+            }
+        )
+
+        let transport = MockRealtimeTransport()
+        transport.onTextTurn = { text, cont in
+            Task {
+                try? await Task.sleep(for: .milliseconds(25))
+                cont.yield(.assistantTranscriptDone("Начинаем CTO Daily! Принято: \(text)"))
+                cont.yield(.audioDone)
+            }
+        }
+        skills.realtimeProvider = .openAIRealtime
+        XCTAssertTrue(skills.setRealtimeAPIKey("test-standup-key", for: .openAIRealtime))
+        let facilitator = IOSAutonomousMeetingFacilitator(
+            skills: skills,
+            workspace: workspace,
+            board: board,
+            resolveBridge: { $0 == cid ? bridge : nil }
+        )
+        facilitator.wakeCoalesceDelay = .milliseconds(20)
+        facilitator.followUpCoalesceDelay = .milliseconds(40)
+        facilitator.silencePollInterval = .milliseconds(25)
+        facilitator.maxSilenceWaitDuration = .milliseconds(350)
+        facilitator.customRealtimeTransportFactory = { transport }
+        facilitator.enable(controllerID: cid, title: "CTO Daily", skillID: "scrum-master", suppressAutoGreet: true)
+        for _ in 0..<80 where !facilitator.realtimeActive {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+
+        let coordinator = IOSAssistantCoordinator(
+            workspace: workspace,
+            preferences: suite.defaults,
+            modelAvailable: { false },
+            evaluationCooldown: 0,
+            mentionCooldown: 0,
+            resolveBridge: { $0 == cid ? bridge : nil }
+        )
+        coordinator.onTranscriptPartialActivity = { id, partialIDs in
+            facilitator.updatePartialActivity(controllerID: id, partialEventIDs: partialIDs)
+        }
+        coordinator.onTranscriptEvents = { id, title, url, events, localNames in
+            facilitator.observeEvents(controllerID: id, title: title, invitationURL: url, events: events, localNames: localNames)
+        }
+        coordinator.isFacilitatorActive = { id in facilitator.activeSessionSkills[id] != nil }
+
+        // While Anna has a partial ASR segment in flight, turn must NOT fire early
+        let t0 = Date()
+        coordinator.observeEvents([
+            SyncedTranscriptEvent(id: "p1", kind: "transcript", occurredAt: t0, speaker: "Анна Иванова", isOwn: false, text: "Рок", deviceID: "mac-1")
+        ], for: cid, partialEventIDs: ["p1"])
+        try await Task.sleep(for: .milliseconds(80))
+        let sentBeforeFinalize = await transport.storage.sentTexts.count
+        XCTAssertEqual(sentBeforeFinalize, 0, "Partial ASR in flight must defer turn execution")
+
+        // Finalize Anna's utterance
+        coordinator.observeEvents([
+            SyncedTranscriptEvent(id: "p1", kind: "transcript", occurredAt: t0, speaker: "Анна Иванова", isOwn: false, text: "Рок, переходи ко мне", deviceID: "mac-1")
+        ], for: cid, partialEventIDs: [])
+        for _ in 0..<60 where spokenReplies.isEmpty {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        XCTAssertEqual(spokenReplies.count, 1)
+
+        // Phonetic garble self-echo shortly after speaking must be ignored
+        coordinator.observeEvents([
+            SyncedTranscriptEvent(id: "e1", kind: "transcript", occurredAt: t0.addingTimeInterval(0.1), speaker: "Виталий Смирнов", isOwn: true, text: "цито Дели", deviceID: "ios-1")
+        ], for: cid, partialEventIDs: [])
+        try await Task.sleep(for: .milliseconds(90))
+        let countAfterEcho = await transport.storage.sentTexts.count
+        XCTAssertEqual(countAfterEcho, 1, "Phonetic echo right after assistant TTS must not re-trigger")
+
+        // Mixed echo + genuine wake command strips echo prefix and preserves command
+        let mixedCleaned = AssistantWakePhraseMatcher.stripAssistantEcho(
+            from: "Начинаем CTO Daily! Рок, отфильтруй по Анне",
+            recentAssistantUtterances: spokenReplies,
+            withinEchoWindow: true
+        )
+        XCTAssertTrue(mixedCleaned.contains("Рок, отфильтруй по Анне"))
+
+        // Human interrupts while assistant starts speaking -> triggers cancelVoiceReplyForBargeIn
+        let longSpeakTask = Task {
+            await facilitator.speakIntoMeeting("Начинаю длинный пересказ всех задач за прошлый квартал...", controllerID: cid)
+        }
+        try await Task.sleep(for: .milliseconds(40))
+        humanSpeakingFlag = true
+        coordinator.observeEvents([
+            SyncedTranscriptEvent(id: "b1", kind: "transcript", occurredAt: t0.addingTimeInterval(0.3), speaker: "Виталий Смирнов", isOwn: true, text: "Подожди секунду", deviceID: "ios-1")
+        ], for: cid, partialEventIDs: ["b1"])
+        XCTAssertGreaterThanOrEqual(bargeInCancelCount, 1, "Human speech during TTS must trigger barge-in cancel")
+        _ = await longSpeakTask.value
+        humanSpeakingFlag = false
+
+        // Post-leave / disconnect: never speaks or falls back to local audition
+        connectedFlag = false
+        let repliesBeforeLeave = spokenReplies.count
+        await facilitator.speakIntoMeeting("Не должно озвучиваться после выхода", controllerID: cid)
+        XCTAssertEqual(spokenReplies.count, repliesBeforeLeave)
+
+        facilitator.sessionEnded(controllerID: cid)
+        for _ in 0..<40 where facilitator.realtimeActive {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        await store.close()
+    }
+
+    func testIOSPerMeetingJiraSettingsAndTeamContextPersistAcrossReloadWithoutRevertRace() async throws {
+        let suite = SuiteBox()
+        let tempRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ios-jira-persist-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempRoot) }
+
+        let roomURL = URL(string: "https://meet.example.com/cto-persist")!
+        let (ws1, store1) = try await makeTestWorkspace(tempRoot: tempRoot, prefs: suite.defaults)
+        let sid = ws1.beginSession(
+            controllerID: UUID(),
+            requestedWorkspaceID: nil,
+            title: "CTO Daily",
+            invitation: roomURL,
+            roomIdentity: "meet.example.com/cto-persist",
+            calendarMeeting: nil,
+            engine: .guest
+        )
+
+        await ws1.saveContextSettings(
+            scopeKey: "room:" + roomURL.absoluteString,
+            scopeKind: .room,
+            title: "CTO Daily",
+            sameRoomTransition: nil,
+            about: "Daily sync",
+            matters: nil,
+            never: nil,
+            people: nil,
+            jiraBoardURL: "jira.internal.ru/secure/RapidBoard.jspa?rapidView=77",
+            updateJiraBoardURL: true,
+            jiraProjectKeys: ["SDBCTO-42, SPS"],
+            updateJiraProjectKeys: true
+        )
+
+        let savedConfig = ws1.resolvedJiraBoardConfig(
+            for: sid,
+            defaultBoardURL: "",
+            defaultProjectKey: "",
+            jiraSettings: .init()
+        )
+        XCTAssertEqual(savedConfig.boardURL?.absoluteString, "https://jira.internal.ru/secure/RapidBoard.jspa?rapidView=77")
+        XCTAssertEqual(savedConfig.projectKeys, ["SDBCTO", "SPS"])
+
+        // Test TeamContext normalization + no revert race across syncAssistantStateToCloudNow + reloadFromStore
+        let skills = IOSAssistantSkillsController(
+            workspace: ws1,
+            preferences: suite.defaults,
+            keychain: WorkspaceAPIKeychain(service: "dev.vsmirn0v.ios.jirapersist.\(UUID().uuidString)"),
+            customRootURL: tempRoot.appendingPathComponent("skills", isDirectory: true)
+        )
+        defer { skills.stopWatcher() }
+        ws1.assistantSyncInputProvider = { [weak skills] in
+            skills?.currentCloudSyncInput() ?? .init(
+                people: .init(), teamContext: .init(), skills: [], prompts: [], preferences: .init()
+            )
+        }
+        ws1.onAssistantSettingsSynced = { [weak skills] settings, baseline in
+            skills?.applyRemoteCloudSync(settings: settings, previousBaseline: baseline)
+        }
+
+        var doc = skills.teamContext
+        doc.defaultJiraBoardURL = "boards.internal.ru/boards/5"
+        doc.defaultJiraProjectKey = "SDBCTO-9"
+        try skills.saveTeamContext(doc)
+        ws1.syncAssistantStateToCloudNow()
+        await ws1.reloadFromStore()
+        try await Task.sleep(for: .milliseconds(80))
+        XCTAssertEqual(skills.teamContext.defaultJiraBoardURL, "https://boards.internal.ru/boards/5")
+        XCTAssertEqual(skills.teamContext.defaultJiraProjectKey, "SDBCTO")
+
+        await ws1.flushNotesNow()
+        await store1.close()
+
+        // Re-open workspace on the same disk store & replica and confirm per-meeting Jira config survives restart
+        let (ws2, store2) = try await makeTestWorkspace(tempRoot: tempRoot, prefs: suite.defaults)
+        try await ws2.reloadFromStore()
+        try await Task.sleep(for: .milliseconds(50))
+        let reloadedConfig = ws2.resolvedJiraBoardConfig(
+            for: sid,
+            defaultBoardURL: "",
+            defaultProjectKey: "",
+            jiraSettings: .init()
+        )
+        XCTAssertEqual(reloadedConfig.boardURL?.absoluteString, "https://jira.internal.ru/secure/RapidBoard.jspa?rapidView=77")
+        XCTAssertEqual(reloadedConfig.projectKeys, ["SDBCTO", "SPS"])
+        await store2.close()
     }
 }

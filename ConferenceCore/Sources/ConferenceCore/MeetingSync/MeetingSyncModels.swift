@@ -1335,18 +1335,78 @@ public struct SyncedMeetingContextSettings: Codable, Equatable, Identifiable, Se
     }
 
     public static func normalizedJiraProjectKeys(from raw: String) -> [String] {
-        let tokens = raw
+        let chunks = raw
             .components(separatedBy: CharacterSet(charactersIn: ",;\n\t "))
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).uppercased() }
-            .filter { token in
-                !token.isEmpty && token.unicodeScalars.allSatisfy { CharacterSet.alphanumerics.contains($0) || $0 == "_" }
-            }
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
         var seen: Set<String> = []
         var result: [String] = []
-        for token in tokens where seen.insert(token).inserted {
-            result.append(token)
+        func appendKey(_ candidate: String) {
+            let upper = candidate.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+            guard !upper.isEmpty,
+                  upper.unicodeScalars.allSatisfy({ CharacterSet.alphanumerics.contains($0) || $0 == "_" }),
+                  seen.insert(upper).inserted else { return }
+            result.append(upper)
+        }
+        for chunk in chunks {
+            if let urlString = normalizedBoardURLString(from: chunk),
+               let url = URL(string: urlString),
+               let parsedKey = JiraBoardContextInfo.parse(from: url)?.projectKey {
+                appendKey(parsedKey)
+                continue
+            }
+            let upper = chunk.uppercased()
+            if let dash = upper.firstIndex(of: "-") {
+                let prefix = String(upper[..<dash])
+                let suffix = String(upper[upper.index(after: dash)...])
+                if !prefix.isEmpty,
+                   !suffix.isEmpty,
+                   suffix.unicodeScalars.allSatisfy({ CharacterSet.decimalDigits.contains($0) }) {
+                    appendKey(prefix)
+                    continue
+                }
+            }
+            if upper.hasPrefix("PROJECTKEY="), upper.count > "PROJECTKEY=".count {
+                appendKey(String(upper.dropFirst("PROJECTKEY=".count)))
+                continue
+            }
+            appendKey(upper)
         }
         return result
+    }
+
+    public static func normalizedBoardURLString(from raw: String?) -> String? {
+        guard let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !trimmed.isEmpty,
+              !trimmed.contains(where: { $0.isWhitespace }) else {
+            return nil
+        }
+        let candidate: String
+        if trimmed.contains("://") {
+            candidate = trimmed
+        } else if trimmed.hasPrefix("localhost") || trimmed.hasPrefix("127.0.0.1") || trimmed.hasPrefix("[::1]") {
+            candidate = "http://" + trimmed
+        } else if trimmed.contains(".") {
+            candidate = "https://" + trimmed
+        } else {
+            return nil
+        }
+        let url: URL? = URL(string: candidate) ?? {
+            let encoded = candidate.unicodeScalars.map { scalar -> String in
+                if scalar.isASCII {
+                    return String(scalar)
+                }
+                return String(scalar).addingPercentEncoding(withAllowedCharacters: .urlFragmentAllowed) ?? ""
+            }.joined()
+            return URL(string: encoded)
+        }()
+        guard let url,
+              let scheme = url.scheme?.lowercased(),
+              scheme == "http" || scheme == "https",
+              let host = url.host, !host.isEmpty else {
+            return nil
+        }
+        return url.absoluteString
     }
 
     public static func normalizedJiraProjectKeys(from rawList: [String]) -> [String] {

@@ -284,6 +284,142 @@ final class JiraBoardAndIdentityTests: XCTestCase {
         stampedDefault.sourceRelativePath = "Skills/scrum-master.md"
         XCTAssertEqual(AssistantCloudSync.skillDigest(stampedDefault), AssistantCloudSync.skillDigest(try XCTUnwrap(DefaultAssistantSkills.skill(id: "scrum-master"))))
     }
+
+    func testMeetingTaskDeduplicatorMergesIdenticalAndMetaTasksPreservingDistinctKeys() {
+        XCTAssertTrue(MeetingTaskDeduplicator.isDuplicate(
+            candidateTitle: "Доработка по итогам CTO Daily",
+            candidateOwner: "Виталий Смирнов",
+            existingTitle: "Доработка по итогам CTO Daily",
+            existingOwner: "Виталий Смирнов"
+        ))
+        XCTAssertTrue(MeetingTaskDeduplicator.isDuplicate(
+            candidateTitle: "Завести задачу на доработку по итогам CTO Daily",
+            candidateOwner: "Виталий Смирнов",
+            existingTitle: "Доработка по итогам CTO Daily",
+            existingOwner: "Виталий Смирнов"
+        ))
+        XCTAssertFalse(MeetingTaskDeduplicator.isDuplicate(
+            candidateTitle: "Проверить SDBCTO-12 на стенде",
+            candidateOwner: "Виталий",
+            existingTitle: "Проверить SDBCTO-13 на стенде",
+            existingOwner: "Виталий"
+        ))
+        XCTAssertFalse(MeetingTaskDeduplicator.isDuplicate(
+            candidateTitle: "Доработка по итогам CTO Daily",
+            candidateOwner: "Виталий",
+            existingTitle: "Доработка по итогам CTO Daily",
+            existingOwner: "Анна"
+        ))
+        XCTAssertFalse(MeetingTaskDeduplicator.areOwnersCompatible("Алексей Иванов", "Алексей Петров"))
+        XCTAssertTrue(MeetingTaskDeduplicator.areOwnersCompatible("Алексей", "Алексей Иванов"))
+        XCTAssertTrue(MeetingTaskDeduplicator.areOwnersCompatible("Иванов Алексей", "Алексей Иванов"))
+    }
+
+    @MainActor
+    func testJiraNormalizationSpokenKeyBoardDerivationAndDOMScripts() async throws {
+        XCTAssertEqual(
+            SyncedMeetingContextSettings.normalizedBoardURLString(from: "tasks.sberdevices.ru/jira/secure/RapidBoard.jspa?rapidView=42"),
+            "https://tasks.sberdevices.ru/jira/secure/RapidBoard.jspa?rapidView=42"
+        )
+        XCTAssertEqual(
+            SyncedMeetingContextSettings.normalizedBoardURLString(from: "127.0.0.1:8080/boards/1"),
+            "http://127.0.0.1:8080/boards/1"
+        )
+        XCTAssertEqual(
+            SyncedMeetingContextSettings.normalizedJiraProjectKeys(from: "SDBCTO-123, https://jira.example.com/projects/SPS/boards/5"),
+            ["SDBCTO", "SPS"]
+        )
+        XCTAssertEqual(
+            WorkspaceTaskSyncController.resolveSpokenProjectKey("Sdp ситио", candidates: ["SPS", "SDBCTO"]),
+            "SDBCTO"
+        )
+
+        let evaluator = MockBoardWebEvaluator()
+        evaluator.currentBoardURL = URL(string: "https://tasks.sberdevices.ru/jira/secure/RapidBoard.jspa?rapidView=15")
+        evaluator.responder = { endpoint, _, _ in
+            if endpoint.contains("/rest/api/2/myself") || endpoint.contains("/rest/api/3/myself") {
+                return (200, "{\"name\":\"v.smirnov\",\"displayName\":\"Vitalii Smirnov\"}")
+            }
+            if endpoint.contains("/rest/agile/1.0/board/15/project") {
+                return (200, "{\"values\":[{\"key\":\"SDBCTO\"}]}")
+            }
+            if endpoint.contains("/rest/agile/1.0/board/15/issue") {
+                return (200, "{\"issues\":[]}")
+            }
+            return (404, "{}")
+        }
+        let connector = JiraBoardWebSessionConnector(evaluator: evaluator)
+        let derived = await connector.deriveBoardProjectKeys()
+        XCTAssertTrue(derived.contains("SDBCTO"))
+
+        let scrollScript = JiraBoardDOMScripts.scrollBoardScript(deltaY: 420)
+        XCTAssertTrue(scrollScript.contains("#ghx-pool"))
+        let presScript = JiraBoardDOMScripts.applyPresentationModeScript(enabled: true)
+        XCTAssertTrue(presScript.contains("__rnr-board-presentation-style"))
+        XCTAssertTrue(presScript.contains(".aui-page-panel"))
+        XCTAssertTrue(presScript.contains("overflow-y: auto"))
+        XCTAssertTrue(presScript.contains("dispatchEvent(new Event('resize'))"))
+        let focusScript = JiraBoardDOMScripts.focusActiveCardsScript()
+        XCTAssertTrue(focusScript.contains("scrollIntoView"))
+
+        XCTAssertEqual(
+            WorkspaceTaskSyncController.resolveSpokenProjectKey("INFRA", candidates: ["SDBCTO"]),
+            "INFRA"
+        )
+        XCTAssertNil(
+            WorkspaceTaskSyncController.resolveSpokenProjectKey("ситио", candidates: [])
+        )
+        XCTAssertEqual(
+            WorkspaceTaskSyncController.resolvedEffectiveJiraProjectKeys(
+                configured: ["TEAM"],
+                globalFallback: ["GLOBAL"],
+                boardDerived: ["BOARD"]
+            ),
+            ["TEAM"]
+        )
+        XCTAssertEqual(
+            WorkspaceTaskSyncController.resolvedEffectiveJiraProjectKeys(
+                configured: ["GLOBAL"],
+                globalFallback: ["GLOBAL"],
+                boardDerived: ["BOARD"]
+            ),
+            ["BOARD", "GLOBAL"]
+        )
+        XCTAssertEqual(
+            WorkspaceTaskSyncController.resolvedEffectiveJiraProjectKeys(
+                configured: ["GLOBAL"],
+                globalFallback: ["GLOBAL"],
+                boardDerived: []
+            ),
+            ["GLOBAL"]
+        )
+
+        let unicodeURL = SyncedMeetingContextSettings.normalizedBoardURLString(
+            from: "https://jira.internal/secure/RapidBoard.jspa?rapidView=5&quickFilter=Виталий"
+        )
+        XCTAssertNotNil(unicodeURL)
+        XCTAssertTrue(unicodeURL?.hasPrefix("https://jira.internal/secure/RapidBoard.jspa?") == true)
+        XCTAssertNotNil(unicodeURL.flatMap(URL.init(string:)))
+
+        // Stale board project keys must clear when switching to a board URL whose endpoints yield no keys.
+        let syncController = WorkspaceTaskSyncController(hooks: .init(
+            loadTasks: { [] },
+            loadContacts: { [] },
+            loadMyAliases: { [] },
+            applyMutations: { _ in },
+            persistPreferences: { _ in },
+            readSecret: { _, _ in nil },
+            writeSecret: { _, _, _ in true }
+        ))
+        syncController.boardWebEvaluator = evaluator
+        let firstKeys = await syncController.resolveBoardDerivedProjectKeys()
+        XCTAssertEqual(firstKeys, ["SDBCTO"])
+
+        evaluator.currentBoardURL = URL(string: "https://tasks.sberdevices.ru/jira/secure/RapidBoard.jspa?rapidView=99")
+        evaluator.responder = { _, _, _ in (404, "{}") }
+        let clearedKeys = await syncController.resolveBoardDerivedProjectKeys()
+        XCTAssertTrue(clearedKeys.isEmpty, "Switching boards must clear stale cached project keys from the previous board")
+    }
 }
 
 private extension AssistantSkillRepository {

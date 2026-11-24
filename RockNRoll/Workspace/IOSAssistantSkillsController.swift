@@ -393,8 +393,16 @@ final class IOSAssistantSkillsController: ObservableObject {
     }
 
     func saveTeamContext(_ doc: AssistantTeamContextDocument) throws {
+        var normalized = doc
+        let rawURL = normalized.defaultJiraBoardURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        normalized.defaultJiraBoardURL = rawURL.isEmpty
+            ? ""
+            : (SyncedMeetingContextSettings.normalizedBoardURLString(from: rawURL) ?? rawURL)
+        let normalizedKeys = SyncedMeetingContextSettings.normalizedJiraProjectKeys(from: normalized.defaultJiraProjectKey)
+        normalized.defaultJiraProjectKey = normalizedKeys.first
+            ?? normalized.defaultJiraProjectKey.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
         try withRepository { repo, _ in
-            try repo.saveTeamContext(doc)
+            try repo.saveTeamContext(normalized)
         }
         refresh()
         notifyLocalCloudSyncableChange()
@@ -608,6 +616,25 @@ final class IOSAssistantSkillsController: ObservableObject {
         dueDay: String? = nil,
         syncToJira: Bool = false
     ) async -> (resolvedTitle: String, resolvedOwner: String, jiraSynced: Bool)? {
+        guard let result = await createTaskDetailedWithPeopleResolution(
+            sessionID: sessionID,
+            title: title,
+            owner: owner,
+            dueDay: dueDay,
+            syncToJira: syncToJira
+        ) else {
+            return nil
+        }
+        return (result.resolvedTitle, result.resolvedOwner, result.jiraSynced)
+    }
+
+    func createTaskDetailedWithPeopleResolution(
+        sessionID: UUID?,
+        title: String,
+        owner: String?,
+        dueDay: String? = nil,
+        syncToJira: Bool = false
+    ) async -> (resolvedTitle: String, resolvedOwner: String, jiraSynced: Bool, alreadyExisted: Bool)? {
         guard let workspace else { return nil }
         let cleanTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleanTitle.isEmpty else { return nil }
@@ -615,20 +642,21 @@ final class IOSAssistantSkillsController: ObservableObject {
         let targetSessionID = sessionID
             ?? workspace.historySessions.first?.id
             ?? TaskExtendedMetadata.externalImportsSessionID
-        await workspace.addTask(
+        guard let result = await workspace.addTask(
             sessionID: targetSessionID,
             text: cleanTitle,
             owner: ownerName,
             dueDay: dueDay,
             reminderAt: nil
-        )
+        ) else {
+            return nil
+        }
         var syncedJira = false
-        if syncToJira && workspace.taskSync.preferences.jira.enabled,
-           let created = workspace.tasks.first(where: { $0.sessionID == targetSessionID && $0.text == cleanTitle }) {
-            await workspace.taskSync.runSync(explicitTaskIDs: [created.id], automaticTrigger: true)
+        if syncToJira && workspace.taskSync.preferences.jira.enabled {
+            await workspace.taskSync.runSync(explicitTaskIDs: [result.item.id], automaticTrigger: true)
             syncedJira = true
         }
-        return (cleanTitle, ownerName, syncedJira)
+        return (result.item.text, result.item.owner, syncedJira, !result.created)
     }
 
     func updateTaskWithPeopleResolution(
@@ -691,9 +719,27 @@ final class IOSAssistantSkillsController: ObservableObject {
         openQuestions: [String] = [],
         actionItems: [(text: String, owner: String, dueDay: String?)] = []
     ) async -> Bool {
-        guard let workspace else { return false }
+        await updateMeetingArtifactsDetailed(
+            sessionID: sessionID,
+            summaryAppend: summaryAppend,
+            replaceSummary: replaceSummary,
+            decisions: decisions,
+            openQuestions: openQuestions,
+            actionItems: actionItems
+        ).updated
+    }
+
+    func updateMeetingArtifactsDetailed(
+        sessionID: UUID?,
+        summaryAppend: String? = nil,
+        replaceSummary: String? = nil,
+        decisions: [String] = [],
+        openQuestions: [String] = [],
+        actionItems: [(text: String, owner: String, dueDay: String?)] = []
+    ) async -> (updated: Bool, createdTaskCount: Int, deduplicatedTaskCount: Int) {
+        guard let workspace else { return (false, 0, 0) }
         let sid = sessionID ?? workspace.historySessions.first?.id
-        guard let sid else { return false }
+        guard let sid else { return (false, 0, 0) }
 
         let existing = workspace.outcomesBySession[sid]
         var summary = existing?.summary ?? ""
@@ -701,7 +747,11 @@ final class IOSAssistantSkillsController: ObservableObject {
             summary = replaceSummary.trimmingCharacters(in: .whitespacesAndNewlines)
         } else if let summaryAppend, !summaryAppend.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             let chunk = summaryAppend.trimmingCharacters(in: .whitespacesAndNewlines)
-            summary = summary.isEmpty ? chunk : (summary + "\n" + chunk)
+            if summary.isEmpty {
+                summary = chunk
+            } else if !summary.localizedCaseInsensitiveContains(chunk) {
+                summary = summary + "\n" + chunk
+            }
         }
 
         var mergedDecisions = existing?.decisions ?? []
@@ -725,18 +775,26 @@ final class IOSAssistantSkillsController: ObservableObject {
             decisions: mergedDecisions,
             openQuestions: mergedQuestions
         )
+        var createdCount = 0
+        var dedupCount = 0
         for item in actionItems {
             let clean = item.text.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !clean.isEmpty else { continue }
-            await workspace.addTask(
+            if let result = await workspace.addTask(
                 sessionID: sid,
                 text: clean,
                 owner: resolvedOwnerName(item.owner),
                 dueDay: item.dueDay,
                 reminderAt: nil
-            )
+            ) {
+                if result.created {
+                    createdCount += 1
+                } else {
+                    dedupCount += 1
+                }
+            }
         }
-        return true
+        return (true, createdCount, dedupCount)
     }
 
     func scheduleCalendarMeeting(

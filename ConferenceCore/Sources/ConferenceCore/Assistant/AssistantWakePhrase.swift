@@ -156,26 +156,203 @@ public struct AssistantWakePhraseMatcher: Sendable {
         isLocal: Bool,
         withinEchoWindow: Bool
     ) -> Bool {
+        let trimmed = lastSpoken.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        return isLikelySelfEcho(
+            candidate: candidate,
+            recentAssistantUtterances: [trimmed],
+            isLocal: isLocal,
+            withinEchoWindow: withinEchoWindow
+        )
+    }
+
+    /// Detects acoustic echo against the most recent assistant utterances, including short phonetic ASR garbles.
+    public static func isLikelySelfEcho(
+        candidate: String,
+        recentAssistantUtterances: [String],
+        isLocal: Bool,
+        withinEchoWindow: Bool
+    ) -> Bool {
         let cleanCandidate = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
-        let cleanLast = lastSpoken.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !cleanCandidate.isEmpty, !cleanLast.isEmpty else { return false }
-        if isLocal && (cleanCandidate == cleanLast || cleanLast.contains(cleanCandidate)) {
-            return true
+        guard !cleanCandidate.isEmpty else { return false }
+        let utterances = recentAssistantUtterances
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        guard !utterances.isEmpty else { return false }
+
+        let normCandidate = normalizeForEchoComparison(cleanCandidate)
+        let candTokens = echoWordTokens(from: cleanCandidate)
+
+        for utterance in utterances {
+            if isLocal && (cleanCandidate == utterance || (normCandidate.count >= 8 && utterance.lowercased().contains(cleanCandidate.lowercased()))) {
+                return true
+            }
+            let normUtterance = normalizeForEchoComparison(utterance)
+            if isLocal && normCandidate.count >= 8 && normUtterance.contains(normCandidate) {
+                return true
+            }
         }
+
         guard withinEchoWindow else { return false }
-        let normalize: (String) -> Set<String> = { text in
-            let folded = text.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil)
-            let tokens = folded
-                .components(separatedBy: CharacterSet.alphanumerics.inverted)
-                .filter { $0.count >= 2 }
-            return Set(tokens)
+        guard !candTokens.isEmpty else { return false }
+
+        for utterance in utterances {
+            let uttTokens = echoWordTokens(from: utterance)
+            guard !uttTokens.isEmpty else { continue }
+            let intersection = candTokens.intersection(uttTokens).count
+            let overlap = Double(intersection) / Double(candTokens.count)
+            if overlap >= 0.72 {
+                return true
+            }
         }
-        let candTokens = normalize(cleanCandidate)
-        let lastTokens = normalize(cleanLast)
-        guard !candTokens.isEmpty, !lastTokens.isEmpty else { return false }
-        let intersection = candTokens.intersection(lastTokens).count
-        let overlap = Double(intersection) / Double(candTokens.count)
-        return overlap >= 0.72
+
+        // Catch short garbled local ASR tails (2-4 words, >= 7 chars) phonetically echoing a recent phrase,
+        // while leaving short human commands/acknowledgments untouched.
+        if isLocal && candTokens.count >= 2 && candTokens.count <= 4 && normCandidate.replacingOccurrences(of: " ", with: "").count >= 7 {
+            let candWords = normCandidate.split(separator: " ").map(String.init)
+            let candPhonetic = phoneticEchoSkeleton(normCandidate)
+            guard candPhonetic.count >= 6 else { return false }
+            for utterance in utterances {
+                let normUtterance = normalizeForEchoComparison(utterance)
+                let uttWords = normUtterance.split(separator: " ").map(String.init)
+                guard !uttWords.isEmpty else { continue }
+                let minWindow = min(uttWords.count, max(candWords.count - 1, 1))
+                let maxWindow = min(uttWords.count, candWords.count + 1)
+                for width in minWindow...maxWindow {
+                    for start in 0...(uttWords.count - width) {
+                        let slice = uttWords[start..<(start + width)].joined(separator: " ")
+                        let uttPhonetic = phoneticEchoSkeleton(slice)
+                        if phoneticLCSSimilarity(candPhonetic, uttPhonetic) >= 0.74 {
+                            return true
+                        }
+                    }
+                }
+            }
+        }
+
+        return false
+    }
+
+    /// Removes trailing or embedded assistant echo clauses from a mixed transcript line.
+    public static func stripAssistantEcho(
+        from text: String,
+        recentAssistantUtterances: [String],
+        withinEchoWindow: Bool
+    ) -> String {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "" }
+        let utterances = recentAssistantUtterances
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        guard !utterances.isEmpty else { return trimmed }
+
+        if isLikelySelfEcho(
+            candidate: trimmed,
+            recentAssistantUtterances: utterances,
+            isLocal: true,
+            withinEchoWindow: withinEchoWindow
+        ) {
+            return ""
+        }
+
+        let clauses = splitEchoClauses(trimmed)
+        guard clauses.count > 1 else { return trimmed }
+        var kept: [String] = []
+        for clause in clauses {
+            let normClause = normalizeForEchoComparison(clause)
+            guard !normClause.isEmpty else { continue }
+            let isEchoClause = isLikelySelfEcho(
+                candidate: clause,
+                recentAssistantUtterances: utterances,
+                isLocal: true,
+                withinEchoWindow: true
+            )
+            if !isEchoClause {
+                kept.append(clause)
+            }
+        }
+        return kept.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func normalizeForEchoComparison(_ text: String) -> String {
+        let folded = text
+            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil)
+            .replacingOccurrences(of: "ё", with: "е")
+        let tokens = folded
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .filter { !$0.isEmpty }
+        return tokens.joined(separator: " ")
+    }
+
+    private static func echoWordTokens(from text: String) -> Set<String> {
+        let folded = text
+            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil)
+            .replacingOccurrences(of: "ё", with: "е")
+        let tokens = folded
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .filter { $0.count >= 2 }
+        return Set(tokens)
+    }
+
+    private static func splitEchoClauses(_ text: String) -> [String] {
+        var clauses: [String] = []
+        var current = ""
+        for ch in text {
+            current.append(ch)
+            if ch == "." || ch == "!" || ch == "?" || ch == "\n" {
+                let clean = current.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !clean.isEmpty {
+                    clauses.append(clean)
+                }
+                current = ""
+            }
+        }
+        let trailing = current.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trailing.isEmpty {
+            clauses.append(trailing)
+        }
+        return clauses
+    }
+
+    private static func phoneticEchoSkeleton(_ normalized: String) -> String {
+        var s = normalized.replacingOccurrences(of: " ", with: "")
+        let replacements: [(String, String)] = [
+            ("daily", "deli"),
+            ("cto", "sito"),
+            ("ai", "e"), ("ay", "e"), ("ei", "e"), ("ey", "e"),
+            ("ph", "f"), ("sh", "s"), ("ch", "c"), ("zh", "z"),
+            ("щ", "с"), ("ш", "с"), ("ч", "ц"), ("ж", "з"),
+            ("ю", "u"), ("я", "a"),
+            ("ц", "s"), ("c", "s"),
+            ("а", "a"), ("б", "b"), ("в", "v"), ("г", "g"), ("д", "d"),
+            ("е", "e"), ("з", "z"), ("и", "i"), ("й", "i"), ("к", "k"),
+            ("л", "l"), ("м", "m"), ("н", "n"), ("о", "o"), ("п", "p"),
+            ("р", "r"), ("с", "s"), ("т", "t"), ("у", "u"), ("ф", "f"),
+            ("х", "h"), ("ы", "i"), ("э", "e"), ("y", "i")
+        ]
+        for (pat, rep) in replacements {
+            s = s.replacingOccurrences(of: pat, with: rep)
+        }
+        return s
+    }
+
+    private static func phoneticLCSSimilarity(_ a: String, _ b: String) -> Double {
+        let ca = Array(a), cb = Array(b)
+        guard !ca.isEmpty, !cb.isEmpty else { return 0 }
+        var prev = Array(repeating: 0, count: cb.count + 1)
+        for i in 1...ca.count {
+            var curr = Array(repeating: 0, count: cb.count + 1)
+            for j in 1...cb.count {
+                if ca[i - 1] == cb[j - 1] {
+                    curr[j] = prev[j - 1] + 1
+                } else {
+                    curr[j] = max(prev[j], curr[j - 1])
+                }
+            }
+            prev = curr
+        }
+        let lcs = prev[cb.count]
+        return Double(lcs) / Double(max(ca.count, cb.count))
     }
 }
 

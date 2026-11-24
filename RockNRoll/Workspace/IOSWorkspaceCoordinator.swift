@@ -125,6 +125,7 @@ final class IOSWorkspaceCoordinator: ObservableObject {
     private let replicaIOQueue = DispatchQueue(label: "dev.vsmirn0v.ios.workspace.replica-io", qos: .utility)
     private var replicaSaveTask: Task<Void, Never>?
     private var replicaLoaded = false
+    private var pendingLocalAssistantExportCount = 0
     private var cloudBackoffUntil: Date = .distantPast
     private var consecutiveCloudBackoffs = 0
     internal var cloudBackoffUntilForTesting: Date { cloudBackoffUntil }
@@ -294,8 +295,10 @@ final class IOSWorkspaceCoordinator: ObservableObject {
     }
 
     func syncAssistantStateToCloudNow() {
+        pendingLocalAssistantExportCount += 1
         Task { @MainActor [weak self] in
             guard let self else { return }
+            defer { self.pendingLocalAssistantExportCount = max(0, self.pendingLocalAssistantExportCount - 1) }
             await self.loadReplicaFromDiskIfNeeded()
             await self.ingestLocalAssistantStateIntoDocument()
             self.persistReplica()
@@ -325,6 +328,7 @@ final class IOSWorkspaceCoordinator: ObservableObject {
     }
 
     private func applySyncedAssistantSettingsIfAvailable(snapshotSettings: [String: SyncedMeetingContextSettings]) {
+        guard pendingLocalAssistantExportCount == 0 else { return }
         guard let onAssistantSettingsSynced else { return }
         var assistantSettings = snapshotSettings.filter { AssistantCloudSync.isAssistantScopeKey($0.key) }
         for (key, value) in replica.workspaceDoc.contextSettings where AssistantCloudSync.isAssistantScopeKey(key) {
@@ -789,8 +793,28 @@ final class IOSWorkspaceCoordinator: ObservableObject {
                 onlyUpdateOwnedExistingTasks: taskSync.preferences.roleMode == .personalOwner
             )
 
-            let mappedTasks = reconciliation.newTasks.enumerated().map { idx, reconciled -> IOSMeetingTaskItem in
+            let existingOpenTasks = tasks.filter { $0.sessionID == sid && !$0.done }
+            var deduplicatedMappedTasks: [IOSMeetingTaskItem] = []
+            for reconciled in reconciliation.newTasks {
                 let snap = reconciled.snapshot
+                let dupInExisting = existingOpenTasks.contains { existing in
+                    MeetingTaskDeduplicator.isDuplicate(
+                        candidateTitle: snap.text,
+                        candidateOwner: snap.owner,
+                        existingTitle: existing.text,
+                        existingOwner: existing.owner
+                    )
+                }
+                let dupInBatch = deduplicatedMappedTasks.contains { added in
+                    MeetingTaskDeduplicator.isDuplicate(
+                        candidateTitle: snap.text,
+                        candidateOwner: snap.owner,
+                        existingTitle: added.text,
+                        existingOwner: added.owner
+                    )
+                }
+                guard !dupInExisting && !dupInBatch else { continue }
+                let idx = deduplicatedMappedTasks.count
                 var ext = snap.extended
                 ext.applyDoneFlag(snap.done)
                 let probeItem = IOSMeetingTaskItem(
@@ -799,7 +823,7 @@ final class IOSWorkspaceCoordinator: ObservableObject {
                     dueDay: snap.dueDay, dueAt: snap.dueAt, reminderAt: snap.reminderAt,
                     done: snap.done, completedAt: snap.completedAt, updatedAt: now, extended: ext
                 )
-                return IOSMeetingTaskItem(
+                deduplicatedMappedTasks.append(IOSMeetingTaskItem(
                     id: snap.id,
                     sessionID: sid,
                     outcomeID: outcomeID,
@@ -814,8 +838,9 @@ final class IOSWorkspaceCoordinator: ObservableObject {
                     completedAt: snap.completedAt,
                     updatedAt: now,
                     extended: ext
-                )
+                ))
             }
+            let mappedTasks = deduplicatedMappedTasks
 
             let duration = max(0, endedAt.timeIntervalSince(session?.startedAt ?? endedAt))
             let existingTasks = tasks.filter { $0.sessionID == sid }
@@ -829,11 +854,24 @@ final class IOSWorkspaceCoordinator: ObservableObject {
             let manualRegenerate = !automatic && prior?.state == "ready"
             var candidates: [SyncedTaskSnapshot] = manualRegenerate ? [] : (prior?.reviewCandidates ?? [])
             let reviewAdditions = (reviewingExisting ? reconciliation.newTasks : []) + reconciliation.reviewCandidates
-            var existingFolded = Set(existingTasks.map { $0.text.workspaceFolded + "|" + $0.owner.workspaceFolded })
-                .union(candidates.map { $0.text.workspaceFolded + "|" + $0.owner.workspaceFolded })
             for add in reviewAdditions {
-                let foldedKey = add.snapshot.text.workspaceFolded + "|" + add.snapshot.owner.workspaceFolded
-                if existingFolded.insert(foldedKey).inserted {
+                let dupInTasks = existingTasks.contains { existing in
+                    MeetingTaskDeduplicator.isDuplicate(
+                        candidateTitle: add.snapshot.text,
+                        candidateOwner: add.snapshot.owner,
+                        existingTitle: existing.text,
+                        existingOwner: existing.owner
+                    )
+                }
+                let dupInCandidates = candidates.contains { existing in
+                    MeetingTaskDeduplicator.isDuplicate(
+                        candidateTitle: add.snapshot.text,
+                        candidateOwner: add.snapshot.owner,
+                        existingTitle: existing.text,
+                        existingOwner: existing.owner
+                    )
+                }
+                if !dupInTasks && !dupInCandidates {
                     candidates.append(add.snapshot)
                 }
             }
@@ -1153,10 +1191,24 @@ final class IOSWorkspaceCoordinator: ObservableObject {
         await updateTask(task)
     }
 
-    func addTask(sessionID: UUID, text: String, owner: String, dueDay: String?, reminderAt: Date?) async {
+    @discardableResult
+    func addTask(sessionID: UUID, text: String, owner: String, dueDay: String?, reminderAt: Date?) async -> (item: IOSMeetingTaskItem, created: Bool)? {
         let sid = replica.workspaceDoc.resolveCanonicalSessionID(for: sessionID)
         let clean = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !clean.isEmpty else { return }
+        guard !clean.isEmpty else { return nil }
+        let cleanOwner = owner.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let existing = tasks.first(where: { existing in
+            existing.sessionID == sid
+                && !existing.done
+                && MeetingTaskDeduplicator.isDuplicate(
+                    candidateTitle: clean,
+                    candidateOwner: cleanOwner,
+                    existingTitle: existing.text,
+                    existingOwner: existing.owner
+                )
+        }) {
+            return (existing, false)
+        }
         let now = Date()
         let outcomeID = outcomesBySession[sid]?.outcomeID
             ?? tasks.first(where: { $0.sessionID == sid })?.outcomeID ?? UUID()
@@ -1167,7 +1219,7 @@ final class IOSWorkspaceCoordinator: ObservableObject {
             outcomeID: outcomeID,
             ordinal: nextOrdinal,
             text: clean,
-            owner: owner.trimmingCharacters(in: .whitespacesAndNewlines),
+            owner: cleanOwner,
             assigneeID: nil,
             dueDay: dueDay,
             dueAt: nil,
@@ -1183,7 +1235,7 @@ final class IOSWorkspaceCoordinator: ObservableObject {
             if let session = try await store.session(sid), replica.workspaceDoc.sessions[sid] == nil {
                 upsertSessionIntoDoc(session, fieldChanges: .all)
             }
-        } catch { syncError = error.localizedDescription; return }
+        } catch { syncError = error.localizedDescription; return nil }
         let v = replica.workspaceDoc.nextVersion()
         let syncedTask = toSyncedTask(item, version: v)
         replica.workspaceDoc.upsertTask(syncedTask)
@@ -1192,6 +1244,7 @@ final class IOSWorkspaceCoordinator: ObservableObject {
         await reloadFromStore()
         await reconcileTaskNotifications()
         scheduleSync(delayMilliseconds: 250)
+        return (item, true)
     }
 
     @discardableResult
@@ -1543,7 +1596,7 @@ final class IOSWorkspaceCoordinator: ObservableObject {
         let session = sessions.first(where: { $0.id == canonical || $0.id == sessionID })
         let seriesIDs = [session?.externalSeriesID, session?.calendarSeriesID].compactMap { $0 }
         let roomKeys = [session?.invitation?.absoluteString, session?.roomIdentity].compactMap { $0 }
-        return resolvedJiraBoardConfig(
+        let resolved = resolvedJiraBoardConfig(
             seriesIDs: seriesIDs,
             roomKeys: roomKeys,
             defaultBoardURL: defaultBoardURL,
@@ -1551,6 +1604,46 @@ final class IOSWorkspaceCoordinator: ObservableObject {
             lastBoardURL: lastBoardURL,
             jiraSettings: jiraSettings
         )
+        let sessionScopeCandidates = Array(Set(["session:" + canonical.uuidString, sessionID.uuidString, "session:" + sessionID.uuidString]))
+        func validSessionURL(_ raw: String?) -> URL? {
+            guard let clean = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !clean.isEmpty,
+                  let normalized = SyncedMeetingContextSettings.normalizedBoardURLString(from: clean),
+                  let url = URL(string: normalized),
+                  let scheme = url.scheme?.lowercased(),
+                  scheme == "http" || scheme == "https",
+                  url.host != nil else { return nil }
+            return url
+        }
+        let hasSeriesOrRoomURL = seriesIDs.contains { validSessionURL(settings(for: "series:" + $0)?.jiraBoardURL?.value) != nil }
+            || roomKeys.contains { validSessionURL(settings(for: "room:" + $0)?.jiraBoardURL?.value) != nil }
+        var finalURL = resolved.boardURL
+        if !hasSeriesOrRoomURL {
+            for key in sessionScopeCandidates {
+                if let url = validSessionURL(settings(for: key)?.jiraBoardURL?.value) {
+                    finalURL = url
+                    break
+                }
+            }
+        }
+        let hasSeriesOrRoomProjects = seriesIDs.contains {
+            !(settings(for: "series:" + $0)?.jiraProjectKeys?.value ?? []).isEmpty
+        } || roomKeys.contains {
+            !(settings(for: "room:" + $0)?.jiraProjectKeys?.value ?? []).isEmpty
+        }
+        var finalProjects = resolved.projectKeys
+        if !hasSeriesOrRoomProjects {
+            for key in sessionScopeCandidates {
+                if let keys = settings(for: key)?.jiraProjectKeys?.value {
+                    let normalized = SyncedMeetingContextSettings.normalizedJiraProjectKeys(from: keys.joined(separator: ","))
+                    if !normalized.isEmpty {
+                        finalProjects = normalized
+                        break
+                    }
+                }
+            }
+        }
+        return (finalURL, finalProjects)
     }
 
     func saveDefaultTransitionMode(_ mode: IOSSameRoomTransitionMode) async {
@@ -1587,6 +1680,7 @@ final class IOSWorkspaceCoordinator: ObservableObject {
         autoExportOverrides: MeetingAutoExportOverrides? = nil,
         updateAutoExportOverrides: Bool = false
     ) async {
+        await loadReplicaFromDiskIfNeeded()
         let existing = replica.workspaceDoc.contextSettings[scopeKey]
         func scalar<V: Equatable>(_ value: V, _ prev: SyncValue<V>?) -> SyncValue<V> {
             if let prev, prev.value == value { return prev }
@@ -1616,7 +1710,7 @@ final class IOSWorkspaceCoordinator: ObservableObject {
             : existing?.autoFacilitatorSkillID
 
         let cleanedBoard = jiraBoardURL?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let normalizedBoard = (cleanedBoard?.isEmpty == false) ? cleanedBoard : nil
+        let normalizedBoard = cleanedBoard.flatMap { SyncedMeetingContextSettings.normalizedBoardURLString(from: $0) }
         let nextBoardURL = updateJiraBoardURL
             ? nullableScalar(normalizedBoard, existing?.jiraBoardURL)
             : existing?.jiraBoardURL
@@ -1673,6 +1767,7 @@ final class IOSWorkspaceCoordinator: ObservableObject {
         )
         replica.workspaceDoc.upsertContextSettings(updated)
         try? await store.saveContextSettings(updated)
+        try? await persistReplicaCheckpoint()
         await reloadFromStore()
         scheduleSync(delayMilliseconds: 300)
     }
@@ -1683,6 +1778,7 @@ final class IOSWorkspaceCoordinator: ObservableObject {
         scopeKind: SyncedMeetingContextSettings.ScopeKind,
         title: String
     ) async {
+        await loadReplicaFromDiskIfNeeded()
         let existing = replica.workspaceDoc.contextSettings[scopeKey]
         let version = replica.workspaceDoc.nextVersion()
         let titleBox: SyncValue<String> = {
@@ -1711,6 +1807,7 @@ final class IOSWorkspaceCoordinator: ObservableObject {
         )
         replica.workspaceDoc.upsertContextSettings(updated)
         try? await store.saveContextSettings(updated)
+        try? await persistReplicaCheckpoint()
         await reloadFromStore()
         scheduleSync(delayMilliseconds: 300)
     }
@@ -1721,6 +1818,7 @@ final class IOSWorkspaceCoordinator: ObservableObject {
         scopeKind: SyncedMeetingContextSettings.ScopeKind,
         title: String
     ) async {
+        await loadReplicaFromDiskIfNeeded()
         let clean = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !clean.isEmpty else { return }
         let fallbackV = replica.workspaceDoc.nextVersion()
@@ -1732,17 +1830,20 @@ final class IOSWorkspaceCoordinator: ObservableObject {
         current.guidanceRules[ruleID] = SyncValue(SyncedGuidanceRule(id: ruleID, text: clean), version: replica.workspaceDoc.nextVersion())
         replica.workspaceDoc.upsertContextSettings(current)
         try? await store.saveContextSettings(current)
+        persistReplica()
         await reloadFromStore()
         scheduleSync(delayMilliseconds: 300)
     }
 
     func removeGuidanceRule(id: UUID, scopeKey: String) async {
+        await loadReplicaFromDiskIfNeeded()
         guard var current = replica.workspaceDoc.contextSettings[scopeKey],
               var rule = current.guidanceRules[id]?.value else { return }
         rule.deleted = true
         current.guidanceRules[id] = SyncValue(rule, version: replica.workspaceDoc.nextVersion())
         replica.workspaceDoc.upsertContextSettings(current)
         try? await store.saveContextSettings(current)
+        persistReplica()
         await reloadFromStore()
         scheduleSync(delayMilliseconds: 300)
     }

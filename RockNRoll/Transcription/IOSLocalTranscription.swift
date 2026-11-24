@@ -247,6 +247,12 @@ private final class AudioIngressRouter: @unchecked Sendable {
         }
     }
 
+    func discardLocalSpeechBuffers() {
+        workerQueue.async { [self] in
+            self.pipelines["local"]?.discardPendingSpeech()
+        }
+    }
+
     func stopASRKeepAudioTap() {
         lock.withLock {
             self.running = true
@@ -547,6 +553,13 @@ final class IOSMeetingTranscriber: ObservableObject {
         onSegmentsChanged?([])
     }
 
+    func discardPendingLocalAudio() {
+        router.discardLocalSpeechBuffers()
+        if activeUtteranceByStream.removeValue(forKey: "local") != nil {
+            publishSegments()
+        }
+    }
+
     func setLocalMicrophoneOnly(_ enabled: Bool) {
         guard isLocalMicrophoneOnly != enabled else { return }
         isLocalMicrophoneOnly = enabled
@@ -816,6 +829,18 @@ private final class SpeakerPipeline {
         appleRequest?.endAudio()
         appleRequest = nil
         vad.resetState()
+    }
+
+    func discardPendingSpeech() {
+        guard !stopped else { return }
+        vad.resetState()
+        appleTask?.cancel()
+        appleTask = nil
+        appleRequest?.endAudio()
+        appleRequest = nil
+        appleTaskStartedAt = nil
+        lastAppleText = ""
+        speechStartedAt = nil
     }
 
     private func processAppleSpeech(samples16k: [Float], originalBuffer: AVAudioPCMBuffer) {

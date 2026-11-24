@@ -137,4 +137,49 @@ final class AssistantWakeAndPresetsTests: XCTestCase {
             candidates.first?.id
         )
     }
+
+    func testMultiUtteranceAndShortPhoneticEchoDetectionAndStripping() {
+        let recent = [
+            "Привет! Я Rock, сегодня проведу стендап.",
+            "Начинаем CTO Daily — кто первый?",
+            "Хорошо, слушаю апдейт по задаче."
+        ]
+
+        // Short phonetic ASR hallucinations right after assistant TTS must be treated as self-echo
+        XCTAssertTrue(AssistantWakePhraseMatcher.isLikelySelfEcho(
+            candidate: "цито Дели",
+            recentAssistantUtterances: recent,
+            isLocal: true,
+            withinEchoWindow: true
+        ))
+        XCTAssertTrue(AssistantWakePhraseMatcher.isLikelySelfEcho(
+            candidate: "сити одели",
+            recentAssistantUtterances: recent,
+            isLocal: true,
+            withinEchoWindow: true
+        ))
+        XCTAssertTrue(AssistantWakePhraseMatcher.isLikelySelfEcho(
+            candidate: "Кто первый?",
+            recentAssistantUtterances: recent,
+            isLocal: false,
+            withinEchoWindow: true
+        ))
+
+        // Distinct human speech must NOT be falsely discarded
+        XCTAssertFalse(AssistantWakePhraseMatcher.isLikelySelfEcho(
+            candidate: "У меня готов фикс для SDBCTO-42",
+            recentAssistantUtterances: recent,
+            isLocal: true,
+            withinEchoWindow: true
+        ))
+
+        // Mixed echo + real command must strip the assistant echo clause and keep user request
+        let stripped = AssistantWakePhraseMatcher.stripAssistantEcho(
+            from: "Начинаем CTO Daily кто первый? Рок, проверь задачу SDBCTO-42",
+            recentAssistantUtterances: recent,
+            withinEchoWindow: true
+        )
+        XCTAssertFalse(stripped.isEmpty)
+        XCTAssertTrue(stripped.contains("Рок, проверь задачу SDBCTO-42"))
+    }
 }

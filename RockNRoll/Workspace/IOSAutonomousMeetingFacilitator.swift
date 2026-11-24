@@ -129,7 +129,9 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
     private static let followUpWindowSeconds: TimeInterval = 90
 
     var wakeCoalesceDelay: Duration = .milliseconds(350)
-    var followUpCoalesceDelay: Duration = .milliseconds(900)
+    var followUpCoalesceDelay: Duration = .milliseconds(1500)
+    var silencePollInterval: Duration = .milliseconds(180)
+    var maxSilenceWaitDuration: Duration = .seconds(5)
 
     private weak var skills: IOSAssistantSkillsController?
     private weak var workspace: IOSWorkspaceCoordinator?
@@ -146,6 +148,14 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
     private var manuallyDisabledSessions: Set<UUID> = []
     private var lastSpokeAtBySession: [UUID: Date] = [:]
     private var lastVoiceDeliveryEndedAtBySession: [UUID: Date] = [:]
+    private var recentSpokenAnswersBySession: [UUID: [String]] = [:]
+    private var activePartialEventIDsBySession: [UUID: Set<String>] = [:]
+    private var speakingSessions: Set<UUID> = []
+    private var speechCancelEpochBySession: [UUID: UInt64] = [:]
+    private var speechActivityEpochBySession: [UUID: UInt64] = [:]
+    private var turnExecutedWriteToolBySession: [UUID: Bool] = [:]
+    private var activeSpeechTaskBySession: [UUID: Task<Void, Never>] = [:]
+    private var activeSpeechTokenBySession: [UUID: UUID] = [:]
     private var realtimeSessions: [UUID: SessionRealtimeState] = [:]
 
     init(
@@ -243,6 +253,12 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
         lastStatusBySession.removeValue(forKey: controllerID)
         lastSpokeAtBySession.removeValue(forKey: controllerID)
         lastVoiceDeliveryEndedAtBySession.removeValue(forKey: controllerID)
+        recentSpokenAnswersBySession.removeValue(forKey: controllerID)
+        activePartialEventIDsBySession.removeValue(forKey: controllerID)
+        speechActivityEpochBySession.removeValue(forKey: controllerID)
+        turnExecutedWriteToolBySession.removeValue(forKey: controllerID)
+        activeSpeechTokenBySession.removeValue(forKey: controllerID)
+        cancelActiveSpeechForBargeIn(controllerID: controllerID)
         busySessions.remove(controllerID)
         resolveBridge(controllerID)?.setRealtimeAudioTap(nil)
         if let state = realtimeSessions.removeValue(forKey: controllerID) {
@@ -291,6 +307,12 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
         lastSpokeAtBySession.removeValue(forKey: controllerID)
         lastSpokenAnswerBySession.removeValue(forKey: controllerID)
         lastVoiceDeliveryEndedAtBySession.removeValue(forKey: controllerID)
+        recentSpokenAnswersBySession.removeValue(forKey: controllerID)
+        activePartialEventIDsBySession.removeValue(forKey: controllerID)
+        speechActivityEpochBySession.removeValue(forKey: controllerID)
+        turnExecutedWriteToolBySession.removeValue(forKey: controllerID)
+        activeSpeechTokenBySession.removeValue(forKey: controllerID)
+        cancelActiveSpeechForBargeIn(controllerID: controllerID)
         busySessions.remove(controllerID)
         resolveBridge(controllerID)?.setRealtimeAudioTap(nil)
         if let state = realtimeSessions.removeValue(forKey: controllerID) {
@@ -360,6 +382,92 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
         seenEventOrderBySession[controllerID] = order
     }
 
+    private func recordSpokenAnswer(_ text: String, for controllerID: UUID) {
+        lastSpokeAtBySession[controllerID] = Date()
+        lastSpokenAnswerBySession[controllerID] = text
+        var history = recentSpokenAnswersBySession[controllerID] ?? []
+        if history.last != text {
+            history.append(text)
+            if history.count > 3 {
+                history.removeFirst(history.count - 3)
+            }
+            recentSpokenAnswersBySession[controllerID] = history
+        }
+    }
+
+    private func recentEchoCandidates(for controllerID: UUID) -> [String] {
+        if let history = recentSpokenAnswersBySession[controllerID], !history.isEmpty {
+            return history
+        }
+        if let last = lastSpokenAnswerBySession[controllerID]?.trimmingCharacters(in: .whitespacesAndNewlines), !last.isEmpty {
+            return [last]
+        }
+        return []
+    }
+
+    private func isWithinEchoWindow(for controllerID: UUID, at now: Date = Date()) -> Bool {
+        if speakingSessions.contains(controllerID) {
+            return true
+        }
+        if let endedAt = lastVoiceDeliveryEndedAtBySession[controllerID],
+           now.timeIntervalSince(endedAt) <= 6 {
+            return true
+        }
+        if let spokenAt = lastSpokeAtBySession[controllerID],
+           now.timeIntervalSince(spokenAt) <= 6 {
+            return true
+        }
+        return false
+    }
+
+    func updatePartialActivity(controllerID: UUID, partialEventIDs: Set<String>) {
+        let previous = activePartialEventIDsBySession[controllerID] ?? []
+        activePartialEventIDsBySession[controllerID] = partialEventIDs
+        if !partialEventIDs.subtracting(previous).isEmpty, speakingSessions.contains(controllerID) {
+            cancelActiveSpeechForBargeIn(controllerID: controllerID)
+        }
+        if partialEventIDs.isEmpty && !previous.isEmpty {
+            schedulePendingTurnIfNeeded(controllerID: controllerID)
+        }
+    }
+
+    func handleExternalVoiceBargeIn(controllerID: UUID) {
+        cancelActiveSpeechForBargeIn(controllerID: controllerID)
+    }
+
+    private func cancelActiveSpeechForBargeIn(controllerID: UUID) {
+        speechCancelEpochBySession[controllerID, default: 0] &+= 1
+        let wasSpeaking = speakingSessions.remove(controllerID) != nil
+        activeSpeechTaskBySession.removeValue(forKey: controllerID)?.cancel()
+        if wasSpeaking {
+            IOSVoicePreviewPlayer.shared.stop()
+            resolveBridge(controllerID)?.cancelVoiceReplyForBargeIn()
+            lastStatusBySession[controllerID] = L("Listening…")
+        }
+        if let rtState = realtimeSessions[controllerID], rtState.responseInProgress {
+            rtState.turnTimeoutTask?.cancel()
+            rtState.turnTimeoutTask = nil
+            rtState.responseInProgress = false
+            rtState.audioChunks.removeAll()
+            rtState.transcriptBuffer = ""
+            busySessions.remove(controllerID)
+        }
+    }
+
+    private func waitForSpeakerSilence(controllerID: UUID) async {
+        guard maxSilenceWaitDuration > .zero, silencePollInterval > .zero else { return }
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: maxSilenceWaitDuration)
+        while !Task.isCancelled && clock.now < deadline {
+            let hasPartials = !(activePartialEventIDsBySession[controllerID]?.isEmpty ?? true)
+            let humanSpeaking = resolveBridge(controllerID)?.isHumanSpeaking() ?? false
+            if !hasPartials && !humanSpeaking {
+                return
+            }
+            try? await clock.sleep(for: silencePollInterval)
+        }
+    }
+
     func observeEvents(
         controllerID: UUID,
         title: String,
@@ -377,18 +485,48 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
         mergeRecentEvents(events, for: controllerID)
         guard activeSessionSkills[controllerID] != nil else { return }
 
+        let now = Date()
+        let inEchoWindow = isWithinEchoWindow(for: controllerID, at: now)
+        let recentAnswers = recentEchoCandidates(for: controllerID)
+
         let seen = seenEventIDsBySession[controllerID] ?? []
         var staged = pendingUnseenEventsBySession[controllerID] ?? []
         var appended = false
+        var sawGenuineHumanSpeech = false
         for ev in events {
             guard !seen.contains(ev.id),
                   ev.kind == "transcript" || ev.kind == "chat",
                   !ev.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
+            if !AssistantSpeechLedger.isAssistantSpeaker(ev.speaker, role: ev.speakerRole) {
+                let clean = ev.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                let isEcho = AssistantWakePhraseMatcher.isLikelySelfEcho(
+                    candidate: clean,
+                    recentAssistantUtterances: recentAnswers,
+                    isLocal: ev.isOwn,
+                    withinEchoWindow: inEchoWindow
+                )
+                if !isEcho {
+                    let stripped = AssistantWakePhraseMatcher.stripAssistantEcho(
+                        from: clean,
+                        recentAssistantUtterances: recentAnswers,
+                        withinEchoWindow: inEchoWindow
+                    )
+                    if !stripped.isEmpty {
+                        sawGenuineHumanSpeech = true
+                    }
+                }
+            }
             if let existingIndex = staged.firstIndex(where: { $0.id == ev.id }) {
                 staged[existingIndex] = ev
             } else {
                 staged.append(ev)
                 appended = true
+            }
+        }
+        if sawGenuineHumanSpeech {
+            speechActivityEpochBySession[controllerID, default: 0] &+= 1
+            if speakingSessions.contains(controllerID) {
+                cancelActiveSpeechForBargeIn(controllerID: controllerID)
             }
         }
         guard !staged.isEmpty else { return }
@@ -408,10 +546,8 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
         let inFollowUpWindow = lastSpokeAtBySession[controllerID].map {
             now.timeIntervalSince($0) <= Self.followUpWindowSeconds
         } ?? false
-        let inEchoWindow = lastVoiceDeliveryEndedAtBySession[controllerID].map {
-            now.timeIntervalSince($0) <= 6
-        } ?? false
-        let lastSpoken = lastSpokenAnswerBySession[controllerID] ?? ""
+        let inEchoWindow = isWithinEchoWindow(for: controllerID, at: now)
+        let recentAnswers = recentEchoCandidates(for: controllerID)
 
         var hasWake = false
         var hasFollowUp = false
@@ -419,15 +555,21 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
             if AssistantSpeechLedger.isAssistantSpeaker(ev.speaker, role: ev.speakerRole) {
                 continue
             }
-            let clean = ev.text.trimmingCharacters(in: .whitespacesAndNewlines)
-            if clean.isEmpty || AssistantWakePhraseMatcher.isLikelySelfEcho(
-                candidate: clean,
-                lastSpoken: lastSpoken,
+            let rawClean = ev.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if rawClean.isEmpty || AssistantWakePhraseMatcher.isLikelySelfEcho(
+                candidate: rawClean,
+                recentAssistantUtterances: recentAnswers,
                 isLocal: ev.isOwn,
                 withinEchoWindow: inEchoWindow
             ) {
                 continue
             }
+            let clean = AssistantWakePhraseMatcher.stripAssistantEcho(
+                from: rawClean,
+                recentAssistantUtterances: recentAnswers,
+                withinEchoWindow: inEchoWindow
+            )
+            guard !clean.isEmpty else { continue }
             switch AssistantWakePhraseMatcher.match(clean) {
             case .command(let cmd) where !cmd.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty:
                 hasWake = true
@@ -441,13 +583,19 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
         }
 
         if !hasWake && !hasFollowUp {
+            if !(activePartialEventIDsBySession[controllerID]?.isEmpty ?? true) {
+                return
+            }
             markEventsSeen(staged, for: controllerID)
             pendingUnseenEventsBySession.removeValue(forKey: controllerID)
             return
         }
 
         coalesceTasksBySession.removeValue(forKey: controllerID)?.cancel()
-        let delay = hasWake ? wakeCoalesceDelay : followUpCoalesceDelay
+        let baseDelay = hasWake ? wakeCoalesceDelay : followUpCoalesceDelay
+        let delay = (!(activePartialEventIDsBySession[controllerID]?.isEmpty ?? true) || (resolveBridge(controllerID)?.isHumanSpeaking() == true))
+            ? max(baseDelay, silencePollInterval)
+            : baseDelay
         coalesceTasksBySession[controllerID] = Task { @MainActor [weak self] in
             if delay > .zero {
                 try? await Task.sleep(for: delay)
@@ -461,6 +609,13 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
     private func flushPendingBatchTurn(controllerID: UUID) async {
         guard !busySessions.contains(controllerID),
               let skillID = activeSessionSkills[controllerID],
+              let initial = pendingUnseenEventsBySession[controllerID],
+              !initial.isEmpty else { return }
+
+        await waitForSpeakerSilence(controllerID: controllerID)
+        guard !Task.isCancelled,
+              !busySessions.contains(controllerID),
+              activeSessionSkills[controllerID] == skillID,
               let batch = pendingUnseenEventsBySession.removeValue(forKey: controllerID),
               !batch.isEmpty else { return }
 
@@ -470,10 +625,8 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
         let inFollowUpWindow = lastSpokeAtBySession[controllerID].map {
             now.timeIntervalSince($0) <= Self.followUpWindowSeconds
         } ?? false
-        let inEchoWindow = lastVoiceDeliveryEndedAtBySession[controllerID].map {
-            now.timeIntervalSince($0) <= 6
-        } ?? false
-        let lastSpoken = lastSpokenAnswerBySession[controllerID] ?? ""
+        let inEchoWindow = isWithinEchoWindow(for: controllerID, at: now)
+        let recentAnswers = recentEchoCandidates(for: controllerID)
 
         var sawWake = false
         var fragments: [String] = []
@@ -482,15 +635,21 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
             if AssistantSpeechLedger.isAssistantSpeaker(ev.speaker, role: ev.speakerRole) {
                 continue
             }
-            let clean = ev.text.trimmingCharacters(in: .whitespacesAndNewlines)
-            if clean.isEmpty || AssistantWakePhraseMatcher.isLikelySelfEcho(
-                candidate: clean,
-                lastSpoken: lastSpoken,
+            let rawClean = ev.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if rawClean.isEmpty || AssistantWakePhraseMatcher.isLikelySelfEcho(
+                candidate: rawClean,
+                recentAssistantUtterances: recentAnswers,
                 isLocal: ev.isOwn,
                 withinEchoWindow: inEchoWindow
             ) {
                 continue
             }
+            let clean = AssistantWakePhraseMatcher.stripAssistantEcho(
+                from: rawClean,
+                recentAssistantUtterances: recentAnswers,
+                withinEchoWindow: inEchoWindow
+            )
+            guard !clean.isEmpty else { continue }
             switch AssistantWakePhraseMatcher.match(clean) {
             case .command(let cmd):
                 let trimmedCmd = cmd.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -646,6 +805,8 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
         }
 
         // 2. Standard AI + deterministic iOS tool loop fallback.
+        let turnEpoch = speechActivityEpochBySession[controllerID, default: 0]
+        turnExecutedWriteToolBySession[controllerID] = false
         let reply = await executeStandardTurn(
             controllerID: controllerID,
             title: title,
@@ -655,6 +816,18 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
             commandText: commandText
         )
         if !reply.isEmpty {
+            await waitForSpeakerSilence(controllerID: controllerID)
+            guard activeSessionSkills[controllerID] != nil,
+                  !manuallyDisabledSessions.contains(controllerID) else { return }
+            let didMutate = turnExecutedWriteToolBySession[controllerID] ?? false
+            let hasNewPending = !(pendingUnseenEventsBySession[controllerID]?.isEmpty ?? true)
+            let activityAdvanced = speechActivityEpochBySession[controllerID, default: 0] != turnEpoch
+            if !didMutate && (activityAdvanced && hasNewPending) {
+                return
+            }
+            if !didMutate && ((resolveBridge(controllerID)?.isHumanSpeaking() ?? false) || !(activePartialEventIDsBySession[controllerID]?.isEmpty ?? true)) {
+                return
+            }
             await speakIntoMeeting(reply, controllerID: controllerID)
         }
     }
@@ -684,6 +857,16 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
             lastBoardURL: skills.lastBoardURL,
             jiraSettings: workspace.taskSync.preferences.jira
         )
+        let boardDerivedKeys = await workspace.taskSync.resolveBoardDerivedProjectKeys()
+        let globalFallbackKeys = SyncedMeetingContextSettings.normalizedJiraProjectKeys(from: [
+            skills.teamContext.defaultJiraProjectKey,
+            workspace.taskSync.preferences.jira.cleanProjectKey
+        ])
+        let effectiveProjectKeys = WorkspaceTaskSyncController.resolvedEffectiveJiraProjectKeys(
+            configured: jiraConfig.projectKeys,
+            globalFallback: globalFallbackKeys,
+            boardDerived: boardDerivedKeys
+        )
         let effectiveBoardURL = jiraConfig.boardURL?.absoluteString ?? skills.teamContext.defaultJiraBoardURL
 
         // Direct deterministic board controls when allowed
@@ -695,6 +878,7 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
                targetID: controllerID,
                people: skills.people
            ) {
+            turnExecutedWriteToolBySession[controllerID] = true
             AppDiagnostics.log("assistant-facilitator-turn", [
                 "skill": skillID,
                 "route": "deterministic-board",
@@ -706,16 +890,22 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
         // Direct deterministic task creation by approved speaker when allowed
         if allowWrites && (allowedGroups.isEmpty || allowedGroups.contains(.tasks)),
            let extractedTask = Self.extractDirectTaskInstruction(from: commandText, lower: lower) {
-            if let created = await skills.createTaskWithPeopleResolution(
+            if let created = await skills.createTaskDetailedWithPeopleResolution(
                 sessionID: resolvedSessionID,
                 title: extractedTask.title,
                 owner: extractedTask.owner ?? speakerName
             ) {
+                turnExecutedWriteToolBySession[controllerID] = true
                 AppDiagnostics.log("assistant-facilitator-turn", [
                     "skill": skillID,
                     "route": "deterministic-task",
                     "allowWrites": allowWrites
                 ])
+                if created.alreadyExisted {
+                    return created.resolvedOwner.isEmpty
+                        ? L("Task “%@” is already on the list.", created.resolvedTitle)
+                        : L("Task “%@” for %@ is already on the list.", created.resolvedTitle, created.resolvedOwner)
+                }
                 return created.resolvedOwner.isEmpty
                     ? L("Created task “%@”.", created.resolvedTitle)
                     : L("Created task “%@” for %@.", created.resolvedTitle, created.resolvedOwner)
@@ -747,7 +937,8 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
         - board_current_url: \(board?.currentURL?.absoluteString ?? "none")
         - board_sharing: \(board?.isSharing == true), reconnecting: \(board?.isRecoveringShare == true)
         - effective_jira_board_url: \(effectiveBoardURL.isEmpty ? "none" : effectiveBoardURL)
-        - effective_jira_project_keys: \(jiraConfig.projectKeys.isEmpty ? "none" : jiraConfig.projectKeys.joined(separator: ", "))
+        - effective_jira_project_keys: \(effectiveProjectKeys.isEmpty ? "none" : effectiveProjectKeys.joined(separator: ", "))
+        - board_derived_project_keys: \(boardDerivedKeys.isEmpty ? "none" : boardDerivedKeys.joined(separator: ", "))
         - participants: \(meetingParticipants.isEmpty ? "unknown" : meetingParticipants.joined(separator: ", "))
         """
 
@@ -789,6 +980,18 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
             tools: toolDeclarations,
             toolExecutor: { [weak self] name, argsJSON in
                 guard let self else { return "{}" }
+                if name == "rocknroll_create_task"
+                    || name == "rocknroll_update_task"
+                    || name == "rocknroll_update_meeting_artifacts"
+                    || name == "rocknroll_schedule_meeting"
+                    || name == "rocknroll_people_directory" {
+                    self.turnExecutedWriteToolBySession[controllerID] = true
+                } else if name == "rocknroll_jira_action" || name == "rocknroll_control_board" {
+                    let lowerArgs = argsJSON.lowercased()
+                    if !lowerArgs.contains("\"search\"") && !lowerArgs.contains("\"inspect\"") && !lowerArgs.contains("\"board_users\"") {
+                        self.turnExecutedWriteToolBySession[controllerID] = true
+                    }
+                }
                 return await Self.executeSharedTool(
                     name: name,
                     argumentsJSON: argsJSON,
@@ -858,7 +1061,17 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
             lastBoardURL: skills.lastBoardURL,
             jiraSettings: workspace?.taskSync.preferences.jira ?? .init()
         )
-        let boardLine = "Effective Jira board URL: \(jiraConfig?.boardURL?.absoluteString ?? skills.teamContext.defaultJiraBoardURL). Effective project keys: \((jiraConfig?.projectKeys ?? []).joined(separator: ", "))."
+        let boardDerivedKeys = await workspace?.taskSync.resolveBoardDerivedProjectKeys() ?? []
+        let globalFallbackKeys = SyncedMeetingContextSettings.normalizedJiraProjectKeys(from: [
+            skills.teamContext.defaultJiraProjectKey,
+            workspace?.taskSync.preferences.jira.cleanProjectKey ?? ""
+        ])
+        let mergedKeys = WorkspaceTaskSyncController.resolvedEffectiveJiraProjectKeys(
+            configured: jiraConfig?.projectKeys ?? globalFallbackKeys,
+            globalFallback: globalFallbackKeys,
+            boardDerived: boardDerivedKeys
+        )
+        let boardLine = "Effective Jira board URL: \(jiraConfig?.boardURL?.absoluteString ?? skills.teamContext.defaultJiraBoardURL). Effective project keys: \(mergedKeys.joined(separator: ", ")). Board-derived project keys: \(boardDerivedKeys.joined(separator: ", "))."
         let instructions = [rendered.basePersona, rendered.instructions, identityGuidance, boardLine]
             .filter { !$0.isEmpty }
             .joined(separator: "\n\n")
@@ -1027,10 +1240,18 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
             lastBoardURL: skills.lastBoardURL,
             jiraSettings: workspace?.taskSync.preferences.jira ?? .init()
         )
-        let effectiveProjectKeys = jiraConfig?.projectKeys ?? SyncedMeetingContextSettings.normalizedJiraProjectKeys(from: [
+        let boardDerivedKeys = await workspace?.taskSync.resolveBoardDerivedProjectKeys() ?? []
+        let globalFallbackKeys = SyncedMeetingContextSettings.normalizedJiraProjectKeys(from: [
             skills.teamContext.defaultJiraProjectKey,
             workspace?.taskSync.preferences.jira.cleanProjectKey ?? ""
         ])
+        let configuredKeys = jiraConfig?.projectKeys ?? globalFallbackKeys
+        let effectiveProjectKeys = WorkspaceTaskSyncController.resolvedEffectiveJiraProjectKeys(
+            configured: configuredKeys,
+            globalFallback: globalFallbackKeys,
+            boardDerived: boardDerivedKeys
+        )
+        let allProjectCandidates = effectiveProjectKeys + boardDerivedKeys.filter { !effectiveProjectKeys.contains($0) }
         let effectiveBoardURL = jiraConfig?.boardURL?.absoluteString ?? skills.teamContext.defaultJiraBoardURL
 
         switch name {
@@ -1148,7 +1369,7 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
             guard let title = (args["title"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !title.isEmpty else {
                 return "{\"error\":\"title required\"}"
             }
-            let created = await skills.createTaskWithPeopleResolution(
+            let created = await skills.createTaskDetailedWithPeopleResolution(
                 sessionID: sessionID,
                 title: title,
                 owner: args["owner"] as? String,
@@ -1156,7 +1377,9 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
                 syncToJira: (args["sync_to_jira"] as? Bool) ?? false
             )
             return jsonString([
-                "created": created != nil,
+                "created": created != nil && created?.alreadyExisted == false,
+                "already_existed": created?.alreadyExisted ?? false,
+                "ok": created != nil,
                 "title": created?.resolvedTitle ?? title,
                 "owner": created?.resolvedOwner ?? ""
             ])
@@ -1198,7 +1421,7 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
                     actionItems.append((text: raw.trimmingCharacters(in: .whitespacesAndNewlines), owner: "", dueDay: nil))
                 }
             }
-            let ok = await skills.updateMeetingArtifacts(
+            let details = await skills.updateMeetingArtifactsDetailed(
                 sessionID: sessionID,
                 summaryAppend: args["summary_append"] as? String,
                 replaceSummary: args["replace_summary"] as? String,
@@ -1206,7 +1429,11 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
                 openQuestions: args["open_questions"] as? [String] ?? [],
                 actionItems: actionItems
             )
-            return jsonString(["updated": ok, "action_items_added": actionItems.count])
+            return jsonString([
+                "updated": details.updated,
+                "action_items_added": details.createdTaskCount,
+                "action_items_deduplicated": details.deduplicatedTaskCount
+            ])
 
         case "rocknroll_schedule_meeting":
             guard allowWrites && allows(.calendarSchedule) else { return "{\"error\":\"Calendar scheduling not allowed\"}" }
@@ -1418,10 +1645,14 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
                     let kind = (args["issue_kind"] as? String).flatMap(TaskIssueKind.init(rawValue:)) ?? .task
                     let priority = (args["priority"] as? String).flatMap(TaskPriorityLevel.init(rawValue:))
                     let explicitProjectKey = (args["project_key"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let resolvedProjectKey = WorkspaceTaskSyncController.resolveSpokenProjectKey(
+                        explicitProjectKey ?? "",
+                        candidates: allProjectCandidates
+                    ) ?? effectiveProjectKeys.first
                     let created = try await skills.createJiraIssueDirect(
                         summary: summary,
                         description: (args["description"] as? String) ?? "",
-                        projectKey: (explicitProjectKey?.isEmpty == false ? explicitProjectKey : effectiveProjectKeys.first),
+                        projectKey: resolvedProjectKey,
                         issueKind: kind,
                         assignee: assigneeContact,
                         priority: priority,
@@ -1687,6 +1918,14 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
             state.audioChunks.removeAll()
             let text = AssistantSpeechLedger.sanitizeSpokenReply(state.transcriptBuffer)
             state.transcriptBuffer = ""
+            await waitForSpeakerSilence(controllerID: controllerID)
+            guard activeSessionSkills[controllerID] != nil,
+                  !manuallyDisabledSessions.contains(controllerID),
+                  resolveBridge(controllerID)?.isConnected() == true,
+                  !(resolveBridge(controllerID)?.isHumanSpeaking() ?? false) else {
+                schedulePendingTurnIfNeeded(controllerID: controllerID)
+                return
+            }
             if let buffer = RealtimeVoiceAudio.pcm16ToAudioBuffer(data: combined, sampleRate: state.outputSampleRate) {
                 state.gate.markVoiceDeliveryStarted()
                 await deliverSpokenBuffer(buffer, fallbackText: text, controllerID: controllerID)
@@ -1733,10 +1972,19 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
     }
 
     func speakIntoMeeting(_ text: String, controllerID: UUID) async {
+        guard activeSessionSkills[controllerID] != nil,
+              !manuallyDisabledSessions.contains(controllerID),
+              let initialBridge = resolveBridge(controllerID),
+              initialBridge.isConnected() else {
+            return
+        }
         let clean = AssistantSpeechLedger.sanitizeSpokenReply(text)
         guard !clean.isEmpty else { return }
-        lastSpokeAtBySession[controllerID] = Date()
-        lastSpokenAnswerBySession[controllerID] = clean
+        let startEpoch = speechCancelEpochBySession[controllerID, default: 0]
+        let speechToken = UUID()
+        activeSpeechTaskBySession[controllerID]?.cancel()
+        activeSpeechTokenBySession[controllerID] = speechToken
+        recordSpokenAnswer(clean, for: controllerID)
         mergeRecentEvents([
             SyncedTranscriptEvent(
                 id: "assistant:\(UUID().uuidString)",
@@ -1750,24 +1998,61 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
             )
         ], for: controllerID)
         realtimeSessions[controllerID]?.gate.markVoiceDeliveryStarted()
+        speakingSessions.insert(controllerID)
         defer {
-            let endedAt = Date()
-            lastSpokeAtBySession[controllerID] = endedAt
-            lastVoiceDeliveryEndedAtBySession[controllerID] = endedAt
-            realtimeSessions[controllerID]?.gate.markVoiceDeliveryEnded(at: endedAt)
-        }
-
-        if let bridge = resolveBridge(controllerID) {
-            do {
-                try await bridge.speakVoice(clean)
-                lastStatusBySession[controllerID] = L("Spoken into “%@”.", bridge.title)
-                return
-            } catch {
-                // Fall back to local voice auditioning when call audio is off/disconnected.
+            if activeSpeechTokenBySession[controllerID] == speechToken {
+                activeSpeechTokenBySession.removeValue(forKey: controllerID)
+                speakingSessions.remove(controllerID)
+                activeSpeechTaskBySession.removeValue(forKey: controllerID)
+                let endedAt = Date()
+                lastSpokeAtBySession[controllerID] = endedAt
+                lastVoiceDeliveryEndedAtBySession[controllerID] = endedAt
+                realtimeSessions[controllerID]?.gate.markVoiceDeliveryEnded(at: endedAt)
             }
         }
-        await playLocalAuditionAndWait(clean)
-        lastStatusBySession[controllerID] = L("Auditioned locally (meeting audio off).")
+
+        if let bridge = resolveBridge(controllerID), bridge.isConnected() {
+            let speechTask = Task<Void, Never> { @MainActor [weak self] in
+                guard let self,
+                      !Task.isCancelled,
+                      self.activeSpeechTokenBySession[controllerID] == speechToken,
+                      self.speechCancelEpochBySession[controllerID, default: 0] == startEpoch,
+                      self.activeSessionSkills[controllerID] != nil,
+                      !self.manuallyDisabledSessions.contains(controllerID) else {
+                    return
+                }
+                do {
+                    try await bridge.speakVoice(clean)
+                    guard !Task.isCancelled,
+                          self.activeSpeechTokenBySession[controllerID] == speechToken,
+                          self.speechCancelEpochBySession[controllerID, default: 0] == startEpoch else {
+                        return
+                    }
+                    self.lastStatusBySession[controllerID] = L("Spoken into “%@”.", bridge.title)
+                    return
+                } catch {
+                    // Only fall back to local auditioning when STILL connected in the meeting and meeting audio is muted/disabled;
+                    // never talk out loud after leaving, disconnecting, disabling facilitator, or being interrupted by human barge-in.
+                    let canAuditionLocally = !Task.isCancelled
+                        && self.activeSpeechTokenBySession[controllerID] == speechToken
+                        && self.speechCancelEpochBySession[controllerID, default: 0] == startEpoch
+                        && self.activeSessionSkills[controllerID] != nil
+                        && !self.manuallyDisabledSessions.contains(controllerID)
+                        && bridge.isConnected()
+                        && !bridge.isMeetingSoundEnabled
+                        && !bridge.isHumanSpeaking()
+                    guard canAuditionLocally else { return }
+                }
+                await self.playLocalAuditionAndWait(clean)
+                if !Task.isCancelled,
+                   self.activeSpeechTokenBySession[controllerID] == speechToken,
+                   self.speechCancelEpochBySession[controllerID, default: 0] == startEpoch {
+                    self.lastStatusBySession[controllerID] = L("Auditioned locally (meeting audio off).")
+                }
+            }
+            activeSpeechTaskBySession[controllerID] = speechTask
+            await speechTask.value
+        }
     }
 
     private func playLocalAuditionAndWait(_ text: String) async {
@@ -1818,10 +2103,19 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
     }
 
     private func deliverSpokenBuffer(_ buffer: AVAudioPCMBuffer, fallbackText: String, controllerID: UUID) async {
+        guard activeSessionSkills[controllerID] != nil,
+              !manuallyDisabledSessions.contains(controllerID),
+              let initialBridge = resolveBridge(controllerID),
+              initialBridge.isConnected() else {
+            return
+        }
         let cleanFallback = AssistantSpeechLedger.sanitizeSpokenReply(fallbackText)
-        lastSpokeAtBySession[controllerID] = Date()
+        let startEpoch = speechCancelEpochBySession[controllerID, default: 0]
+        let speechToken = UUID()
+        activeSpeechTaskBySession[controllerID]?.cancel()
+        activeSpeechTokenBySession[controllerID] = speechToken
         if !cleanFallback.isEmpty {
-            lastSpokenAnswerBySession[controllerID] = cleanFallback
+            recordSpokenAnswer(cleanFallback, for: controllerID)
             mergeRecentEvents([
                 SyncedTranscriptEvent(
                     id: "assistant:\(UUID().uuidString)",
@@ -1834,43 +2128,86 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
                     deviceID: "local-assistant"
                 )
             ], for: controllerID)
+        } else {
+            lastSpokeAtBySession[controllerID] = Date()
         }
         realtimeSessions[controllerID]?.gate.markVoiceDeliveryStarted()
+        speakingSessions.insert(controllerID)
         defer {
-            let endedAt = Date()
-            lastSpokeAtBySession[controllerID] = endedAt
-            lastVoiceDeliveryEndedAtBySession[controllerID] = endedAt
-            realtimeSessions[controllerID]?.gate.markVoiceDeliveryEnded(at: endedAt)
+            if activeSpeechTokenBySession[controllerID] == speechToken {
+                activeSpeechTokenBySession.removeValue(forKey: controllerID)
+                speakingSessions.remove(controllerID)
+                activeSpeechTaskBySession.removeValue(forKey: controllerID)
+                let endedAt = Date()
+                lastSpokeAtBySession[controllerID] = endedAt
+                lastVoiceDeliveryEndedAtBySession[controllerID] = endedAt
+                realtimeSessions[controllerID]?.gate.markVoiceDeliveryEnded(at: endedAt)
+            }
         }
 
-        if let bridge = resolveBridge(controllerID) {
-            if let speakBuffer = bridge.speakAudioBuffer {
-                let utteranceID = UUID().uuidString
-                let startedAt = Date()
-                if !cleanFallback.isEmpty {
-                    bridge.recordAssistantSpeech(utteranceID, cleanFallback, startedAt, nil)
+        if let bridge = resolveBridge(controllerID), bridge.isConnected() {
+            let speechTask = Task<Void, Never> { @MainActor [weak self] in
+                guard let self,
+                      !Task.isCancelled,
+                      self.activeSpeechTokenBySession[controllerID] == speechToken,
+                      self.speechCancelEpochBySession[controllerID, default: 0] == startEpoch,
+                      self.activeSessionSkills[controllerID] != nil,
+                      !self.manuallyDisabledSessions.contains(controllerID) else {
+                    return
                 }
-                do {
-                    defer {
-                        if !cleanFallback.isEmpty {
-                            bridge.recordAssistantSpeech(utteranceID, cleanFallback, startedAt, Date())
-                        }
+                if let speakBuffer = bridge.speakAudioBuffer {
+                    let utteranceID = UUID().uuidString
+                    let startedAt = Date()
+                    if !cleanFallback.isEmpty {
+                        bridge.recordAssistantSpeech(utteranceID, cleanFallback, startedAt, nil)
                     }
-                    try await speakBuffer(buffer)
-                    lastStatusBySession[controllerID] = L("Spoken into “%@”.", bridge.title)
-                    return
-                } catch {}
+                    do {
+                        defer {
+                            if !cleanFallback.isEmpty {
+                                bridge.recordAssistantSpeech(utteranceID, cleanFallback, startedAt, Date())
+                            }
+                        }
+                        try await speakBuffer(buffer)
+                        if !Task.isCancelled,
+                           self.activeSpeechTokenBySession[controllerID] == speechToken,
+                           self.speechCancelEpochBySession[controllerID, default: 0] == startEpoch {
+                            self.lastStatusBySession[controllerID] = L("Spoken into “%@”.", bridge.title)
+                        }
+                        return
+                    } catch {}
+                }
+                if !cleanFallback.isEmpty,
+                   !Task.isCancelled,
+                   self.activeSpeechTokenBySession[controllerID] == speechToken,
+                   self.speechCancelEpochBySession[controllerID, default: 0] == startEpoch,
+                   self.activeSessionSkills[controllerID] != nil,
+                   !self.manuallyDisabledSessions.contains(controllerID),
+                   bridge.isConnected() {
+                    do {
+                        try await bridge.speakVoice(cleanFallback)
+                        if !Task.isCancelled,
+                           self.activeSpeechTokenBySession[controllerID] == speechToken,
+                           self.speechCancelEpochBySession[controllerID, default: 0] == startEpoch {
+                            self.lastStatusBySession[controllerID] = L("Spoken into “%@”.", bridge.title)
+                        }
+                        return
+                    } catch {}
+                }
+                let canAuditionLocally = !Task.isCancelled
+                    && self.activeSpeechTokenBySession[controllerID] == speechToken
+                    && self.speechCancelEpochBySession[controllerID, default: 0] == startEpoch
+                    && self.activeSessionSkills[controllerID] != nil
+                    && !self.manuallyDisabledSessions.contains(controllerID)
+                    && bridge.isConnected()
+                    && !bridge.isMeetingSoundEnabled
+                    && !bridge.isHumanSpeaking()
+                guard canAuditionLocally else { return }
+                try? IOSVoicePreviewPlayer.shared.play(buffer)
+                self.lastStatusBySession[controllerID] = L("Auditioned locally (meeting audio off).")
             }
-            if !cleanFallback.isEmpty {
-                do {
-                    try await bridge.speakVoice(cleanFallback)
-                    lastStatusBySession[controllerID] = L("Spoken into “%@”.", bridge.title)
-                    return
-                } catch {}
-            }
+            activeSpeechTaskBySession[controllerID] = speechTask
+            await speechTask.value
         }
-        try? IOSVoicePreviewPlayer.shared.play(buffer)
-        lastStatusBySession[controllerID] = L("Auditioned locally (meeting audio off).")
     }
 
     private func syncRealtimeActiveFlag() {

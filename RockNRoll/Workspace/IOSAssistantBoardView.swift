@@ -43,7 +43,7 @@ private final class IOSBoardDirtyScriptHandlerProxy: NSObject, WKScriptMessageHa
 /// and streaming desktop-sized Jira or project boards directly into an active iOS meeting.
 @MainActor
 final class IOSAssistantBoardController: NSObject, ObservableObject, WKNavigationDelegate, WKUIDelegate, JiraBoardWebEvaluating {
-    static let desktopViewportSize = CGSize(width: 1440, height: 810)
+    static let desktopViewportSize = CGSize(width: 1280, height: 720)
     static let sharedOutputSize = CGSize(width: 1920, height: 1080)
     static let desktopUserAgent =
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15"
@@ -98,6 +98,7 @@ final class IOSAssistantBoardController: NSObject, ObservableObject, WKNavigatio
     @Published private(set) var sharingMeetingTitle: String?
     @Published private(set) var isStartingShare = false
     @Published private(set) var isRecoveringShare = false
+    @Published var presentationModeEnabled = true
     @Published var isPresented = false
     var isInlineSheetActive = false
 
@@ -366,6 +367,11 @@ final class IOSAssistantBoardController: NSObject, ObservableObject, WKNavigatio
                 desiredShareURL = loaded
             }
 
+            if presentationModeEnabled, currentURL != nil {
+                _ = try? await callBoardAsyncJS(JiraBoardDOMScripts.applyPresentationModeScript(enabled: true), arguments: [:])
+                _ = try? await callBoardAsyncJS(JiraBoardDOMScripts.focusActiveCardsScript(), arguments: [:])
+            }
+
             guard shareAttemptGeneration == attempt else { throw CancellationError() }
             guard target.canShareBoard else {
                 throw MeetingSessionError.unavailable(L("Connect to a meeting before sharing the Assistant Board."))
@@ -546,6 +552,15 @@ final class IOSAssistantBoardController: NSObject, ObservableObject, WKNavigatio
             }
         }
         ensureWebViewHostedForRendering()
+        if clearDesiredIntent, wasSharing, currentURL != nil {
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                _ = try? await self.callBoardAsyncJS(
+                    JiraBoardDOMScripts.applyPresentationModeScript(enabled: false),
+                    arguments: [:]
+                )
+            }
+        }
         if wasSharing {
             AppDiagnostics.log("board-share-stop", [
                 "notifyTarget": notifyTarget,
@@ -631,12 +646,22 @@ final class IOSAssistantBoardController: NSObject, ObservableObject, WKNavigatio
         webView.goForward()
     }
 
+    func setPresentationMode(_ enabled: Bool) async {
+        presentationModeEnabled = enabled
+        guard currentURL != nil else { return }
+        _ = try? await callBoardAsyncJS(JiraBoardDOMScripts.applyPresentationModeScript(enabled: enabled), arguments: [:])
+        if enabled {
+            _ = try? await callBoardAsyncJS(JiraBoardDOMScripts.focusActiveCardsScript(), arguments: [:])
+        }
+        markBoardDirty()
+    }
+
     func scroll(deltaY: Int) async throws -> String {
         guard currentURL != nil else {
             throw MeetingSessionError.unavailable(L("Open a board first before scrolling."))
         }
         let clamped = max(-4000, min(4000, deltaY))
-        _ = try await evaluateJS("window.scrollBy({top: \(clamped), behavior: 'smooth'}); return window.scrollY;")
+        _ = try await callBoardAsyncJS(JiraBoardDOMScripts.scrollBoardScript(deltaY: clamped), arguments: [:])
         markBoardDirty()
         lastActionSummary = L("Scrolled board by %ld px", clamped)
         return L("Scrolled the board by %ld px.", clamped)
@@ -648,8 +673,11 @@ final class IOSAssistantBoardController: NSObject, ObservableObject, WKNavigatio
         }
         let clean = query.trimmingCharacters(in: .whitespacesAndNewlines)
         let msg = try await callBoardAsyncJS(JiraBoardDOMScripts.filterBoardScript(query: clean), arguments: [:])
-        markBoardDirty()
         let ok = !msg.contains("No board search input")
+        if ok && !clean.isEmpty {
+            _ = try? await callBoardAsyncJS(JiraBoardDOMScripts.focusActiveCardsScript(), arguments: [:])
+        }
+        markBoardDirty()
         lastActionSummary = ok ? (clean.isEmpty ? L("Cleared board search") : L("Filtered board: %@", clean)) : L("No search box found on board")
         return ok
             ? (clean.isEmpty ? L("Cleared board search filter.") : L("Applied board filter “%@”.", clean))
@@ -669,9 +697,12 @@ final class IOSAssistantBoardController: NSObject, ObservableObject, WKNavigatio
             JiraBoardDOMScripts.selectPersonFilterScript(candidateTerms: terms, displayLabel: label),
             arguments: [:]
         )
-        markBoardDirty()
         let parsed = (raw.data(using: .utf8).flatMap { try? JSONSerialization.jsonObject(with: $0) }) as? [String: Any]
         let matched = parsed?["matched"] as? Bool ?? false
+        if matched {
+            _ = try? await callBoardAsyncJS(JiraBoardDOMScripts.focusActiveCardsScript(), arguments: [:])
+        }
+        markBoardDirty()
         let resolvedLabel = (parsed?["label"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
         let shownLabel = (resolvedLabel?.isEmpty == false ? resolvedLabel! : label)
         lastActionSummary = matched ? L("Filtered board by %@", shownLabel) : L("No filter matched %@", shownLabel)
@@ -1043,6 +1074,17 @@ final class IOSAssistantBoardController: NSObject, ObservableObject, WKNavigatio
         ensureWebViewHostedForRendering()
         Task { @MainActor [weak self] in
             guard let self else { return }
+            if self.isSharing && self.presentationModeEnabled {
+                _ = try? await self.callBoardAsyncJS(
+                    JiraBoardDOMScripts.applyPresentationModeScript(enabled: true),
+                    arguments: [:]
+                )
+                _ = try? await self.callBoardAsyncJS(
+                    JiraBoardDOMScripts.focusActiveCardsScript(),
+                    arguments: [:]
+                )
+                self.markBoardDirty()
+            }
             await self.taskSync?.adoptJiraSessionFromBoardIfAvailable(self)
         }
     }
@@ -1301,6 +1343,39 @@ struct IOSAssistantBoardSheet: View {
                         }
                     }
                     .buttonStyle(.bordered)
+                    Button {
+                        Task {
+                            errorMessage = nil
+                            do {
+                                _ = try await controller.scroll(deltaY: -420)
+                            } catch {
+                                errorMessage = error.localizedDescription
+                            }
+                        }
+                    } label: {
+                        Image(systemName: "arrow.up")
+                    }
+                    .buttonStyle(.bordered)
+                    .accessibilityLabel(L("Scroll Up"))
+                    Button {
+                        Task {
+                            errorMessage = nil
+                            do {
+                                _ = try await controller.scroll(deltaY: 420)
+                            } catch {
+                                errorMessage = error.localizedDescription
+                            }
+                        }
+                    } label: {
+                        Image(systemName: "arrow.down")
+                    }
+                    .buttonStyle(.bordered)
+                    .accessibilityLabel(L("Scroll Down"))
+                    Button(controller.presentationModeEnabled ? L("Full") : L("Compact")) {
+                        let next = !controller.presentationModeEnabled
+                        Task { await controller.setPresentationMode(next) }
+                    }
+                    .buttonStyle(.bordered)
                 }
                 .padding(.horizontal)
                 .padding(.bottom, 6)
@@ -1378,7 +1453,7 @@ struct IOSAssistantBoardSheet: View {
                     .buttonStyle(.bordered)
                     .controlSize(.small)
                 }
-                Text(L("You can tap Done to return to the call — the 1440×810 desktop board keeps streaming."))
+                Text(L("You can tap Done to return to the call — the 1280×720 desktop board keeps streaming."))
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             } else if controller.isRecoveringShare {
@@ -1419,14 +1494,14 @@ struct IOSAssistantBoardSheet: View {
                     .controlSize(.small)
                     .disabled(controller.isStartingShare || controller.isLoading)
 
-                    Text(L("1440×810 → 1080p desktop view"))
+                    Text(L("1280×720 → 1080p desktop view"))
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                         .lineLimit(2)
                     Spacer(minLength: 0)
                 }
             } else {
-                Text(L("Renders in 1440×810 desktop layout (pinch or double-tap to zoom). Join a call to stream it as a desktop screen."))
+                Text(L("Renders in 1280×720 desktop layout (pinch or double-tap to zoom). Join a call to stream it as a desktop screen."))
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }

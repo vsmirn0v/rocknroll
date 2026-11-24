@@ -29,6 +29,7 @@ final class AssistantBoardWindowController: NSObject, ObservableObject, WKNaviga
     @Published private(set) var isRecoveringShare = false
     @Published private(set) var lastActionSummary: String?
     @Published private(set) var loadError: String?
+    @Published private(set) var presentationModeEnabled = true
     weak var taskSync: WorkspaceTaskSyncController?
     var defaultBoardURLProvider: (() async -> String)?
     var onBoardURLChanged: ((String) -> Void)?
@@ -43,6 +44,7 @@ final class AssistantBoardWindowController: NSObject, ObservableObject, WKNaviga
     private var loadingIndicator: NSProgressIndicator?
     private var shareBannerLabel: NSTextField?
     private var stopShareButton: NSButton?
+    private var presentationModeButton: NSButton?
     private var frameTask: Task<Void, Never>?
     private var recoveryTask: Task<Void, Never>?
     private var navigationContinuation: CheckedContinuation<Void, Never>?
@@ -207,6 +209,10 @@ final class AssistantBoardWindowController: NSObject, ObservableObject, WKNaviga
 
         let targetSessionID = model.sessionID
         let shareStartedAt = Date()
+        if presentationModeEnabled, currentURL != nil {
+            _ = try? await callBoardAsyncJS(JiraBoardDOMScripts.applyPresentationModeScript(enabled: true), arguments: [:])
+            _ = try? await callBoardAsyncJS(JiraBoardDOMScripts.focusActiveCardsScript(), arguments: [:])
+        }
         markBoardDirty()
         lastCaptureUptime = 0
         if let initialBuffer = await captureFrameBuffer() {
@@ -286,6 +292,15 @@ final class AssistantBoardWindowController: NSObject, ObservableObject, WKNaviga
         if wasSharing {
             probeLog("board-share-stop", ["notifyModel": notifyModel, "recoveredPending": !clearDesiredIntent])
         }
+        if clearDesiredIntent, wasSharing, currentURL != nil {
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                _ = try? await self.callBoardAsyncJS(
+                    JiraBoardDOMScripts.applyPresentationModeScript(enabled: false),
+                    arguments: [:]
+                )
+            }
+        }
         refreshBanner()
         if clearDesiredIntent {
             lastActionSummary = L("Stopped sharing board")
@@ -344,12 +359,23 @@ final class AssistantBoardWindowController: NSObject, ObservableObject, WKNaviga
         }
     }
 
+    func setPresentationMode(_ enabled: Bool) async {
+        presentationModeEnabled = enabled
+        presentationModeButton?.title = enabled ? L("Full") : L("Compact")
+        guard currentURL != nil else { return }
+        _ = try? await callBoardAsyncJS(JiraBoardDOMScripts.applyPresentationModeScript(enabled: enabled), arguments: [:])
+        if enabled {
+            _ = try? await callBoardAsyncJS(JiraBoardDOMScripts.focusActiveCardsScript(), arguments: [:])
+        }
+        markBoardDirty()
+    }
+
     func scroll(deltaY: Int) async throws -> String {
-        guard let webView else {
+        guard webView != nil, currentURL != nil else {
             throw NativeDesktopError.unavailable(L("Open a board first before scrolling."))
         }
         let clamped = max(-4000, min(4000, deltaY))
-        _ = try await evaluateJS(webView: webView, script: "window.scrollBy({top: \(clamped), behavior: 'smooth'}); return window.scrollY;")
+        _ = try await callBoardAsyncJS(JiraBoardDOMScripts.scrollBoardScript(deltaY: clamped), arguments: [:])
         markBoardDirty()
         lastActionSummary = L("Scrolled board by %ld px", clamped)
         return L("Scrolled the board by %ld px.", clamped)
@@ -361,8 +387,11 @@ final class AssistantBoardWindowController: NSObject, ObservableObject, WKNaviga
         }
         let clean = query.trimmingCharacters(in: .whitespacesAndNewlines)
         let msg = try await callBoardAsyncJS(JiraBoardDOMScripts.filterBoardScript(query: clean), arguments: [:])
-        markBoardDirty()
         let ok = !msg.contains("No board search input")
+        if ok && !clean.isEmpty {
+            _ = try? await callBoardAsyncJS(JiraBoardDOMScripts.focusActiveCardsScript(), arguments: [:])
+        }
+        markBoardDirty()
         lastActionSummary = ok ? (clean.isEmpty ? L("Cleared board search") : L("Filtered board: %@", clean)) : L("No search box found on board")
         return ok
             ? (clean.isEmpty ? L("Cleared board search filter.") : L("Applied board filter “%@”.", clean))
@@ -382,9 +411,12 @@ final class AssistantBoardWindowController: NSObject, ObservableObject, WKNaviga
             JiraBoardDOMScripts.selectPersonFilterScript(candidateTerms: terms, displayLabel: label),
             arguments: [:]
         )
-        markBoardDirty()
         let parsed = (raw.data(using: .utf8).flatMap { try? JSONSerialization.jsonObject(with: $0) }) as? [String: Any]
         let matched = parsed?["matched"] as? Bool ?? false
+        if matched {
+            _ = try? await callBoardAsyncJS(JiraBoardDOMScripts.focusActiveCardsScript(), arguments: [:])
+        }
+        markBoardDirty()
         let resolvedLabel = (parsed?["label"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
         let shownLabel = (resolvedLabel?.isEmpty == false ? resolvedLabel! : label)
         lastActionSummary = matched ? L("Filtered board by %@", shownLabel) : L("No filter matched %@", shownLabel)
@@ -663,7 +695,15 @@ final class AssistantBoardWindowController: NSObject, ObservableObject, WKNaviga
         jiraBtn.bezelStyle = .rounded
         jiraBtn.setContentHuggingPriority(.required, for: .horizontal)
 
-        let toolbarStack = NSStackView(views: [back, forward, reload, jiraBtn, field, spinner, banner, stopBtn])
+        let modeBtn = NSButton(
+            title: presentationModeEnabled ? L("Full") : L("Compact"),
+            target: self,
+            action: #selector(handleTogglePresentationMode(_:))
+        )
+        modeBtn.bezelStyle = .rounded
+        modeBtn.setContentHuggingPriority(.required, for: .horizontal)
+
+        let toolbarStack = NSStackView(views: [back, forward, reload, jiraBtn, modeBtn, field, spinner, banner, stopBtn])
         toolbarStack.orientation = .horizontal
         toolbarStack.alignment = .centerY
         toolbarStack.spacing = 8
@@ -736,6 +776,7 @@ final class AssistantBoardWindowController: NSObject, ObservableObject, WKNaviga
         self.urlField = field
         self.shareBannerLabel = banner
         self.stopShareButton = stopBtn
+        self.presentationModeButton = modeBtn
         refreshNavigationUI()
         refreshBanner()
     }
@@ -783,6 +824,13 @@ final class AssistantBoardWindowController: NSObject, ObservableObject, WKNaviga
 
     @objc private func handleStopShare(_ sender: Any?) {
         stopSharing()
+    }
+
+    @objc private func handleTogglePresentationMode(_ sender: Any?) {
+        let next = !presentationModeEnabled
+        Task { @MainActor [weak self] in
+            await self?.setPresentationMode(next)
+        }
     }
 
     @objc private func handleOpenDefaultJira(_ sender: Any?) {
@@ -953,6 +1001,17 @@ final class AssistantBoardWindowController: NSObject, ObservableObject, WKNaviga
         finishPendingNavigation()
         Task { @MainActor [weak self] in
             guard let self else { return }
+            if self.sharingMeetingID != nil && self.presentationModeEnabled {
+                _ = try? await self.callBoardAsyncJS(
+                    JiraBoardDOMScripts.applyPresentationModeScript(enabled: true),
+                    arguments: [:]
+                )
+                _ = try? await self.callBoardAsyncJS(
+                    JiraBoardDOMScripts.focusActiveCardsScript(),
+                    arguments: [:]
+                )
+                self.markBoardDirty()
+            }
             await self.taskSync?.adoptJiraSessionFromBoardIfAvailable(self)
         }
     }

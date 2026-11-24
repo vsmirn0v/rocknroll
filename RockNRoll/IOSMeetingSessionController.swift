@@ -138,38 +138,143 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
     private final class VoiceReplyEchoGate: @unchecked Sendable {
         private let lock = NSLock()
         private var inFlight = false
-        private var endedUptime: TimeInterval = -.infinity
+        private var suppressUntilUptime: TimeInterval = -.infinity
 
         func begin() {
             lock.lock()
             inFlight = true
+            suppressUntilUptime = .infinity
             lock.unlock()
         }
 
-        func end() {
+        func end(tailSeconds: TimeInterval = 1.8) {
+            let now = ProcessInfo.processInfo.systemUptime
             lock.lock()
             inFlight = false
-            endedUptime = ProcessInfo.processInfo.systemUptime
+            suppressUntilUptime = now + max(0, tailSeconds)
             lock.unlock()
         }
 
         var isSuppressing: Bool {
             let now = ProcessInfo.processInfo.systemUptime
             lock.lock()
-            let active = inFlight || (now - endedUptime) < 0.45
+            let active = inFlight || now < suppressUntilUptime
             lock.unlock()
             return active
         }
     }
 
+    private final class SpeechActivityTracker: @unchecked Sendable {
+        private let lock = NSLock()
+        private var lastLocalSpeechUptime: TimeInterval = -.infinity
+        private var bargeInStartUptime: TimeInterval?
+        private var lastBargeInTriggerUptime: TimeInterval = -.infinity
+        private var speakerOutput = true
+
+        func setSpeakerOutput(_ enabled: Bool) {
+            lock.lock()
+            speakerOutput = enabled
+            lock.unlock()
+        }
+
+        func secondsSinceLocalSpeech(now: TimeInterval = ProcessInfo.processInfo.systemUptime) -> TimeInterval {
+            lock.lock()
+            let last = lastLocalSpeechUptime
+            lock.unlock()
+            return last.isFinite ? max(0, now - last) : .infinity
+        }
+
+        /// Evaluates mic buffer RMS off MainActor. Returns `true` when sustained local speech should barge in.
+        func observeLocalBuffer(_ buffer: AVAudioPCMBuffer, isEchoSuppressing: Bool, isVoiceReplyInFlight: Bool) -> Bool {
+            let rms = Self.fastRMS(of: buffer)
+            let now = ProcessInfo.processInfo.systemUptime
+            lock.lock()
+            defer { lock.unlock() }
+            if !isEchoSuppressing && rms >= 0.015 {
+                lastLocalSpeechUptime = now
+            }
+            guard isVoiceReplyInFlight else {
+                bargeInStartUptime = nil
+                return false
+            }
+            let threshold: Float = speakerOutput ? 0.085 : 0.035
+            if rms >= threshold {
+                if bargeInStartUptime == nil {
+                    bargeInStartUptime = now
+                }
+                if let start = bargeInStartUptime,
+                   now - start >= 0.28,
+                   now - lastBargeInTriggerUptime >= 0.8 {
+                    lastBargeInTriggerUptime = now
+                    bargeInStartUptime = nil
+                    lastLocalSpeechUptime = now
+                    return true
+                }
+            } else {
+                bargeInStartUptime = nil
+            }
+            return false
+        }
+
+        private static func fastRMS(of buffer: AVAudioPCMBuffer) -> Float {
+            let count = Int(buffer.frameLength)
+            guard count > 0 else { return 0 }
+            let step = max(1, count >= 128 ? 4 : 1)
+            var sumSq: Float = 0
+            var samples = 0
+            if let floatData = buffer.floatChannelData?[0] {
+                var i = 0
+                while i < count {
+                    let s = floatData[i]
+                    sumSq += s * s
+                    samples += 1
+                    i += step
+                }
+            } else if let int16Data = buffer.int16ChannelData?[0] {
+                let norm: Float = 1.0 / 32768.0
+                var i = 0
+                while i < count {
+                    let s = Float(int16Data[i]) * norm
+                    sumSq += s * s
+                    samples += 1
+                    i += step
+                }
+            }
+            guard samples > 0 else { return 0 }
+            return sqrt(sumSq / Float(samples))
+        }
+    }
+
     private let voiceReplyLock = NSLock()
     private let voiceReplyEchoGate = VoiceReplyEchoGate()
+    private let speechActivityTracker = SpeechActivityTracker()
     nonisolated(unsafe) private var voiceReplyInFlightFlag = false
+    private var lastRemoteSpeechUptime: TimeInterval = -.infinity
+    private var remoteBargeInTask: Task<Void, Never>?
+    var onVoiceReplyBargeIn: (() -> Void)?
     var isVoiceReplyInFlight: Bool { voiceReplyTask != nil }
+    var isConnectedForAssistant: Bool { !leaving && phase == .connected }
     nonisolated func isVoiceReplyInFlightThreadSafe() -> Bool {
         voiceReplyLock.lock()
         defer { voiceReplyLock.unlock() }
         return voiceReplyInFlightFlag || voiceReplyEchoGate.isSuppressing
+    }
+    var isHumanSpeakingNow: Bool {
+        guard !leaving, phase == .connected else { return false }
+        if session.sessionSnapshot.participants.contains(where: { !$0.isLocal && $0.speaking == true }) {
+            return true
+        }
+        let now = ProcessInfo.processInfo.systemUptime
+        if (now - lastRemoteSpeechUptime) < 0.85 {
+            return true
+        }
+        if isLocalMicrophoneUnmuted && speechActivityTracker.secondsSinceLocalSpeech(now: now) < 0.85 {
+            return true
+        }
+        if !localTranscriber.partialSegmentIDs.isEmpty {
+            return true
+        }
+        return false
     }
     private var assistantHUDContext: (talk: IOSAssistantTalkController, speech: IOSAssistantSpeechCoordinator)?
     private var micActiveStart: Date?
@@ -860,6 +965,7 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
     func leave() {
         guard !leaving else { return }
         leaving = true
+        cancelVoiceReply(forBargeIn: false)
         let event: CallEvent = everConnected || joinStarted ? .left : .canceled
         Task { @MainActor [weak self] in
             await self?.finish(event: event)
@@ -957,6 +1063,7 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
             .receive(on: DispatchQueue.main)
             .sink { [weak self] output in
                 self?.callView?.setAudioOutput(output)
+                self?.speechActivityTracker.setSpeakerOutput(output.builtInSpeaker == true)
             }
             .store(in: &audioSubscriptions)
     }
@@ -1031,6 +1138,24 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
         isCameraOn = snapshot.effective.cameraOn
         callView?.setCamera(snapshot.effective.cameraOn)
         updateMicrophoneIndicator(snapshot: snapshot)
+
+        let remoteSpeaking = snapshot.participants.contains { !$0.isLocal && $0.speaking == true }
+        if remoteSpeaking {
+            lastRemoteSpeechUptime = ProcessInfo.processInfo.systemUptime
+            if isSpeakingVoiceReply && remoteBargeInTask == nil {
+                remoteBargeInTask = Task { @MainActor [weak self] in
+                    try? await Task.sleep(for: .milliseconds(280))
+                    guard let self, !Task.isCancelled, !self.leaving, self.isSpeakingVoiceReply else { return }
+                    let stillSpeaking = self.session.sessionSnapshot.participants.contains { !$0.isLocal && $0.speaking == true }
+                    if stillSpeaking {
+                        self.handleVoiceReplyBargeIn(source: "remoteSpeaker")
+                    }
+                }
+            }
+        } else {
+            remoteBargeInTask?.cancel()
+            remoteBargeInTask = nil
+        }
 
         if snapshot.phase != .connected {
             requestedMicrophone = nil
@@ -1413,9 +1538,14 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
                     let utteranceID = UUID().uuidString
                     let startedAt = Date()
                     self.recordAssistantSpokenUtterance(id: utteranceID, text: text, startedAt: startedAt)
+                    localTranscriber.discardPendingLocalAudio()
                     voiceReplyEchoGate.begin()
+                    var completedNaturally = false
                     defer {
-                        voiceReplyEchoGate.end()
+                        voiceReplyEchoGate.end(tailSeconds: completedNaturally ? 1.8 : 0.25)
+                        if completedNaturally {
+                            self.localTranscriber.discardPendingLocalAudio()
+                        }
                         self.assistantSpeechLedger.endUtterance(id: utteranceID, endedAt: Date())
                     }
                     let playbackStream = AsyncThrowingStream<AVAudioPCMBuffer, Error> { continuation in
@@ -1439,6 +1569,7 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
                     let played = await session.playVoiceReplyStream(playbackStream)
                     try Task.checkCancellation()
                     guard played else { throw MeetingSessionError.unavailable(L("Could not send the voice reply into this meeting.")) }
+                    completedNaturally = true
                     AppDiagnostics.log("voice-reply-finished", ["provider": kind.rawValue])
                 } else {
                     let buffer = try await voiceStore.synthesize(text)
@@ -1449,14 +1580,20 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
                     let utteranceID = UUID().uuidString
                     let startedAt = Date()
                     self.recordAssistantSpokenUtterance(id: utteranceID, text: text, startedAt: startedAt)
+                    localTranscriber.discardPendingLocalAudio()
                     voiceReplyEchoGate.begin()
+                    var completedNaturally = false
                     defer {
-                        voiceReplyEchoGate.end()
+                        voiceReplyEchoGate.end(tailSeconds: completedNaturally ? 1.8 : 0.25)
+                        if completedNaturally {
+                            self.localTranscriber.discardPendingLocalAudio()
+                        }
                         self.assistantSpeechLedger.endUtterance(id: utteranceID, endedAt: Date())
                     }
                     let played = await session.playVoiceReply(buffer)
                     try Task.checkCancellation()
                     guard played else { throw MeetingSessionError.unavailable(L("Could not send the voice reply into this meeting.")) }
+                    completedNaturally = true
                     AppDiagnostics.log("voice-reply-finished", ["provider": kind.rawValue])
                 }
             } catch {
@@ -1491,11 +1628,19 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
             _ = await previous?.result
             try Task.checkCancellation()
             guard let self, !leaving, phase == .connected, !isHeld else { throw MeetingSessionError.notConnected }
+            localTranscriber.discardPendingLocalAudio()
             voiceReplyEchoGate.begin()
-            defer { voiceReplyEchoGate.end() }
+            var completedNaturally = false
+            defer {
+                voiceReplyEchoGate.end(tailSeconds: completedNaturally ? 1.8 : 0.25)
+                if completedNaturally {
+                    self.localTranscriber.discardPendingLocalAudio()
+                }
+            }
             let played = await session.playVoiceReply(buffer)
             try Task.checkCancellation()
             guard played else { throw MeetingSessionError.unavailable(L("Could not send the voice reply into this meeting.")) }
+            completedNaturally = true
         }
         voiceReplyTask = task
         defer {
@@ -1507,10 +1652,19 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
         try await withTaskCancellationHandler { try await task.value } onCancel: { task.cancel() }
     }
 
-    func cancelVoiceReply() {
+    func cancelVoiceReply(forBargeIn: Bool = false) {
+        remoteBargeInTask?.cancel()
+        remoteBargeInTask = nil
         voiceReplyTask?.cancel()
-        voiceReplyEchoGate.end()
+        voiceReplyEchoGate.end(tailSeconds: forBargeIn ? 0.25 : 1.8)
         isSpeakingVoiceReply = false
+    }
+
+    private func handleVoiceReplyBargeIn(source: String) {
+        guard isSpeakingVoiceReply || isVoiceReplyInFlight else { return }
+        AppDiagnostics.log("voice-reply-barge-in", ["source": source])
+        cancelVoiceReply(forBargeIn: true)
+        onVoiceReplyBargeIn?()
     }
 
     var canSendAssistantChat: Bool {
@@ -1691,10 +1845,39 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
         }
         let transcriber = localTranscriber
         let echoGate = voiceReplyEchoGate
-        session.setLocalAudioSink { buffer in
+        let tracker = speechActivityTracker
+        session.setLocalAudioSink { [weak self] buffer in
             privateSink?(buffer)
-            if transcribeLocal && !echoGate.isSuppressing {
+            let suppressing = echoGate.isSuppressing
+            let inFlight = self?.isVoiceReplyInFlightThreadSafe() == true
+            if tracker.observeLocalBuffer(buffer, isEchoSuppressing: suppressing, isVoiceReplyInFlight: inFlight) {
+                Task { @MainActor [weak self] in
+                    self?.handleVoiceReplyBargeIn(source: "localMic")
+                }
+            }
+            if transcribeLocal && !suppressing {
                 transcriber.enqueueLocalAudio(buffer)
+            }
+        }
+    }
+
+    private func sanitizedLocalSegmentsForEmission() -> [TranscriptSegment] {
+        localTranscriber.segments.compactMap { seg -> TranscriptSegment? in
+            guard seg.isOwn == true else { return seg }
+            switch assistantSpeechLedger.classifyOwnServerSegment(text: seg.text, occurredAt: seg.spokenAt) {
+            case .pureAssistant:
+                return nil
+            case .mixed(let userText, _):
+                return TranscriptSegment(
+                    id: seg.id,
+                    speaker: seg.speaker,
+                    text: userText,
+                    spokenAt: seg.spokenAt,
+                    isOwn: seg.isOwn,
+                    speakerRole: seg.speakerRole
+                )
+            case .pureUser:
+                return seg
             }
         }
     }
@@ -1703,7 +1886,7 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
         guard !leaving else { return }
         let localRunning = localTranscriber.state.isRunning
         let ownServerSegments = providerTranscriptSegments.filter { $0.isOwn == true }
-        let visibleLocalSegments = localTranscriber.segments.filter { localSeg in
+        let visibleLocalSegments = sanitizedLocalSegmentsForEmission().filter { localSeg in
             guard localSeg.isOwn == true, !ownServerSegments.isEmpty else { return true }
             let localAt = localSeg.spokenAt
             return !ownServerSegments.contains { srv in
@@ -1766,7 +1949,7 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
                 deviceID: device
             ))
         }
-        for seg in localTranscriber.segments {
+        for seg in sanitizedLocalSegmentsForEmission() {
             let isOwn = seg.isOwn ?? false
             out.append(SyncedTranscriptEvent(
                 id: "local:" + seg.id,

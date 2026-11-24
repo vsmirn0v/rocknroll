@@ -100,14 +100,18 @@ struct IOSMeetingDetailView: View {
         return local.isEmpty ? nil : local
     }
 
-    private var contextScopeKey: String {
-        if useSeriesScope, let series = preferredSeriesID, !series.isEmpty {
-            return "series:" + series
+    private func scopeDescriptor(useSeries: Bool) -> (key: String, kind: SyncedMeetingContextSettings.ScopeKind) {
+        if useSeries, let series = preferredSeriesID, !series.isEmpty {
+            return ("series:" + series, .calendarSeries)
         }
         if let room = session?.invitation?.absoluteString ?? session?.roomIdentity, !room.isEmpty {
-            return "room:" + room
+            return ("room:" + room, .room)
         }
-        return "session:" + sessionID.uuidString
+        return ("session:" + sessionID.uuidString, .room)
+    }
+
+    private var contextScopeKey: String {
+        scopeDescriptor(useSeries: useSeriesScope).key
     }
 
     var body: some View {
@@ -189,6 +193,9 @@ struct IOSMeetingDetailView: View {
             ToolbarItemGroup(placement: .keyboard) {
                 Spacer()
                 Button(L("Done")) {
+                    if tab == .settings {
+                        flushPendingJiraDraftsIfNeeded()
+                    }
                     UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
                 }
             }
@@ -199,6 +206,11 @@ struct IOSMeetingDetailView: View {
         .onChange(of: sessionID) { _, _ in
             loadInitialState()
             Task { await loadTranscript() }
+        }
+        .onChange(of: tab) { oldTab, _ in
+            if oldTab == .settings {
+                flushPendingJiraDraftsIfNeeded()
+            }
         }
         .onChange(of: previewNotes) { _, isPreview in
             if isPreview { refreshNotePreviewIfNeeded() }
@@ -711,7 +723,11 @@ struct IOSMeetingDetailView: View {
             if let series = preferredSeriesID, !series.isEmpty {
                 Section {
                     Toggle(L("Apply to entire calendar series"), isOn: $useSeriesScope)
-                        .onChange(of: useSeriesScope) { _, _ in loadContextFields() }
+                        .onChange(of: useSeriesScope) { oldValue, _ in
+                            let oldScope = scopeDescriptor(useSeries: oldValue)
+                            flushPendingJiraDraftsIfNeeded(scopeKeyOverride: oldScope.key, scopeKindOverride: oldScope.kind)
+                            loadContextFields()
+                        }
                 }
             }
 
@@ -780,6 +796,11 @@ struct IOSMeetingDetailView: View {
                 .onSubmit { saveCurrentContextSettings() }
                 Button(L("Save Jira Settings")) {
                     saveCurrentContextSettings()
+                }
+                if settingsSaved {
+                    Label(L("Saved"), systemImage: "checkmark.circle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.green)
                 }
             } header: {
                 Text(L("Jira Board & Project"))
@@ -907,36 +928,83 @@ struct IOSMeetingDetailView: View {
         }
     }
 
-    private func saveCurrentContextSettings() {
+    private func saveCurrentContextSettings(
+        scopeKeyOverride: String? = nil,
+        scopeKindOverride: SyncedMeetingContextSettings.ScopeKind? = nil
+    ) {
         let people = peopleDraft.split(separator: ",")
             .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
         let projectKeys = SyncedMeetingContextSettings.normalizedJiraProjectKeys(from: jiraProjectKeysDraft)
-        let kind: SyncedMeetingContextSettings.ScopeKind = useSeriesScope ? .calendarSeries : .room
+        let currentScope = scopeDescriptor(useSeries: useSeriesScope)
+        let targetScopeKey = scopeKeyOverride ?? currentScope.key
+        let targetKind = scopeKindOverride ?? currentScope.kind
+        let titleSnapshot = session?.title ?? L("Meeting")
+        let transitionSnapshot = transitionChoice?.rawValue
+        let aboutSnapshot = aboutDraft
+        let mattersSnapshot = mattersDraft
+        let neverSnapshot = neverDraft
+        let autoJoinSnapshot = autoJoinChoice
+        let autoSkillSnapshot = autoFacilitatorSkillID
+        let rawBoard = jiraBoardURLDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedBoardSnapshot = SyncedMeetingContextSettings.normalizedBoardURLString(from: rawBoard)
+        let hasInvalidBoardInput = !rawBoard.isEmpty && normalizedBoardSnapshot == nil
+        let shouldUpdateBoardURL = !hasInvalidBoardInput
+        if let normalizedBoardSnapshot, scopeKeyOverride == nil {
+            jiraBoardURLDraft = normalizedBoardSnapshot
+        }
+        if !projectKeys.isEmpty, scopeKeyOverride == nil {
+            jiraProjectKeysDraft = projectKeys.joined(separator: ", ")
+        }
+        let autoExportSnapshot = autoExportOverridesDraft
+        let existingSettings = workspace.settings(for: targetScopeKey)
+        let otherFieldsChanged: Bool = {
+            let savedAbout = existingSettings?.about?.value ?? ""
+            let savedMatters = existingSettings?.matters?.value ?? ""
+            let savedNever = existingSettings?.never?.value ?? ""
+            let savedPeople = existingSettings?.people?.value ?? []
+            let savedAutoJoin = existingSettings?.autoJoin?.value
+            let savedSkill = existingSettings?.autoFacilitatorSkillID?.value?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let cleanAutoSkill = autoSkillSnapshot?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let savedTransition = existingSettings?.sameRoomTransition?.value
+            let savedProjects = existingSettings?.jiraProjectKeys?.value ?? []
+            let savedAutoExport = existingSettings?.autoExportSettings?.overrides ?? .init()
+            return aboutSnapshot != savedAbout
+                || mattersSnapshot != savedMatters
+                || neverSnapshot != savedNever
+                || people != savedPeople
+                || autoJoinSnapshot != savedAutoJoin
+                || (cleanAutoSkill?.isEmpty == true ? nil : cleanAutoSkill) != (savedSkill?.isEmpty == true ? nil : savedSkill)
+                || transitionSnapshot != savedTransition
+                || projectKeys != savedProjects
+                || autoExportSnapshot != savedAutoExport
+        }()
         Task {
             await workspace.saveContextSettings(
-                scopeKey: contextScopeKey,
-                scopeKind: kind,
-                title: session?.title ?? L("Meeting"),
-                sameRoomTransition: transitionChoice?.rawValue,
-                about: aboutDraft,
-                matters: mattersDraft,
-                never: neverDraft,
+                scopeKey: targetScopeKey,
+                scopeKind: targetKind,
+                title: titleSnapshot,
+                sameRoomTransition: transitionSnapshot,
+                about: aboutSnapshot,
+                matters: mattersSnapshot,
+                never: neverSnapshot,
                 people: people,
-                autoJoin: autoJoinChoice,
+                autoJoin: autoJoinSnapshot,
                 updateAutoJoin: true,
-                autoFacilitatorSkillID: autoFacilitatorSkillID,
+                autoFacilitatorSkillID: autoSkillSnapshot,
                 updateAutoFacilitatorSkillID: true,
-                jiraBoardURL: jiraBoardURLDraft,
-                updateJiraBoardURL: true,
+                jiraBoardURL: normalizedBoardSnapshot ?? "",
+                updateJiraBoardURL: shouldUpdateBoardURL,
                 jiraProjectKeys: projectKeys,
                 updateJiraProjectKeys: true,
-                autoExportOverrides: autoExportOverridesDraft,
+                autoExportOverrides: autoExportSnapshot,
                 updateAutoExportOverrides: true
             )
-            settingsSaved = true
-            try? await Task.sleep(for: .seconds(2))
-            settingsSaved = false
+            if shouldUpdateBoardURL || otherFieldsChanged {
+                settingsSaved = true
+                try? await Task.sleep(for: .seconds(2))
+                settingsSaved = false
+            }
         }
     }
 
@@ -975,15 +1043,27 @@ struct IOSMeetingDetailView: View {
         autoExportOverridesDraft = settings?.autoExportSettings?.overrides ?? .init()
     }
 
-    private func flushPendingJiraDraftsIfNeeded() {
+    private func flushPendingJiraDraftsIfNeeded(
+        scopeKeyOverride: String? = nil,
+        scopeKindOverride: SyncedMeetingContextSettings.ScopeKind? = nil
+    ) {
         guard !isLoadingContext else { return }
-        let settings = workspace.settings(for: contextScopeKey)
+        let targetKey = scopeKeyOverride ?? contextScopeKey
+        let settings = workspace.settings(for: targetKey)
         let savedBoard = (settings?.jiraBoardURL?.value ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        let draftBoard = jiraBoardURLDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        let rawBoard = jiraBoardURLDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedDraftBoard = SyncedMeetingContextSettings.normalizedBoardURLString(from: rawBoard)
+        let boardDirty: Bool = {
+            if rawBoard.isEmpty {
+                return !savedBoard.isEmpty
+            }
+            guard let valid = normalizedDraftBoard else { return false }
+            return valid != savedBoard
+        }()
         let savedProjects = settings?.jiraProjectKeys?.value ?? []
         let draftProjects = SyncedMeetingContextSettings.normalizedJiraProjectKeys(from: jiraProjectKeysDraft)
-        guard draftBoard != savedBoard || draftProjects != savedProjects else { return }
-        saveCurrentContextSettings()
+        guard boardDirty || draftProjects != savedProjects else { return }
+        saveCurrentContextSettings(scopeKeyOverride: scopeKeyOverride, scopeKindOverride: scopeKindOverride)
     }
 
     private func copyTranscript() {

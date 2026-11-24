@@ -446,6 +446,140 @@ public final class JiraBoardWebSessionConnector: JiraTaskConnecting, @unchecked 
         return try await searchIssues(jql: "updated >= -30d ORDER BY updated DESC", maxResults: cap)
     }
 
+    /// Derives candidate Jira project keys from the active board URL, visible DOM cards,
+    /// Jira Agile REST board endpoints (`/project`, `/configuration`), or active board issues.
+    public func deriveBoardProjectKeys() async -> [String] {
+        guard let context = try? await MainActor.run(body: { try resolvedContext() }) else {
+            return []
+        }
+        var ordered: [String] = []
+        var seen: Set<String> = []
+        func addKey(_ raw: String?) {
+            guard let raw else { return }
+            let clean = raw.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+            guard !clean.isEmpty,
+                  clean.range(of: #"^[A-Z][A-Z0-9_]+$"#, options: .regularExpression) != nil,
+                  seen.insert(clean).inserted else {
+                return
+            }
+            ordered.append(clean)
+        }
+
+        addKey(context.projectKey)
+
+        if let evaluator {
+            let rawDOM: String? = try? await evaluator.callBoardAsyncJS(
+                JiraBoardDOMScripts.extractBoardContextScript(),
+                arguments: [:]
+            )
+            if let data = rawDOM?.data(using: .utf8),
+               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                if let domProjects = obj["projectKeys"] as? [String] {
+                    for key in domProjects { addKey(key) }
+                }
+                if let domIssues = obj["issueKeys"] as? [String] {
+                    for issueKey in domIssues {
+                        if let dash = issueKey.firstIndex(of: "-") {
+                            addKey(String(issueKey[..<dash]))
+                        }
+                    }
+                }
+            }
+        }
+
+        if ordered.isEmpty, let rapidViewID = context.rapidViewID {
+            if let root = try? await fetchJSONObject(
+                paths: ["/rest/agile/1.0/board/\(rapidViewID)/project"],
+                method: "GET"
+            ),
+               let values = root["values"] as? [[String: Any]] {
+                for item in values {
+                    addKey(item["key"] as? String)
+                }
+            }
+        }
+
+        if ordered.isEmpty, let rapidViewID = context.rapidViewID {
+            if let config = try? await fetchJSONObject(
+                paths: ["/rest/agile/1.0/board/\(rapidViewID)/configuration"],
+                method: "GET"
+            ) {
+                if let location = config["location"] as? [String: Any] {
+                    addKey(location["projectKey"] as? String ?? location["key"] as? String)
+                }
+                if let filter = config["filter"] as? [String: Any] {
+                    let filterID = (filter["id"] as? String)
+                        ?? (filter["id"] as? Int).map(String.init)
+                    if let query = filter["query"] as? String {
+                        for key in Self.extractProjectKeys(fromJQL: query) { addKey(key) }
+                    } else if ordered.isEmpty, let filterID,
+                              let filterObj = try? await fetchJSONObject(
+                                paths: ["/rest/api/2/filter/\(filterID)", "/rest/api/3/filter/\(filterID)"],
+                                method: "GET"
+                              ),
+                              let jql = filterObj["jql"] as? String {
+                        for key in Self.extractProjectKeys(fromJQL: jql) { addKey(key) }
+                    }
+                }
+            }
+        }
+
+        if ordered.isEmpty,
+           let boardIssues = try? await fetchActiveBoardIssues(maxResults: 25) {
+            var counts: [String: Int] = [:]
+            var firstOrder: [String] = []
+            for issue in boardIssues {
+                if let dash = issue.key.firstIndex(of: "-") {
+                    let prefix = String(issue.key[..<dash]).uppercased()
+                    if counts[prefix] == nil {
+                        firstOrder.append(prefix)
+                    }
+                    counts[prefix, default: 0] += 1
+                }
+            }
+            let ranked = firstOrder.sorted { (counts[$0] ?? 0) > (counts[$1] ?? 0) }
+            for key in ranked { addKey(key) }
+        }
+
+        return ordered
+    }
+
+    public static func extractProjectKeys(fromJQL jql: String) -> [String] {
+        var keys: [String] = []
+        var seen: Set<String> = []
+        func add(_ raw: String) {
+            let upper = raw.trimmingCharacters(in: .whitespacesAndNewlines.union(CharacterSet(charactersIn: "\"'"))).uppercased()
+            guard !upper.isEmpty,
+                  upper.range(of: #"^[A-Z][A-Z0-9_]+$"#, options: .regularExpression) != nil,
+                  seen.insert(upper).inserted else { return }
+            keys.append(upper)
+        }
+        let nsRange = NSRange(jql.startIndex..<jql.endIndex, in: jql)
+        if let eqRegex = try? NSRegularExpression(
+            pattern: #"\bproject\s*=\s*["']?([A-Za-z][A-Za-z0-9_]+)["']?"#,
+            options: [.caseInsensitive]
+        ) {
+            for match in eqRegex.matches(in: jql, range: nsRange) {
+                if match.numberOfRanges >= 2, let r = Range(match.range(at: 1), in: jql) {
+                    add(String(jql[r]))
+                }
+            }
+        }
+        if let inRegex = try? NSRegularExpression(
+            pattern: #"\bproject\s+in\s*\(([^)]+)\)"#,
+            options: [.caseInsensitive]
+        ) {
+            for match in inRegex.matches(in: jql, range: nsRange) {
+                if match.numberOfRanges >= 2, let r = Range(match.range(at: 1), in: jql) {
+                    for part in jql[r].split(separator: ",") {
+                        add(String(part))
+                    }
+                }
+            }
+        }
+        return keys
+    }
+
     public func fetchIssueDetails(key: String) async throws -> JiraRemoteIssue {
         let context = try await MainActor.run { try resolvedContext() }
         let encodedKey = try JiraTaskConnector.validatedJiraKey(key)
@@ -717,7 +851,7 @@ public final class JiraBoardWebSessionConnector: JiraTaskConnecting, @unchecked 
             credentials: 'include',
             headers: headers
         };
-        if (bodyJSON !== null && bodyJSON !== undefined && method !== 'GET') {
+        if (typeof bodyJSON !== 'undefined' && bodyJSON !== null && method !== 'GET') {
             headers['Content-Type'] = 'application/json';
             init.body = bodyJSON;
         }
@@ -730,9 +864,7 @@ public final class JiraBoardWebSessionConnector: JiraTaskConnecting, @unchecked 
             "fallbackContextPath": fallbackContextPath,
             "method": method
         ]
-        if let bodyJSONString {
-            args["bodyJSON"] = bodyJSONString
-        }
+        args["bodyJSON"] = bodyJSONString ?? NSNull()
         return try await evaluator.callBoardAsyncJS(js, arguments: args)
     }
 
@@ -1117,6 +1249,236 @@ public enum JiraBoardDOMScripts {
             filterAssignees,
             cards,
             bodyTextSample: (document.body?.innerText || '').slice(0, 2000)
+        });
+        """
+    }
+
+    public static func extractBoardContextScript() -> String {
+        """
+        const counts = new Map();
+        const addProject = (raw, weight) => {
+            const clean = String(raw || '').trim().toUpperCase();
+            if (!/^[A-Z][A-Z0-9_]{1,}$/.test(clean)) return;
+            counts.set(clean, (counts.get(clean) || 0) + (weight || 1));
+        };
+        const metaProj = document.querySelector('meta[name="ajs-project-key"]')?.getAttribute('content');
+        if (metaProj) addProject(metaProj, 10);
+        try {
+            const url = new URL(location.href);
+            addProject(url.searchParams.get('projectKey') || url.searchParams.get('project'), 10);
+            const pathMatch = url.pathname.match(/\\/projects\\/([A-Za-z][A-Za-z0-9_]+)/i);
+            if (pathMatch) addProject(pathMatch[1], 10);
+            const browseMatch = url.pathname.match(/\\/browse\\/([A-Za-z][A-Za-z0-9_]+)-\\d+/i);
+            if (browseMatch) addProject(browseMatch[1], 8);
+        } catch (_) {}
+        try {
+            if (window.GH && GH.RapidBoard && GH.RapidBoard.State && GH.RapidBoard.State.data) {
+                addProject(GH.RapidBoard.State.data.projectKey, 10);
+            }
+            if (window.AJS && AJS.Meta && typeof AJS.Meta.get === 'function') {
+                addProject(AJS.Meta.get('project-key'), 10);
+            }
+        } catch (_) {}
+        document.querySelectorAll('[data-project-key]').forEach(el => addProject(el.getAttribute('data-project-key'), 5));
+        const issueKeys = [];
+        const seenIssues = new Set();
+        const pushIssue = (raw) => {
+            const m = String(raw || '').toUpperCase().match(/[A-Z][A-Z0-9_]+-\\d+/);
+            if (!m) return;
+            const key = m[0];
+            if (!seenIssues.has(key)) {
+                seenIssues.add(key);
+                issueKeys.push(key);
+                addProject(key.split('-')[0], 2);
+            }
+        };
+        document.querySelectorAll('[data-issue-key], .ghx-issue, [data-testid*="card"], a[href*="/browse/"]').forEach(el => {
+            pushIssue(el.getAttribute('data-issue-key'));
+            pushIssue(el.getAttribute('href'));
+            pushIssue((el.textContent || '').slice(0, 120));
+        });
+        const projectKeys = Array.from(counts.entries())
+            .sort((a, b) => b[1] - a[1])
+            .map(e => e[0]);
+        const activeFilters = Array.from(document.querySelectorAll('[aria-pressed="true"], .ghx-active'))
+            .map(el => (el.getAttribute('aria-label') || el.getAttribute('title') || el.textContent || '').trim())
+            .filter(Boolean)
+            .slice(0, 12);
+        const columns = Array.from(document.querySelectorAll('#ghx-column-headers .ghx-column h2, [data-testid*="column-header"]'))
+            .map(el => (el.innerText || el.textContent || '').trim())
+            .filter(Boolean)
+            .slice(0, 16);
+        return JSON.stringify({
+            url: location.href,
+            title: document.title,
+            projectKeys,
+            issueKeys: issueKeys.slice(0, 40),
+            activeFilters,
+            columns
+        });
+        """
+    }
+
+    public static func scrollBoardScript(deltaY: Int, deltaX: Int = 0) -> String {
+        """
+        const dy = \(deltaY);
+        const dx = \(deltaX);
+        const prioritySelectors = [
+            '#ghx-pool',
+            '#ghx-work',
+            '[data-testid*="software-board.board-container"]',
+            '[data-testid*="board-container"]',
+            '[data-testid*="software-board"]',
+            'main [role="main"]',
+            'main'
+        ];
+        const canScrollY = (el) => {
+            if (!el) return false;
+            const oy = getComputedStyle(el).overflowY;
+            return (oy === 'auto' || oy === 'scroll' || oy === 'overlay') && el.scrollHeight > el.clientHeight + 20;
+        };
+        const canScrollX = (el) => {
+            if (!el) return false;
+            const ox = getComputedStyle(el).overflowX;
+            return (ox === 'auto' || ox === 'scroll' || ox === 'overlay') && el.scrollWidth > el.clientWidth + 20;
+        };
+        let target = null;
+        for (const sel of prioritySelectors) {
+            for (const el of document.querySelectorAll(sel)) {
+                if ((dy !== 0 && canScrollY(el)) || (dx !== 0 && canScrollX(el))) {
+                    target = el;
+                    break;
+                }
+            }
+            if (target) break;
+        }
+        if (!target) {
+            let bestArea = 0;
+            for (const el of document.querySelectorAll('div, section, main')) {
+                if ((dy !== 0 && canScrollY(el)) || (dx !== 0 && canScrollX(el))) {
+                    const rect = el.getBoundingClientRect();
+                    const area = rect.width * rect.height;
+                    if (area > bestArea) {
+                        bestArea = area;
+                        target = el;
+                    }
+                }
+            }
+        }
+        if (target) {
+            const beforeY = target.scrollTop;
+            const beforeX = target.scrollLeft;
+            if (typeof target.scrollBy === 'function') {
+                target.scrollBy({ top: dy, left: dx, behavior: 'auto' });
+            } else {
+                target.scrollTop += dy;
+                target.scrollLeft += dx;
+            }
+            return JSON.stringify({
+                scrolled: target.scrollTop !== beforeY || target.scrollLeft !== beforeX,
+                container: target.id || target.getAttribute('data-testid') || target.tagName.toLowerCase(),
+                scrollTop: Math.round(target.scrollTop),
+                maxScrollTop: Math.max(0, Math.round(target.scrollHeight - target.clientHeight)),
+                scrollLeft: Math.round(target.scrollLeft),
+                maxScrollLeft: Math.max(0, Math.round(target.scrollWidth - target.clientWidth))
+            });
+        }
+        const root = document.scrollingElement || document.documentElement;
+        const beforeY = window.scrollY || (root ? root.scrollTop : 0);
+        const beforeX = window.scrollX || (root ? root.scrollLeft : 0);
+        window.scrollBy({ top: dy, left: dx, behavior: 'auto' });
+        const afterY = window.scrollY || (root ? root.scrollTop : 0);
+        const afterX = window.scrollX || (root ? root.scrollLeft : 0);
+        return JSON.stringify({
+            scrolled: afterY !== beforeY || afterX !== beforeX,
+            container: 'window',
+            scrollTop: Math.round(afterY),
+            maxScrollTop: root ? Math.max(0, Math.round(root.scrollHeight - window.innerHeight)) : 0,
+            scrollLeft: Math.round(afterX),
+            maxScrollLeft: root ? Math.max(0, Math.round(root.scrollWidth - window.innerWidth)) : 0
+        });
+        """
+    }
+
+    public static func applyPresentationModeScript(enabled: Bool) -> String {
+        if !enabled {
+            return """
+            const existing = document.getElementById('__rnr-board-presentation-style');
+            if (existing) existing.remove();
+            window.dispatchEvent(new Event('resize'));
+            return JSON.stringify({ enabled: false });
+            """
+        }
+        return """
+        const styleId = '__rnr-board-presentation-style';
+        let styleEl = document.getElementById(styleId);
+        const css = `
+            #header, #aui-header, .aui-header, [data-testid="atlassian-navigation"],
+            [data-testid*="global-nav"], #ghx-navigation, .aui-sidebar,
+            [data-testid*="navigation-appshell"] nav, [data-testid="contextual-navigation"],
+            [data-testid*="project-sidebar"], #ghx-header .aui-nav,
+            .ghx-feedback-banner, #announcement-banner {
+                display: none !important;
+                height: 0 !important;
+                min-height: 0 !important;
+            }
+            #page, #content, .aui-page-panel, .aui-page-panel-inner,
+            #ghx-content-main, #ghx-work, #ghx-pool-column {
+                margin-left: 0 !important;
+                padding-left: 0 !important;
+                padding-top: 0 !important;
+                top: 0 !important;
+            }
+            #ghx-header {
+                padding: 4px 8px !important;
+                margin-bottom: 4px !important;
+            }
+            #ghx-quick-filters, [data-testid*="filters"] {
+                margin: 2px 0 !important;
+                padding-top: 2px !important;
+                padding-bottom: 2px !important;
+            }
+            #ghx-pool {
+                height: auto !important;
+                min-height: calc(100vh - 96px) !important;
+                max-height: calc(100vh - 96px) !important;
+                overflow-y: auto !important;
+            }
+        `;
+        if (!styleEl) {
+            styleEl = document.createElement('style');
+            styleEl.id = styleId;
+            (document.head || document.documentElement).appendChild(styleEl);
+        }
+        styleEl.textContent = css;
+        window.dispatchEvent(new Event('resize'));
+        return JSON.stringify({ enabled: true });
+        """
+    }
+
+    public static func focusActiveCardsScript() -> String {
+        """
+        const cards = Array.from(document.querySelectorAll('[data-issue-key], .ghx-issue, [data-testid*="card"]'))
+            .filter(el => {
+                const r = el.getBoundingClientRect();
+                return r.width > 0 && r.height > 0 && getComputedStyle(el).visibility !== 'hidden';
+            });
+        if (cards.length === 0) {
+            return JSON.stringify({ focused: false });
+        }
+        const firstCard = cards[0];
+        const pool = document.querySelector('#ghx-pool, #ghx-work, [data-testid*="software-board.board-container"], [data-testid*="board-container"]');
+        if (pool && pool.scrollHeight > pool.clientHeight + 20) {
+            const cardRect = firstCard.getBoundingClientRect();
+            const poolRect = pool.getBoundingClientRect();
+            if (cardRect.top > poolRect.bottom - 40 || cardRect.top < poolRect.top) {
+                firstCard.scrollIntoView({ behavior: 'auto', block: 'start', inline: 'nearest' });
+            }
+        }
+        return JSON.stringify({
+            focused: true,
+            visibleCards: cards.length,
+            firstKey: firstCard.getAttribute('data-issue-key') || null
         });
         """
     }

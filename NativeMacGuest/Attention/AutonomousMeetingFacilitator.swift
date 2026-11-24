@@ -116,7 +116,9 @@ final class AutonomousMeetingFacilitator: ObservableObject {
     }
 
     var wakeCoalesceDelay: Duration = .milliseconds(350)
-    var followUpCoalesceDelay: Duration = .milliseconds(900)
+    var followUpCoalesceDelay: Duration = .milliseconds(1500)
+    var silencePollInterval: Duration = .milliseconds(180)
+    var maxSilenceWaitDuration: Duration = .seconds(5)
 
     private static let followUpWindowSeconds: TimeInterval = 90
 
@@ -129,6 +131,13 @@ final class AutonomousMeetingFacilitator: ObservableObject {
     private var manuallyDisabledSessions: Set<UUID> = []
     private var lastSpokeAtBySession: [UUID: Date] = [:]
     private var lastVoiceDeliveryEndedAtBySession: [UUID: Date] = [:]
+    private var recentSpokenAnswersBySession: [UUID: [String]] = [:]
+    private var speakingSessions: Set<UUID> = []
+    private var speechCancelEpochBySession: [UUID: UInt64] = [:]
+    private var speechActivityEpochBySession: [UUID: UInt64] = [:]
+    private var turnExecutedWriteToolBySession: [UUID: Bool] = [:]
+    private var activeSpeechTasksBySession: [UUID: Task<Void, Never>] = [:]
+    private var activeSpeechTokenBySession: [UUID: UUID] = [:]
     private var realtimeSessions: [UUID: SessionRealtimeState] = [:]
     private var cachedSkills: [AssistantSkill] = []
     private var lastSkillRefreshAt = Date.distantPast
@@ -223,6 +232,13 @@ final class AutonomousMeetingFacilitator: ObservableObject {
         pendingTranscriptObservationSessions.remove(sessionID)
         lastStatusBySession.removeValue(forKey: sessionID)
         lastSpokeAtBySession.removeValue(forKey: sessionID)
+        lastSpokenAnswerBySession.removeValue(forKey: sessionID)
+        lastVoiceDeliveryEndedAtBySession.removeValue(forKey: sessionID)
+        recentSpokenAnswersBySession.removeValue(forKey: sessionID)
+        speechActivityEpochBySession.removeValue(forKey: sessionID)
+        turnExecutedWriteToolBySession.removeValue(forKey: sessionID)
+        activeSpeechTokenBySession.removeValue(forKey: sessionID)
+        cancelActiveSpeechForBargeIn(sessionID: sessionID)
         busySessions.remove(sessionID)
         if let model = attention?.meetings().first(where: { $0.sessionID == sessionID }) {
             model.onRealtimeAudioPCM16 = nil
@@ -307,7 +323,79 @@ final class AutonomousMeetingFacilitator: ObservableObject {
         let now = Date()
         for model in models where !model.isClosed && model.connected {
             guard let skillID = activeSessionSkills[model.sessionID] else { continue }
+            if model.participationRemoteSpeaking && speakingSessions.contains(model.sessionID) {
+                cancelActiveSpeechForBargeIn(sessionID: model.sessionID)
+            }
             evaluateTranscriptLines(for: model, skillID: skillID, now: now)
+        }
+    }
+
+    private func recordSpokenAnswer(_ text: String, for sessionID: UUID) {
+        lastSpokeAtBySession[sessionID] = Date()
+        lastSpokenAnswerBySession[sessionID] = text
+        var history = recentSpokenAnswersBySession[sessionID] ?? []
+        if history.last != text {
+            history.append(text)
+            if history.count > 3 {
+                history.removeFirst(history.count - 3)
+            }
+            recentSpokenAnswersBySession[sessionID] = history
+        }
+    }
+
+    private func recentEchoCandidates(for sessionID: UUID) -> [String] {
+        if let history = recentSpokenAnswersBySession[sessionID], !history.isEmpty {
+            return history
+        }
+        if let last = lastSpokenAnswerBySession[sessionID]?.trimmed, !last.isEmpty {
+            return [last]
+        }
+        return []
+    }
+
+    private func isWithinEchoWindow(for sessionID: UUID, at now: Date = Date()) -> Bool {
+        if speakingSessions.contains(sessionID) {
+            return true
+        }
+        if let endedAt = lastVoiceDeliveryEndedAtBySession[sessionID],
+           now.timeIntervalSince(endedAt) <= 6 {
+            return true
+        }
+        if let spokenAt = lastSpokeAtBySession[sessionID],
+           now.timeIntervalSince(spokenAt) <= 6 {
+            return true
+        }
+        return false
+    }
+
+    func cancelActiveSpeechForBargeIn(sessionID: UUID) {
+        speechCancelEpochBySession[sessionID, default: 0] &+= 1
+        let wasSpeaking = speakingSessions.remove(sessionID) != nil
+        activeSpeechTasksBySession.removeValue(forKey: sessionID)?.cancel()
+        if wasSpeaking {
+            VoicePreviewPlayer.shared.stop()
+            lastStatusBySession[sessionID] = L("Listening…")
+        }
+        if let rtState = realtimeSessions[sessionID], rtState.responseInProgress {
+            rtState.turnTimeoutTask?.cancel()
+            rtState.turnTimeoutTask = nil
+            rtState.responseInProgress = false
+            rtState.audioChunks.removeAll()
+            rtState.transcriptBuffer = ""
+            busySessions.remove(sessionID)
+        }
+    }
+
+    private func waitForSpeakerSilence(for model: NativeDesktopMeetingModel) async {
+        guard maxSilenceWaitDuration > .zero, silencePollInterval > .zero else { return }
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: maxSilenceWaitDuration)
+        while !Task.isCancelled && clock.now < deadline {
+            if model.isClosed || !model.connected { return }
+            if !model.participationSomeoneSpeaking {
+                return
+            }
+            try? await clock.sleep(for: silencePollInterval)
         }
     }
 
@@ -330,7 +418,6 @@ final class AutonomousMeetingFacilitator: ObservableObject {
     }
 
     private func evaluateTranscriptLines(for model: NativeDesktopMeetingModel, skillID: String, now: Date) {
-        guard !busySessions.contains(model.sessionID) else { return }
         let seen = processedLineIDsBySession[model.sessionID] ?? []
         let unseen = model.transcript.suffix(80).filter {
             !seen.contains($0.id) && !$0.text.trimmed.isEmpty
@@ -340,22 +427,33 @@ final class AutonomousMeetingFacilitator: ObservableObject {
         let inFollowUpWindow = lastSpokeAtBySession[model.sessionID].map {
             now.timeIntervalSince($0) <= Self.followUpWindowSeconds
         } ?? false
-        let inEchoWindow = lastVoiceDeliveryEndedAtBySession[model.sessionID].map {
-            now.timeIntervalSince($0) <= 6
-        } ?? false
-        let lastSpoken = lastSpokenAnswerBySession[model.sessionID]?.trimmed ?? ""
+        let inEchoWindow = isWithinEchoWindow(for: model.sessionID, at: now)
+        let recentAnswers = recentEchoCandidates(for: model.sessionID)
 
         var hasWake = false
         var hasFollowUp = false
+        var sawGenuineHumanSpeech = false
         for line in unseen {
             if line.id.hasPrefix("assistant:") || AssistantSpeechLedger.isAssistantSpeaker(line.participantName, role: nil) {
                 continue
             }
-            let text = line.text.trimmed
-            guard !text.isEmpty else { continue }
-            if Self.isLikelySelfEcho(candidate: text, lastSpoken: lastSpoken, isLocal: line.isOwn, withinEchoWindow: inEchoWindow) {
+            let rawText = line.text.trimmed
+            guard !rawText.isEmpty else { continue }
+            if AssistantWakePhraseMatcher.isLikelySelfEcho(
+                candidate: rawText,
+                recentAssistantUtterances: recentAnswers,
+                isLocal: line.isOwn,
+                withinEchoWindow: inEchoWindow
+            ) {
                 continue
             }
+            let text = AssistantWakePhraseMatcher.stripAssistantEcho(
+                from: rawText,
+                recentAssistantUtterances: recentAnswers,
+                withinEchoWindow: inEchoWindow
+            )
+            guard !text.isEmpty else { continue }
+            sawGenuineHumanSpeech = true
             switch AssistantWakePhraseMatcher.match(text) {
             case .command(let cmd) where !cmd.trimmed.isEmpty:
                 hasWake = true
@@ -368,6 +466,15 @@ final class AutonomousMeetingFacilitator: ObservableObject {
             }
         }
 
+        if sawGenuineHumanSpeech {
+            speechActivityEpochBySession[model.sessionID, default: 0] &+= 1
+            if speakingSessions.contains(model.sessionID) || realtimeSessions[model.sessionID]?.responseInProgress == true {
+                cancelActiveSpeechForBargeIn(sessionID: model.sessionID)
+            }
+        }
+
+        guard !busySessions.contains(model.sessionID) else { return }
+
         if !hasWake && !hasFollowUp {
             markLinesSeen(unseen, for: model.sessionID)
             return
@@ -375,7 +482,8 @@ final class AutonomousMeetingFacilitator: ObservableObject {
 
         let sid = model.sessionID
         coalesceTasksBySession.removeValue(forKey: sid)?.cancel()
-        let delay = hasWake ? wakeCoalesceDelay : followUpCoalesceDelay
+        let baseDelay = hasWake ? wakeCoalesceDelay : followUpCoalesceDelay
+        let delay = model.participationSomeoneSpeaking ? max(baseDelay, silencePollInterval) : baseDelay
         coalesceTasksBySession[sid] = Task { @MainActor [weak self, weak model] in
             if delay > .zero {
                 try? await Task.sleep(for: delay)
@@ -392,6 +500,12 @@ final class AutonomousMeetingFacilitator: ObservableObject {
               activeSessionSkills[sid] == skillID,
               !model.isClosed, model.connected else { return }
 
+        await waitForSpeakerSilence(for: model)
+        guard !Task.isCancelled,
+              !busySessions.contains(sid),
+              activeSessionSkills[sid] == skillID,
+              !model.isClosed, model.connected else { return }
+
         let seen = processedLineIDsBySession[sid] ?? []
         let unseen = model.transcript.suffix(80).filter {
             !seen.contains($0.id) && !$0.text.trimmed.isEmpty
@@ -403,10 +517,8 @@ final class AutonomousMeetingFacilitator: ObservableObject {
         let inFollowUpWindow = lastSpokeAtBySession[sid].map {
             now.timeIntervalSince($0) <= Self.followUpWindowSeconds
         } ?? false
-        let inEchoWindow = lastVoiceDeliveryEndedAtBySession[sid].map {
-            now.timeIntervalSince($0) <= 6
-        } ?? false
-        let lastSpoken = lastSpokenAnswerBySession[sid]?.trimmed ?? ""
+        let inEchoWindow = isWithinEchoWindow(for: sid, at: now)
+        let recentAnswers = recentEchoCandidates(for: sid)
 
         var sawWake = false
         var fragments: [String] = []
@@ -415,11 +527,22 @@ final class AutonomousMeetingFacilitator: ObservableObject {
             if line.id.hasPrefix("assistant:") || AssistantSpeechLedger.isAssistantSpeaker(line.participantName, role: nil) {
                 continue
             }
-            let text = line.text.trimmed
-            guard !text.isEmpty else { continue }
-            if Self.isLikelySelfEcho(candidate: text, lastSpoken: lastSpoken, isLocal: line.isOwn, withinEchoWindow: inEchoWindow) {
+            let rawText = line.text.trimmed
+            guard !rawText.isEmpty else { continue }
+            if AssistantWakePhraseMatcher.isLikelySelfEcho(
+                candidate: rawText,
+                recentAssistantUtterances: recentAnswers,
+                isLocal: line.isOwn,
+                withinEchoWindow: inEchoWindow
+            ) {
                 continue
             }
+            let text = AssistantWakePhraseMatcher.stripAssistantEcho(
+                from: rawText,
+                recentAssistantUtterances: recentAnswers,
+                withinEchoWindow: inEchoWindow
+            )
+            guard !text.isEmpty else { continue }
             switch AssistantWakePhraseMatcher.match(text) {
             case .command(let cmd) where !cmd.trimmed.isEmpty:
                 sawWake = true
@@ -629,6 +752,8 @@ final class AutonomousMeetingFacilitator: ObservableObject {
         )
 
         let runtime = AssistantRuntime()
+        let turnEpoch = speechActivityEpochBySession[model.sessionID, default: 0]
+        turnExecutedWriteToolBySession[model.sessionID] = false
         let framedPrompt = "\(speakerName) says: \(commandText)\n" +
             (allowWrites
                 ? "(Approved speaker. Answer concisely for voice playback in 1-3 sentences after running any needed tools.)"
@@ -641,19 +766,39 @@ final class AutonomousMeetingFacilitator: ObservableObject {
         let outcome = await runtime.submit(framedPrompt, environment: environment)
 
         let spokenText: String?
+        let didMutate: Bool
         switch outcome {
-        case .success(.completed(let text, _, _)):
+        case .success(.completed(let text, let sources, _)):
             spokenText = text
+            let writeIndicators = ["create", "update", "task", "jira", "board", "schedule", "people", "summary", "artifacts"]
+            let sourceMutated = sources.contains { src in
+                let hay = (src.kind + " " + src.title).lowercased()
+                return writeIndicators.contains { hay.contains($0) }
+            }
+            didMutate = sourceMutated || (turnExecutedWriteToolBySession[model.sessionID] ?? false)
         case .success(.needsUserInput(let question)):
             spokenText = question
+            didMutate = false
         case .success(.approvalRequired(let approval)):
             lastStatusBySession[model.sessionID] = L("Approval required: %@", approval.title)
             spokenText = nil
+            didMutate = false
         case .failure:
             spokenText = nil
+            didMutate = false
         }
 
         if let spokenText, !spokenText.trimmed.isEmpty {
+            await waitForSpeakerSilence(for: model)
+            guard !model.isClosed, model.connected,
+                  activeSessionSkills[model.sessionID] != nil,
+                  !manuallyDisabledSessions.contains(model.sessionID) else { return }
+            let activityAdvanced = speechActivityEpochBySession[model.sessionID, default: 0] != turnEpoch
+            let seenNow = processedLineIDsBySession[model.sessionID] ?? []
+            let hasNewUnseen = model.transcript.contains { !seenNow.contains($0.id) && !$0.text.trimmed.isEmpty }
+            if !didMutate && ((activityAdvanced && hasNewUnseen) || model.participationSomeoneSpeaking) {
+                return
+            }
             await speakIntoMeeting(spokenText, model: model)
         }
     }
@@ -865,7 +1010,19 @@ final class AutonomousMeetingFacilitator: ObservableObject {
             state.audioChunks.removeAll()
             let text = AssistantSpeechLedger.sanitizeSpokenReply(state.transcriptBuffer)
             state.transcriptBuffer = ""
-            if let model, !model.isClosed {
+            if let model, !model.isClosed, model.connected,
+               activeSessionSkills[model.sessionID] != nil,
+               !manuallyDisabledSessions.contains(model.sessionID) {
+                await waitForSpeakerSilence(for: model)
+                guard !model.isClosed, model.connected,
+                      activeSessionSkills[model.sessionID] != nil,
+                      !manuallyDisabledSessions.contains(model.sessionID),
+                      !model.participationSomeoneSpeaking else {
+                    if activeSessionSkills[model.sessionID] != nil {
+                        observeTranscriptChanged(for: model)
+                    }
+                    return
+                }
                 if let buffer = Self.pcm16ToAudioBuffer(data: combined, sampleRate: state.outputSampleRate) {
                     await deliverSpokenBuffer(buffer, fallbackText: text, model: model)
                 } else if !text.isEmpty {
@@ -919,55 +1076,121 @@ final class AutonomousMeetingFacilitator: ObservableObject {
     }
 
     func speakIntoMeeting(_ text: String, model: NativeDesktopMeetingModel) async {
-        guard let attention, !model.isClosed else { return }
+        let sid = model.sessionID
+        guard let attention,
+              !model.isClosed,
+              model.connected,
+              activeSessionSkills[sid] != nil,
+              !manuallyDisabledSessions.contains(sid) else { return }
         let clean = AssistantSpeechLedger.sanitizeSpokenReply(text)
         guard !clean.isEmpty else { return }
-        lastSpokeAtBySession[model.sessionID] = Date()
-        lastSpokenAnswerBySession[model.sessionID] = clean
-        realtimeSessions[model.sessionID]?.gate.markVoiceDeliveryStarted()
+        let startEpoch = speechCancelEpochBySession[sid, default: 0]
+        let speechToken = UUID()
+        activeSpeechTasksBySession[sid]?.cancel()
+        activeSpeechTokenBySession[sid] = speechToken
+        recordSpokenAnswer(clean, for: sid)
+        realtimeSessions[sid]?.gate.markVoiceDeliveryStarted()
+        speakingSessions.insert(sid)
         defer {
-            let endedAt = Date()
-            lastSpokeAtBySession[model.sessionID] = endedAt
-            lastVoiceDeliveryEndedAtBySession[model.sessionID] = endedAt
-            realtimeSessions[model.sessionID]?.gate.markVoiceDeliveryEnded(at: endedAt)
-        }
-        do {
-            if attention.canStreamVoiceDelivery, model.supportsVoiceReply, model.snapshot.playoutOn {
-                if !model.ownsMicrophone, let arbiter = model.microphoneArbiter {
-                    _ = await arbiter(model)
-                }
-                let request = UUID()
-                let pre = try await AttentionCoordinator.preparePrepulledStream(
-                    from: attention.streamSynthesize(clean, cloneRequest: request),
-                    cloneRequest: request
-                )
-                let utteranceID = UUID().uuidString
-                let startedAt = Date()
-                model.recordAssistantSpokenUtterance(id: utteranceID, text: clean, startedAt: startedAt, endedAt: nil)
-                do {
-                    try await attention.deliverVoiceStream(model, pre.replayStream)
-                    model.assistantSpeechLedger.endUtterance(id: utteranceID, endedAt: Date())
-                    lastStatusBySession[model.sessionID] = L("Spoken into “%@”.", model.title)
-                    return
-                } catch {
-                    pre.cancel()
-                    model.assistantSpeechLedger.endUtterance(id: utteranceID, endedAt: Date())
-                    // Fall through to local audition playback if WebRTC send fails before playing.
-                }
-            } else if !model.supportsVoiceReply || !model.snapshot.playoutOn {
-                let utteranceID = UUID().uuidString
-                let startedAt = Date()
-                model.recordAssistantSpokenUtterance(id: utteranceID, text: clean, startedAt: startedAt, endedAt: nil)
-                await playLocalAuditionAndWait(clean, attention: attention)
-                model.assistantSpeechLedger.endUtterance(id: utteranceID, endedAt: Date())
-                lastStatusBySession[model.sessionID] = L("Auditioned locally (meeting audio off).")
-                return
+            if activeSpeechTokenBySession[sid] == speechToken {
+                activeSpeechTokenBySession.removeValue(forKey: sid)
+                speakingSessions.remove(sid)
+                activeSpeechTasksBySession.removeValue(forKey: sid)
+                let endedAt = Date()
+                lastSpokeAtBySession[sid] = endedAt
+                lastVoiceDeliveryEndedAtBySession[sid] = endedAt
+                realtimeSessions[sid]?.gate.markVoiceDeliveryEnded(at: endedAt)
             }
-            let buffer = try await attention.store.voiceConfiguration.synthesize(clean)
-            await deliverSpokenBuffer(buffer, fallbackText: clean, model: model)
-        } catch {
-            lastStatusBySession[model.sessionID] = error.localizedDescription
         }
+
+        let speechTask = Task<Void, Never> { @MainActor [weak self, weak model, weak attention] in
+            guard let self, let model, let attention,
+                  !Task.isCancelled,
+                  self.activeSpeechTokenBySession[sid] == speechToken,
+                  self.speechCancelEpochBySession[sid, default: 0] == startEpoch else { return }
+            do {
+                if attention.canStreamVoiceDelivery, model.supportsVoiceReply, model.snapshot.playoutOn {
+                    if !model.ownsMicrophone, let arbiter = model.microphoneArbiter {
+                        _ = await arbiter(model)
+                    }
+                    try Task.checkCancellation()
+                    guard !model.isClosed, model.connected,
+                          self.activeSpeechTokenBySession[sid] == speechToken,
+                          self.speechCancelEpochBySession[sid, default: 0] == startEpoch,
+                          self.activeSessionSkills[sid] != nil,
+                          !self.manuallyDisabledSessions.contains(sid) else { return }
+                    let request = UUID()
+                    let pre = try await AttentionCoordinator.preparePrepulledStream(
+                        from: attention.streamSynthesize(clean, cloneRequest: request),
+                        cloneRequest: request
+                    )
+                    let utteranceID = UUID().uuidString
+                    let startedAt = Date()
+                    model.recordAssistantSpokenUtterance(id: utteranceID, text: clean, startedAt: startedAt, endedAt: nil)
+                    do {
+                        try await attention.deliverVoiceStream(model, pre.replayStream)
+                        model.assistantSpeechLedger.endUtterance(id: utteranceID, endedAt: Date())
+                        if !Task.isCancelled,
+                           self.activeSpeechTokenBySession[sid] == speechToken,
+                           self.speechCancelEpochBySession[sid, default: 0] == startEpoch {
+                            self.lastStatusBySession[sid] = L("Spoken into “%@”.", model.title)
+                        }
+                        return
+                    } catch {
+                        pre.cancel()
+                        model.assistantSpeechLedger.endUtterance(id: utteranceID, endedAt: Date())
+                        guard !Task.isCancelled,
+                              self.activeSpeechTokenBySession[sid] == speechToken,
+                              self.speechCancelEpochBySession[sid, default: 0] == startEpoch,
+                              !model.isClosed, model.connected,
+                              !model.participationRemoteSpeaking,
+                              self.activeSessionSkills[sid] != nil,
+                              !self.manuallyDisabledSessions.contains(sid) else { return }
+                    }
+                } else if !model.supportsVoiceReply || !model.snapshot.playoutOn {
+                    guard !model.isClosed, model.connected,
+                          self.activeSpeechTokenBySession[sid] == speechToken,
+                          self.speechCancelEpochBySession[sid, default: 0] == startEpoch,
+                          self.activeSessionSkills[sid] != nil,
+                          !self.manuallyDisabledSessions.contains(sid),
+                          !model.participationRemoteSpeaking else { return }
+                    let utteranceID = UUID().uuidString
+                    let startedAt = Date()
+                    model.recordAssistantSpokenUtterance(id: utteranceID, text: clean, startedAt: startedAt, endedAt: nil)
+                    await self.playLocalAuditionAndWait(clean, attention: attention)
+                    model.assistantSpeechLedger.endUtterance(id: utteranceID, endedAt: Date())
+                    if !Task.isCancelled,
+                       self.activeSpeechTokenBySession[sid] == speechToken,
+                       self.speechCancelEpochBySession[sid, default: 0] == startEpoch {
+                        self.lastStatusBySession[sid] = L("Auditioned locally (meeting audio off).")
+                    }
+                    return
+                }
+                guard !Task.isCancelled,
+                      self.activeSpeechTokenBySession[sid] == speechToken,
+                      self.speechCancelEpochBySession[sid, default: 0] == startEpoch,
+                      !model.isClosed, model.connected,
+                      !model.participationRemoteSpeaking else { return }
+                let buffer: AVAudioPCMBuffer
+                if let synthesizeOverride = attention.synthesizeOverride {
+                    buffer = try await synthesizeOverride(clean)
+                } else {
+                    buffer = try await attention.store.voiceConfiguration.synthesize(clean)
+                }
+                try Task.checkCancellation()
+                guard self.activeSpeechTokenBySession[sid] == speechToken,
+                      self.speechCancelEpochBySession[sid, default: 0] == startEpoch,
+                      !model.isClosed, model.connected,
+                      !model.participationRemoteSpeaking else { return }
+                await self.deliverSpokenBufferCore(buffer, fallbackText: clean, model: model, startEpoch: startEpoch)
+            } catch {
+                if !Task.isCancelled, self.activeSpeechTokenBySession[sid] == speechToken {
+                    self.lastStatusBySession[sid] = error.localizedDescription
+                }
+            }
+        }
+        activeSpeechTasksBySession[sid] = speechTask
+        await speechTask.value
     }
 
     private func playLocalAuditionAndWait(_ text: String, attention: AttentionCoordinator) async {
@@ -1020,23 +1243,64 @@ final class AutonomousMeetingFacilitator: ObservableObject {
     }
 
     private func deliverSpokenBuffer(_ buffer: AVAudioPCMBuffer, fallbackText: String, model: NativeDesktopMeetingModel) async {
-        guard let attention, !model.isClosed else { return }
+        let sid = model.sessionID
+        guard let attention,
+              !model.isClosed,
+              model.connected,
+              activeSessionSkills[sid] != nil,
+              !manuallyDisabledSessions.contains(sid) else { return }
+        _ = attention
         let cleanFallback = AssistantSpeechLedger.sanitizeSpokenReply(fallbackText)
-        lastSpokeAtBySession[model.sessionID] = Date()
+        let startEpoch = speechCancelEpochBySession[sid, default: 0]
+        let speechToken = UUID()
+        activeSpeechTasksBySession[sid]?.cancel()
+        activeSpeechTokenBySession[sid] = speechToken
         if !cleanFallback.isEmpty {
-            lastSpokenAnswerBySession[model.sessionID] = cleanFallback
+            recordSpokenAnswer(cleanFallback, for: sid)
+        } else {
+            lastSpokeAtBySession[sid] = Date()
         }
-        realtimeSessions[model.sessionID]?.gate.markVoiceDeliveryStarted()
+        realtimeSessions[sid]?.gate.markVoiceDeliveryStarted()
+        speakingSessions.insert(sid)
         defer {
-            let endedAt = Date()
-            lastSpokeAtBySession[model.sessionID] = endedAt
-            lastVoiceDeliveryEndedAtBySession[model.sessionID] = endedAt
-            realtimeSessions[model.sessionID]?.gate.markVoiceDeliveryEnded(at: endedAt)
+            if activeSpeechTokenBySession[sid] == speechToken {
+                activeSpeechTokenBySession.removeValue(forKey: sid)
+                speakingSessions.remove(sid)
+                activeSpeechTasksBySession.removeValue(forKey: sid)
+                let endedAt = Date()
+                lastSpokeAtBySession[sid] = endedAt
+                lastVoiceDeliveryEndedAtBySession[sid] = endedAt
+                realtimeSessions[sid]?.gate.markVoiceDeliveryEnded(at: endedAt)
+            }
         }
+        let speechTask = Task<Void, Never> { @MainActor [weak self, weak model] in
+            guard let self, let model,
+                  !Task.isCancelled,
+                  self.activeSpeechTokenBySession[sid] == speechToken,
+                  self.speechCancelEpochBySession[sid, default: 0] == startEpoch else { return }
+            await self.deliverSpokenBufferCore(buffer, fallbackText: cleanFallback, model: model, startEpoch: startEpoch)
+        }
+        activeSpeechTasksBySession[sid] = speechTask
+        await speechTask.value
+    }
+
+    private func deliverSpokenBufferCore(
+        _ buffer: AVAudioPCMBuffer,
+        fallbackText cleanFallback: String,
+        model: NativeDesktopMeetingModel,
+        startEpoch: UInt64
+    ) async {
+        let sid = model.sessionID
+        guard let attention else { return }
         if model.supportsVoiceReply && model.snapshot.playoutOn {
             if !model.ownsMicrophone, let arbiter = model.microphoneArbiter {
                 _ = await arbiter(model)
             }
+            guard !Task.isCancelled,
+                  speechCancelEpochBySession[sid, default: 0] == startEpoch,
+                  !model.isClosed, model.connected,
+                  activeSessionSkills[sid] != nil,
+                  !manuallyDisabledSessions.contains(sid) else { return }
             let utteranceID = UUID().uuidString
             let startedAt = Date()
             if !cleanFallback.isEmpty {
@@ -1045,17 +1309,35 @@ final class AutonomousMeetingFacilitator: ObservableObject {
             do {
                 try await attention.deliverVoice(model, buffer)
                 model.assistantSpeechLedger.endUtterance(id: utteranceID, endedAt: Date())
-                lastStatusBySession[model.sessionID] = L("Spoken into “%@”.", model.title)
+                if !Task.isCancelled, speechCancelEpochBySession[sid, default: 0] == startEpoch {
+                    lastStatusBySession[sid] = L("Spoken into “%@”.", model.title)
+                }
                 return
             } catch {
                 model.assistantSpeechLedger.endUtterance(id: utteranceID, endedAt: Date())
-                // Fall through to local preview playback if WebRTC send fails.
+                let canAuditionLocally = !Task.isCancelled
+                    && speechCancelEpochBySession[sid, default: 0] == startEpoch
+                    && !model.isClosed
+                    && model.connected
+                    && activeSessionSkills[sid] != nil
+                    && !manuallyDisabledSessions.contains(sid)
+                    && !model.participationRemoteSpeaking
+                    && !model.snapshot.playoutOn
+                guard canAuditionLocally else { return }
             }
         }
+        guard !Task.isCancelled,
+              speechCancelEpochBySession[sid, default: 0] == startEpoch,
+              !model.isClosed, model.connected,
+              activeSessionSkills[sid] != nil,
+              !manuallyDisabledSessions.contains(sid),
+              !model.participationRemoteSpeaking else { return }
         if (try? VoicePreviewPlayer.shared.play(buffer)) == nil, !cleanFallback.isEmpty {
             await playLocalAuditionAndWait(cleanFallback, attention: attention)
         }
-        lastStatusBySession[model.sessionID] = L("Auditioned locally (meeting audio off).")
+        if !Task.isCancelled, speechCancelEpochBySession[sid, default: 0] == startEpoch {
+            lastStatusBySession[sid] = L("Auditioned locally (meeting audio off).")
+        }
     }
 
     private func syncRealtimeActiveFlag() {

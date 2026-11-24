@@ -200,6 +200,9 @@ struct IOSAssistantSessionBridge {
     var releaseFacilitatorTranscription: @MainActor () async -> Void = {}
     var isVoiceReplyInFlight: @MainActor () -> Bool = { false }
     var isVoiceReplyInFlightNonisolated: (@Sendable () -> Bool)? = nil
+    var isConnected: @MainActor () -> Bool = { true }
+    var isHumanSpeaking: @MainActor () -> Bool = { false }
+    var cancelVoiceReplyForBargeIn: @MainActor () -> Void = {}
     var setRealtimeAudioTap: @MainActor ((@Sendable (String, Data) -> Void)?) -> Void = { _ in }
     var sendChat: @MainActor (String) async throws -> Void
     var speakVoice: @MainActor (String) async throws -> Void
@@ -492,6 +495,7 @@ final class IOSAssistantCoordinator: ObservableObject {
     var onBannerAlert: ((IOSAssistantAlertCard) -> Void)?
     var onSessionModeChanged: ((UUID, IOSMeetingAssistantMode, Bool) -> Void)?
     var onTranscriptEvents: ((UUID, String, URL?, [SyncedTranscriptEvent], [String]) -> Void)?
+    var onTranscriptPartialActivity: ((UUID, Set<String>) -> Void)?
     var isFacilitatorActive: ((UUID) -> Bool)?
     var attentionPromptProvider: (() -> String?)?
 
@@ -752,6 +756,7 @@ final class IOSAssistantCoordinator: ObservableObject {
     // MARK: - Live Event Observation & Evaluation
 
     func observeEvents(_ events: [SyncedTranscriptEvent], for controllerID: UUID, partialEventIDs: Set<String> = []) {
+        onTranscriptPartialActivity?(controllerID, partialEventIDs)
         guard !events.isEmpty else { return }
         var seen = seenEventIDs[controllerID] ?? []
         let previousCount = seen.count

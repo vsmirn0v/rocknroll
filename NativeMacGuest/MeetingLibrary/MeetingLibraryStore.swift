@@ -1896,6 +1896,19 @@ extension MeetingLibraryStore {
             targetOutcome.meetingID = Self.assistantStandaloneSessionID
         }
 
+        let cleanOwner = owner.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let existing = targetOutcome.tasks.first(where: { existing in
+            !existing.done && MeetingTaskDeduplicator.isDuplicate(
+                candidateTitle: cleanTitle,
+                candidateOwner: cleanOwner,
+                existingTitle: existing.text,
+                existingOwner: existing.owner
+            )
+        }) {
+            let commit = try commitOutcome(targetOutcome, state: .ready)
+            return (commit, existing)
+        }
+
         var ext = TaskExtendedMetadata()
         if let notes = notes?.trimmingCharacters(in: .whitespacesAndNewlines), !notes.isEmpty {
             ext.appendContextNote(notes)
@@ -1903,7 +1916,7 @@ extension MeetingLibraryStore {
         let task = MeetingOutcomeTask(
             id: UUID(),
             text: cleanTitle,
-            owner: owner.trimmingCharacters(in: .whitespacesAndNewlines),
+            owner: cleanOwner,
             assigneeID: assigneeID,
             dueDay: dueDay,
             done: false,
@@ -1955,9 +1968,12 @@ extension MeetingLibraryStore {
         if let replaceSummary = replaceSummary?.trimmingCharacters(in: .whitespacesAndNewlines), !replaceSummary.isEmpty {
             outcome.summary = replaceSummary
         } else if let append = summaryAppend?.trimmingCharacters(in: .whitespacesAndNewlines), !append.isEmpty {
-            outcome.summary = outcome.summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                ? append
-                : outcome.summary.trimmingCharacters(in: .whitespacesAndNewlines) + "\n\n" + append
+            let cleanCurrent = outcome.summary.trimmingCharacters(in: .whitespacesAndNewlines)
+            if cleanCurrent.isEmpty {
+                outcome.summary = append
+            } else if !cleanCurrent.localizedCaseInsensitiveContains(append) {
+                outcome.summary = cleanCurrent + "\n\n" + append
+            }
         }
 
         for d in addDecisions {
@@ -1975,10 +1991,20 @@ extension MeetingLibraryStore {
         for item in addTasks {
             let cleanText = item.text.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !cleanText.isEmpty else { continue }
+            let cleanOwner = item.owner.trimmingCharacters(in: .whitespacesAndNewlines)
+            let isDup = outcome.tasks.contains { existing in
+                !existing.done && MeetingTaskDeduplicator.isDuplicate(
+                    candidateTitle: cleanText,
+                    candidateOwner: cleanOwner,
+                    existingTitle: existing.text,
+                    existingOwner: existing.owner
+                )
+            }
+            guard !isDup else { continue }
             outcome.tasks.append(MeetingOutcomeTask(
                 id: UUID(),
                 text: cleanText,
-                owner: item.owner.trimmingCharacters(in: .whitespacesAndNewlines),
+                owner: cleanOwner,
                 assigneeID: item.assigneeID,
                 dueDay: item.dueDay,
                 done: false

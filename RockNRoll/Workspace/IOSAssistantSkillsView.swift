@@ -112,12 +112,19 @@ struct IOSAssistantSkillsView: View {
         .toolbar {
             ToolbarItemGroup(placement: .keyboard) {
                 Spacer()
-                Button(L("Done")) { dismissKeyboard() }
+                Button(L("Done")) {
+                    flushTeamContextIfDirty()
+                    dismissKeyboard()
+                }
             }
         }
         .onAppear { loadDrafts() }
-        .onDisappear { board.isInlineSheetActive = false }
+        .onDisappear {
+            flushTeamContextIfDirty()
+            board.isInlineSheetActive = false
+        }
         .onChange(of: selectedTab) { _, _ in
+            flushTeamContextIfDirty()
             statusBanner = nil
             statusIsError = false
         }
@@ -490,23 +497,16 @@ struct IOSAssistantSkillsView: View {
                     .keyboardType(.URL)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
+                    .onSubmit { saveTeamContextDraft(showConfirmation: true) }
                 TextField(L("Default Jira Project Key (e.g. PROJ)"), text: $projectKeyDraft)
                     .textInputAutocapitalization(.characters)
                     .autocorrectionDisabled()
+                    .onSubmit { saveTeamContextDraft(showConfirmation: true) }
                 TextField(L("Team Context Notes"), text: $teamNotesDraft, axis: .vertical)
                     .lineLimit(3...8)
 
                 Button(L("Save Team Context")) {
-                    var doc = skills.teamContext
-                    doc.defaultJiraBoardURL = boardURLDraft
-                    doc.defaultJiraProjectKey = projectKeyDraft
-                    doc.notes = teamNotesDraft
-                    do {
-                        try skills.saveTeamContext(doc)
-                        showStatus(L("Saved Knowledge/TeamContext.md."))
-                    } catch {
-                        showStatus(error.localizedDescription, isError: true)
-                    }
+                    saveTeamContextDraft(showConfirmation: true)
                 }
                 .buttonStyle(.borderedProminent)
 
@@ -628,6 +628,40 @@ struct IOSAssistantSkillsView: View {
         projectKeyDraft = skills.teamContext.defaultJiraProjectKey
         teamNotesDraft = skills.teamContext.notes
         realtimeKeyDraft = skills.realtimeAPIKey(for: skills.realtimeProvider) ?? ""
+    }
+
+    private func saveTeamContextDraft(showConfirmation: Bool) {
+        var doc = skills.teamContext
+        doc.defaultJiraBoardURL = boardURLDraft
+        doc.defaultJiraProjectKey = projectKeyDraft
+        doc.notes = teamNotesDraft
+        do {
+            try skills.saveTeamContext(doc)
+            boardURLDraft = skills.teamContext.defaultJiraBoardURL
+            projectKeyDraft = skills.teamContext.defaultJiraProjectKey
+            teamNotesDraft = skills.teamContext.notes
+            if showConfirmation {
+                showStatus(L("Saved Knowledge/TeamContext.md."))
+            }
+        } catch {
+            if showConfirmation {
+                showStatus(error.localizedDescription, isError: true)
+            }
+        }
+    }
+
+    private func flushTeamContextIfDirty() {
+        let savedURL = skills.teamContext.defaultJiraBoardURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let rawURL = boardURLDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        let draftURL = rawURL.isEmpty
+            ? ""
+            : (SyncedMeetingContextSettings.normalizedBoardURLString(from: rawURL) ?? rawURL)
+        let savedKey = skills.teamContext.defaultJiraProjectKey.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        let draftKey = SyncedMeetingContextSettings.normalizedJiraProjectKeys(from: projectKeyDraft).first
+            ?? projectKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        let savedNotes = skills.teamContext.notes
+        guard draftURL != savedURL || draftKey != savedKey || teamNotesDraft != savedNotes else { return }
+        saveTeamContextDraft(showConfirmation: false)
     }
 
     private func saveRealtimeAPIKey() {

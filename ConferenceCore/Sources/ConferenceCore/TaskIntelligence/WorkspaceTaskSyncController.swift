@@ -79,6 +79,8 @@ public final class WorkspaceTaskSyncController: ObservableObject {
     public var jiraConnectorForTesting: (any JiraTaskConnecting)?
     public weak var boardWebEvaluator: (any JiraBoardWebEvaluating)?
     @Published public private(set) var boardJiraSessionActive = false
+    @Published public private(set) var derivedBoardProjectKeys: [String] = []
+    private var derivedBoardCacheURL: String?
     @Published public var currentJiraUser: JiraUserContact?
     @Published public var reminderLists: [ReminderListInfo] = []
     @Published public var appContacts: [AppContactPerson] = []
@@ -861,6 +863,7 @@ public final class WorkspaceTaskSyncController: ObservableObject {
         }
 
         let webConnector = JiraBoardWebSessionConnector(evaluator: evaluator, fallbackSettings: preferences.jira)
+        let derivedFromBoard = await resolveBoardDerivedProjectKeys(forceRefresh: true)
         guard let me = try? await webConnector.verifyMyself() else {
             boardJiraSessionActive = false
             return
@@ -878,13 +881,14 @@ public final class WorkspaceTaskSyncController: ObservableObject {
             saveJiraSecret(cookieHeader, kind: .jiraSessionCookies, settings: adoptSettings)
         }
 
+        let effectiveBoardProject = (info.projectKey?.cleanedNilIfEmpty) ?? derivedFromBoard.first
         let sameHost = preferences.jira.normalizedBaseURL?.host?.lowercased() == info.baseURL.host?.lowercased()
         if !preferences.jira.enabled || preferences.jira.normalizedBaseURL == nil {
             var updated = preferences
             updated.jira.enabled = true
             updated.jira.baseURL = info.baseURL.absoluteString
             updated.jira.authMode = .webSession
-            if updated.jira.cleanProjectKey.isEmpty, let proj = info.projectKey, !proj.isEmpty {
+            if updated.jira.cleanProjectKey.isEmpty, let proj = effectiveBoardProject, !proj.isEmpty {
                 updated.jira.projectKey = proj
             }
             if updated.jira.usernameOrEmail.isEmpty,
@@ -894,7 +898,7 @@ public final class WorkspaceTaskSyncController: ObservableObject {
             await savePreferences(updated)
         } else if sameHost,
                   preferences.jira.cleanProjectKey.isEmpty,
-                  let proj = info.projectKey,
+                  let proj = effectiveBoardProject,
                   !proj.isEmpty {
             var updated = preferences
             updated.jira.projectKey = proj
@@ -1185,6 +1189,47 @@ public final class WorkspaceTaskSyncController: ObservableObject {
         return updated
     }
 
+    public func resolveBoardDerivedProjectKeys(forceRefresh: Bool = false) async -> [String] {
+        guard let evaluator = boardWebEvaluator, let url = evaluator.currentBoardURL else {
+            return derivedBoardProjectKeys
+        }
+        let cacheKey = url.absoluteString
+        let previousURL = derivedBoardCacheURL
+        if !forceRefresh, previousURL == cacheKey, !derivedBoardProjectKeys.isEmpty {
+            return derivedBoardProjectKeys
+        }
+        let webConnector = JiraBoardWebSessionConnector(evaluator: evaluator, fallbackSettings: preferences.jira)
+        let keys = await webConnector.deriveBoardProjectKeys()
+        if !keys.isEmpty {
+            derivedBoardCacheURL = cacheKey
+            derivedBoardProjectKeys = keys
+        } else if previousURL != cacheKey {
+            derivedBoardCacheURL = nil
+            derivedBoardProjectKeys = []
+        }
+        return derivedBoardProjectKeys
+    }
+
+    /// Resolves effective Jira project keys prioritizing an explicit per-meeting override over board-derived keys,
+    /// then falling back to configured/global defaults.
+    nonisolated public static func resolvedEffectiveJiraProjectKeys(
+        configured: [String],
+        globalFallback: [String],
+        boardDerived: [String]
+    ) -> [String] {
+        let cleanConfigured = SyncedMeetingContextSettings.normalizedJiraProjectKeys(from: configured)
+        let cleanGlobal = SyncedMeetingContextSettings.normalizedJiraProjectKeys(from: globalFallback)
+        let cleanBoard = SyncedMeetingContextSettings.normalizedJiraProjectKeys(from: boardDerived)
+        let hasPerMeetingOverride = !cleanConfigured.isEmpty && cleanConfigured != cleanGlobal
+        if hasPerMeetingOverride {
+            return cleanConfigured
+        }
+        if !cleanBoard.isEmpty {
+            return cleanBoard + cleanConfigured.filter { !cleanBoard.contains($0) }
+        }
+        return cleanConfigured
+    }
+
     public func createJiraIssueDirect(
         summary: String,
         description: String = "",
@@ -1199,9 +1244,15 @@ public final class WorkspaceTaskSyncController: ObservableObject {
             guard let url = boardWebEvaluator?.currentBoardURL else { return nil }
             return JiraBoardContextInfo.parse(from: url)?.projectKey
         }()
-        let resolvedProject = projectKey?.cleanedNilIfEmpty
-            ?? preferences.jira.cleanProjectKey.cleanedNilIfEmpty
-            ?? boardContextProject
+        let explicitKey = projectKey?.cleanedNilIfEmpty
+        let configuredKey = preferences.jira.cleanProjectKey.cleanedNilIfEmpty
+        var derivedProject: String? = boardContextProject
+        if explicitKey == nil && configuredKey == nil && derivedProject == nil {
+            derivedProject = await resolveBoardDerivedProjectKeys().first
+        }
+        let resolvedProject = explicitKey
+            ?? configuredKey
+            ?? derivedProject
         guard let resolvedProject, !resolvedProject.isEmpty else {
             throw JiraConnectorError.badRequest(L("Jira project key is required."))
         }
@@ -1218,5 +1269,109 @@ public final class WorkspaceTaskSyncController: ObservableObject {
         let created = try await connector.createIssue(payload)
         await boardWebEvaluator?.refreshBoardAfterJiraMutation(highlightIssueKey: created.key)
         return created
+    }
+
+    /// Resolves spoken or ASR-garbled project keys (e.g. "Sdp ситио", "SDB CTO") against known candidates.
+    nonisolated public static func resolveSpokenProjectKey(_ raw: String, candidates: [String]) -> String? {
+        let cleanCandidates = SyncedMeetingContextSettings.normalizedJiraProjectKeys(from: candidates)
+        let rawTrimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let direct = SyncedMeetingContextSettings.normalizedJiraProjectKeys(from: rawTrimmed)
+        if let exact = direct.first(where: { cleanCandidates.contains($0) }) {
+            return exact
+        }
+        let stripped = rawTrimmed
+            .lowercased()
+            .replacingOccurrences(of: "ё", with: "е")
+        let filler: Set<String> = ["ключ", "проект", "проекта", "джира", "жира", "jira", "project", "key", "задача", "в", "на"]
+        let words = stripped
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .filter { !$0.isEmpty && !filler.contains($0) }
+        guard !words.isEmpty else { return nil }
+        let joinedDirect = words.joined().uppercased()
+        if let exact = cleanCandidates.first(where: { $0 == joinedDirect }) {
+            return exact
+        }
+
+        func explicitASCIIKeyIfValid() -> String? {
+            guard !rawTrimmed.isEmpty,
+                  rawTrimmed.unicodeScalars.allSatisfy(\.isASCII),
+                  direct.count == 1 else {
+                return nil
+            }
+            let explicit = direct[0]
+            guard explicit.range(of: #"^[A-Z][A-Z0-9_]{1,}$"#, options: .regularExpression) != nil else {
+                return nil
+            }
+            if words.count == 1 || rawTrimmed.contains("://") || rawTrimmed.contains("-") {
+                return explicit
+            }
+            return nil
+        }
+
+        guard !cleanCandidates.isEmpty else {
+            return explicitASCIIKeyIfValid()
+        }
+
+        func spokenToLatin(_ token: String) -> String {
+            var s = token
+            let multiMap: [(String, String)] = [
+                ("ситио", "cto"), ("сити", "ct"), ("джи", "j"), ("эйч", "h"),
+                ("сдб", "sdb"), ("спс", "sps"), ("кти", "ct"),
+                ("ш", "sh"), ("щ", "sh"), ("ч", "ch"), ("ж", "zh"), ("ю", "yu"), ("я", "ya")
+            ]
+            for (pat, rep) in multiMap {
+                s = s.replacingOccurrences(of: pat, with: rep)
+            }
+            let charMap: [Character: String] = [
+                "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "з": "z",
+                "и": "i", "й": "y", "к": "k", "л": "l", "м": "m", "н": "n", "о": "o",
+                "п": "p", "р": "r", "с": "s", "т": "t", "у": "u", "ф": "f", "х": "h",
+                "ц": "c"
+            ]
+            var out = ""
+            for ch in s {
+                if let mapped = charMap[ch] {
+                    out += mapped
+                } else if ch.isASCII && ch.isLetter || ch.isNumber {
+                    out.append(ch)
+                }
+            }
+            return out.uppercased()
+        }
+
+        let phoneticForms: [String] = [
+            words.map(spokenToLatin).joined(),
+            spokenToLatin(words.joined())
+        ].filter { !$0.isEmpty }
+
+        func similarity(_ a: String, _ b: String) -> Double {
+            let ca = Array(a), cb = Array(b)
+            if ca.isEmpty || cb.isEmpty { return 0 }
+            if a == b { return 1.0 }
+            var dp = Array(repeating: Array(repeating: 0, count: cb.count + 1), count: ca.count + 1)
+            for i in 0...ca.count { dp[i][0] = i }
+            for j in 0...cb.count { dp[0][j] = j }
+            for i in 1...ca.count {
+                for j in 1...cb.count {
+                    let cost = ca[i - 1] == cb[j - 1] ? 0 : 1
+                    dp[i][j] = min(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + cost)
+                }
+            }
+            let dist = dp[ca.count][cb.count]
+            let maxLen = max(ca.count, cb.count)
+            return max(0.0, 1.0 - Double(dist) / Double(maxLen))
+        }
+
+        var best: (key: String, score: Double)?
+        for cand in cleanCandidates {
+            let score = phoneticForms.map { similarity($0, cand) }.max() ?? 0
+            if best == nil || score > best!.score {
+                best = (cand, score)
+            }
+        }
+        if let best, best.score >= 0.55 {
+            return best.key
+        }
+        return explicitASCIIKeyIfValid()
     }
 }
