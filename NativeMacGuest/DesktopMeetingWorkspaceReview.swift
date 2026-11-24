@@ -25,7 +25,7 @@ struct WorkspaceSessionReview: View {
     }
 
     let session: MeetingWorkspaceSession
-    @ObservedObject var journal: MeetingWorkspaceJournal
+    let journal: MeetingWorkspaceJournal
     @ObservedObject var guidance: MeetingWorkspaceGuidance
     var highlightedEventID: String? = nil
     var showsDelete = true
@@ -37,17 +37,24 @@ struct WorkspaceSessionReview: View {
     @State private var confirmDelete = false
     @State private var deleteError: String?
     @State private var copiedFeedback = false
-
-    private var events: [MeetingWorkspaceEvent] { session.visibleEvents }
-    private var filteredEvents: [MeetingWorkspaceEvent] {
-        let search = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        return events.filter { filter.includes($0) && $0.matches(search) }
-    }
+    @State private var showingReflection = false
 
     var body: some View {
+        let visibleEvents = session.visibleEvents
+        let search = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        let filteredEvents = (filter == .all && search.isEmpty)
+            ? visibleEvents
+            : visibleEvents.filter { filter.includes($0) && $0.matches(search) }
+        let selectedReply = replyID.flatMap { id in
+            visibleEvents.first { $0.id == id && $0.kind == .assistantReply }
+        }
+        let hasContent = visibleEvents.contains { event in
+            (event.kind == .transcript || event.kind == .chat)
+                && event.text?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+        }
         VStack(alignment: .leading, spacing: 12) {
-            header
-            if session.interrupted || events.contains(where: { $0.kind == .captureGap }) {
+            header(hasContent: hasContent)
+            if session.interrupted || visibleEvents.contains(where: { $0.kind == .captureGap }) {
                 Label(L("This conversation has gaps in speech capture."), systemImage: "waveform.slash")
                     .font(.caption).foregroundStyle(.orange)
             }
@@ -114,18 +121,7 @@ struct WorkspaceSessionReview: View {
         }
     }
 
-    @State private var showingReflection = false
-    private var selectedReply: MeetingWorkspaceEvent? { events.first { $0.id == replyID && $0.kind == .assistantReply } }
-
-    private var exportableEvents: [SyncedTranscriptEvent] {
-        MeetingWorkspaceJournal.syncedTranscriptEvents(from: events)
-    }
-
-    private var hasTranscriptContent: Bool {
-        !TranscriptExportFormatter.formatPlainText(events: exportableEvents).isEmpty
-    }
-
-    private var header: some View {
+    private func header(hasContent: Bool) -> some View {
         HStack(alignment: .top) {
             VStack(alignment: .leading, spacing: 4) {
                 Label(session.interrupted ? L("Conversation history interrupted") : L("Full conversation"),
@@ -133,7 +129,7 @@ struct WorkspaceSessionReview: View {
                     .font(.caption).foregroundStyle(session.interrupted ? .orange : .secondary)
             }
             Spacer(minLength: 7)
-            if hasTranscriptContent {
+            if hasContent {
                 Button {
                     copyTranscript()
                 } label: {
@@ -166,6 +162,7 @@ struct WorkspaceSessionReview: View {
     }
 
     private func copyTranscript() {
+        let exportableEvents = MeetingWorkspaceJournal.syncedTranscriptEvents(from: session.visibleEvents)
         let text = TranscriptExportFormatter.formatPlainText(
             events: exportableEvents,
             meetingTitle: session.title,
@@ -182,6 +179,7 @@ struct WorkspaceSessionReview: View {
     }
 
     private func exportTranscript() {
+        let exportableEvents = MeetingWorkspaceJournal.syncedTranscriptEvents(from: session.visibleEvents)
         let markdown = TranscriptExportFormatter.formatMarkdown(
             events: exportableEvents,
             title: session.title,

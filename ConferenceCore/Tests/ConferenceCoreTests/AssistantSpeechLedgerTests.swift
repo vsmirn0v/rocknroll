@@ -254,4 +254,21 @@ final class AssistantSpeechLedgerTests: XCTestCase {
         XCTAssertTrue(fileName.hasPrefix("2025-10-15-") || fileName.contains(".transcript.md"))
         XCTAssertTrue(fileName.hasSuffix(".transcript.md"))
     }
+
+    func testTranscriptExportFormatterHasTranscriptContentMatchesPlainText() {
+        let start = Date(timeIntervalSince1970: 1_760_000_000)
+        let cases: [[SyncedTranscriptEvent]] = [
+            [],
+            [SyncedTranscriptEvent(id: "g1", kind: "captureGap", occurredAt: start, text: "gap", deviceID: "mac-1")],
+            [SyncedTranscriptEvent(id: "t1", kind: "transcript", occurredAt: start, text: "   \n\t ", deviceID: "mac-1")],
+            [SyncedTranscriptEvent(id: "t2", kind: "transcript", occurredAt: start, speaker: "Anna", text: "Hello", deviceID: "mac-1")],
+            [SyncedTranscriptEvent(id: "c1", kind: "chat", occurredAt: start, speaker: "Vitalii", text: "Link", deviceID: "mac-1")],
+            [SyncedTranscriptEvent(id: "a1", kind: "action", occurredAt: start, text: "Assistant paused", deviceID: "mac-1")],
+        ]
+
+        for events in cases {
+            let expected = !TranscriptExportFormatter.formatPlainText(events: events).isEmpty
+            XCTAssertEqual(TranscriptExportFormatter.hasTranscriptContent(events), expected)
+        }
+    }
 }

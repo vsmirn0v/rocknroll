@@ -22,11 +22,15 @@ struct MeetingWorkspaceSession: Codable, Equatable, Identifiable {
 /// its exact text separately from the transport's at-most-once fence. Opening the
 /// archive after a process exit repairs incomplete events without replaying them.
 @MainActor final class MeetingWorkspaceJournal: ObservableObject {
-    @Published private(set) var sessions: [MeetingWorkspaceSession] = []
+    @Published private(set) var sessions: [MeetingWorkspaceSession] = [] {
+        didSet { sessionsRevision &+= 1 }
+    }
+    private(set) var sessionsRevision: UInt64 = 0
     @Published private(set) var persistenceError: String?
     private var failedObservations: [UUID: [MeetingWorkspaceEvent]] = [:]
     private let directory: URL
     private var connection: MeetingSQLiteConnection?
+    private var sessionsByID: [UUID: MeetingWorkspaceSession] = [:]
     private var eventsBySession: [UUID: [String: MeetingWorkspaceEvent]] = [:]
 
     init(root: URL) {
@@ -58,7 +62,7 @@ struct MeetingWorkspaceSession: Codable, Equatable, Identifiable {
 
     func close() { connection?.close(); connection = nil }
 
-    func session(id: UUID) -> MeetingWorkspaceSession? { sessions.first { $0.id == id } }
+    func session(id: UUID) -> MeetingWorkspaceSession? { sessionsByID[id] }
 
     func begin(sessionID: UUID, title: String, calendarSeriesID: String?, roomIdentity: String?,
                roomRuleKey: String? = nil, at: Date = .now) {
@@ -126,6 +130,7 @@ struct MeetingWorkspaceSession: Codable, Equatable, Identifiable {
         for id in removableIDs { eventsBySession[parentID]?.removeValue(forKey: id) }
         if let index = sessions.firstIndex(where: { $0.id == parentID }) {
             sessions[index].events.removeAll { removableIDs.contains($0.id) }
+            sessionsByID[parentID] = sessions[index]
         }
     }
 
@@ -147,6 +152,7 @@ struct MeetingWorkspaceSession: Codable, Equatable, Identifiable {
         try db.run("DELETE FROM workspace_sessions WHERE id=?") { try MeetingSQLiteConnection.bindText($0, sessionID.uuidString, at: 1) }
         eventsBySession[sessionID] = nil
         failedObservations[sessionID] = nil
+        sessionsByID.removeValue(forKey: sessionID)
         sessions.removeAll { $0.id == sessionID }
         try? db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     }
@@ -296,6 +302,7 @@ struct MeetingWorkspaceSession: Codable, Equatable, Identifiable {
             return session
         }
         eventsBySession = Dictionary(uniqueKeysWithValues: loaded.map { ($0.id, Dictionary(uniqueKeysWithValues: $0.events.map { ($0.id, $0) })) })
+        sessionsByID = Dictionary(uniqueKeysWithValues: loaded.map { ($0.id, $0) })
         connection = db
         sessions = loaded.sorted(by: Self.sessionOrder)
         return db
@@ -358,6 +365,7 @@ struct MeetingWorkspaceSession: Codable, Equatable, Identifiable {
         }
         if let index = sessions.firstIndex(where: { $0.id == session.id }) { sessions[index] = session }
         else { sessions = (sessions + [session]).sorted(by: Self.sessionOrder) }
+        sessionsByID[session.id] = session
         return true
     }
 
@@ -376,6 +384,7 @@ struct MeetingWorkspaceSession: Codable, Equatable, Identifiable {
         guard deleted else { return }
         eventsBySession.removeValue(forKey: sessionID)
         failedObservations.removeValue(forKey: sessionID)
+        sessionsByID.removeValue(forKey: sessionID)
         sessions.removeAll { $0.id == sessionID }
     }
 
@@ -390,6 +399,7 @@ struct MeetingWorkspaceSession: Codable, Equatable, Identifiable {
         guard cleared else { return }
         eventsBySession.removeAll()
         failedObservations.removeAll()
+        sessionsByID.removeAll()
         sessions.removeAll()
     }
 

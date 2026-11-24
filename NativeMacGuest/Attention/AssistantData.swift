@@ -298,7 +298,21 @@ private struct AssistantDataDocument: Codable {
         saveWarning = L("Meeting outcomes could not move to the durable library. The original file was kept. %@", detail)
     }
 
-    @Published private(set) var outcomes: [MeetingOutcome] = []
+    @Published private(set) var outcomes: [MeetingOutcome] = [] {
+        didSet {
+            outcomesRevision &+= 1
+            cachedOutcomesByID = nil
+        }
+    }
+    private(set) var outcomesRevision: UInt64 = 0
+    private var cachedOutcomesByID: [UUID: MeetingOutcome]?
+
+    func outcome(id: UUID) -> MeetingOutcome? {
+        if cachedOutcomesByID == nil {
+            cachedOutcomesByID = Dictionary(outcomes.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        }
+        return cachedOutcomesByID?[id]
+    }
     @Published private(set) var outcomeWriteErrors: [UUID: String] = [:]
     @Published var taskProfile = PersonalTaskProfile(id: "")
     @Published var taskArchiveDates: [UUID: Date] = [:]

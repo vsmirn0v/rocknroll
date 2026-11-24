@@ -111,11 +111,17 @@ public enum TranscriptExportFormatter {
         return "\(datePrefix)-\(slug).transcript.\(cleanExt)"
     }
 
+    public static func hasTranscriptContent(_ events: [SyncedTranscriptEvent]) -> Bool {
+        events.contains(where: isRelevantTranscriptEvent)
+    }
+
+    private static func isRelevantTranscriptEvent(_ event: SyncedTranscriptEvent) -> Bool {
+        (event.kind == "transcript" || event.kind == "chat")
+            && !event.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
     private static func filteredTranscriptEvents(_ events: [SyncedTranscriptEvent]) -> [SyncedTranscriptEvent] {
-        events.filter { event in
-            (event.kind == "transcript" || event.kind == "chat")
-                && !event.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        }.sorted {
+        events.filter(isRelevantTranscriptEvent).sorted {
             if $0.occurredAt != $1.occurredAt { return $0.occurredAt < $1.occurredAt }
             return $0.id < $1.id
         }

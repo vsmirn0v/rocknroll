@@ -136,6 +136,15 @@ public enum MeetingContentMeaningfulness {
     /// (notes, actionable outcome items, non-empty summary, active/retryable generation,
     /// or substantive transcript/chat).
     public static func isMeaningful(_ input: MeetingMeaningfulnessInput) -> Bool {
+        isMeaningful(input, lazyTranscriptTexts: { AnySequence(input.transcriptTexts) })
+    }
+
+    /// Evaluates meaningfulness while deferring transcript enumeration until
+    /// metadata, notes, and outcome fields prove inconclusive.
+    public static func isMeaningful(
+        _ input: MeetingMeaningfulnessInput,
+        lazyTranscriptTexts: () -> AnySequence<String>
+    ) -> Bool {
         if input.isGeneratingOutcome || input.hasFailedOutcomeWithInput {
             return true
         }
@@ -156,7 +165,7 @@ public enum MeetingContentMeaningfulness {
                 return !isNonMeaningfulSummary(trimmedSummary)
             }
         }
-        return hasSubstantiveTranscript(input.transcriptTexts)
+        return hasSubstantiveTranscript(lazyTranscriptTexts())
     }
 
     public static func isNonMeaningfulSummary(_ summary: String) -> Bool {
@@ -178,7 +187,7 @@ public enum MeetingContentMeaningfulness {
         return false
     }
 
-    public static func hasSubstantiveTranscript(_ texts: [String]) -> Bool {
+    public static func hasSubstantiveTranscript<S: Sequence>(_ texts: S) -> Bool where S.Element == String {
         var nonFillerCount = 0
         var nonFillerCharacters = 0
         for text in texts {

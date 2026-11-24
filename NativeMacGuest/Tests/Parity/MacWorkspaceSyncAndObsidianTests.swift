@@ -1059,4 +1059,76 @@ final class MacWorkspaceSyncAndObsidianTests: XCTestCase {
         let quoteCount = thirdExport.components(separatedBy: quoteMarker).count - 1
         XCTAssertEqual(quoteCount, 1, "Expected exactly one conflict quote block in Obsidian export, got:\n\(thirdExport)")
     }
+
+    func testHistoryResolutionAndConversationLookupScaleAcrossManySessions() async throws {
+        let f = try await makeFixture()
+        let baseDate = Date(timeIntervalSince1970: 1_760_000_000)
+        var sessionIDs: [UUID] = []
+        for index in 0..<200 {
+            let id = UUID()
+            sessionIDs.append(id)
+            let start = baseDate.addingTimeInterval(Double(index) * 3_600)
+            let end = start.addingTimeInterval(1_800)
+            try await f.library.store.upsertSession(
+                MeetingSessionRecord(id: id, title: "Meeting \(index)", startedAt: start, endedAt: end, state: .ended)
+            )
+            f.library.workspaceJournal.begin(
+                sessionID: id,
+                title: "Meeting \(index)",
+                calendarSeriesID: nil,
+                roomIdentity: "room-\(index)",
+                at: start
+            )
+            f.library.workspaceJournal.observe(
+                sessionID: id,
+                events: (0..<10).map { offset in
+                    MeetingWorkspaceEvent(
+                        id: "ev-\(index)-\(offset)",
+                        kind: .transcript,
+                        occurredAt: start.addingTimeInterval(Double(offset) * 10),
+                        source: "local",
+                        author: "Anna",
+                        text: "Line \(offset) for meeting \(index)"
+                    )
+                }
+            )
+            f.library.workspaceJournal.end(sessionID: id, at: end)
+        }
+        await f.library.refresh()
+
+        let parentID = sessionIDs[10]
+        let childID = sessionIDs[11]
+        f.sync.setHistoryGroup(sessionID: childID, parent: parentID)
+        XCTAssertEqual(f.sync.historySessionID(childID), parentID)
+
+        let startClock = ContinuousClock.now
+        for id in sessionIDs {
+            let resolved = f.sync.historySessionID(id)
+            let conversation = f.sync.historyConversation(for: id, in: f.library.workspaceJournal)
+            XCTAssertNotNil(conversation)
+            if id == parentID || id == childID {
+                XCTAssertEqual(resolved, parentID)
+                XCTAssertEqual(conversation?.events.count, 20)
+            } else {
+                XCTAssertEqual(resolved, id)
+                XCTAssertEqual(conversation?.events.count, 10)
+            }
+        }
+        let elapsed = startClock.duration(to: .now)
+        let seconds = Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
+        XCTAssertLessThan(seconds, 0.5, "200 history lookups should stay O(1) without scanning all sessions, took \(seconds)s")
+
+        // Adding a new card must invalidate cached visible card IDs cleanly.
+        let addedID = UUID()
+        try await f.library.store.upsertSession(
+            MeetingSessionRecord(id: addedID, title: "Meeting 200", startedAt: baseDate, endedAt: baseDate + 600, state: .ended)
+        )
+        await f.library.refresh()
+        f.sync.setHistoryGroup(sessionID: sessionIDs[12], parent: addedID)
+        XCTAssertEqual(f.sync.historySessionID(sessionIDs[12]), addedID)
+
+        // Removing a parent card must stop resolving children to the removed card.
+        await f.library.deleteSession(addedID)
+        XCTAssertEqual(f.sync.historySessionID(sessionIDs[12]), sessionIDs[12])
+    }
 }

@@ -12,7 +12,10 @@ enum MeetingNoteSaveStatus: Equatable {
     let store: MeetingLibraryStore
     let workspaceJournal: MeetingWorkspaceJournal
     let participationVaultConnection = ParticipationVaultConnection()
-    @Published private(set) var cards: [MeetingLibraryCard] = []
+    @Published private(set) var cards: [MeetingLibraryCard] = [] {
+        didSet { cardsRevision &+= 1 }
+    }
+    private(set) var cardsRevision: UInt64 = 0
     @Published private(set) var noteStatus: [UUID: MeetingNoteSaveStatus] = [:]
     @Published private(set) var persistenceError: String?
     var onSessionRenamed: (@MainActor (UUID, String) -> Void)?
@@ -77,8 +80,12 @@ enum MeetingNoteSaveStatus: Equatable {
     /// Sessions visible to Assistant/history. Failed joins with no content are excluded
     /// by the store's card query.
     func refresh() async {
-        do { cards = try await store.cards() }
-        catch { persistenceError = error.localizedDescription }
+        do {
+            let loaded = try await store.cards()
+            if cards != loaded { cards = loaded }
+        } catch {
+            persistenceError = error.localizedDescription
+        }
     }
 
     private func scheduleRefresh() {

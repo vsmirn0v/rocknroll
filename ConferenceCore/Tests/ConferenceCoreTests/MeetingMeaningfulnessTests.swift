@@ -186,4 +186,43 @@ final class MeetingMeaningfulnessTests: XCTestCase {
         XCTAssertEqual(texts[canonicalID], ["Hello team", "Link shared"])
         XCTAssertNil(texts[aliasID])
     }
+
+    func testLazyMeaningfulnessSkipsTranscriptEvaluationWhenMetadataDecides() {
+        let cases: [MeetingMeaningfulnessInput] = [
+            MeetingMeaningfulnessInput(hasNotes: true),
+            MeetingMeaningfulnessInput(notePreview: "Follow up on build"),
+            MeetingMeaningfulnessInput(outcomeSummary: "Finalized the rollout schedule."),
+            MeetingMeaningfulnessInput(outcomeSummary: "No meaningful discussion took place during the call."),
+            MeetingMeaningfulnessInput(decisionsCount: 1),
+            MeetingMeaningfulnessInput(tasksCount: 1),
+            MeetingMeaningfulnessInput(openQuestionsCount: 1),
+            MeetingMeaningfulnessInput(isGeneratingOutcome: true),
+            MeetingMeaningfulnessInput(hasFailedOutcomeWithInput: true),
+        ]
+
+        for input in cases {
+            var evaluated = false
+            _ = MeetingContentMeaningfulness.isMeaningful(input) {
+                evaluated = true
+                return AnySequence(["Substantive spoken discussion about deployment."])
+            }
+            XCTAssertFalse(evaluated, "Metadata should decide meaningfulness without reading transcript: \(input)")
+        }
+    }
+
+    func testLazyMeaningfulnessStopsEarlyOnLargeTranscriptSequence() {
+        var yielded = 0
+        let stream = AnySequence<String> {
+            AnyIterator {
+                guard yielded < 10_000 else { return nil }
+                yielded += 1
+                return "Engineering deployment discussion item number \(yielded)"
+            }
+        }
+        let meaningful = MeetingContentMeaningfulness.isMeaningful(MeetingMeaningfulnessInput()) {
+            stream
+        }
+        XCTAssertTrue(meaningful)
+        XCTAssertLessThanOrEqual(yielded, 2, "Should stop iterating as soon as substantive threshold is reached")
+    }
 }

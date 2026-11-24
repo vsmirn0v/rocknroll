@@ -33,10 +33,19 @@ struct ParticipationOutcomeActivity: View {
             }
         }
         .task(id: sessionID) {
+            let root = self.root
+            let sessionID = self.sessionID
             do {
-                receipts = try ParticipationReceiptStore(root: root).receipts(for: sessionID)
+                let loaded = try await Task.detached(priority: .userInitiated) {
+                    try ParticipationReceiptStore(root: root).receipts(for: sessionID)
+                }.value
+                guard !Task.isCancelled else { return }
+                receipts = loaded
                 unavailable = false
+            } catch is CancellationError {
+                return
             } catch {
+                guard !Task.isCancelled else { return }
                 receipts = []
                 unavailable = true
             }

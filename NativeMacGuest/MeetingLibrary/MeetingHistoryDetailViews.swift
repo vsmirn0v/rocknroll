@@ -12,10 +12,11 @@ struct ArchivedHistoryTranscript: View {
     @State private var copiedFeedback = false
 
     private var hasTranscriptContent: Bool {
-        !TranscriptExportFormatter.formatPlainText(events: events).isEmpty
+        TranscriptExportFormatter.hasTranscriptContent(events)
     }
 
     var body: some View {
+        let displayed = query.isEmpty ? events : events.filter(matches)
         VStack(alignment: .leading, spacing: 10) {
             HStack {
                 Label(L("Saved on this Mac"), systemImage: "internaldrive").foregroundStyle(.secondary)
@@ -44,7 +45,7 @@ struct ArchivedHistoryTranscript: View {
             TextField(L("Search within this conversation"), text: $query).textFieldStyle(.roundedBorder)
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 12) {
-                    ForEach(events.filter(matches)) { event in
+                    ForEach(displayed) { event in
                         VStack(alignment: .leading, spacing: 4) {
                             Text(workspaceDate(event.occurredAt) + " · " + (event.speaker ?? L("Unknown speaker")))
                                 .font(.caption).foregroundStyle(.secondary)

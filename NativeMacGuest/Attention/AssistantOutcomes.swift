@@ -245,6 +245,7 @@ enum MeetingOutcomePrompt {
     static func displayText(_ text: String) -> String { sourceReferences(in: text).text }
 
     static func sourceReferences(in text: String) -> (text: String, references: [String]) {
+        guard text.contains("[L") else { return (text, []) }
         let characters = Array(text)
         func closing(_ start: Int, open: Character, close: Character) -> Int? {
             var depth = 1, index = start + 1

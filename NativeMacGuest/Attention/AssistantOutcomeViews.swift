@@ -16,6 +16,412 @@ enum MeetingHistoryTab: String, CaseIterable, Identifiable {
     @Published var taskID: UUID?
     @Published var source: NativeDesktopWorkspace.Section?
     @Published var eventID: String?
+
+    func select(sessionID: UUID?, eventID: String?, tab: MeetingHistoryTab) {
+        if selectedSessionID != sessionID { selectedSessionID = sessionID }
+        if indexVisible { indexVisible = false }
+        if taskID != nil { taskID = nil }
+        if source != nil { source = nil }
+        if self.eventID != eventID { self.eventID = eventID }
+        if self.tab != tab { self.tab = tab }
+    }
+}
+
+fileprivate struct HistoryDay: Hashable {
+    let date: Date?
+}
+
+/// Memoizes derived history lists, meaningfulness filtering, search results,
+/// outcome prompt windows, and decision-source lookups across clicks.
+/// Holds no `@Published` properties so reading/updating during `body` never triggers
+/// re-entrant SwiftUI state mutations.
+@MainActor
+private final class HistoryViewCache: ObservableObject {
+    struct CatalogKey: Equatable {
+        let cardsRevision: UInt64
+        let sessionsRevision: UInt64
+        let syncTopologyRevision: UInt64
+        let liveSessionIDs: Set<UUID>
+    }
+
+    struct CatalogSnapshot {
+        let key: CatalogKey
+        let libraryCardIDs: Set<UUID>
+        let sourceCards: [MeetingLibraryCard]
+        let groupedCardsByHistoryID: [UUID: [MeetingLibraryCard]]
+        let historyCards: [MeetingLibraryCard]
+        let historyCardsByID: [UUID: MeetingLibraryCard]
+
+        func groupedCards(for id: UUID) -> [MeetingLibraryCard] {
+            groupedCardsByHistoryID[id] ?? []
+        }
+    }
+
+    struct BaseKey: Equatable {
+        let catalogKey: CatalogKey
+        let outcomesRevision: UInt64
+        let outcomeStatusKeys: Set<UUID>
+        let showEmptyMeetings: Bool
+        let calendar: Calendar
+    }
+
+    struct BaseSnapshot {
+        let key: BaseKey
+        let catalog: CatalogSnapshot
+        let outcomesByID: [UUID: MeetingOutcome]
+        let visibleHistoryCards: [MeetingLibraryCard]
+        let visibleHistoryCardIDs: [UUID]
+        let allDays: [(key: HistoryDay, value: [MeetingLibraryCard])]
+
+        var libraryCardIDs: Set<UUID> { catalog.libraryCardIDs }
+        var historyCards: [MeetingLibraryCard] { catalog.historyCards }
+        var historyCardsByID: [UUID: MeetingLibraryCard] { catalog.historyCardsByID }
+        func groupedCards(for id: UUID) -> [MeetingLibraryCard] { catalog.groupedCards(for: id) }
+    }
+
+    struct SearchKey: Equatable {
+        let baseKey: BaseKey
+        let query: String
+    }
+
+    final class SearchSnapshot {
+        let key: SearchKey
+        let groups: [(key: HistoryDay, value: [MeetingLibraryCard])]
+        var matchedEventIDs: [UUID: String?]
+
+        init(key: SearchKey, groups: [(key: HistoryDay, value: [MeetingLibraryCard])], matchedEventIDs: [UUID: String?]) {
+            self.key = key
+            self.groups = groups
+            self.matchedEventIDs = matchedEventIDs
+        }
+    }
+
+    struct OutcomeWindowKey: Equatable {
+        let sessionID: UUID
+        let title: String
+        let endedAt: Date
+        let sessionsRevision: UInt64
+        let cardsRevision: UInt64
+        let syncTopologyRevision: UInt64
+        let onDevice: Bool
+        let contextTokens: Int?
+    }
+
+    struct OutcomeWindowSnapshot {
+        let key: OutcomeWindowKey
+        let window: AttentionWindow
+        let fingerprint: String
+    }
+
+    struct VisibleEventsKey: Equatable {
+        let sessionID: UUID
+        let sessionsRevision: UInt64
+        let cardsRevision: UInt64
+        let syncTopologyRevision: UInt64
+    }
+
+    struct VisibleEventsIndex {
+        let key: VisibleEventsKey
+        let byID: [String: (order: Int, event: MeetingWorkspaceEvent)]
+    }
+
+    private var catalogCache: CatalogSnapshot?
+    private var baseCache: BaseSnapshot?
+    private var searchCache: SearchSnapshot?
+    private var outcomeWindowCache: OutcomeWindowSnapshot?
+    private var visibleEventsCache: VisibleEventsIndex?
+
+    private func catalogSnapshot(
+        key: CatalogKey,
+        libraryCards: [MeetingLibraryCard],
+        journal: MeetingWorkspaceJournal,
+        sync: MacWorkspaceSyncCoordinator?
+    ) -> CatalogSnapshot {
+        if let catalogCache, catalogCache.key == key {
+            return catalogCache
+        }
+        let libraryCardIDs = Set(libraryCards.map(\.sessionID))
+        let journalOnly = journal.sessions.filter { $0.endedAt != nil && !libraryCardIDs.contains($0.id) }.map { entry in
+            MeetingLibraryCard(
+                sessionID: entry.id,
+                title: entry.title,
+                startedAt: entry.startedAt,
+                endedAt: entry.endedAt,
+                state: .ended,
+                hasNotes: false,
+                noteID: nil,
+                noteRevision: 0,
+                notePreview: nil,
+                outcomeID: nil,
+                outcomeState: .notStarted,
+                updatedAt: entry.endedAt ?? entry.startedAt,
+                startProvenance: .recorded,
+                outcomeEndFallback: nil
+            )
+        }
+        let sourceCards = (libraryCards + journalOnly).filter { card in
+            !key.liveSessionIDs.contains(card.sessionID) &&
+                (sync?.canonicalSessionID(card.sessionID) ?? card.sessionID) == card.sessionID
+        }
+        var groupedByID: [UUID: [MeetingLibraryCard]] = [:]
+        var historyCards: [MeetingLibraryCard] = []
+        historyCards.reserveCapacity(sourceCards.count)
+        for card in sourceCards {
+            let historyID = sync?.historySessionID(card.sessionID) ?? card.sessionID
+            if historyID == card.sessionID {
+                historyCards.append(card)
+            }
+            let groupKey = sync != nil ? historyID : card.sessionID
+            groupedByID[groupKey, default: []].append(card)
+        }
+        for (groupKey, group) in groupedByID where group.count > 1 {
+            groupedByID[groupKey] = group.sorted {
+                ($0.sessionID != groupKey ? 1 : 0, $0.startedAt) < ($1.sessionID != groupKey ? 1 : 0, $1.startedAt)
+            }
+        }
+        let historyCardsByID = Dictionary(historyCards.map { ($0.sessionID, $0) }, uniquingKeysWith: { first, _ in first })
+        let snapshot = CatalogSnapshot(
+            key: key,
+            libraryCardIDs: libraryCardIDs,
+            sourceCards: sourceCards,
+            groupedCardsByHistoryID: groupedByID,
+            historyCards: historyCards,
+            historyCardsByID: historyCardsByID
+        )
+        catalogCache = snapshot
+        return snapshot
+    }
+
+    func baseSnapshot(
+        key: BaseKey,
+        libraryCards: [MeetingLibraryCard],
+        journal: MeetingWorkspaceJournal,
+        outcomes: [MeetingOutcome],
+        sync: MacWorkspaceSyncCoordinator?
+    ) -> BaseSnapshot {
+        if let baseCache, baseCache.key == key {
+            return baseCache
+        }
+        let catalog = catalogSnapshot(key: key.catalogKey, libraryCards: libraryCards, journal: journal, sync: sync)
+        let outcomesByID = Dictionary(outcomes.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        let visibleHistoryCards: [MeetingLibraryCard] = if key.showEmptyMeetings {
+            catalog.historyCards
+        } else {
+            catalog.historyCards.filter { card in
+                Self.isMeaningfulCard(
+                    card,
+                    catalog: catalog,
+                    outcomesByID: outcomesByID,
+                    outcomeStatusKeys: key.outcomeStatusKeys,
+                    journal: journal,
+                    sync: sync
+                )
+            }
+        }
+        let visibleIDs = visibleHistoryCards.map(\.sessionID)
+        let allDays = Self.groupedDays(visibleHistoryCards, calendar: key.calendar)
+        let snapshot = BaseSnapshot(
+            key: key,
+            catalog: catalog,
+            outcomesByID: outcomesByID,
+            visibleHistoryCards: visibleHistoryCards,
+            visibleHistoryCardIDs: visibleIDs,
+            allDays: allDays
+        )
+        baseCache = snapshot
+        return snapshot
+    }
+
+    func searchSnapshot(
+        query: String,
+        base: BaseSnapshot,
+        journal: MeetingWorkspaceJournal,
+        sync: MacWorkspaceSyncCoordinator?
+    ) -> SearchSnapshot {
+        let searchKey = SearchKey(baseKey: base.key, query: query)
+        if let searchCache, searchCache.key == searchKey {
+            return searchCache
+        }
+        guard !query.isEmpty else {
+            let snapshot = SearchSnapshot(key: searchKey, groups: base.allDays, matchedEventIDs: [:])
+            searchCache = snapshot
+            return snapshot
+        }
+        var matchedEventIDs: [UUID: String?] = [:]
+        var filteredCards: [MeetingLibraryCard] = []
+        for card in base.visibleHistoryCards {
+            if card.title.localizedStandardContains(query) ||
+                card.notePreview?.localizedStandardContains(query) == true ||
+                card.outcomeID.flatMap({ base.outcomesByID[$0] })?.summary.localizedStandardContains(query) == true {
+                filteredCards.append(card)
+            } else {
+                let session = sync?.historyConversation(for: card.sessionID, in: journal) ?? journal.session(id: card.sessionID)
+                let eventID = Self.firstMatchingVisibleEventID(in: session, query: query)
+                matchedEventIDs[card.sessionID] = eventID
+                if eventID != nil {
+                    filteredCards.append(card)
+                }
+            }
+        }
+        let groups = Self.groupedDays(filteredCards, calendar: base.key.calendar)
+        let snapshot = SearchSnapshot(key: searchKey, groups: groups, matchedEventIDs: matchedEventIDs)
+        searchCache = snapshot
+        return snapshot
+    }
+
+    func matchedEventID(
+        for sessionID: UUID,
+        query: String,
+        in snapshot: SearchSnapshot,
+        journal: MeetingWorkspaceJournal,
+        sync: MacWorkspaceSyncCoordinator?
+    ) -> String? {
+        guard !query.isEmpty else { return nil }
+        if let cached = snapshot.matchedEventIDs[sessionID] {
+            return cached
+        }
+        let session = sync?.historyConversation(for: sessionID, in: journal) ?? journal.session(id: sessionID)
+        let eventID = Self.firstMatchingVisibleEventID(in: session, query: query)
+        snapshot.matchedEventIDs[sessionID] = eventID
+        return eventID
+    }
+
+    func outcomeWindow(
+        key: OutcomeWindowKey,
+        card: MeetingLibraryCard,
+        session: MeetingWorkspaceSession
+    ) -> OutcomeWindowSnapshot {
+        if let outcomeWindowCache, outcomeWindowCache.key == key {
+            return outcomeWindowCache
+        }
+        let window = MeetingOutcomePrompt.historyWindow(
+            title: card.title,
+            events: session.events,
+            endedAt: key.endedAt,
+            onDevice: key.onDevice,
+            contextTokens: key.contextTokens
+        )
+        let fingerprint = MeetingOutcomePrompt.fingerprint(window)
+        let snapshot = OutcomeWindowSnapshot(key: key, window: window, fingerprint: fingerprint)
+        outcomeWindowCache = snapshot
+        return snapshot
+    }
+
+    func visibleEventsIndex(
+        key: VisibleEventsKey,
+        journal: MeetingWorkspaceJournal,
+        sync: MacWorkspaceSyncCoordinator?
+    ) -> VisibleEventsIndex? {
+        if let visibleEventsCache, visibleEventsCache.key == key {
+            return visibleEventsCache
+        }
+        guard let session = sync?.historyConversation(for: key.sessionID, in: journal) ?? journal.session(id: key.sessionID) else {
+            return nil
+        }
+        var byID: [String: (order: Int, event: MeetingWorkspaceEvent)] = [:]
+        let visible = session.visibleEvents
+        byID.reserveCapacity(visible.count)
+        for (order, event) in visible.enumerated() {
+            byID[event.id] = (order, event)
+        }
+        let index = VisibleEventsIndex(key: key, byID: byID)
+        visibleEventsCache = index
+        return index
+    }
+
+    private static func groupedDays(
+        _ cards: [MeetingLibraryCard],
+        calendar: Calendar
+    ) -> [(key: HistoryDay, value: [MeetingLibraryCard])] {
+        Dictionary(grouping: cards) { card in
+            HistoryDay(date: card.effectiveDate.map { calendar.startOfDay(for: $0.date) })
+        }
+        .mapValues { dayCards in
+            dayCards.sorted { left, right in
+                let lhs = left.effectiveDate?.date ?? .distantPast
+                let rhs = right.effectiveDate?.date ?? .distantPast
+                return lhs == rhs ? left.sessionID.uuidString < right.sessionID.uuidString : lhs > rhs
+            }
+        }
+        .sorted { ($0.key.date ?? .distantPast) > ($1.key.date ?? .distantPast) }
+    }
+
+    private static func isMeaningfulCard(
+        _ card: MeetingLibraryCard,
+        catalog: CatalogSnapshot,
+        outcomesByID: [UUID: MeetingOutcome],
+        outcomeStatusKeys: Set<UUID>,
+        journal: MeetingWorkspaceJournal,
+        sync: MacWorkspaceSyncCoordinator?
+    ) -> Bool {
+        catalog.groupedCards(for: card.sessionID).contains { source in
+            let outcome = source.outcomeID.flatMap { outcomesByID[$0] }
+            if outcome == nil, source.outcomeID != nil,
+               source.outcomeState == .ready || source.outcomeState == .draft {
+                return true
+            }
+            let input = MeetingMeaningfulnessInput(
+                hasNotes: source.hasNotes,
+                notePreview: source.notePreview,
+                outcomeSummary: outcome.map { MeetingOutcomePrompt.displayText($0.summary) },
+                decisionsCount: outcome?.decisions.count ?? 0,
+                tasksCount: outcome?.tasks.count ?? 0,
+                openQuestionsCount: outcome?.openQuestions.count ?? 0,
+                isGeneratingOutcome: source.outcomeState == .pending || outcomeStatusKeys.contains(source.sessionID),
+                hasFailedOutcomeWithInput: source.outcomeState == .failed && source.hasOutcomeInput
+            )
+            return MeetingContentMeaningfulness.isMeaningful(input) {
+                let session = sync?.historyConversation(for: source.sessionID, in: journal) ?? journal.session(id: source.sessionID)
+                return lazyTranscriptTexts(for: session)
+            }
+        }
+    }
+
+    private static func lazyTranscriptTexts(for session: MeetingWorkspaceSession?) -> AnySequence<String> {
+        guard let events = session?.events, !events.isEmpty else {
+            return AnySequence(EmptyCollection())
+        }
+        return AnySequence { () -> AnyIterator<String> in
+            var index = 0
+            var linkedChat: Set<String>?
+            return AnyIterator {
+                while index < events.count {
+                    let event = events[index]
+                    index += 1
+                    guard !event.isPrivate, let text = event.text else { continue }
+                    if event.kind == .transcript {
+                        return text
+                    }
+                    if event.kind == .chat {
+                        if linkedChat == nil {
+                            linkedChat = Set(events.compactMap(\.linkedChatID))
+                        }
+                        if linkedChat?.contains(event.id) == false {
+                            return text
+                        }
+                    }
+                }
+                return nil
+            }
+        }
+    }
+
+    static func firstMatchingVisibleEventID(in session: MeetingWorkspaceSession?, query: String) -> String? {
+        guard !query.isEmpty, let events = session?.events, !events.isEmpty else { return nil }
+        var linkedChat: Set<String>?
+        for event in events {
+            if event.kind == .chat {
+                if linkedChat == nil {
+                    linkedChat = Set(events.compactMap(\.linkedChatID))
+                }
+                if linkedChat?.contains(event.id) == true { continue }
+            }
+            if event.matches(query) {
+                return event.id
+            }
+        }
+        return nil
+    }
 }
 
 struct MeetingHistoryView: View {
@@ -25,8 +431,9 @@ struct MeetingHistoryView: View {
     @ObservedObject private var journal: MeetingWorkspaceJournal
     @ObservedObject private var preferences: AttentionStore
     @ObservedObject private var navigation: MeetingHistoryNavigation
+    @StateObject private var cache = HistoryViewCache()
     @State private var selectedNoteSource: UUID?
-    @State private var syncRevision = 0
+    @State private var syncTopologyRevision: UInt64 = 0
     @State private var archivedEvents: [SyncedTranscriptEvent] = []
     @State private var loadedArchiveID: UUID?
     private let workspace: NativeDesktopWorkspace?
@@ -37,7 +444,7 @@ struct MeetingHistoryView: View {
     @State private var showingTranscriptSources = false
     @State private var reviewedDraft: AttentionCoordinator.HistoryOutcomeDraft?
     @State private var pendingSend: (outcome: UUID, meeting: UUID)?
-    @State private var collapsedDays: Set<Day> = []
+    @State private var collapsedDays: Set<HistoryDay> = []
     @State private var calendar = Calendar.current
     @State private var rename: Rename?
     @State private var exportRequest: ExportRequest?
@@ -49,10 +456,6 @@ struct MeetingHistoryView: View {
         var id: UUID { task.id }
         let outcome: MeetingOutcome
         let task: MeetingOutcomeTask
-    }
-
-    private struct Day: Hashable {
-        let date: Date?
     }
 
     private struct Rename: Identifiable {
@@ -77,121 +480,60 @@ struct MeetingHistoryView: View {
 
     private var search: String { navigation.query.trimmingCharacters(in: .whitespacesAndNewlines) }
 
-    private var groups: [(key: Day, value: [MeetingLibraryCard])] {
-        let outcomes = outcomesByID
-        let visibleCards = showEmptyMeetings
-            ? historyCards
-            : historyCards.filter { isMeaningfulCard($0, outcomesByID: outcomes) }
-        let cards = visibleCards.filter { card in
-            search.isEmpty || card.title.localizedStandardContains(search) ||
-                card.notePreview?.localizedStandardContains(search) == true ||
-                card.outcomeID.flatMap { outcomes[$0] }?.summary.localizedStandardContains(search) == true ||
-                searchedEvent(card.sessionID) != nil
-        }
-        return Dictionary(grouping: cards) { card in
-            Day(date: card.effectiveDate.map { calendar.startOfDay(for: $0.date) })
-        }
-        .mapValues { cards in
-            cards.sorted { left, right in
-                let lhs = left.effectiveDate?.date ?? .distantPast
-                let rhs = right.effectiveDate?.date ?? .distantPast
-                return lhs == rhs ? left.sessionID.uuidString < right.sessionID.uuidString : lhs > rhs
-            }
-        }
-        .sorted { ($0.key.date ?? .distantPast) > ($1.key.date ?? .distantPast) }
+    private var currentSyncTopologyRevision: UInt64 {
+        max(syncTopologyRevision, workspace?.workspaceSync.historyTopologyRevision ?? 0)
     }
 
-    private var sourceCards: [MeetingLibraryCard] {
-        let live = Set(attention.meetings().flatMap { [$0.sessionID, $0.workspaceSessionID] + $0.segments.map(\.sessionID) })
-        let saved = Set(library.cards.map(\.sessionID))
-        let journalOnly = journal.sessions.filter { $0.endedAt != nil && !saved.contains($0.id) }.map { entry in
-            MeetingLibraryCard(sessionID: entry.id, title: entry.title, startedAt: entry.startedAt, endedAt: entry.endedAt,
-                state: .ended, hasNotes: false, noteID: nil, noteRevision: 0, notePreview: nil,
-                outcomeID: nil, outcomeState: .notStarted, updatedAt: entry.endedAt ?? entry.startedAt,
-                startProvenance: .recorded, outcomeEndFallback: nil)
-        }
-        return (library.cards + journalOnly).filter { card in
-            !live.contains(card.sessionID) &&
-                (workspace?.workspaceSync.canonicalSessionID(card.sessionID) ?? card.sessionID) == card.sessionID
-        }
-    }
-
-    private var outcomesByID: [UUID: MeetingOutcome] {
-        Dictionary(data.outcomes.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
-    }
-
-    private var historyCards: [MeetingLibraryCard] {
-        _ = syncRevision
-        return sourceCards.filter { (workspace?.workspaceSync.historySessionID($0.sessionID) ?? $0.sessionID) == $0.sessionID }
-    }
-
-    private var visibleHistoryCards: [MeetingLibraryCard] {
-        if showEmptyMeetings { return historyCards }
-        let outcomes = outcomesByID
-        return historyCards.filter { isMeaningfulCard($0, outcomesByID: outcomes) }
-    }
-
-    private func isMeaningfulCard(_ card: MeetingLibraryCard, outcomesByID: [UUID: MeetingOutcome]) -> Bool {
-        groupedCards(for: card.sessionID).contains { source in
-            let outcome = source.outcomeID.flatMap { outcomesByID[$0] }
-            if outcome == nil, source.outcomeID != nil,
-               source.outcomeState == .ready || source.outcomeState == .draft {
-                return true
-            }
-            let transcriptTexts = (conversation(source.sessionID)?.visibleEvents ?? []).compactMap { event -> String? in
-                guard !event.isPrivate, event.kind == .transcript || event.kind == .chat else { return nil }
-                return event.text
-            }
-            return MeetingContentMeaningfulness.isMeaningful(
-                MeetingMeaningfulnessInput(
-                    hasNotes: source.hasNotes,
-                    notePreview: source.notePreview,
-                    outcomeSummary: outcome.map { MeetingOutcomePrompt.displayText($0.summary) },
-                    decisionsCount: outcome?.decisions.count ?? 0,
-                    tasksCount: outcome?.tasks.count ?? 0,
-                    openQuestionsCount: outcome?.openQuestions.count ?? 0,
-                    isGeneratingOutcome: source.outcomeState == .pending || attention.outcomeStatus[source.sessionID] != nil,
-                    hasFailedOutcomeWithInput: source.outcomeState == .failed && source.hasOutcomeInput,
-                    transcriptTexts: transcriptTexts
-                )
-            )
-        }
-    }
-
-    private func groupedCards(for id: UUID) -> [MeetingLibraryCard] {
-        guard let workspace else { return sourceCards.filter { $0.sessionID == id } }
-        return sourceCards.filter { workspace.workspaceSync.historySessionID($0.sessionID) == id }
-            .sorted { ($0.sessionID != id ? 1 : 0, $0.startedAt) < ($1.sessionID != id ? 1 : 0, $1.startedAt) }
-    }
-
-    private func searchedEvent(_ id: UUID) -> MeetingWorkspaceEvent? {
-        guard !search.isEmpty else { return nil }
-        return conversation(id)?.visibleEvents.first { $0.matches(search) }
+    private func currentBaseSnapshot() -> HistoryViewCache.BaseSnapshot {
+        let liveIDs = Set(attention.meetings().flatMap { [$0.sessionID, $0.workspaceSessionID] + $0.segments.map(\.sessionID) })
+        let catalogKey = HistoryViewCache.CatalogKey(
+            cardsRevision: library.cardsRevision,
+            sessionsRevision: journal.sessionsRevision,
+            syncTopologyRevision: currentSyncTopologyRevision,
+            liveSessionIDs: liveIDs
+        )
+        let baseKey = HistoryViewCache.BaseKey(
+            catalogKey: catalogKey,
+            outcomesRevision: data.outcomesRevision,
+            outcomeStatusKeys: Set(attention.outcomeStatus.keys),
+            showEmptyMeetings: showEmptyMeetings,
+            calendar: calendar
+        )
+        return cache.baseSnapshot(
+            key: baseKey,
+            libraryCards: library.cards,
+            journal: journal,
+            outcomes: data.outcomes,
+            sync: workspace?.workspaceSync
+        )
     }
 
     private func conversation(_ id: UUID) -> MeetingWorkspaceSession? {
         workspace?.workspaceSync.historyConversation(for: id, in: journal) ?? journal.session(id: id)
     }
 
-    private var selectedCard: MeetingLibraryCard? {
-        if let id = navigation.selectedSessionID {
-            let canonical = workspace?.workspaceSync.historySessionID(id) ?? id
-            return historyCards.first { $0.sessionID == canonical }
-        }
-        return nil
+    private func resolvedSelectedCard(in base: HistoryViewCache.BaseSnapshot) -> MeetingLibraryCard? {
+        guard let id = navigation.selectedSessionID else { return nil }
+        let canonical = workspace?.workspaceSync.historySessionID(id) ?? id
+        return base.historyCardsByID[canonical]
     }
 
-    private var mainHistoryLayout: some View {
+    private func mainHistoryLayout(
+        base: HistoryViewCache.BaseSnapshot,
+        searchSnapshot: HistoryViewCache.SearchSnapshot,
+        selectedCard: MeetingLibraryCard?
+    ) -> some View {
         GeometryReader { geometry in
             let narrow = readingMode || geometry.size.width < 615
             HStack(spacing: 0) {
                 if !narrow || navigation.indexVisible || selectedCard == nil {
-                    index.frame(width: narrow ? nil : 228).frame(maxWidth: narrow ? .infinity : nil)
+                    index(base: base, searchSnapshot: searchSnapshot, selectedCard: selectedCard)
+                        .frame(width: narrow ? nil : 228).frame(maxWidth: narrow ? .infinity : nil)
                 }
                 if !narrow || (!navigation.indexVisible && selectedCard != nil) {
                     if !narrow { Divider() }
                     if let card = selectedCard {
-                        selectedMeeting(card, compact: narrow).id(card.sessionID)
+                        selectedMeeting(card, compact: narrow, base: base).id(card.sessionID)
                     } else {
                         Text(L("Choose a meeting")).foregroundStyle(.secondary)
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -201,11 +543,13 @@ struct MeetingHistoryView: View {
         }
         .navigationTitle(L("Meeting history"))
         .tint(.orange)
-        .onReceive(workspace?.workspaceSync.objectWillChange.eraseToAnyPublisher() ?? Empty().eraseToAnyPublisher()) { _ in
-            syncRevision += 1
+        .onReceive(workspace?.workspaceSync.$historyTopologyRevision.dropFirst().eraseToAnyPublisher() ?? Empty().eraseToAnyPublisher()) { revision in
+            syncTopologyRevision = revision
         }
-        .onChange(of: visibleHistoryCards.map(\.sessionID)) { ids in
-            if navigation.selectedSessionID == nil, !ids.isEmpty { select(groups.first?.value.first) }
+        .onChange(of: base.visibleHistoryCardIDs) { ids in
+            if navigation.selectedSessionID == nil, !ids.isEmpty {
+                select(searchSnapshot.groups.first?.value.first, searchSnapshot: searchSnapshot)
+            }
         }
         .onChange(of: selectedCard?.sessionID) { _ in showingTranscriptSources = false }
         .onAppear {
@@ -213,7 +557,9 @@ struct MeetingHistoryView: View {
                 navigation.selectedSessionID = requested
                 navigation.indexVisible = false
                 attention.requestedOutcomeSessionID = nil
-            } else if navigation.selectedSessionID == nil { select(groups.first?.value.first) }
+            } else if navigation.selectedSessionID == nil {
+                select(searchSnapshot.groups.first?.value.first, searchSnapshot: searchSnapshot)
+            }
         }
         .onChange(of: attention.requestedOutcomeSessionID) { id in
             if let id {
@@ -229,10 +575,10 @@ struct MeetingHistoryView: View {
         .onDisappear { data.flushOutcomeEdits() }
     }
 
-    private func outcomeTaskDetailSheet(_ target: OutcomeTaskSheetTarget) -> some View {
+    private func outcomeTaskDetailSheet(_ target: OutcomeTaskSheetTarget, selectedSessionID: UUID?) -> some View {
         let sessionID = target.outcome.meetingID
             ?? library.cards.first(where: { $0.outcomeID == target.outcome.id })?.sessionID
-            ?? selectedCard?.sessionID
+            ?? selectedSessionID
             ?? target.outcome.id
         let record = WorkspaceTaskRecord(
             id: target.task.id,
@@ -269,7 +615,15 @@ struct MeetingHistoryView: View {
     }
 
     var body: some View {
-        mainHistoryLayout
+        let base = currentBaseSnapshot()
+        let searchSnapshot = cache.searchSnapshot(
+            query: search,
+            base: base,
+            journal: journal,
+            sync: workspace?.workspaceSync
+        )
+        let selectedCard = resolvedSelectedCard(in: base)
+        mainHistoryLayout(base: base, searchSnapshot: searchSnapshot, selectedCard: selectedCard)
             .sheet(item: $rename) { value in
                 RenameMeetingSheet(library: library, sessionID: value.id, currentTitle: value.title)
             }
@@ -285,7 +639,7 @@ struct MeetingHistoryView: View {
                 WorkspaceSavedGuidance(guidance: preferences.workspaceGuidance, journal: journal)
             }
             .sheet(item: $editingOutcomeTask) { target in
-                outcomeTaskDetailSheet(target)
+                outcomeTaskDetailSheet(target, selectedSessionID: selectedCard?.sessionID)
             }
             .alert(L("Save in Obsidian"), isPresented: Binding(get: { obsidianMessage != nil },
                 set: { shown in if !shown { obsidianMessage = nil } })) {
@@ -295,21 +649,29 @@ struct MeetingHistoryView: View {
             }
     }
 
-    private var index: some View {
-            VStack(spacing: 0) {
+    private func index(
+        base: HistoryViewCache.BaseSnapshot,
+        searchSnapshot: HistoryViewCache.SearchSnapshot,
+        selectedCard: MeetingLibraryCard?
+    ) -> some View {
+            let selectedID = selectedCard?.sessionID
+            return VStack(spacing: 0) {
                 TextField(L("Search meetings"), text: $navigation.query)
                     .textFieldStyle(.roundedBorder).padding(10)
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 3) {
-                        ForEach(groups, id: \.key) { day, cards in
+                        ForEach(searchSnapshot.groups, id: \.key) { day, cards in
                             DisclosureGroup(isExpanded: Binding(get: { !search.isEmpty || !collapsedDays.contains(day) },
                                 set: { expanded in
                                     guard search.isEmpty else { return }
                                     if expanded { collapsedDays.remove(day) } else { collapsedDays.insert(day) }
                                 })) {
                                 ForEach(cards) { card in
-                                    Button { select(card) } label: { cardRow(card) }
-                                        .buttonStyle(.plain).accessibilityIdentifier("assistant.meeting-card")
+                                    let outcome = card.outcomeID.flatMap { base.outcomesByID[$0] }
+                                    Button { select(card, searchSnapshot: searchSnapshot) } label: {
+                                        cardRow(card, isSelected: selectedID == card.sessionID, outcome: outcome)
+                                    }
+                                    .buttonStyle(.plain).accessibilityIdentifier("assistant.meeting-card")
                                 }
                             } label: {
                                 HStack {
@@ -321,8 +683,8 @@ struct MeetingHistoryView: View {
                         }
                     }.padding(8)
                 }
-                if groups.isEmpty {
-                    if search.isEmpty && !showEmptyMeetings && !historyCards.isEmpty {
+                if searchSnapshot.groups.isEmpty {
+                    if search.isEmpty && !showEmptyMeetings && !base.historyCards.isEmpty {
                         VStack(spacing: 8) {
                             Text(L("Empty meetings are hidden."))
                                 .font(.callout).foregroundStyle(.secondary)
@@ -338,22 +700,40 @@ struct MeetingHistoryView: View {
                     Toggle(L("Show empty meetings"), isOn: $showEmptyMeetings)
                     Toggle(L("Reading mode"), isOn: $readingMode)
                     Button(L("Saved guidance")) { showingGuidance = true }
-                    Button(L("Export Markdown…")) { exportRequest = ExportRequest() }.disabled(library.cards.isEmpty)
+                    Button(L("Export Markdown…")) { exportRequest = ExportRequest() }.disabled(base.libraryCardIDs.isEmpty)
                 }.padding(10)
             }.background(Color(nsColor: .controlBackgroundColor))
     }
 
-    private func select(_ card: MeetingLibraryCard?) {
-        navigation.selectedSessionID = card?.sessionID
-        navigation.indexVisible = false
-        navigation.taskID = nil
-        navigation.source = nil
-        navigation.eventID = card.flatMap { searchedEvent($0.sessionID)?.id }
-        navigation.tab = navigation.eventID != nil ? .transcript : .summary
+    private func select(_ card: MeetingLibraryCard?, searchSnapshot: HistoryViewCache.SearchSnapshot? = nil) {
+        let eventID: String? = if let card, !search.isEmpty {
+            if let searchSnapshot {
+                cache.matchedEventID(
+                    for: card.sessionID,
+                    query: search,
+                    in: searchSnapshot,
+                    journal: journal,
+                    sync: workspace?.workspaceSync
+                )
+            } else {
+                HistoryViewCache.firstMatchingVisibleEventID(in: conversation(card.sessionID), query: search)
+            }
+        } else {
+            nil
+        }
+        navigation.select(
+            sessionID: card?.sessionID,
+            eventID: eventID,
+            tab: eventID != nil ? .transcript : .summary
+        )
     }
 
-    private func selectedMeeting(_ card: MeetingLibraryCard, compact: Bool) -> some View {
-        let sources = groupedCards(for: card.sessionID)
+    private func selectedMeeting(
+        _ card: MeetingLibraryCard,
+        compact: Bool,
+        base: HistoryViewCache.BaseSnapshot
+    ) -> some View {
+        let sources = base.groupedCards(for: card.sessionID)
         return VStack(spacing: 0) {
             if compact || navigation.source != nil {
                 HStack {
@@ -384,7 +764,7 @@ struct MeetingHistoryView: View {
                     }
                 }
                 Spacer(minLength: 4)
-                if library.cards.contains(where: { $0.sessionID == card.sessionID }) {
+                if base.libraryCardIDs.contains(card.sessionID) {
                     Button { rename = Rename(id: card.sessionID, title: card.title) } label: {
                         Image(systemName: "pencil")
                     }.buttonStyle(.borderless).help(L("Rename meeting")).accessibilityLabel(L("Rename meeting"))
@@ -392,9 +772,9 @@ struct MeetingHistoryView: View {
                 }
                 if workspace != nil {
                     Button {
+                        let outcome = card.outcomeID.flatMap { base.outcomesByID[$0] }
                         Task { @MainActor in
                             let record = try? await library.store.session(card.sessionID)
-                            let outcome = card.outcomeID.flatMap { outcomesByID[$0] }
                             let wsSession = conversation(card.sessionID)
                             let seriesID = record?.calendarSeriesID ?? outcome?.seriesID ?? wsSession?.calendarSeriesID
                             let url = record?.invitation ?? outcome?.invitation ?? URL(string: "about:blank")!
@@ -427,13 +807,15 @@ struct MeetingHistoryView: View {
             ).padding([.horizontal, .bottom], 10)
             Divider()
             switch navigation.tab {
-            case .summary, .tasks, .notes: overview(card, sources: sources)
+            case .summary, .tasks, .notes: overview(card, sources: sources, base: base)
             case .transcript:
                 if let session = conversation(card.sessionID), !session.events.isEmpty {
                     WorkspaceSessionReview(session: session, journal: journal, guidance: preferences.workspaceGuidance,
                                            highlightedEventID: navigation.eventID, showsDelete: sources.count <= 1,
                                            onBookmark: { event in
-                                               let source = journal.sessions.first {
+                                               let source = sources.first {
+                                                   journal.session(id: $0.sessionID)?.events.contains { $0.id == event } == true
+                                               }?.sessionID ?? journal.sessions.first {
                                                    (workspace?.workspaceSync.historySessionID($0.id) ?? $0.id) == card.sessionID &&
                                                        $0.events.contains { $0.id == event }
                                                }?.id ?? session.id
@@ -471,7 +853,11 @@ struct MeetingHistoryView: View {
         }
     }
 
-    private func overview(_ card: MeetingLibraryCard, sources: [MeetingLibraryCard]) -> some View {
+    private func overview(
+        _ card: MeetingLibraryCard,
+        sources: [MeetingLibraryCard],
+        base: HistoryViewCache.BaseSnapshot
+    ) -> some View {
         ScrollViewReader { scroll in
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
@@ -489,9 +875,9 @@ struct MeetingHistoryView: View {
                         meetingNotes(source).id(source.sessionID)
                             .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
                     }.padding([.top, .horizontal], 20).id("notes")
-                    outcomeContent(card)
-                    overviewTasks(sources: sources).padding(.horizontal, 20).id("tasks")
-                    if let outcome = data.outcomes.first(where: { $0.id == card.outcomeID }) {
+                    outcomeContent(card, base: base)
+                    overviewTasks(sources: sources, base: base).padding(.horizontal, 20).id("tasks")
+                    if let outcome = card.outcomeID.flatMap({ base.outcomesByID[$0] }) {
                         seriesHistory(outcome).padding(.horizontal, 20)
                     }
                     AssistantOutcomeHistoryView(store: library.store, sessionID: card.sessionID, updatedAt: card.updatedAt)
@@ -508,8 +894,11 @@ struct MeetingHistoryView: View {
         }
     }
 
-    @ViewBuilder private func overviewTasks(sources: [MeetingLibraryCard]) -> some View {
-        let outcomes = sources.compactMap { source in data.outcomes.first { $0.id == source.outcomeID } }
+    @ViewBuilder private func overviewTasks(
+        sources: [MeetingLibraryCard],
+        base: HistoryViewCache.BaseSnapshot
+    ) -> some View {
+        let outcomes = sources.compactMap { $0.outcomeID.flatMap { base.outcomesByID[$0] } }
         if outcomes.isEmpty {
             GroupBox(L("Tasks")) {
                 Text(L("No tasks yet.")).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading)
@@ -517,7 +906,7 @@ struct MeetingHistoryView: View {
         } else {
             ForEach(outcomes) { outcome in
                 if outcomes.count > 1 { Text(outcome.meetingTitle).font(.headline) }
-                meetingTasks(outcome)
+                meetingTasks(outcome, base: base)
             }
         }
     }
@@ -536,9 +925,12 @@ struct MeetingHistoryView: View {
             }, compactWhenEmpty: true)
     }
 
-    @ViewBuilder private func outcomeContent(_ card: MeetingLibraryCard) -> some View {
+    @ViewBuilder private func outcomeContent(
+        _ card: MeetingLibraryCard,
+        base: HistoryViewCache.BaseSnapshot
+    ) -> some View {
         VStack(alignment: .leading, spacing: 0) {
-            historyOutcomeActions(card)
+            historyOutcomeActions(card, base: base)
             if let id = card.outcomeID, let error = data.outcomeWriteErrors[id] {
                 VStack(alignment: .leading, spacing: 8) {
                     Text(L("Outcome changes could not be saved. %@", error)).font(.callout).foregroundStyle(.red)
@@ -551,9 +943,9 @@ struct MeetingHistoryView: View {
                 }.padding(16)
             }
             if card.outcomeState == .failed || card.outcomeState == .pending {
-                generationDetail(card)
-            } else if let outcome = data.outcomes.first(where: { $0.id == card.outcomeID }) {
-                detail(outcome, card: card)
+                generationDetail(card, base: base)
+            } else if let outcome = card.outcomeID.flatMap({ base.outcomesByID[$0] }) {
+                detail(outcome, card: card, base: base)
             } else if card.state == .active || card.state == .reconnecting {
                 Text(L("Meeting in progress"))
                     .foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading).padding(20)
@@ -564,7 +956,7 @@ struct MeetingHistoryView: View {
                         Text(error).font(.caption).foregroundStyle(.red)
                     }
                     Button {
-                        triggerRegenerate(card)
+                        triggerRegenerate(card, base: base)
                     } label: {
                         Label(L("Generate summary"), systemImage: "sparkles")
                     }
@@ -575,7 +967,10 @@ struct MeetingHistoryView: View {
         }
     }
 
-    @ViewBuilder private func historyOutcomeActions(_ card: MeetingLibraryCard) -> some View {
+    @ViewBuilder private func historyOutcomeActions(
+        _ card: MeetingLibraryCard,
+        base: HistoryViewCache.BaseSnapshot
+    ) -> some View {
         if let draft = attention.historyOutcomeDrafts[card.sessionID] {
             Button(L("Review summary draft")) { reviewedDraft = draft }.padding(16)
         } else if let status = attention.outcomeStatus[card.sessionID] {
@@ -583,17 +978,26 @@ struct MeetingHistoryView: View {
         } else if let session = conversation(card.sessionID) {
             let writer = preferences.effectiveWriter
             let end = session.endedAt ?? card.endedAt ?? card.startedAt
-            let window = MeetingOutcomePrompt.historyWindow(title: card.title, events: session.events, endedAt: end,
-                onDevice: writer.kind == .apple, contextTokens: preferences.outcomeContextTokens)
-            let previous = data.outcomes.first { $0.id == card.outcomeID }
-            if !window.lines.isEmpty, previous?.transcriptFingerprint != MeetingOutcomePrompt.fingerprint(window) {
+            let windowKey = HistoryViewCache.OutcomeWindowKey(
+                sessionID: card.sessionID,
+                title: card.title,
+                endedAt: end,
+                sessionsRevision: journal.sessionsRevision,
+                cardsRevision: library.cardsRevision,
+                syncTopologyRevision: currentSyncTopologyRevision,
+                onDevice: writer.kind == .apple,
+                contextTokens: preferences.outcomeContextTokens
+            )
+            let cached = cache.outcomeWindow(key: windowKey, card: card, session: session)
+            let previous = card.outcomeID.flatMap { base.outcomesByID[$0] }
+            if !cached.window.lines.isEmpty, previous?.transcriptFingerprint != cached.fingerprint {
                 VStack(alignment: .leading, spacing: 6) {
                     if previous?.transcriptFingerprint != nil {
                         Label(L("The available transcript has changed."), systemImage: "text.badge.plus")
                             .foregroundStyle(.secondary)
                     }
                     Button(previous == nil ? L("Generate summary") : L("Refresh summary")) {
-                        attention.prepareHistoryOutcome(sessionID: card.sessionID, title: card.title, endedAt: end, window: window)
+                        attention.prepareHistoryOutcome(sessionID: card.sessionID, title: card.title, endedAt: end, window: cached.window)
                     }
                     if (card.state == .active || card.state == .reconnecting),
                        let error = attention.outcomeError[card.sessionID] {
@@ -604,8 +1008,11 @@ struct MeetingHistoryView: View {
         }
     }
 
-    @ViewBuilder private func cardRow(_ card: MeetingLibraryCard) -> some View {
-        let isSelected = selectedCard?.sessionID == card.sessionID
+    @ViewBuilder private func cardRow(
+        _ card: MeetingLibraryCard,
+        isSelected: Bool,
+        outcome: MeetingOutcome?
+    ) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 4) {
                 Text(card.title).fontWeight(.semibold).lineLimit(1)
@@ -636,7 +1043,7 @@ struct MeetingHistoryView: View {
                     Text(card.state == .active || card.state == .reconnecting ? L("Meeting in progress") : L("Outcome unavailable"))
                         .font(.caption).foregroundStyle(.secondary)
                 }
-                if let outcome = data.outcomes.first(where: { $0.id == card.outcomeID }) {
+                if let outcome {
                     Text("·").foregroundStyle(.secondary)
                     Text(MeetingOutcomePrompt.displayText(outcome.summary)).font(.caption).foregroundStyle(.secondary).lineLimit(1)
                 } else if let status = attention.outcomeStatus[card.sessionID] {
@@ -650,7 +1057,7 @@ struct MeetingHistoryView: View {
             .contentShape(Rectangle())
     }
 
-    private func generationDetail(_ card: MeetingLibraryCard) -> some View {
+    private func generationDetail(_ card: MeetingLibraryCard, base: HistoryViewCache.BaseSnapshot? = nil) -> some View {
         VStack(alignment: .leading, spacing: 12) {
             if let error = attention.outcomeError[card.sessionID] {
                 Text(error).foregroundStyle(.red)
@@ -668,7 +1075,7 @@ struct MeetingHistoryView: View {
                             .accessibilityIdentifier("assistant.retry-outcome")
                             .disabled(attention.outcomeStatus[card.sessionID] != nil)
                         Button {
-                            triggerRegenerate(card)
+                            triggerRegenerate(card, base: base)
                         } label: {
                             Label(L("Regenerate"), systemImage: "sparkles")
                         }
@@ -678,7 +1085,7 @@ struct MeetingHistoryView: View {
                 } else {
                     Text(L("The original meeting input is unavailable for retry.")).foregroundStyle(.secondary)
                     Button {
-                        triggerRegenerate(card)
+                        triggerRegenerate(card, base: base)
                     } label: {
                         Label(L("Regenerate"), systemImage: "sparkles")
                     }
@@ -689,8 +1096,9 @@ struct MeetingHistoryView: View {
         }.padding(20).frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    private func triggerRegenerate(_ card: MeetingLibraryCard) {
-        let sourceIDs = groupedCards(for: card.sessionID).map(\.sessionID)
+    private func triggerRegenerate(_ card: MeetingLibraryCard, base: HistoryViewCache.BaseSnapshot? = nil) {
+        let resolvedBase = base ?? currentBaseSnapshot()
+        let sourceIDs = resolvedBase.groupedCards(for: card.sessionID).map(\.sessionID)
         let events = conversation(card.sessionID)?.events ?? []
         let synced = workspace?.workspaceSync.syncedTranscriptEvents(for: sourceIDs) ?? []
         let archive = loadedArchiveID == card.sessionID ? archivedEvents : []
@@ -723,14 +1131,19 @@ struct MeetingHistoryView: View {
         }
     }
 
-    @ViewBuilder private func detail(_ outcome: MeetingOutcome, card: MeetingLibraryCard) -> some View {
-        let binding = Binding(get: { data.outcomes.first { $0.id == outcome.id } ?? outcome },
+    @ViewBuilder private func detail(
+        _ outcome: MeetingOutcome,
+        card: MeetingLibraryCard,
+        base: HistoryViewCache.BaseSnapshot
+    ) -> some View {
+        let binding = Binding(get: { data.outcome(id: outcome.id) ?? outcome },
             set: { data.updateOutcome($0) })
         let summary = Binding(get: { MeetingOutcomePrompt.displayText(binding.wrappedValue.summary) }, set: { text in
             var edited = binding.wrappedValue
             edited.summary = text
             binding.wrappedValue = edited
         })
+        let eventsIndex = visibleEventsIndex(for: outcome)
         VStack(alignment: .leading, spacing: 16) {
             HStack(alignment: .top) {
                 Button(L("Copy as text")) {
@@ -744,7 +1157,7 @@ struct MeetingHistoryView: View {
                 }
                 .disabled(attention.outcomeChatTarget(outcome) == nil)
                 Button {
-                    triggerRegenerate(card)
+                    triggerRegenerate(card, base: base)
                 } label: {
                     Label(L("Regenerate"), systemImage: "sparkles")
                 }
@@ -778,13 +1191,13 @@ struct MeetingHistoryView: View {
                     .textFieldStyle(.plain).frame(maxWidth: .infinity, alignment: .leading)
                     .accessibilityIdentifier("history.summary")
             }
-            if hasDecisionSources(outcome) {
+            if hasDecisionSources(outcome, index: eventsIndex) {
                 Toggle(L("Show transcript references"), isOn: $showingTranscriptSources)
                     .toggleStyle(.checkbox).font(.caption)
                     .accessibilityIdentifier("history.show-sources")
             }
             editableLines(L("Decisions"), values: binding.decisions,
-                          evidence: outcome.decisionEvidence ?? [:], sessionID: outcome.meetingID)
+                          evidence: outcome.decisionEvidence ?? [:], eventsIndex: eventsIndex)
             editableLines(L("Open questions"), values: binding.openQuestions)
         }.padding(20).frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -806,8 +1219,8 @@ struct MeetingHistoryView: View {
         }
     }
 
-    private func meetingTasks(_ outcome: MeetingOutcome) -> some View {
-        let binding = Binding(get: { data.outcomes.first { $0.id == outcome.id } ?? outcome },
+    private func meetingTasks(_ outcome: MeetingOutcome, base: HistoryViewCache.BaseSnapshot) -> some View {
+        let binding = Binding(get: { data.outcome(id: outcome.id) ?? outcome },
                               set: { data.updateOutcome($0) })
         return VStack(alignment: .leading, spacing: 12) {
             GroupBox(L("Tasks")) {
@@ -901,16 +1314,33 @@ struct MeetingHistoryView: View {
         }
     }
 
-    private func hasDecisionSources(_ outcome: MeetingOutcome) -> Bool {
-        guard let sessionID = outcome.meetingID, let session = conversation(sessionID) else { return false }
-        let evidence = outcome.decisionEvidence ?? [:]
-        let ids = Set(outcome.decisions.flatMap { evidence[$0] ?? [] })
-        return session.visibleEvents.contains { ids.contains($0.id) }
+    private func visibleEventsIndex(for outcome: MeetingOutcome) -> HistoryViewCache.VisibleEventsIndex? {
+        guard let evidence = outcome.decisionEvidence, !evidence.isEmpty,
+              !outcome.decisions.isEmpty, let sessionID = outcome.meetingID else {
+            return nil
+        }
+        let key = HistoryViewCache.VisibleEventsKey(
+            sessionID: sessionID,
+            sessionsRevision: journal.sessionsRevision,
+            cardsRevision: library.cardsRevision,
+            syncTopologyRevision: currentSyncTopologyRevision
+        )
+        return cache.visibleEventsIndex(key: key, journal: journal, sync: workspace?.workspaceSync)
     }
 
-    @ViewBuilder private func decisionSources(_ ids: [String], sessionID: UUID?) -> some View {
-        if let sessionID, let session = conversation(sessionID) {
-            let events: [MeetingWorkspaceEvent] = session.visibleEvents.filter { ids.contains($0.id) }
+    private func hasDecisionSources(_ outcome: MeetingOutcome, index: HistoryViewCache.VisibleEventsIndex?) -> Bool {
+        guard let index, let evidence = outcome.decisionEvidence else { return false }
+        return outcome.decisions.contains { decision in
+            (evidence[decision] ?? []).contains { index.byID[$0] != nil }
+        }
+    }
+
+    @ViewBuilder private func decisionSources(
+        _ ids: [String],
+        index: HistoryViewCache.VisibleEventsIndex?
+    ) -> some View {
+        if let index, !ids.isEmpty {
+            let events = Set(ids).compactMap { index.byID[$0] }.sorted { $0.order < $1.order }.map(\.event)
             ForEach(events) { event in
                 decisionSource(event)
             }
@@ -930,8 +1360,12 @@ struct MeetingHistoryView: View {
             .accessibilityIdentifier("history.decision-source")
     }
 
-    private func editableLines(_ title: String, values: Binding<[String]>, evidence: [String: [String]] = [:],
-                               sessionID: UUID? = nil) -> some View {
+    private func editableLines(
+        _ title: String,
+        values: Binding<[String]>,
+        evidence: [String: [String]] = [:],
+        eventsIndex: HistoryViewCache.VisibleEventsIndex? = nil
+    ) -> some View {
         GroupBox(title) {
             VStack(alignment: .leading, spacing: 6) {
                 ForEach(Array(values.wrappedValue.enumerated()), id: \.offset) { index, current in
@@ -946,7 +1380,7 @@ struct MeetingHistoryView: View {
                         VStack(alignment: .leading, spacing: 4) {
                             TextField(title, text: lineBinding, axis: .vertical).textFieldStyle(.plain)
                             if showingTranscriptSources {
-                                decisionSources(evidence[current] ?? [], sessionID: sessionID)
+                                decisionSources(evidence[current] ?? [], index: eventsIndex)
                             }
                         }
                         Button {

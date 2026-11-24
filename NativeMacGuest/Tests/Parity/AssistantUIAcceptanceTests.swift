@@ -1794,6 +1794,124 @@ import XCTest
         XCTAssertTrue(containsText(rendered, "read_chat"))
         try capture(rendered)
     }
+
+    func testMeetingHistoryViewRemainsResponsiveAcrossManySessionsAndClicks() async throws {
+        let store = store()
+        await store.waitForMeetingLibrary()
+        let showEmptyKey = "native.meetingHistory.showEmptyMeetings"
+        let previousShowEmpty = UserDefaults.standard.object(forKey: showEmptyKey)
+        UserDefaults.standard.set(false, forKey: showEmptyKey)
+        addTeardownBlock { UserDefaults.standard.set(previousShowEmpty, forKey: showEmptyKey) }
+
+        let attention = AttentionCoordinator(store: store)
+        let prefsName = "history-perf-ui-\(UUID())"
+        let preferences = try XCTUnwrap(UserDefaults(suiteName: prefsName))
+        addTeardownBlock { preferences.removePersistentDomain(forName: prefsName) }
+        let library = NativeDesktopLibrary(
+            preferences: preferences,
+            history: RoomHistoryStore(storage: OutcomeFixtureCalendarStorage()),
+            syncStorage: OutcomeFixtureCalendarStorage()
+        )
+        let workspace = NativeDesktopWorkspace(
+            library: library,
+            detect: { _ in .unknown },
+            makeMeeting: { destination, name, title, quiet in
+                NativeDesktopMeetingModel(destination: destination, name: name, title: title, quiet: quiet, engine: AssistantUIEngine())
+            },
+            attention: attention
+        )
+        addTeardownBlock {
+            _ = await workspace.leave()
+            await MainActor.run { attention.stop() }
+        }
+
+        let baseDay = Calendar.current.startOfDay(for: Date())
+        var transcriptSessionIDs: [UUID] = []
+        var outcomeSessionIDs: [UUID] = []
+        for index in 0..<130 {
+            let dayOffset = -(index / 10)
+            let day = try XCTUnwrap(Calendar.current.date(byAdding: .day, value: dayOffset, to: baseDay))
+            let start = day.addingTimeInterval(Double(9 + (index % 10)) * 3_600)
+            let end = start.addingTimeInterval(1_800)
+            let session = MeetingSessionRecord(
+                title: "Perf History Meeting \(index)",
+                startedAt: start,
+                endedAt: end,
+                state: .ended
+            )
+            try await store.meetingLibrary.store.upsertSession(session)
+
+            if index < 40 {
+                try await store.meetingLibrary.store.saveOutcome(
+                    MeetingOutcome(
+                        meetingID: session.id,
+                        meetingTitle: session.title,
+                        endedAt: end,
+                        summary: "Summary for Perf History Meeting \(index)",
+                        decisions: ["Approved rollout step \(index)"]
+                    ),
+                    state: .ready
+                )
+                outcomeSessionIDs.append(session.id)
+            } else if index < 90 {
+                store.meetingLibrary.workspaceJournal.begin(
+                    sessionID: session.id,
+                    title: session.title,
+                    calendarSeriesID: nil,
+                    roomIdentity: "perf-room-\(index)",
+                    at: start
+                )
+                let events = (0..<60).map { offset in
+                    MeetingWorkspaceEvent(
+                        id: "perf-\(index)-\(offset)",
+                        kind: .transcript,
+                        occurredAt: start.addingTimeInterval(Double(offset) * 10),
+                        source: "local",
+                        author: "Anna",
+                        text: "Detailed architecture rollout discussion sentence \(offset) in meeting \(index)."
+                    )
+                }
+                store.meetingLibrary.workspaceJournal.observe(sessionID: session.id, events: events)
+                store.meetingLibrary.workspaceJournal.end(sessionID: session.id, at: end)
+                transcriptSessionIDs.append(session.id)
+            }
+        }
+        await store.meetingLibrary.refresh()
+        store.assistant.restorePersistedOutcomes(try await store.meetingLibrary.store.outcomes())
+        workspace.workspaceSync.setHistoryGroup(sessionID: transcriptSessionIDs[1], parent: transcriptSessionIDs[0])
+        XCTAssertEqual(
+            workspace.workspaceSync.historyConversation(
+                for: transcriptSessionIDs[1],
+                in: store.meetingLibrary.workspaceJournal
+            )?.events.count,
+            120
+        )
+
+        let rendered = await present(
+            MeetingHistoryView(attention: attention, workspace: workspace),
+            size: NSSize(width: 1100, height: 700),
+            name: "history-many-sessions"
+        )
+        rendered.window.makeKeyAndOrderFront(nil)
+        await settle()
+
+        let startClock = ContinuousClock.now
+        for idx in 0..<5 {
+            attention.historyNavigation.selectedSessionID = outcomeSessionIDs[idx]
+            attention.historyNavigation.tab = .summary
+            await settle()
+            XCTAssertTrue(containsText(rendered, "Summary for Perf History Meeting \(idx)"))
+
+            attention.historyNavigation.selectedSessionID = transcriptSessionIDs[idx]
+            attention.historyNavigation.tab = .transcript
+            await settle()
+            let expectedMeetingIndex = idx == 1 ? 40 : 40 + idx
+            XCTAssertTrue(containsText(rendered, "Detailed architecture rollout discussion sentence 0 in meeting \(expectedMeetingIndex)."))
+        }
+        let elapsed = startClock.duration(to: .now)
+        let seconds = Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
+        XCTAssertLessThan(seconds, 5.0, "Switching among 130 history sessions and tabs should stay fast, took \(seconds)s")
+    }
 }
 
 private actor OutcomeFixtureCalendar: CalendarReading {

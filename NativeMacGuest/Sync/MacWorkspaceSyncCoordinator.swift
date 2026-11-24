@@ -11,6 +11,7 @@ final class MacWorkspaceSyncCoordinator: ObservableObject {
     @Published private(set) var syncError: String?
     @Published private(set) var isSyncing = false
     @Published private(set) var nextRetryAt: Date?
+    @Published private(set) var historyTopologyRevision: UInt64 = 0
 
     let deviceID: String
     var onTranscriptChanged: ((UUID) -> Void)?
@@ -33,7 +34,12 @@ final class MacWorkspaceSyncCoordinator: ObservableObject {
     let archiveStore: TranscriptArchiveStore
 
     private let replicaWriter: MacWorkspaceReplicaWriter<ReplicaState>
-    private var replica: ReplicaState
+    private var replica: ReplicaState {
+        didSet { replicaRevision &+= 1 }
+    }
+    private var replicaRevision: UInt64 = 0
+    private var cachedVisibleCardIDs: (revision: UInt64, ids: Set<UUID>)?
+    private var cachedHistoryMembers: (cardsRevision: UInt64, replicaRevision: UInt64, byRoot: [UUID: [UUID]])?
     private var started = false
     private var pendingSyncTask: Task<Void, Never>?
     private var pendingSyncAt: Date?
@@ -252,8 +258,51 @@ final class MacWorkspaceSyncCoordinator: ObservableObject {
         return local ?? synced
     }
 
+    private func visibleCardIDs() -> Set<UUID> {
+        let rev = meetingLibrary.cardsRevision
+        if let cached = cachedVisibleCardIDs, cached.revision == rev {
+            return cached.ids
+        }
+        let ids = Set(meetingLibrary.cards.map(\.sessionID))
+        cachedVisibleCardIDs = (rev, ids)
+        return ids
+    }
+
+    private func linkedHistoryMembersByRoot() -> [UUID: [UUID]] {
+        let cardsRev = meetingLibrary.cardsRevision
+        let repRev = replicaRevision
+        if let cached = cachedHistoryMembers,
+           cached.cardsRevision == cardsRev,
+           cached.replicaRevision == repRev {
+            return cached.byRoot
+        }
+        let visible = visibleCardIDs()
+        var candidates: Set<UUID> = []
+        for (id, session) in replica.workspaceDoc.sessions {
+            if session.canonicalSessionID != nil || session.historyGroupParent != nil {
+                candidates.insert(id)
+            }
+        }
+        if let localGroups = replica.historyGroups {
+            for (id, link) in localGroups where link.value != nil {
+                candidates.insert(id)
+            }
+        }
+        var byRoot: [UUID: [UUID]] = [:]
+        for candidate in candidates {
+            let resolved = replica.workspaceDoc.resolveHistorySessionID(for: candidate, visibleIDs: visible) {
+                replica.historyGroups?[$0]
+            }
+            if resolved != candidate {
+                byRoot[resolved, default: []].append(candidate)
+            }
+        }
+        cachedHistoryMembers = (cardsRev, repRev, byRoot)
+        return byRoot
+    }
+
     func historySessionID(_ id: UUID) -> UUID {
-        replica.workspaceDoc.resolveHistorySessionID(for: id, visibleIDs: Set(meetingLibrary.cards.map(\.sessionID))) {
+        replica.workspaceDoc.resolveHistorySessionID(for: id, visibleIDs: visibleCardIDs()) {
             replica.historyGroups?[$0]
         }
     }
@@ -270,15 +319,33 @@ final class MacWorkspaceSyncCoordinator: ObservableObject {
             session.historyGroupParent = link
             replica.workspaceDoc.upsertSession(session)
         }
+        historyTopologyRevision &+= 1
         objectWillChange.send()
         persistReplica()
         scheduleSync(delayMilliseconds: 100)
     }
 
     func historyConversation(for id: UUID, in journal: MeetingWorkspaceJournal) -> MeetingWorkspaceSession? {
-        let id = historySessionID(id)
-        let related = journal.sessions.filter { historySessionID($0.id) == id }
-        guard var session = related.first(where: { $0.id == id }) ?? related.min(by: { $0.startedAt < $1.startedAt }) else { return nil }
+        let root = historySessionID(id)
+        let extraIDs = linkedHistoryMembersByRoot()[root] ?? []
+        if extraIDs.isEmpty {
+            return journal.session(id: root)
+        }
+        var related: [MeetingWorkspaceSession] = []
+        if let primary = journal.session(id: root) {
+            related.append(primary)
+        }
+        for memberID in extraIDs {
+            if let member = journal.session(id: memberID) {
+                related.append(member)
+            }
+        }
+        guard !related.isEmpty else { return nil }
+        if related.count == 1 {
+            return related[0]
+        }
+        var session = related.first(where: { $0.id == root })
+            ?? related.min(by: { ($0.startedAt, $0.id.uuidString) < ($1.startedAt, $1.id.uuidString) })!
         var byID: [String: MeetingWorkspaceEvent] = [:]
         for item in related.flatMap(\.events) {
             let known = byID[item.id]
@@ -728,6 +795,7 @@ final class MacWorkspaceSyncCoordinator: ObservableObject {
         guard !report.changedSessions.contains(where: { notes.draft(sessionID: $0)?.isDirty == true }) else {
             throw DeferredHistoryMerge.unsavedNotes
         }
+        historyTopologyRevision &+= 1
         objectWillChange.send()
         try await applyRemoteLibraryReport(report)
         replica.pendingHistoryApply = nil
@@ -807,7 +875,10 @@ final class MacWorkspaceSyncCoordinator: ObservableObject {
             prefetchedTranscripts = session
         }
 
-        if !report.changedSessions.isEmpty { objectWillChange.send() }
+        if !report.changedSessions.isEmpty {
+            historyTopologyRevision &+= 1
+            objectWillChange.send()
+        }
         if requiresApply {
             // A failed/partial SQLite apply is replayed before the next local export.
             try await applyPendingCloudChanges(preMergeLocalNoteMarkdown: preMergeLocalNoteMarkdown)
