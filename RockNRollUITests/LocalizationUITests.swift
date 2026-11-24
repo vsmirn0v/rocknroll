@@ -137,4 +137,72 @@ final class LocalizationUITests: XCTestCase {
         assertVisible(refresh, app: app)
         attach(app, "Russian local sharing preview")
     }
+
+    func testAssistantSettingsMeetingParamsChangeOnSingleTap() {
+        let app = launch(language: "en")
+        let settingsButton = app.buttons["Settings"]
+        XCTAssertTrue(settingsButton.waitForExistence(timeout: 10))
+        settingsButton.tap()
+
+        let assistantLink = app.buttons["settings.assistant"]
+        XCTAssertTrue(assistantLink.waitForExistence(timeout: 5))
+        assistantLink.tap()
+
+        XCTAssertTrue(app.navigationBars["Assistant & Sync"].waitForExistence(timeout: 5))
+        // Wait past HomeInteractionState's 180ms settle window to reproduce the idle sheet state.
+        Thread.sleep(forTimeInterval: 0.4)
+
+        let modePickers: [(id: String, candidateA: String, candidateB: String)] = [
+            ("assistant.settings.foregroundMode", "Follow", "Mentions"),
+            ("assistant.settings.backgroundMode", "Follow", "Participate"),
+            ("assistant.settings.silencedMode", "Participate", "Off"),
+            ("assistant.settings.replyChannel", "Voice reply", "Chat message")
+        ]
+
+        for entry in modePickers {
+            let picker = app.buttons[entry.id].firstMatch
+            XCTAssertTrue(picker.waitForExistence(timeout: 5), "Missing picker \(entry.id)")
+            XCTAssertTrue(picker.isHittable, "Picker not hittable: \(entry.id)")
+            let current = picker.value as? String
+            let target = (current == entry.candidateA) ? entry.candidateB : entry.candidateA
+
+            // Tap once on the leading label area to verify full-row hit testing and single-tap opening.
+            picker.coordinate(withNormalizedOffset: CGVector(dx: 0.2, dy: 0.5)).tap()
+
+            let option = app.buttons[target].firstMatch
+            XCTAssertTrue(option.waitForExistence(timeout: 3), "Menu option '\(target)' did not appear after one tap on \(entry.id)")
+            option.tap()
+
+            XCTAssertEqual(picker.value as? String, target, "Picker \(entry.id) did not update on first option tap")
+        }
+
+        // Navigate back to Settings and dismiss, then verify the second entry point via Assistant Hub.
+        app.navigationBars.buttons.element(boundBy: 0).tap()
+        let doneButton = app.navigationBars.buttons["Done"]
+        XCTAssertTrue(doneButton.waitForExistence(timeout: 5))
+        doneButton.tap()
+
+        let hubButton = app.buttons["home.assistant"]
+        XCTAssertTrue(hubButton.waitForExistence(timeout: 5))
+        hubButton.tap()
+
+        let hubSettings = app.buttons["workspace.hub.settings"]
+        XCTAssertTrue(hubSettings.waitForExistence(timeout: 5))
+        hubSettings.tap()
+
+        XCTAssertTrue(app.navigationBars["Assistant & Sync"].waitForExistence(timeout: 5))
+        Thread.sleep(forTimeInterval: 0.4)
+
+        let backgroundPicker = app.buttons["assistant.settings.backgroundMode"].firstMatch
+        XCTAssertTrue(backgroundPicker.waitForExistence(timeout: 5))
+        XCTAssertTrue(backgroundPicker.isHittable)
+        let initialBg = backgroundPicker.value as? String
+        let nextBg = (initialBg == "Mentions") ? "Follow" : "Mentions"
+        backgroundPicker.coordinate(withNormalizedOffset: CGVector(dx: 0.2, dy: 0.5)).tap()
+
+        let nextBgOption = app.buttons[nextBg].firstMatch
+        XCTAssertTrue(nextBgOption.waitForExistence(timeout: 3), "Menu option '\(nextBg)' did not appear after one tap in hub sheet")
+        nextBgOption.tap()
+        XCTAssertEqual(backgroundPicker.value as? String, nextBg)
+    }
 }

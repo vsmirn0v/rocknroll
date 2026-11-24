@@ -68,6 +68,57 @@ final class CalendarMeetingStoreTests: XCTestCase {
         try await Task.sleep(for: .milliseconds(40))
         XCTAssertFalse(state.active, "Inactive Home cancels settling and ignores queued scroll notifications")
     }
+
+    func testHomeInteractionProbeSuspendsAndIgnoresTouchesOverPresentedModals() throws {
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.first as? UIWindowScene)
+        let previous = scene.windows.first(where: \.isKeyWindow)
+        let window = UIWindow(windowScene: scene)
+        let rootController = UIViewController()
+        let hostingController = UIViewController()
+        rootController.addChild(hostingController)
+        rootController.view.addSubview(hostingController.view)
+        hostingController.view.frame = window.bounds
+        hostingController.didMove(toParent: rootController)
+        window.rootViewController = rootController
+        window.makeKeyAndVisible()
+        defer { window.isHidden = true; previous?.makeKey() }
+
+        let state = HomeInteractionState()
+        let probe = HomeInteractionProbe.Probe(state: state)
+        probe.frame = CGRect(x: 0, y: 0, width: 320, height: 400)
+        hostingController.view.addSubview(probe)
+        defer { probe.detach(); state.cancel() }
+        window.layoutIfNeeded()
+
+        let insidePoint = CGPoint(x: 24, y: 24)
+        XCTAssertTrue(probe.shouldReceiveTouch(locationInSelf: insidePoint, touchView: hostingController.view))
+        XCTAssertTrue(probe.gestureRecognizer(UIGestureRecognizer(), shouldReceive: UITouch()))
+        XCTAssertEqual(window.gestureRecognizers?.filter { $0.delegate === probe }.map(\.isEnabled), [true])
+
+        probe.suspended = true
+        XCTAssertFalse(probe.shouldReceiveTouch(locationInSelf: insidePoint, touchView: hostingController.view))
+        XCTAssertFalse(probe.gestureRecognizer(UIGestureRecognizer(), shouldReceive: UITouch()))
+        XCTAssertEqual(window.gestureRecognizers?.filter { $0.delegate === probe }.map(\.isEnabled), [false])
+
+        probe.suspended = false
+        XCTAssertEqual(window.gestureRecognizers?.filter { $0.delegate === probe }.map(\.isEnabled), [true])
+
+        let externalOverlay = UIView(frame: window.bounds)
+        window.addSubview(externalOverlay)
+        XCTAssertFalse(probe.shouldReceiveTouch(locationInSelf: insidePoint, touchView: externalOverlay))
+        externalOverlay.removeFromSuperview()
+
+        let modal = UIViewController()
+        hostingController.present(modal, animated: false)
+        XCTAssertFalse(probe.shouldReceiveTouch(locationInSelf: insidePoint, touchView: hostingController.view))
+        XCTAssertFalse(probe.gestureRecognizer(UIGestureRecognizer(), shouldReceive: UITouch()))
+
+        let dismissExpectation = expectation(description: "modal dismissed")
+        hostingController.dismiss(animated: false) { dismissExpectation.fulfill() }
+        wait(for: [dismissExpectation], timeout: 2)
+        XCTAssertTrue(probe.shouldReceiveTouch(locationInSelf: insidePoint, touchView: hostingController.view))
+        XCTAssertFalse(state.active)
+    }
     actor Reader: CalendarReading {
         var authorization: CalendarAccess = .allowed
         var requests = 0

@@ -353,11 +353,15 @@ struct IOSAssistantModeSheet: View {
 
                 if activeMode == .participating {
                     Section(L("Participation Settings")) {
-                        Picker(L("Reply channel"), selection: $output) {
-                            ForEach(IOSParticipationOutput.allCases) { ch in
-                                Label(ch.title, systemImage: ch.symbol).tag(ch)
-                            }
-                        }
+                        IOSFullRowMenuPicker(
+                            L("Reply channel"),
+                            selection: $output,
+                            options: IOSParticipationOutput.allCases,
+                            optionTitle: \.title,
+                            optionSymbol: \.symbol,
+                            selectedTitle: output.title
+                        )
+                        .accessibilityIdentifier("assistant.mode.replyChannel")
                         .onChange(of: output) { _, _ in syncParticipationOptions() }
 
                         Toggle(L("Ask before replying"), isOn: $askBeforeSending)

@@ -161,7 +161,7 @@ struct JoinView: View {
                 .onPreferenceChange(HomeRowFrames.self) { homeInteraction.layoutChanged($0) }
             }
         }
-        .background(HomeInteractionProbe(state: homeInteraction))
+        .background(HomeInteractionProbe(state: homeInteraction, suspended: homeModalPresented))
         .navigationTitle("Rock’n’Roll")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
@@ -404,8 +404,15 @@ struct JoinView: View {
             calendar.choosingMeeting != nil || model.siteSelection != nil || model.engineSelection != nil ||
             model.showSwitchConfirmation || busy
     }
+    private var homeModalPresented: Bool {
+        activeSheet != nil || setup.isPresented || mediaCheck.presented ||
+            calendar.showingMacSettings || calendar.choosingMeeting != nil ||
+            confirmingStaleContinuation || model.siteSelection != nil ||
+            model.engineSelection != nil || model.showSwitchConfirmation ||
+            (model.assistantBoard.isPresented && !model.assistantBoard.isInlineSheetActive)
+    }
     private var shouldTick: Bool {
-        homeVisible && foreground && !model.isInConference &&
+        homeVisible && foreground && !model.isInConference && !homeModalPresented &&
             (calendar.enabled || !calendar.syncedRemoteMeetings.isEmpty || !continuation.candidates.isEmpty)
     }
     private func refreshHome(meetings: [CalendarMeeting]? = nil, handoffs: [ActiveJam]? = nil) {
@@ -1283,28 +1290,77 @@ struct HomeTouchLifetime<Touch: Hashable> {
     mutating func reset() { touches.removeAll() }
 }
 
-private struct HomeInteractionProbe: UIViewRepresentable {
+struct HomeInteractionProbe: UIViewRepresentable {
     let state: HomeInteractionState
-    func makeUIView(context: Context) -> Probe { Probe(state: state) }
-    func updateUIView(_ view: Probe, context: Context) {}
+    var suspended: Bool = false
+    func makeUIView(context: Context) -> Probe { Probe(state: state, suspended: suspended) }
+    func updateUIView(_ view: Probe, context: Context) { view.suspended = suspended }
     static func dismantleUIView(_ view: Probe, coordinator: ()) { view.detach() }
     final class Probe: UIView, UIGestureRecognizerDelegate {
         weak var state: HomeInteractionState?
+        var suspended = false {
+            didSet {
+                guard oldValue != suspended else { return }
+                observer?.isEnabled = !suspended
+            }
+        }
         private var observer: TouchObserver?
-        init(state: HomeInteractionState) { self.state = state; super.init(frame: .zero); isUserInteractionEnabled = false }
+        init(state: HomeInteractionState, suspended: Bool = false) {
+            self.state = state
+            self.suspended = suspended
+            super.init(frame: .zero)
+            isUserInteractionEnabled = false
+        }
         required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
         override func didMoveToWindow() {
             super.didMoveToWindow(); detach()
             guard let window else { return }
             let observer = TouchObserver(target: nil, action: nil)
             observer.cancelsTouchesInView = false; observer.delaysTouchesBegan = false; observer.delaysTouchesEnded = false
+            observer.isEnabled = !suspended
             observer.delegate = self
             observer.onTouch = { [weak state] touching, view in state?.touch(touching, in: view) }
             window.addGestureRecognizer(observer); self.observer = observer
         }
         func detach() { if let observer { observer.view?.removeGestureRecognizer(observer) }; observer = nil }
+
+        private var nearestHostingController: UIViewController? {
+            var responder: UIResponder? = next
+            while let current = responder, !(current is UIViewController) {
+                responder = current.next
+            }
+            return responder as? UIViewController
+        }
+
+        var rootHostingController: UIViewController? {
+            guard var controller = nearestHostingController else { return nil }
+            while let parent = controller.parent {
+                controller = parent
+            }
+            return controller
+        }
+
+        private var hasPresentedViewController: Bool {
+            var controller = nearestHostingController
+            while let current = controller {
+                if current.presentedViewController != nil { return true }
+                controller = current.parent
+            }
+            return false
+        }
+
+        func shouldReceiveTouch(locationInSelf: CGPoint, touchView: UIView?) -> Bool {
+            guard !suspended, window != nil else { return false }
+            if hasPresentedViewController { return false }
+            if let rootController = rootHostingController,
+               let touchView, !touchView.isDescendant(of: rootController.view) {
+                return false
+            }
+            return bounds.contains(locationInSelf)
+        }
+
         func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
-            window != nil && bounds.contains(touch.location(in: self))
+            shouldReceiveTouch(locationInSelf: touch.location(in: self), touchView: touch.view)
         }
         func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool { true }
     }

@@ -12,7 +12,6 @@ struct IOSAssistantSettingsView: View {
     var skills: IOSAssistantSkillsController? = nil
     var board: IOSAssistantBoardController? = nil
     @ObservedObject private var voiceStore = IOSVoiceStore.shared
-    @ObservedObject private var voxStore = IOSVoxCPM2Store.shared
 
     @State private var apiKeyDraft = ""
     @State private var keyFeedback: String?
@@ -26,26 +25,42 @@ struct IOSAssistantSettingsView: View {
     var body: some View {
         Form {
             Section {
-                Picker(L("Default mode in active meeting"), selection: $assistant.defaultForegroundMode) {
-                    ForEach(IOSMeetingAssistantMode.allCases) { mode in
-                        Label(mode.title, systemImage: mode.symbol).tag(mode)
-                    }
-                }
-                Picker(L("Default mode in background meetings"), selection: $assistant.defaultBackgroundMode) {
-                    ForEach(IOSMeetingAssistantMode.allCases) { mode in
-                        Label(mode.title, systemImage: mode.symbol).tag(mode)
-                    }
-                }
-                Picker(L("When meeting sound is off"), selection: $assistant.defaultSilencedMode) {
-                    ForEach(IOSMeetingAssistantMode.allCases) { mode in
-                        Label(mode.title, systemImage: mode.symbol).tag(mode)
-                    }
-                }
-                Picker(L("Participation reply channel"), selection: $assistant.participationConfig.defaultOutput) {
-                    ForEach(IOSParticipationOutput.allCases) { channel in
-                        Label(channel.title, systemImage: channel.symbol).tag(channel)
-                    }
-                }
+                IOSFullRowMenuPicker(
+                    L("Default mode in active meeting"),
+                    selection: $assistant.defaultForegroundMode,
+                    options: IOSMeetingAssistantMode.allCases,
+                    optionTitle: \.title,
+                    optionSymbol: \.symbol,
+                    selectedTitle: assistant.defaultForegroundMode.title
+                )
+                .accessibilityIdentifier("assistant.settings.foregroundMode")
+                IOSFullRowMenuPicker(
+                    L("Default mode in background meetings"),
+                    selection: $assistant.defaultBackgroundMode,
+                    options: IOSMeetingAssistantMode.allCases,
+                    optionTitle: \.title,
+                    optionSymbol: \.symbol,
+                    selectedTitle: assistant.defaultBackgroundMode.title
+                )
+                .accessibilityIdentifier("assistant.settings.backgroundMode")
+                IOSFullRowMenuPicker(
+                    L("When meeting sound is off"),
+                    selection: $assistant.defaultSilencedMode,
+                    options: IOSMeetingAssistantMode.allCases,
+                    optionTitle: \.title,
+                    optionSymbol: \.symbol,
+                    selectedTitle: assistant.defaultSilencedMode.title
+                )
+                .accessibilityIdentifier("assistant.settings.silencedMode")
+                IOSFullRowMenuPicker(
+                    L("Participation reply channel"),
+                    selection: $assistant.participationConfig.defaultOutput,
+                    options: IOSParticipationOutput.allCases,
+                    optionTitle: \.title,
+                    optionSymbol: \.symbol,
+                    selectedTitle: assistant.participationConfig.defaultOutput.title
+                )
+                .accessibilityIdentifier("assistant.settings.replyChannel")
                 Toggle(L("Ask before sending replies"), isOn: $assistant.participationConfig.askBeforeSending)
                 TextField(L("Default participation goal (optional)"), text: $assistant.participationConfig.goal, axis: .vertical)
                     .lineLimit(1...3)
@@ -94,24 +109,27 @@ struct IOSAssistantSettingsView: View {
 
             Section {
                 Toggle(L("Generate summaries automatically after meetings"), isOn: $workspace.outcomeConfig.autoGenerateOnLeave)
-                Picker(L("Summary provider"), selection: Binding(
-                    get: { workspace.outcomeConfig.providerKind },
-                    set: { kind in
-                        var configuration = workspace.outcomeConfig
-                        guard configuration.providerKind != kind else { return }
-                        configuration.providerKind = kind
-                        configuration.model = kind.defaultModel
-                        configuration.contextTokens = nil
-                        workspace.outcomeConfig = configuration
-                        apiKeyDraft = workspace.readAPIKey(for: kind)
-                        keyFeedback = nil
-                        keyFeedbackIsError = false
-                    }
-                )) {
-                    ForEach(PortableOutcomeProviderKind.allCases, id: \.self) { kind in
-                        Text(kind.title).tag(kind)
-                    }
-                }
+                IOSFullRowMenuPicker(
+                    L("Summary provider"),
+                    selection: Binding(
+                        get: { workspace.outcomeConfig.providerKind },
+                        set: { kind in
+                            var configuration = workspace.outcomeConfig
+                            guard configuration.providerKind != kind else { return }
+                            configuration.providerKind = kind
+                            configuration.model = kind.defaultModel
+                            configuration.contextTokens = nil
+                            workspace.outcomeConfig = configuration
+                            apiKeyDraft = workspace.readAPIKey(for: kind)
+                            keyFeedback = nil
+                            keyFeedbackIsError = false
+                        }
+                    ),
+                    options: PortableOutcomeProviderKind.allCases,
+                    optionTitle: \.title,
+                    selectedTitle: workspace.outcomeConfig.providerKind.title
+                )
+                .accessibilityIdentifier("assistant.settings.summaryProvider")
 
                 if workspace.outcomeConfig.providerKind == .custom {
                     TextField(L("Base URL (OpenAI-compatible /v1)"), text: $workspace.outcomeConfig.baseURL)
@@ -182,17 +200,17 @@ struct IOSAssistantSettingsView: View {
             }
 
             Section(L("Same-Room Back-to-Back Meetings")) {
-                Picker(
+                IOSFullRowMenuPicker(
                     L("Default behavior"),
                     selection: Binding(
                         get: { workspace.defaultTransitionMode },
                         set: { mode in Task { await workspace.saveDefaultTransitionMode(mode) } }
-                    )
-                ) {
-                    ForEach(IOSSameRoomTransitionMode.allCases, id: \.self) { mode in
-                        Text(mode.title).tag(mode)
-                    }
-                }
+                    ),
+                    options: IOSSameRoomTransitionMode.allCases,
+                    optionTitle: \.title,
+                    selectedTitle: workspace.defaultTransitionMode.title
+                )
+                .accessibilityIdentifier("assistant.settings.sameRoomTransition")
             }
 
             Section {
@@ -270,6 +288,7 @@ struct IOSAssistantSettingsView: View {
                 }
             }
         }
+        .scrollDismissesKeyboard(.interactively)
         .navigationTitle(L("Assistant & Sync"))
         .sheet(isPresented: $choosingModel) {
             let configuration = workspace.outcomeConfig
@@ -328,6 +347,121 @@ struct IOSAssistantSettingsView: View {
                 }
             }
         }
+    }
+}
+
+/// Full-row menu picker for SwiftUI `Form`/`List` sections so tapping anywhere on the label opens the inline options menu.
+struct IOSFullRowMenuPicker<SelectionValue: Hashable, Option, ID: Hashable>: View {
+    let title: String
+    let selection: Binding<SelectionValue>
+    let options: [Option]
+    let id: KeyPath<Option, ID>
+    let valueOf: (Option) -> SelectionValue
+    let optionTitle: (Option) -> String
+    let optionSymbol: ((Option) -> String)?
+    let selectedTitle: String
+
+    init(
+        _ title: String,
+        selection: Binding<SelectionValue>,
+        options: [Option],
+        id: KeyPath<Option, ID>,
+        valueOf: @escaping (Option) -> SelectionValue,
+        optionTitle: @escaping (Option) -> String,
+        optionSymbol: ((Option) -> String)? = nil,
+        selectedTitle: String
+    ) {
+        self.title = title
+        self.selection = selection
+        self.options = options
+        self.id = id
+        self.valueOf = valueOf
+        self.optionTitle = optionTitle
+        self.optionSymbol = optionSymbol
+        self.selectedTitle = selectedTitle
+    }
+
+    var body: some View {
+        Menu {
+            Picker(title, selection: selection) {
+                ForEach(options, id: id) { option in
+                    if let symbol = optionSymbol?(option) {
+                        Label(optionTitle(option), systemImage: symbol).tag(valueOf(option))
+                    } else {
+                        Text(optionTitle(option)).tag(valueOf(option))
+                    }
+                }
+            }
+            .pickerStyle(.inline)
+        } label: {
+            HStack(spacing: 12) {
+                Text(title)
+                    .foregroundStyle(.primary)
+                    .multilineTextAlignment(.leading)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 8)
+                HStack(spacing: 4) {
+                    Text(selectedTitle)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    Image(systemName: "chevron.up.chevron.down")
+                        .font(.caption2.weight(.semibold))
+                }
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: true, vertical: false)
+            }
+            .frame(maxWidth: .infinity, minHeight: 32, alignment: .leading)
+            .contentShape(Rectangle())
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(title)
+        .accessibilityValue(selectedTitle)
+        .accessibilityAddTraits(.isButton)
+    }
+}
+
+extension IOSFullRowMenuPicker where Option: Identifiable, ID == Option.ID {
+    init(
+        _ title: String,
+        selection: Binding<SelectionValue>,
+        options: [Option],
+        valueOf: @escaping (Option) -> SelectionValue,
+        optionTitle: @escaping (Option) -> String,
+        optionSymbol: ((Option) -> String)? = nil,
+        selectedTitle: String
+    ) {
+        self.init(
+            title,
+            selection: selection,
+            options: options,
+            id: \.id,
+            valueOf: valueOf,
+            optionTitle: optionTitle,
+            optionSymbol: optionSymbol,
+            selectedTitle: selectedTitle
+        )
+    }
+}
+
+extension IOSFullRowMenuPicker where Option == SelectionValue, ID == Option {
+    init(
+        _ title: String,
+        selection: Binding<SelectionValue>,
+        options: [Option],
+        optionTitle: @escaping (Option) -> String,
+        optionSymbol: ((Option) -> String)? = nil,
+        selectedTitle: String
+    ) {
+        self.init(
+            title,
+            selection: selection,
+            options: options,
+            id: \.self,
+            valueOf: { $0 },
+            optionTitle: optionTitle,
+            optionSymbol: optionSymbol,
+            selectedTitle: selectedTitle
+        )
     }
 }
 
