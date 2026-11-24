@@ -1,9 +1,11 @@
 import ConferenceCore
+import MeetingEngine
 import SwiftUI
 
 enum IOSWorkspaceHubTab: String, CaseIterable, Identifiable {
     case ask
     case history
+    case calendar
     case tasks
     case search
 
@@ -13,6 +15,7 @@ enum IOSWorkspaceHubTab: String, CaseIterable, Identifiable {
         switch self {
         case .ask: return L("Ask")
         case .history: return L("Meetings")
+        case .calendar: return L("Calendar")
         case .tasks: return L("Tasks")
         case .search: return L("Search")
         }
@@ -28,6 +31,14 @@ struct IOSWorkspaceHubView: View {
     var skills: IOSAssistantSkillsController? = nil
     var facilitator: IOSAutonomousMeetingFacilitator? = nil
     var board: IOSAssistantBoardController? = nil
+    var calendar: CalendarMeetingStore? = nil
+    var history: RoomHistoryStore? = nil
+    var continuation: MeetingContinuationCoordinator? = nil
+    var suggestedSiteOrigins: [URL] = []
+    var defaultDisplayName: String = ""
+    var onJoinCalendarMeeting: ((CalendarMeeting) -> Void)? = nil
+    var onOpenCalendarSettings: (() -> Void)? = nil
+    var onSaveCreatedRoomFavorite: ((CreatedMeetingRoom) -> Void)? = nil
     var candidatesProvider: (() -> [JoinableMeetingCandidate])? = nil
     var onJoinMultiple: (([JoinableMeetingCandidate], String, Bool) -> Void)? = nil
     let initialTab: IOSWorkspaceHubTab
@@ -46,6 +57,10 @@ struct IOSWorkspaceHubView: View {
     @State private var renameDraft = ""
     @State private var pendingDeleteSession: IOSMeetingSessionItem?
     @AppStorage("ios.workspace.showEmptyMeetings") private var showEmptyMeetings = false
+    @State private var showingHistoryMonthGrid = false
+    @State private var historyScrubberMonth = Date()
+    @State private var selectedHistoryDay: Date?
+    @State private var historyCalendar = Calendar.current
     @State private var searchQuery = ""
     @State private var searchHits: [IOSWorkspaceSearchHit] = []
 
@@ -62,6 +77,14 @@ struct IOSWorkspaceHubView: View {
         skills: IOSAssistantSkillsController? = nil,
         facilitator: IOSAutonomousMeetingFacilitator? = nil,
         board: IOSAssistantBoardController? = nil,
+        calendar: CalendarMeetingStore? = nil,
+        history: RoomHistoryStore? = nil,
+        continuation: MeetingContinuationCoordinator? = nil,
+        suggestedSiteOrigins: [URL] = [],
+        defaultDisplayName: String = "",
+        onJoinCalendarMeeting: ((CalendarMeeting) -> Void)? = nil,
+        onOpenCalendarSettings: (() -> Void)? = nil,
+        onSaveCreatedRoomFavorite: ((CreatedMeetingRoom) -> Void)? = nil,
         candidatesProvider: (() -> [JoinableMeetingCandidate])? = nil,
         onJoinMultiple: (([JoinableMeetingCandidate], String, Bool) -> Void)? = nil,
         initialTab: IOSWorkspaceHubTab = .history
@@ -74,6 +97,14 @@ struct IOSWorkspaceHubView: View {
         self.skills = skills
         self.facilitator = facilitator
         self.board = board
+        self.calendar = calendar
+        self.history = history
+        self.continuation = continuation
+        self.suggestedSiteOrigins = suggestedSiteOrigins
+        self.defaultDisplayName = defaultDisplayName
+        self.onJoinCalendarMeeting = onJoinCalendarMeeting
+        self.onOpenCalendarSettings = onOpenCalendarSettings
+        self.onSaveCreatedRoomFavorite = onSaveCreatedRoomFavorite
         self.candidatesProvider = candidatesProvider
         self.onJoinMultiple = onJoinMultiple
         self.initialTab = initialTab
@@ -267,6 +298,21 @@ struct IOSWorkspaceHubView: View {
             }
         case .history:
             historyList
+        case .calendar:
+            IOSUnifiedCalendarView(
+                workspace: workspace,
+                calendar: calendar,
+                history: history,
+                continuation: continuation,
+                suggestedSiteOrigins: suggestedSiteOrigins,
+                defaultDisplayName: defaultDisplayName,
+                onOpenMeeting: { sessionID in
+                    openMeeting(sessionID)
+                },
+                onJoinCalendarMeeting: onJoinCalendarMeeting,
+                onOpenCalendarSettings: onOpenCalendarSettings,
+                onSaveCreatedRoomFavorite: onSaveCreatedRoomFavorite
+            )
         case .tasks:
             IOSPersonalTasksView(workspace: workspace) { sessionID in
                 openMeeting(sessionID)
@@ -371,34 +417,172 @@ struct IOSWorkspaceHubView: View {
                     counts[task.sessionID, default: 0] += 1
                 }
             }
-            List(selection: sizeClass == .regular ? $selectedSessionID : .constant(nil)) {
-                ForEach(history) { session in
-                    Button {
-                        openMeeting(session.id)
-                    } label: {
-                        meetingRow(session, openTasks: openTaskCounts[session.id] ?? 0)
+            let sections = historySections(from: history)
+            let markers = historyDayMarkers(for: sections)
+            let activeDay = selectedHistoryDay ?? sections.first?.dayStart
+            ScrollViewReader { proxy in
+                VStack(spacing: 0) {
+                    VStack(spacing: 6) {
+                        HStack(spacing: 6) {
+                            CompactWeekStripView(
+                                referenceDate: activeDay ?? Date(),
+                                selectedDate: activeDay,
+                                markersByDay: markers,
+                                calendar: historyCalendar,
+                                onSelectDay: { day in
+                                    jumpToHistoryDay(day, sections: sections, proxy: proxy)
+                                }
+                            )
+                            Button {
+                                if !showingHistoryMonthGrid {
+                                    historyScrubberMonth = activeDay ?? Date()
+                                }
+                                withAnimation(.easeInOut(duration: 0.2)) {
+                                    showingHistoryMonthGrid.toggle()
+                                }
+                            } label: {
+                                Image(systemName: showingHistoryMonthGrid ? "calendar.circle.fill" : "calendar")
+                                    .font(.title3)
+                                    .foregroundStyle(showingHistoryMonthGrid ? Color.rockBrandTint : .secondary)
+                                    .frame(minWidth: 36, minHeight: 36)
+                                    .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel(L("Jump to date"))
+                            .accessibilityIdentifier("ios.history.calendar.toggle")
+                        }
+                        if showingHistoryMonthGrid {
+                            CompactMonthScrubberView(
+                                displayedMonth: $historyScrubberMonth,
+                                selectedDate: activeDay,
+                                markersByDay: markers,
+                                calendar: historyCalendar,
+                                onSelectDay: { day in
+                                    jumpToHistoryDay(day, sections: sections, proxy: proxy)
+                                    withAnimation(.easeInOut(duration: 0.2)) {
+                                        showingHistoryMonthGrid = false
+                                    }
+                                },
+                                onToday: {
+                                    let today = historyCalendar.startOfDay(for: Date())
+                                    if sections.contains(where: { historyCalendar.isDate($0.dayStart, inSameDayAs: today) }) {
+                                        jumpToHistoryDay(today, sections: sections, proxy: proxy)
+                                    } else if let latest = sections.first?.dayStart {
+                                        jumpToHistoryDay(latest, sections: sections, proxy: proxy)
+                                    }
+                                    withAnimation(.easeInOut(duration: 0.2)) {
+                                        showingHistoryMonthGrid = false
+                                    }
+                                }
+                            )
+                            .accessibilityIdentifier("ios.history.calendar.scrubber")
+                        }
                     }
-                    .buttonStyle(.plain)
-                    .tag(session.id)
-                    .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-                        Button(role: .destructive) {
-                            pendingDeleteSession = session
-                        } label: {
-                            Label(L("Delete"), systemImage: "trash")
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(Color(uiColor: .secondarySystemGroupedBackground))
+
+                    List(selection: sizeClass == .regular ? $selectedSessionID : .constant(nil)) {
+                        ForEach(sections, id: \.dayStart) { section in
+                            Section {
+                                ForEach(section.sessions) { session in
+                                    Button {
+                                        selectedHistoryDay = section.dayStart
+                                        openMeeting(session.id)
+                                    } label: {
+                                        meetingRow(session, openTasks: openTaskCounts[session.id] ?? 0)
+                                    }
+                                    .buttonStyle(.plain)
+                                    .tag(session.id)
+                                    .id(session.id)
+                                    .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                                        Button(role: .destructive) {
+                                            pendingDeleteSession = session
+                                        } label: {
+                                            Label(L("Delete"), systemImage: "trash")
+                                        }
+                                        Button {
+                                            renameDraft = session.title
+                                            renamingSession = session
+                                        } label: {
+                                            Label(L("Rename"), systemImage: "pencil")
+                                        }
+                                        .tint(.blue)
+                                    }
+                                }
+                            } header: {
+                                HStack {
+                                    Text(historyDayTitle(section.dayStart))
+                                    Spacer()
+                                    Text("\(section.sessions.count)")
+                                        .foregroundStyle(.secondary)
+                                }
+                                .id(section.dayStart)
+                            }
                         }
-                        Button {
-                            renameDraft = session.title
-                            renamingSession = session
-                        } label: {
-                            Label(L("Rename"), systemImage: "pencil")
-                        }
-                        .tint(.blue)
+                    }
+                    .listStyle(.insetGrouped)
+                    .refreshable {
+                        await workspace.synchronizeNow()
+                    }
+                    .onReceive(NotificationCenter.default.publisher(for: .NSSystemTimeZoneDidChange)) { _ in
+                        historyCalendar = Calendar.current
                     }
                 }
             }
-            .listStyle(.insetGrouped)
-            .refreshable {
-                await workspace.synchronizeNow()
+        }
+    }
+
+    private func historySections(from items: [IOSMeetingSessionItem]) -> [(dayStart: Date, sessions: [IOSMeetingSessionItem])] {
+        Dictionary(grouping: items) { item in
+            historyCalendar.startOfDay(for: item.startedAt)
+        }
+        .map { entry in
+            (
+                dayStart: entry.key,
+                sessions: entry.value.sorted { ($0.startedAt, $0.id.uuidString) > ($1.startedAt, $1.id.uuidString) }
+            )
+        }
+        .sorted { $0.dayStart > $1.dayStart }
+    }
+
+    private func historyDayMarkers(for sections: [(dayStart: Date, sessions: [IOSMeetingSessionItem])]) -> [Date: CompactCalendarDayMarker] {
+        var markers: [Date: CompactCalendarDayMarker] = [:]
+        for section in sections {
+            markers[section.dayStart] = CompactCalendarDayMarker(primaryCount: section.sessions.count)
+        }
+        return markers
+    }
+
+    private func historyDayTitle(_ dayStart: Date) -> String {
+        if historyCalendar.isDateInToday(dayStart) {
+            return L("Today") + " · " + dayStart.formatted(.dateTime.day().month(.wide))
+        }
+        if historyCalendar.isDateInYesterday(dayStart) {
+            return L("Yesterday") + " · " + dayStart.formatted(.dateTime.day().month(.wide))
+        }
+        return dayStart.formatted(.dateTime.weekday(.wide).day().month(.wide).year())
+    }
+
+    private func jumpToHistoryDay(
+        _ day: Date,
+        sections: [(dayStart: Date, sessions: [IOSMeetingSessionItem])],
+        proxy: ScrollViewProxy
+    ) {
+        let target = historyCalendar.startOfDay(for: day)
+        guard let section = sections.first(where: { historyCalendar.isDate($0.dayStart, inSameDayAs: target) }) else {
+            return
+        }
+        selectedHistoryDay = section.dayStart
+        historyScrubberMonth = section.dayStart
+        if sizeClass == .regular,
+           let firstID = section.sessions.first?.id,
+           !section.sessions.contains(where: { $0.id == selectedSessionID }) {
+            selectedSessionID = firstID
+        }
+        if let firstID = section.sessions.first?.id {
+            withAnimation(.easeInOut(duration: 0.25)) {
+                proxy.scrollTo(firstID, anchor: .top)
             }
         }
     }
@@ -551,7 +735,9 @@ struct IOSWorkspaceHubView: View {
 
     private func openMeeting(_ sessionID: UUID) {
         selectedSessionID = sessionID
-        selectedTab = .history
+        if sizeClass == .regular {
+            selectedTab = .history
+        }
         compactColumn = .detail
     }
 }

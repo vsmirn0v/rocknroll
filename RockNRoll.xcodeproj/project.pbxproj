@@ -98,6 +98,7 @@
 		450288953FD2C7B7B28E2CB3 /* HandoffReadOnlyDeviceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D6DC2AC14F2642D10138665A /* HandoffReadOnlyDeviceTests.swift */; };
 		455505BFABD74D09BCA7116C /* MeetingAccessTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2FEF63DF50B4DB95CA1BD86E /* MeetingAccessTests.swift */; };
 		459BD79F3E24CA87ADA9F089 /* SceneDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = DF64302A8DFA2B622264D317 /* SceneDelegate.swift */; };
+		462B211C4D302E956FC68151 /* IOSUnifiedCalendarView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 81330A5EC5023FBF7FD18353 /* IOSUnifiedCalendarView.swift */; };
 		479150F8710E3CC566B3C7C8 /* IOSScreenShareCapture.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC20A3D362E49D6BF89AB441 /* IOSScreenShareCapture.swift */; };
 		47D9AD9AB9C8D0731BD81E2C /* CalendarInvitationContext.swift in Sources */ = {isa = PBXBuildFile; fileRef = D60B8C9FAF4E5D62CF6C5DB7 /* CalendarInvitationContext.swift */; };
 		4909D515578F82C5463C7E5D /* MeetingActivityState.swift in Sources */ = {isa = PBXBuildFile; fileRef = CFE277883989A4677747996B /* MeetingActivityState.swift */; };
@@ -162,6 +163,7 @@
 		7E1290D237496EDC7FD1C57F /* IOSWorkspaceCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9C933CF131AACC960EEFBB8B /* IOSWorkspaceCoordinator.swift */; };
 		7E4CC5A5A3459BCC75F2B172 /* ParticipantMediaBadgeUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6107CBE9DA5BB425FB24BFCC /* ParticipantMediaBadgeUITests.swift */; };
 		7F4F945FBC862EA778B1C017 /* MeetingActivityWidget.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C589E73D96C7A60F9ABC260 /* MeetingActivityWidget.swift */; };
+		7F9E6E80DE1743E4FEEA9E7E /* IOSUnifiedCalendarTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5004ADC332DE00635CA7D1F7 /* IOSUnifiedCalendarTests.swift */; };
 		8114E58CBABF98EFE781E0C9 /* MicrophoneActivityTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1FC786FE646EE28859FE43C9 /* MicrophoneActivityTests.swift */; };
 		81EC1734AE46C322404A5F31 /* LiveKitWebRTC in Frameworks */ = {isa = PBXBuildFile; productRef = 1CF2445B568B7A0BFE699865 /* LiveKitWebRTC */; };
 		81FAB07C47B53539FFC098DE /* SpeakerFixtureActions.swift in Sources */ = {isa = PBXBuildFile; fileRef = BED2653E8497C35147D804BC /* SpeakerFixtureActions.swift */; };
@@ -496,6 +498,7 @@
 		4E177269CF747C9FD3B7987C /* StudioWorkflowTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StudioWorkflowTests.swift; sourceTree = "<group>"; };
 		4E1EF35CB2CC3F314FDBB804 /* CameraUplinkEvidenceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CameraUplinkEvidenceTests.swift; sourceTree = "<group>"; };
 		4FFCA5602816073CDAEE4132 /* RoomSyncLiveProbe.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RoomSyncLiveProbe.swift; sourceTree = "<group>"; };
+		5004ADC332DE00635CA7D1F7 /* IOSUnifiedCalendarTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IOSUnifiedCalendarTests.swift; sourceTree = "<group>"; };
 		50ACB89C40D49C8B2417F98A /* MeetingAccessControls.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MeetingAccessControls.swift; sourceTree = "<group>"; };
 		5127962F2CBE03E63CBB7923 /* MicrophoneActivityUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MicrophoneActivityUITests.swift; sourceTree = "<group>"; };
 		51E69EB969FD513C7C9B24DB /* IOSMultiMeetingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IOSMultiMeetingTests.swift; sourceTree = "<group>"; };
@@ -567,6 +570,7 @@
 		7E00CA98C4B1068D38036062 /* MicrophoneActivity.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MicrophoneActivity.swift; sourceTree = "<group>"; };
 		80CAAA9434F6FC3C4BA590CC /* MeetingContinuationView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MeetingContinuationView.swift; sourceTree = "<group>"; };
 		80E482B5E0DED4C45A090A5F /* MeetingActivitySessionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MeetingActivitySessionTests.swift; sourceTree = "<group>"; };
+		81330A5EC5023FBF7FD18353 /* IOSUnifiedCalendarView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IOSUnifiedCalendarView.swift; sourceTree = "<group>"; };
 		81D2B945CF3AC6D1EAA0BCD1 /* CalendarReminderNotifications.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CalendarReminderNotifications.swift; sourceTree = "<group>"; };
 		823027E72F5C2F40A2D1639B /* RoomSyncSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RoomSyncSettingsView.swift; sourceTree = "<group>"; };
 		8495CBB24498D4A7F4AAC199 /* IOSPersonalTasksTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IOSPersonalTasksTests.swift; sourceTree = "<group>"; };
@@ -907,6 +911,7 @@
 				1E1683A65A81A3409A0BECE2 /* IOSMeetingTaskEditor.swift */,
 				AB8CB469BF66BBD98401ACA0 /* IOSPersonalTasksQuery.swift */,
 				7DFB7DF77E8CDDC8A654DF2E /* IOSPersonalTasksView.swift */,
+				81330A5EC5023FBF7FD18353 /* IOSUnifiedCalendarView.swift */,
 				9C933CF131AACC960EEFBB8B /* IOSWorkspaceCoordinator.swift */,
 				AD98891C6528B42F3FE21869 /* IOSWorkspaceHubView.swift */,
 				7DD0C656AA69D8C696A5B5DB /* IOSWorkspaceStore.swift */,
@@ -1132,6 +1137,7 @@
 				0F09328762DCF8EB21F20ADC /* IOSLocalTranscriptionAndVoiceTests.swift */,
 				51E69EB969FD513C7C9B24DB /* IOSMultiMeetingTests.swift */,
 				8495CBB24498D4A7F4AAC199 /* IOSPersonalTasksTests.swift */,
+				5004ADC332DE00635CA7D1F7 /* IOSUnifiedCalendarTests.swift */,
 				8706BC3799939D614C2972DD /* IOSVoxCPM2ResilienceTests.swift */,
 				2B85B36EC73686DEFC3D9B6C /* IOSWorkspaceAudioCoordinatorTests.swift */,
 				C5691273D94C8770D950071A /* IOSWorkspaceSyncTests.swift */,
@@ -1582,6 +1588,7 @@
 				3DB70A30425448ECEDDD5304 /* IOSPersonalTasksQuery.swift in Sources */,
 				83363219906BDFA94359B00C /* IOSPersonalTasksView.swift in Sources */,
 				479150F8710E3CC566B3C7C8 /* IOSScreenShareCapture.swift in Sources */,
+				462B211C4D302E956FC68151 /* IOSUnifiedCalendarView.swift in Sources */,
 				B9DB4DD60A8C2A84362BFD29 /* IOSVoiceActivityDetector.swift in Sources */,
 				7640207F80390B7C009B8C94 /* IOSVoiceAndTranscriptionViews.swift in Sources */,
 				A8C8BF3E27B3CC82E5BE9E72 /* IOSVoiceSynthesis.swift in Sources */,
@@ -1774,6 +1781,7 @@
 				BD77F6D1988D2285626E2A8C /* IOSLocalTranscriptionAndVoiceTests.swift in Sources */,
 				5D7D0FC0980D60BB15992594 /* IOSMultiMeetingTests.swift in Sources */,
 				B2230DA501A8EDA607C74043 /* IOSPersonalTasksTests.swift in Sources */,
+				7F9E6E80DE1743E4FEEA9E7E /* IOSUnifiedCalendarTests.swift in Sources */,
 				984AC9AAF7FFC2D0E0FD944A /* IOSVoxCPM2ResilienceTests.swift in Sources */,
 				AD2B0F55365B191CD81A34EE /* IOSWorkspaceAudioCoordinatorTests.swift in Sources */,
 				DB9855AA9726026F68345AE1 /* IOSWorkspaceSyncTests.swift in Sources */,

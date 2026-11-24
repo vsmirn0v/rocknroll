@@ -1,4 +1,5 @@
 import ConferenceCore
+import MeetingEngine
 import QuickLook
 import SwiftUI
 
@@ -39,6 +40,13 @@ private enum ActiveHomeSheet: Identifiable {
         if case .agenda = self { return true }
         return false
     }
+
+    var handlesCalendarSheets: Bool {
+        switch self {
+        case .agenda, .workspace: return true
+        default: return false
+        }
+    }
 }
 
 struct JoinView: View {
@@ -56,6 +64,7 @@ struct JoinView: View {
     @Environment(\.dynamicTypeSize) private var textSize
     @State private var showingAllFavorites = false
     @State private var agendaSettings = false
+    @State private var showingAgendaCreateMeeting = false
     @State private var homeSnapshot = HomeMeetingSnapshot()
     @State private var homeVisible = false
     @StateObject private var homeInteraction = HomeInteractionState()
@@ -231,7 +240,7 @@ struct JoinView: View {
                 MeetingSetupView(setup: setup, calendar: calendar, reminders: calendar.reminders, sync: sync, continuation: continuation)
                     .onAppear { setup.presentationDidMount() }
             }
-            .modifier(CalendarReminderSheet(reminders: calendar.reminders, isActive: { activeSheet?.isAgenda != true }))
+            .modifier(CalendarReminderSheet(reminders: calendar.reminders, isActive: { activeSheet?.handlesCalendarSheets != true }))
             .sheet(isPresented: Binding(get: { mediaCheck.presented }, set: { if !$0 { mediaCheck.close() } })) {
                 StudioPanel(model: mediaCheck)
             }
@@ -258,7 +267,7 @@ struct JoinView: View {
                     onCancel: { model.siteSelection = nil }
                 )
             }
-            .sheet(item: Binding(get: { activeSheet?.isAgenda == true ? nil : calendar.choosingMeeting },
+            .sheet(item: Binding(get: { activeSheet?.handlesCalendarSheets == true ? nil : calendar.choosingMeeting },
                                  set: { calendar.choosingMeeting = $0 })) { meeting in
                 CalendarRoomBindingView(meeting: meeting, calendar: calendar, history: history)
             }
@@ -672,6 +681,12 @@ struct JoinView: View {
             }
             .accessibilityIdentifier("home.workspace.meetings")
             Button {
+                activeSheet = .workspace(.calendar)
+            } label: {
+                Label(L("Calendar"), systemImage: "calendar")
+            }
+            .accessibilityIdentifier("home.workspace.calendar")
+            Button {
                 activeSheet = .workspace(.tasks)
             } label: {
                 HStack {
@@ -702,8 +717,34 @@ struct JoinView: View {
             }
             .navigationTitle(L("Upcoming meetings")).navigationBarTitleDisplayMode(.inline)
             .navigationDestination(isPresented: $agendaSettings) { CalendarSettingsView(calendar: calendar) }
-            .toolbar { ToolbarItem(placement: .confirmationAction) { Button(L("Done")) { activeSheet = nil } } }
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button { showingAgendaCreateMeeting = true } label: { Image(systemName: "plus") }
+                        .accessibilityLabel(L("New meeting"))
+                }
+                ToolbarItem(placement: .confirmationAction) { Button(L("Done")) { activeSheet = nil } }
+            }
             .sheet(item: $calendar.choosingMeeting) { CalendarRoomBindingView(meeting: $0, calendar: calendar, history: history) }
+            .sheet(isPresented: $showingAgendaCreateMeeting) {
+                CreateCalendarMeetingSheet(
+                    suggestedOrigins: suggestedSiteOrigins,
+                    favoriteRooms: history.rooms.map {
+                        FavoriteRoomOption(id: $0.id, title: $0.displayTitle, invitationURL: $0.joinURL)
+                    },
+                    preferredCalendarIDs: calendar.selected,
+                    defaultDisplayName: model.displayName,
+                    onOpenCalendarSettings: {
+                        showingAgendaCreateMeeting = false
+                        agendaSettings = true
+                    },
+                    onCreated: { result, createdRoom, saveFavorite in
+                        if saveFavorite, let createdRoom {
+                            model.saveCreatedRoomFavorite(createdRoom)
+                        }
+                        calendar.handleCreatedCalendarEvent(calendarID: result.calendarIdentifier, eventStart: result.startAt)
+                    }
+                )
+            }
             .modifier(CalendarReminderSheet(reminders: calendar.reminders, isActive: { activeSheet?.isAgenda == true }))
         }
     }
@@ -843,6 +884,21 @@ struct JoinView: View {
                 skills: model.assistantSkills,
                 facilitator: model.assistantFacilitator,
                 board: model.assistantBoard,
+                calendar: calendar,
+                history: history,
+                continuation: continuation,
+                suggestedSiteOrigins: suggestedSiteOrigins,
+                defaultDisplayName: model.displayName,
+                onJoinCalendarMeeting: { meeting in
+                    activeSheet = nil
+                    model.joinCalendarMeeting(meeting)
+                },
+                onOpenCalendarSettings: {
+                    activeSheet = .settings
+                },
+                onSaveCreatedRoomFavorite: { created in
+                    model.saveCreatedRoomFavorite(created)
+                },
                 candidatesProvider: {
                     CurrentMeetingTargetResolver.rankedCandidates(
                         now: Date(),

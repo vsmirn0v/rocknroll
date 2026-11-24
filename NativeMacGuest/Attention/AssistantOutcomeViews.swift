@@ -1,6 +1,7 @@
 import AppKit
 import Combine
 import ConferenceCore
+import MeetingEngine
 import SwiftUI
 
 enum MeetingHistoryTab: String, CaseIterable, Identifiable {
@@ -439,6 +440,7 @@ struct MeetingHistoryView: View {
     private let workspace: NativeDesktopWorkspace?
     @AppStorage("native.meetingHistory.readingMode") private var readingMode = false
     @AppStorage("native.meetingHistory.showEmptyMeetings") private var showEmptyMeetings = false
+    @AppStorage("native.meetingHistory.showCalendarWidget") private var showCalendarWidget = false
     @State private var showingGuidance = false
     @State private var showingContext = false
     @State private var showingTranscriptSources = false
@@ -446,6 +448,9 @@ struct MeetingHistoryView: View {
     @State private var pendingSend: (outcome: UUID, meeting: UUID)?
     @State private var collapsedDays: Set<HistoryDay> = []
     @State private var calendar = Calendar.current
+    @State private var scrubberMonth = Date()
+    @State private var selectedScrubberDate: Date?
+    @State private var highlightedDay: HistoryDay?
     @State private var rename: Rename?
     @State private var exportRequest: ExportRequest?
     @State private var obsidianMessage: String?
@@ -528,7 +533,8 @@ struct MeetingHistoryView: View {
             HStack(spacing: 0) {
                 if !narrow || navigation.indexVisible || selectedCard == nil {
                     index(base: base, searchSnapshot: searchSnapshot, selectedCard: selectedCard)
-                        .frame(width: narrow ? nil : 228).frame(maxWidth: narrow ? .infinity : nil)
+                        .frame(width: narrow ? nil : (showCalendarWidget ? 252 : 228))
+                        .frame(maxWidth: narrow ? .infinity : nil)
                 }
                 if !narrow || (!navigation.indexVisible && selectedCard != nil) {
                     if !narrow { Divider() }
@@ -551,7 +557,12 @@ struct MeetingHistoryView: View {
                 select(searchSnapshot.groups.first?.value.first, searchSnapshot: searchSnapshot)
             }
         }
-        .onChange(of: selectedCard?.sessionID) { _ in showingTranscriptSources = false }
+        .onChange(of: selectedCard?.sessionID) { _ in
+            showingTranscriptSources = false
+            if let date = selectedCard?.effectiveDate?.date {
+                selectedScrubberDate = calendar.startOfDay(for: date)
+            }
+        }
         .onAppear {
             if let requested = attention.requestedOutcomeSessionID {
                 navigation.selectedSessionID = requested
@@ -655,54 +666,165 @@ struct MeetingHistoryView: View {
         selectedCard: MeetingLibraryCard?
     ) -> some View {
             let selectedID = selectedCard?.sessionID
-            return VStack(spacing: 0) {
-                TextField(L("Search meetings"), text: $navigation.query)
-                    .textFieldStyle(.roundedBorder).padding(10)
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 3) {
-                        ForEach(searchSnapshot.groups, id: \.key) { day, cards in
-                            DisclosureGroup(isExpanded: Binding(get: { !search.isEmpty || !collapsedDays.contains(day) },
-                                set: { expanded in
-                                    guard search.isEmpty else { return }
-                                    if expanded { collapsedDays.remove(day) } else { collapsedDays.insert(day) }
-                                })) {
-                                ForEach(cards) { card in
-                                    let outcome = card.outcomeID.flatMap { base.outcomesByID[$0] }
-                                    Button { select(card, searchSnapshot: searchSnapshot) } label: {
-                                        cardRow(card, isSelected: selectedID == card.sessionID, outcome: outcome)
-                                    }
-                                    .buttonStyle(.plain).accessibilityIdentifier("assistant.meeting-card")
-                                }
-                            } label: {
-                                HStack {
-                                    Text(day.date?.formatted(.dateTime.day().month(.wide).year().locale(locale)) ?? L("Date unknown"))
-                                    Spacer()
-                                    Text(cards.count.formatted()).foregroundStyle(.secondary)
-                                }.font(.subheadline.weight(.semibold))
-                            }.padding(.vertical, 4)
+            let activeDate = selectedScrubberDate ?? selectedCard?.effectiveDate.map { calendar.startOfDay(for: $0.date) }
+            let dayMarkers = historyDayMarkers(for: searchSnapshot.groups)
+            return ScrollViewReader { proxy in
+                VStack(spacing: 0) {
+                    HStack(spacing: 6) {
+                        TextField(L("Search meetings"), text: $navigation.query)
+                            .textFieldStyle(.roundedBorder)
+                        Button {
+                            if !showCalendarWidget {
+                                let anchor = activeDate ?? searchSnapshot.groups.first?.key.date ?? Date()
+                                scrubberMonth = anchor
+                                selectedScrubberDate = calendar.startOfDay(for: anchor)
+                            }
+                            withAnimation(.easeInOut(duration: 0.18)) {
+                                showCalendarWidget.toggle()
+                            }
+                        } label: {
+                            Image(systemName: showCalendarWidget ? "calendar.circle.fill" : "calendar")
+                                .foregroundStyle(showCalendarWidget ? Color.orange : Color.secondary)
                         }
-                    }.padding(8)
-                }
-                if searchSnapshot.groups.isEmpty {
-                    if search.isEmpty && !showEmptyMeetings && !base.historyCards.isEmpty {
-                        VStack(spacing: 8) {
-                            Text(L("Empty meetings are hidden."))
-                                .font(.callout).foregroundStyle(.secondary)
-                            Button(L("Show empty meetings")) { showEmptyMeetings = true }
-                        }.padding()
-                    } else {
-                        Text(search.isEmpty ? L("Meeting notes and outcomes appear here.") : L("No matching meetings"))
-                            .font(.callout).foregroundStyle(.secondary).padding()
+                        .buttonStyle(.borderless)
+                        .help(L("Jump to date"))
+                        .accessibilityLabel(L("Jump to date"))
+                        .accessibilityIdentifier("history.calendar.toggle")
                     }
-                }
-                Divider()
-                Menu(L("History options")) {
-                    Toggle(L("Show empty meetings"), isOn: $showEmptyMeetings)
-                    Toggle(L("Reading mode"), isOn: $readingMode)
-                    Button(L("Saved guidance")) { showingGuidance = true }
-                    Button(L("Export Markdown…")) { exportRequest = ExportRequest() }.disabled(base.libraryCardIDs.isEmpty)
-                }.padding(10)
-            }.background(Color(nsColor: .controlBackgroundColor))
+                    .padding(10)
+
+                    if showCalendarWidget {
+                        CompactMonthScrubberView(
+                            displayedMonth: $scrubberMonth,
+                            selectedDate: activeDate,
+                            markersByDay: dayMarkers,
+                            calendar: calendar,
+                            onSelectDay: { date in
+                                jumpToHistoryDay(
+                                    date,
+                                    searchSnapshot: searchSnapshot,
+                                    selectedCard: selectedCard,
+                                    proxy: proxy
+                                )
+                            },
+                            onToday: {
+                                jumpToTodayOrLatest(
+                                    searchSnapshot: searchSnapshot,
+                                    selectedCard: selectedCard,
+                                    proxy: proxy
+                                )
+                            }
+                        )
+                        .padding([.horizontal, .bottom], 8)
+                        .accessibilityIdentifier("history.calendar.scrubber")
+                    }
+
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 3) {
+                            ForEach(searchSnapshot.groups, id: \.key) { day, cards in
+                                DisclosureGroup(isExpanded: Binding(get: { !search.isEmpty || !collapsedDays.contains(day) },
+                                    set: { expanded in
+                                        guard search.isEmpty else { return }
+                                        if expanded { collapsedDays.remove(day) } else { collapsedDays.insert(day) }
+                                    })) {
+                                    ForEach(cards) { card in
+                                        let outcome = card.outcomeID.flatMap { base.outcomesByID[$0] }
+                                        Button { select(card, searchSnapshot: searchSnapshot) } label: {
+                                            cardRow(card, isSelected: selectedID == card.sessionID, outcome: outcome)
+                                        }
+                                        .buttonStyle(.plain).accessibilityIdentifier("assistant.meeting-card")
+                                    }
+                                } label: {
+                                    HStack {
+                                        Text(day.date?.formatted(.dateTime.day().month(.wide).year().locale(locale)) ?? L("Date unknown"))
+                                        Spacer()
+                                        Text(cards.count.formatted()).foregroundStyle(.secondary)
+                                    }.font(.subheadline.weight(.semibold))
+                                }
+                                .padding(.vertical, 4)
+                                .padding(.horizontal, 4)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 6)
+                                        .fill(highlightedDay == day ? Color.orange.opacity(0.14) : Color.clear)
+                                )
+                                .id(day)
+                            }
+                        }.padding(8)
+                    }
+                    if searchSnapshot.groups.isEmpty {
+                        if search.isEmpty && !showEmptyMeetings && !base.historyCards.isEmpty {
+                            VStack(spacing: 8) {
+                                Text(L("Empty meetings are hidden."))
+                                    .font(.callout).foregroundStyle(.secondary)
+                                Button(L("Show empty meetings")) { showEmptyMeetings = true }
+                            }.padding()
+                        } else {
+                            Text(search.isEmpty ? L("Meeting notes and outcomes appear here.") : L("No matching meetings"))
+                                .font(.callout).foregroundStyle(.secondary).padding()
+                        }
+                    }
+                    Divider()
+                    Menu(L("History options")) {
+                        Toggle(L("Show empty meetings"), isOn: $showEmptyMeetings)
+                        Toggle(L("Reading mode"), isOn: $readingMode)
+                        Button(L("Saved guidance")) { showingGuidance = true }
+                        Button(L("Export Markdown…")) { exportRequest = ExportRequest() }.disabled(base.libraryCardIDs.isEmpty)
+                    }.padding(10)
+                }.background(Color(nsColor: .controlBackgroundColor))
+            }
+    }
+
+    private func historyDayMarkers(for groups: [(key: HistoryDay, value: [MeetingLibraryCard])]) -> [Date: CompactCalendarDayMarker] {
+        var markers: [Date: CompactCalendarDayMarker] = [:]
+        for (day, cards) in groups {
+            guard let date = day.date else { continue }
+            markers[calendar.startOfDay(for: date)] = CompactCalendarDayMarker(primaryCount: cards.count)
+        }
+        return markers
+    }
+
+    private func jumpToTodayOrLatest(
+        searchSnapshot: HistoryViewCache.SearchSnapshot,
+        selectedCard: MeetingLibraryCard?,
+        proxy: ScrollViewProxy
+    ) {
+        let today = calendar.startOfDay(for: Date())
+        if searchSnapshot.groups.contains(where: { $0.key.date.map { calendar.isDate($0, inSameDayAs: today) } ?? false }) {
+            jumpToHistoryDay(today, searchSnapshot: searchSnapshot, selectedCard: selectedCard, proxy: proxy)
+        } else if let latest = searchSnapshot.groups.first?.key.date {
+            jumpToHistoryDay(latest, searchSnapshot: searchSnapshot, selectedCard: selectedCard, proxy: proxy)
+        }
+    }
+
+    private func jumpToHistoryDay(
+        _ date: Date,
+        searchSnapshot: HistoryViewCache.SearchSnapshot,
+        selectedCard: MeetingLibraryCard?,
+        proxy: ScrollViewProxy
+    ) {
+        let targetStart = calendar.startOfDay(for: date)
+        guard let group = searchSnapshot.groups.first(where: {
+            $0.key.date.map { calendar.isDate($0, inSameDayAs: targetStart) } ?? false
+        }) else {
+            return
+        }
+        selectedScrubberDate = targetStart
+        scrubberMonth = targetStart
+        collapsedDays.remove(group.key)
+        if let firstCard = group.value.first,
+           !group.value.contains(where: { $0.sessionID == selectedCard?.sessionID }) {
+            select(firstCard, searchSnapshot: searchSnapshot)
+        }
+        highlightedDay = group.key
+        withAnimation(.easeInOut(duration: 0.25)) {
+            proxy.scrollTo(group.key, anchor: .top)
+        }
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(1.2))
+            if highlightedDay == group.key {
+                highlightedDay = nil
+            }
+        }
     }
 
     private func select(_ card: MeetingLibraryCard?, searchSnapshot: HistoryViewCache.SearchSnapshot? = nil) {

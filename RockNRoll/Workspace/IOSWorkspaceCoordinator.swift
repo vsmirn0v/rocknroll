@@ -1900,6 +1900,11 @@ final class IOSWorkspaceCoordinator: ObservableObject {
         }
     }
 
+    func calendarAssociation(for sessionID: UUID) -> MeetingCalendarAssociation? {
+        let canonical = replica.workspaceDoc.resolveCanonicalSessionID(for: sessionID)
+        return replica.workspaceDoc.sessions[canonical]?.calendarAssociation?.value
+    }
+
     func historyTranscriptForDisplay(sessionID: UUID) async -> (events: [SyncedTranscriptEvent], isLocalArchiveOnly: Bool) {
         let sources = linkedHistorySources(for: sessionID)
         guard !sources.isEmpty else { return await transcriptForDisplay(sessionID: sessionID) }

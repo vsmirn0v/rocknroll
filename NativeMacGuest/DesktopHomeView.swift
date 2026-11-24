@@ -170,7 +170,7 @@ struct NativeDesktopHomeView: View {
                         case .settings: settingsView
                         case .favorites: roomList(library.favorites, title: L("Favorites"), search: $favoritesSearch, reorder: true)
                         case .recent: roomList(library.recent, title: L("Recent rooms"), search: $recentSearch)
-                        case .calendar: agenda
+                        case .calendar: NativeDesktopCalendarView(workspace: workspace, library: library, suggestedOrigins: suggestedSiteOrigins)
                         case .workspace: NativeDesktopMeetingWorkspaceView(workspace: workspace)
                         case .history: MeetingHistoryView(attention: workspace.attention, workspace: workspace)
                             .onAppear { workspace.workspaceSync.scheduleSync(delayMilliseconds: 100, localChanges: false) }
@@ -597,30 +597,6 @@ struct NativeDesktopHomeView: View {
             }
             if library.history.removedRoom != nil { Button(L("Undo removal")) { library.undoDelete() }.padding() }
         }.navigationTitle(title)
-    }
-    private var agenda: some View {
-        ScrollView {
-            LazyVStack(alignment: .leading, spacing: 12) {
-                if !library.calendar.enabled {
-                    Label(L("Choose calendars to find your meetings"), systemImage: "calendar")
-                    Button(L("Choose calendars")) { workspace.openCalendarSettings() }
-                } else if library.calendar.loading {
-                    ProgressView(L("Loading calendars…"))
-                } else if library.calendar.access == .denied {
-                    Label(L("Calendar access is off in System Settings."), systemImage: "calendar.badge.exclamationmark")
-                    Button(L("Review calendar access")) { workspace.openCalendarSettings() }
-                } else if let error = library.calendar.error {
-                    Label(error, systemImage: "exclamationmark.triangle").foregroundStyle(.orange)
-                    Button(L("Try Again")) { library.calendar.refresh() }
-                } else if library.calendar.selected.isEmpty {
-                    Label(L("No calendars selected."), systemImage: "calendar")
-                    Button(L("Choose calendars")) { workspace.openCalendarSettings() }
-                } else if library.calendarMeetings.isEmpty {
-                    Text(L("No meetings with supported invitation links")).foregroundStyle(.secondary).padding(.vertical, 32)
-                }
-                ForEach(library.calendarMeetings) { calendarRow($0) }
-            }.padding(28)
-        }.navigationTitle(L("Calendar"))
     }
     private func calendarRow(_ item: CalendarMeeting) -> some View {
         HStack(spacing: 16) {

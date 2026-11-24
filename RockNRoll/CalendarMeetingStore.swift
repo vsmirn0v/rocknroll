@@ -33,6 +33,7 @@ final class CalendarMeetingStore: ObservableObject {
     @Published private(set) var meetings: [CalendarMeeting] = [] {
         didSet { rebuildUpcomingCache() }
     }
+    @Published private(set) var extraRangeMeetings: [CalendarMeeting] = []
     @Published private(set) var syncedRemoteMeetings: [CalendarMeeting] = []
     @Published private(set) var access: CalendarAccess = .notDetermined
     @Published private(set) var loading = false
@@ -86,6 +87,9 @@ final class CalendarMeetingStore: ObservableObject {
     private var scheduledUIBlocked = false
     private var resolvedEndpoints: [URL: URL] = [:]
     private var localMeetings: [CalendarMeeting] = []
+    private var loadedMonthKeys: Set<String> = []
+    private var extraRangeMonths: [String: Date] = [:]
+    private var extraRangeMonthOrder: [String] = []
     private var remoteOccurrences: [SyncedCalendarOccurrence] = []
     private var lastLocalDeviceID: String = ""
     private let clock: () -> Date
@@ -146,6 +150,8 @@ final class CalendarMeetingStore: ObservableObject {
         if !value {
             revision = UUID(); task?.cancel(); task = nil; loading = false
             boundaryTask?.cancel(); cancelAutomaticJoin(); localMeetings = []; calendars = []
+            extraRangeMeetings = []; loadedMonthKeys.removeAll()
+            extraRangeMonths.removeAll(); extraRangeMonthOrder.removeAll()
             rebuildMeetings()
             state.visits = [:]; persist()
             updateReminders()
@@ -292,7 +298,9 @@ final class CalendarMeetingStore: ObservableObject {
                 guard !Task.isCancelled, revision == token else { return }
                 access = authorization
                 guard authorization == .allowed else {
-                    localMeetings = []; calendars = []; loading = false; rebuildMeetings(); state.visits = [:]; persist(); updateReminders()
+                    localMeetings = []; calendars = []; loading = false
+                    extraRangeMeetings = []; loadedMonthKeys.removeAll()
+                    rebuildMeetings(); state.visits = [:]; persist(); updateReminders()
                     onLocalScheduleSnapshot?([], state.bindings, state.suppressed)
                     return
                 }
@@ -306,58 +314,15 @@ final class CalendarMeetingStore: ObservableObject {
                     localMeetings.removeAll { !selected.contains($0.calendarID) }
                 }
                 preferences.set(selected.sorted(), forKey: "calendarMeetings.selected")
-                var incoming = snapshot.meetings.filter { selected.contains($0.calendarID) }
-                let candidateGroups = incoming.map { meeting -> [[URL]] in
-                    if let bound = state.bindings[meeting.id] ?? state.bindings[meeting.seriesID] { return [[bound]] }
-                    var seen: Set<MeetingRoomIdentity> = []
-                    return meeting.linkGroups.map { group in
-                        group.links.compactMap(invitationNormalizer).filter {
-                            guard let key = MeetingRoomIdentity($0) else { return false }
-                            return seen.insert(key).inserted
-                        }
-                    }
-                }
-                // Keep the resolved snapshot until the whole refresh is ready.
-                let proofs = await probe(candidateGroups.flatMap { $0.flatMap { $0 } })
+                let incoming = snapshot.meetings.filter { selected.contains($0.calendarID) }
+                let resolved = await resolveInvitations(incoming)
                 guard !Task.isCancelled, revision == token else { return }
-                for index in incoming.indices {
-                    for group in candidateGroups[index] {
-                        var unresolvedConflict = false
-                        let supported = group.compactMap { url -> (URL, MeetingEngineKind, URL?)? in
-                            let key = self.probeKey(url)
-                            let kind: MeetingEngineKind?
-                            var endpoint: URL? = nil
-                            switch proofs[key] ?? .unknown {
-                            case .verified(.guest(let discoveredEndpoint)):
-                                kind = .guest
-                                endpoint = discoveredEndpoint
-                                self.resolvedEndpoints[key] = discoveredEndpoint
-                            case .verified(.community): kind = .community
-                            case .verified(.telemost): kind = .telemost
-                            case .verified(.trueconf): kind = .trueconf
-                            case .ambiguous:
-                                kind = self.knownEngine(url)
-                                if kind == .guest { endpoint = self.resolvedEndpoints[key] }
-                                unresolvedConflict = unresolvedConflict || kind == nil
-                            case .unknown:
-                                kind = self.knownEngine(url)
-                                if kind == .guest { endpoint = self.resolvedEndpoints[key] }
-                            }
-                            return kind.map { (url, $0, endpoint) }
-                        }
-                        if unresolvedConflict || supported.count > 1 { incoming[index].requiresChoice = true; break }
-                        if let (url, kind, endpoint) = supported.first {
-                            incoming[index].invitation = url
-                            incoming[index].engine = kind
-                            incoming[index].endpoint = endpoint
-                            break
-                        }
-                    }
-                }
                 // Deduplicate identical copies without collapsing different events in one room.
                 now = clock()
                 var seen: Set<CalendarCopy> = []
-                localMeetings = incoming.filter { seen.insert(CalendarCopy($0)).inserted }
+                localMeetings = resolved.filter { seen.insert(CalendarCopy($0)).inserted }
+                extraRangeMeetings = []
+                loadedMonthKeys.removeAll()
                 rebuildMeetings()
                 loading = false; task = nil
                 let retained = state.suppressed.filter { $0.value > now }
@@ -365,6 +330,10 @@ final class CalendarMeetingStore: ObservableObject {
                 completedRevision = token
                 updateReminders(); scheduleBoundary(); considerAutomaticJoin()
                 onLocalScheduleSnapshot?(localMeetings, state.bindings, state.suppressed)
+                let rememberedMonths = Array(extraRangeMonths.values)
+                for monthDate in rememberedMonths {
+                    loadMonthIfNeeded(containing: monthDate)
+                }
             } catch {
                 guard !Task.isCancelled, revision == token else { return }
                 self.error = L("Calendar access could not be completed. Try again."); loading = false
@@ -503,6 +472,139 @@ final class CalendarMeetingStore: ObservableObject {
     var next: CalendarMeeting? {
         let timely = upcoming.filter { $0.isTimely(now) }
         return timely.count == 1 ? timely[0] : nil
+    }
+    var allTimelineMeetings: [CalendarMeeting] {
+        var byID: [String: CalendarMeeting] = [:]
+        for item in extraRangeMeetings where enabled && access == .allowed && selected.contains(item.calendarID) {
+            byID[item.id] = item
+        }
+        for item in meetings {
+            byID[item.id] = item
+        }
+        return byID.values.sorted { ($0.start, $0.title, $0.id) < ($1.start, $1.title, $1.id) }
+    }
+    private func rememberExtraRangeMonth(key: String, start: Date) {
+        extraRangeMonths[key] = start
+        extraRangeMonthOrder.removeAll { $0 == key }
+        extraRangeMonthOrder.append(key)
+        while extraRangeMonthOrder.count > 6 {
+            let evicted = extraRangeMonthOrder.removeFirst()
+            extraRangeMonths.removeValue(forKey: evicted)
+        }
+    }
+    func loadMonthIfNeeded(containing date: Date, calendar: Calendar = .current) {
+        guard enabled, access == .allowed, !selected.isEmpty else { return }
+        guard let monthInterval = calendar.dateInterval(of: .month, for: date) else { return }
+        let currentNow = clock()
+        if let defaultStart = calendar.date(byAdding: .day, value: -29, to: calendar.startOfDay(for: currentNow)),
+           let defaultEnd = calendar.date(byAdding: .day, value: 29, to: calendar.startOfDay(for: currentNow)),
+           monthInterval.start >= defaultStart && monthInterval.end <= defaultEnd {
+            return
+        }
+        let comps = calendar.dateComponents([.year, .month], from: monthInterval.start)
+        let key = "\(comps.year ?? 0)-\(comps.month ?? 0)"
+        rememberExtraRangeMonth(key: key, start: monthInterval.start)
+        guard loadedMonthKeys.insert(key).inserted else { return }
+        let token = revision
+        let selectedIDs = selected
+        let origins = knownOrigins()
+        let currentAliases = aliases()
+        Task { [weak self] in
+            guard let self else { return }
+            let raw = await reader.readRange(selected: selectedIDs, interval: monthInterval, knownOrigins: origins, aliases: currentAliases)
+            guard !Task.isCancelled, revision == token, enabled, access == .allowed else {
+                if revision == token { loadedMonthKeys.remove(key) }
+                return
+            }
+            let resolved = await resolveInvitations(raw)
+            guard !Task.isCancelled, revision == token, enabled, access == .allowed else {
+                if revision == token { loadedMonthKeys.remove(key) }
+                return
+            }
+            var seen: Set<CalendarCopy> = Set(localMeetings.map(CalendarCopy.init))
+            var byID = Dictionary(extraRangeMeetings.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+            for item in resolved where seen.insert(CalendarCopy(item)).inserted {
+                byID[item.id] = item
+            }
+            extraRangeMeetings = byID.values.sorted { ($0.start, $0.title, $0.id) < ($1.start, $1.title, $1.id) }
+        }
+    }
+    func handleCreatedCalendarEvent(calendarID: String, eventStart: Date? = nil, calendar: Calendar = .current) {
+        invalidateScheduledAdmission()
+        if !enabled {
+            enabled = true
+            preferences.set(true, forKey: "calendarMeetings.enabled")
+        }
+        if !calendarID.isEmpty && !selected.contains(calendarID) {
+            selected.insert(calendarID)
+            preferences.set(selected.sorted(), forKey: "calendarMeetings.selected")
+        }
+        loadedMonthKeys.removeAll()
+        extraRangeMeetings = []
+        if let eventStart,
+           let monthInterval = calendar.dateInterval(of: .month, for: eventStart) {
+            let currentNow = clock()
+            if let defaultStart = calendar.date(byAdding: .day, value: -29, to: calendar.startOfDay(for: currentNow)),
+               let defaultEnd = calendar.date(byAdding: .day, value: 29, to: calendar.startOfDay(for: currentNow)),
+               !(monthInterval.start >= defaultStart && monthInterval.end <= defaultEnd) {
+                let comps = calendar.dateComponents([.year, .month], from: monthInterval.start)
+                let key = "\(comps.year ?? 0)-\(comps.month ?? 0)"
+                rememberExtraRangeMonth(key: key, start: monthInterval.start)
+            }
+        }
+        cancelAutomaticJoin()
+        armedAfter = clock()
+        refresh(requestPermission: true)
+    }
+    private func resolveInvitations(_ rawMeetings: [CalendarMeeting]) async -> [CalendarMeeting] {
+        var incoming = rawMeetings
+        let candidateGroups = incoming.map { meeting -> [[URL]] in
+            if let bound = state.bindings[meeting.id] ?? state.bindings[meeting.seriesID] { return [[bound]] }
+            var seen: Set<MeetingRoomIdentity> = []
+            return meeting.linkGroups.map { group in
+                group.links.compactMap(invitationNormalizer).filter {
+                    guard let key = MeetingRoomIdentity($0) else { return false }
+                    return seen.insert(key).inserted
+                }
+            }
+        }
+        let proofs = await probe(candidateGroups.flatMap { $0.flatMap { $0 } })
+        guard !Task.isCancelled else { return incoming }
+        for index in incoming.indices {
+            for group in candidateGroups[index] {
+                var unresolvedConflict = false
+                let supported = group.compactMap { url -> (URL, MeetingEngineKind, URL?)? in
+                    let key = self.probeKey(url)
+                    let kind: MeetingEngineKind?
+                    var endpoint: URL? = nil
+                    switch proofs[key] ?? .unknown {
+                    case .verified(.guest(let discoveredEndpoint)):
+                        kind = .guest
+                        endpoint = discoveredEndpoint
+                        self.resolvedEndpoints[key] = discoveredEndpoint
+                    case .verified(.community): kind = .community
+                    case .verified(.telemost): kind = .telemost
+                    case .verified(.trueconf): kind = .trueconf
+                    case .ambiguous:
+                        kind = self.knownEngine(url)
+                        if kind == .guest { endpoint = self.resolvedEndpoints[key] }
+                        unresolvedConflict = unresolvedConflict || kind == nil
+                    case .unknown:
+                        kind = self.knownEngine(url)
+                        if kind == .guest { endpoint = self.resolvedEndpoints[key] }
+                    }
+                    return kind.map { (url, $0, endpoint) }
+                }
+                if unresolvedConflict || supported.count > 1 { incoming[index].requiresChoice = true; break }
+                if let (url, kind, endpoint) = supported.first {
+                    incoming[index].invitation = url
+                    incoming[index].engine = kind
+                    incoming[index].endpoint = endpoint
+                    break
+                }
+            }
+        }
+        return incoming
     }
     func bind(_ meeting: CalendarMeeting, to url: URL, series: Bool) {
         guard let url = invitationNormalizer(url) else { return }

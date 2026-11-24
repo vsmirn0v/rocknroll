@@ -18,6 +18,13 @@ protocol CalendarReading: Sendable {
     func access() async -> CalendarAccess
     func requestAccess() async throws -> Bool
     func read(selected: Set<String>, now: Date, knownOrigins: Set<String>, aliases: [String: URL]) async -> CalendarSnapshot
+    func readRange(selected: Set<String>, interval: DateInterval, knownOrigins: Set<String>, aliases: [String: URL]) async -> [CalendarMeeting]
+}
+
+extension CalendarReading {
+    func readRange(selected: Set<String>, interval: DateInterval, knownOrigins: Set<String>, aliases: [String: URL]) async -> [CalendarMeeting] {
+        []
+    }
 }
 
 /// EventKit objects never leave this actor. Only value snapshots reach the UI.
@@ -54,10 +61,27 @@ actor AppleCalendarReader: CalendarReading {
         let chosen = calendars.filter { selected.contains($0.calendarIdentifier) }
         guard !chosen.isEmpty else { return .init(calendars: options, meetings: []) }
         let day = Calendar.current.startOfDay(for: now)
-        let start = Calendar.current.date(byAdding: .day, value: -1, to: day)!
-        let end = Calendar.current.date(byAdding: .day, value: 8, to: day)!
-        let predicate = store.predicateForEvents(withStart: start, end: end, calendars: chosen)
-        let meetings = store.events(matching: predicate).compactMap { event -> CalendarMeeting? in
+        let start = Calendar.current.date(byAdding: .day, value: -30, to: day)!
+        let end = Calendar.current.date(byAdding: .day, value: 30, to: day)!
+        let meetings = mapEvents(
+            in: DateInterval(start: start, end: end),
+            calendars: chosen,
+            knownOrigins: knownOrigins,
+            aliases: aliases
+        )
+        let upcoming = Array(meetings.filter { $0.end > now }.prefix(300))
+        let past = Array(meetings.filter { $0.end <= now }.suffix(300))
+        return .init(calendars: options, meetings: past + upcoming)
+    }
+    func readRange(selected: Set<String>, interval: DateInterval, knownOrigins: Set<String>, aliases: [String: URL]) -> [CalendarMeeting] {
+        guard access() == .allowed, interval.duration > 0 else { return [] }
+        let chosen = store.calendars(for: .event).filter { selected.contains($0.calendarIdentifier) }
+        guard !chosen.isEmpty else { return [] }
+        return Array(mapEvents(in: interval, calendars: chosen, knownOrigins: knownOrigins, aliases: aliases).prefix(400))
+    }
+    private func mapEvents(in interval: DateInterval, calendars chosen: [EKCalendar], knownOrigins: Set<String>, aliases: [String: URL]) -> [CalendarMeeting] {
+        let predicate = store.predicateForEvents(withStart: interval.start, end: interval.end, calendars: chosen)
+        return store.events(matching: predicate).compactMap { event -> CalendarMeeting? in
             guard let eventCalendar = event.calendar, event.status != .canceled, let begin = event.startDate, let finish = event.endDate,
                   finish > begin, event.attendees?.contains(where: { $0.isCurrentUser && $0.participantStatus == .declined }) != true else { return nil }
             let groups = CalendarLinkDiscovery.groups(url: event.url, location: event.location, notes: event.notes,
@@ -73,9 +97,6 @@ actor AppleCalendarReader: CalendarReading {
                 allDay: event.isAllDay, tentative: event.status == .tentative,
                 linkGroups: groups, externalSeriesID: externalSeries, originalOccurrenceStart: occurrence)
         }.sorted { ($0.start, $0.title, $0.id) < ($1.start, $1.title, $1.id) }
-        let upcoming = Array(meetings.filter { $0.end > now }.prefix(300))
-        let past = Array(meetings.filter { $0.end <= now }.suffix(50))
-        return .init(calendars: options, meetings: past + upcoming)
     }
     private func digest(_ value: String) -> String {
         SHA256.hash(data: Data(value.utf8)).map { String(format: "%02x", $0) }.joined()

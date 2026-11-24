@@ -6,7 +6,7 @@ import UserNotifications
 
 @MainActor final class NativeDesktopWorkspace: NSObject, ObservableObject, NSWindowDelegate {
     enum Section: String, CaseIterable, Identifiable {
-        case home = "Home", workspace = "Live", history = "Meeting history", tasks = "Tasks", assistant = "Assistant", favorites = "Favorites", calendar = "Calendar", recent = "Recent meetings", settings = "Settings"
+        case home = "Home", workspace = "Live", calendar = "Calendar", history = "Meeting history", tasks = "Tasks", assistant = "Assistant", favorites = "Favorites", recent = "Recent meetings", settings = "Settings"
         var id: Self { self }
         var symbol: String {
             switch self { case .home: "house"; case .workspace: "dot.radiowaves.left.and.right"; case .history: "clock.arrow.circlepath"; case .assistant: "tray"; case .tasks: "checklist"; case .favorites: "star"; case .calendar: "calendar"; case .recent: "clock"; case .settings: "gearshape" }

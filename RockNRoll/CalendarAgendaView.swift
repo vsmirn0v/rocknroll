@@ -227,7 +227,7 @@ struct CalendarSettingsView: View {
                 Toggle(L("Show calendar meetings"), isOn: Binding(get: { calendar.enabled }, set: calendar.setEnabled))
                     .accessibilityIdentifier("calendar.enabled")
             } footer: {
-                Text(L("Find meetings in calendars you choose. Calendar schedule sharing can sync meeting details through your private iCloud storage. Your calendar is never edited."))
+                Text(L("Find meetings in calendars you choose and save new calendar meetings you create in the app. Calendar schedule sharing can sync meeting details through your private iCloud storage."))
             }
             if calendar.supportsScheduledJoining {
                 CalendarAutomaticJoinSettings(calendar: calendar)
