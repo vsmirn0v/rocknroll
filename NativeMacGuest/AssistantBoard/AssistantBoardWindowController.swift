@@ -132,7 +132,14 @@ final class AssistantBoardWindowController: NSObject, ObservableObject, WKNaviga
         let title = webView.title?.trimmed.isEmpty == false ? (webView.title ?? url.host ?? url.absoluteString) : url.absoluteString
         pageTitle = title
         onBoardURLChanged?(url.absoluteString)
-        await taskSync?.adoptJiraSessionFromBoardIfAvailable(self)
+        if isLoading {
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                await self.taskSync?.adoptJiraSessionFromBoardIfAvailable(self)
+            }
+        } else {
+            await taskSync?.adoptJiraSessionFromBoardIfAvailable(self)
+        }
         if let err = loadError {
             lastActionSummary = err
             return err
@@ -209,15 +216,27 @@ final class AssistantBoardWindowController: NSObject, ObservableObject, WKNaviga
 
         let targetSessionID = model.sessionID
         let shareStartedAt = Date()
-        if presentationModeEnabled, currentURL != nil {
-            _ = try? await callBoardAsyncJS(JiraBoardDOMScripts.applyPresentationModeScript(enabled: true), arguments: [:])
-            _ = try? await callBoardAsyncJS(JiraBoardDOMScripts.focusActiveCardsScript(), arguments: [:])
-        }
         markBoardDirty()
         lastCaptureUptime = 0
         if let initialBuffer = await captureFrameBuffer() {
             lastCaptureUptime = ProcessInfo.processInfo.systemUptime
             model.pushBoardShareFrame(initialBuffer)
+        }
+        if presentationModeEnabled, currentURL != nil {
+            Task { @MainActor [weak self] in
+                guard let self, self.sharingMeetingID == targetSessionID else { return }
+                _ = try? await self.callBoardAsyncJS(
+                    JiraBoardDOMScripts.applyPresentationModeScript(enabled: true),
+                    arguments: [:],
+                    timeoutSeconds: 3
+                )
+                _ = try? await self.callBoardAsyncJS(
+                    JiraBoardDOMScripts.focusActiveCardsScript(),
+                    arguments: [:],
+                    timeoutSeconds: 3
+                )
+                self.markBoardDirty()
+            }
         }
         frameTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
@@ -1018,25 +1037,41 @@ final class AssistantBoardWindowController: NSObject, ObservableObject, WKNaviga
 
     // MARK: - JiraBoardWebEvaluating
 
+    private struct JSArgumentsBox: @unchecked Sendable {
+        let value: [String: Any]
+    }
+
     var currentBoardURL: URL? { currentURL }
+    var isBoardLoading: Bool { isLoading }
 
     func callBoardAsyncJS(_ functionBody: String, arguments: [String: Any]) async throws -> String {
+        try await callBoardAsyncJS(functionBody, arguments: arguments, timeoutSeconds: 6)
+    }
+
+    func callBoardAsyncJS(
+        _ functionBody: String,
+        arguments: [String: Any],
+        timeoutSeconds: TimeInterval
+    ) async throws -> String {
         guard let webView else {
             throw NativeDesktopError.unavailable(L("Assistant Board web view is unavailable."))
         }
-        let result = try await webView.callAsyncJavaScript(
-            functionBody,
-            arguments: arguments,
-            in: nil,
-            contentWorld: .page
-        )
-        if let str = result as? String { return str }
-        if let obj = result, JSONSerialization.isValidJSONObject(obj),
-           let data = try? JSONSerialization.data(withJSONObject: obj),
-           let str = String(data: data, encoding: .utf8) {
-            return str
+        let argsBox = JSArgumentsBox(value: arguments)
+        return try await JiraBoardAsyncTimeout.run(seconds: timeoutSeconds) {
+            let result = try await webView.callAsyncJavaScript(
+                functionBody,
+                arguments: argsBox.value,
+                in: nil,
+                contentWorld: .page
+            )
+            if let str = result as? String { return str }
+            if let obj = result, JSONSerialization.isValidJSONObject(obj),
+               let data = try? JSONSerialization.data(withJSONObject: obj),
+               let str = String(data: data, encoding: .utf8) {
+                return str
+            }
+            return ""
         }
-        return ""
     }
 
     func cookiesForBoard(matching origin: URL) async -> [HTTPCookie] {

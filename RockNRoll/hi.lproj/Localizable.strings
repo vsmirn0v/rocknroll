@@ -4199,3 +4199,6 @@
 "Scroll Down" = "नीचे स्क्रॉल करें";
 "Task “%@” is already on the list." = "कार्य “%@” पहले से सूची में है।";
 "Task “%@” for %@ is already on the list." = "कार्य “%@” (%@ के लिए) पहले से सूची में है।";
+"Assistant error: %@" = "सहायक त्रुटि: %@";
+"Hi everyone, let's kick off our daily standup. Who would like to go first with updates and blockers?" = "सभी को नमस्ते, आइए अपना दैनिक स्टैंडअप शुरू करें। अपडेट और ब्लॉकर्स साझा करने की शुरुआत कौन करना चाहेगा?";
+"Hi everyone, I'm ready to assist with %@." = "सभी को नमस्ते, मैं %@ में सहायता करने के लिए तैयार हूँ।";

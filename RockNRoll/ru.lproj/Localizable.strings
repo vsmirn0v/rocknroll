@@ -4426,3 +4426,6 @@
 "Scroll Down" = "Прокрутить вниз";
 "Task “%@” is already on the list." = "Задача «%@» уже есть в списке.";
 "Task “%@” for %@ is already on the list." = "Задача «%@» для %@ уже есть в списке.";
+"Assistant error: %@" = "Ошибка ассистента: %@";
+"Hi everyone, let's kick off our daily standup. Who would like to go first with updates and blockers?" = "Всем привет, давайте начнём ежедневный стендап. Кто готов первым рассказать о статусе и блокерах?";
+"Hi everyone, I'm ready to assist with %@." = "Всем привет, я готов помогать в роли «%@».";

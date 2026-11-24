@@ -1198,6 +1198,12 @@ public final class WorkspaceTaskSyncController: ObservableObject {
         if !forceRefresh, previousURL == cacheKey, !derivedBoardProjectKeys.isEmpty {
             return derivedBoardProjectKeys
         }
+        if !forceRefresh, evaluator.isBoardLoading {
+            if let parsedKey = JiraBoardContextInfo.parse(from: url)?.projectKey, !parsedKey.isEmpty {
+                return [parsedKey]
+            }
+            return []
+        }
         let webConnector = JiraBoardWebSessionConnector(evaluator: evaluator, fallbackSettings: preferences.jira)
         let keys = await webConnector.deriveBoardProjectKeys()
         if !keys.isEmpty {

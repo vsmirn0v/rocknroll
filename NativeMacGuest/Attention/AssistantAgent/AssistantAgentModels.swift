@@ -147,7 +147,7 @@ struct AssistantAgentModelPrompt {
     would call. Once the tool results answer the request, return {"text": "your answer"} and \
     optionally "sources" with evidence objects containing "id", "kind", "title" and "at". \
     If a decision requires user input, return only {"question": "your question"}. \
-    Call no write or outward action unless the user explicitly asked for it.
+    Only call write or outward actions when requested by the user or explicitly authorized by the active meeting skill instructions.
     """
 }
 
@@ -206,27 +206,51 @@ struct OpenAIAssistantAgentModel: AssistantAgentModel {
         }
     }
 
+    static func supportsCustomTemperature(provider: AttentionProvider) -> Bool {
+        if provider.kind == .openAI { return false }
+        let normalized = provider.model.trimmed.lowercased()
+        let bareModel = normalized.split(separator: "/").last.map(String.init) ?? normalized
+        if bareModel.hasPrefix("gpt-5")
+            || bareModel.hasPrefix("o1")
+            || bareModel.hasPrefix("o3")
+            || bareModel.hasPrefix("o4") {
+            return false
+        }
+        return true
+    }
+
     static func requestBody(_ request: AssistantAgentModelRequest, provider: AttentionProvider,
                             nativeToolCalling: Bool? = nil) -> [String: Any] {
         let useNativeTools = nativeToolCalling ?? !provider.onThisMac
         var messages = AssistantAgentModelPrompt.messages(request, describeTools: !useNativeTools)
         let model = provider.model.trimmed
+        let includeTemperature = Self.supportsCustomTemperature(provider: provider)
         if useNativeTools {
-            return ["model": model, "messages": messages, "temperature": 0,
-                    "tools": request.tools.map { tool in
-                        ["type": "function", "function": [
-                            "name": tool.name,
-                            "description": tool.description,
-                            "parameters": Self.parameters(tool),
-                        ] as [String: Any]]
-                    },
-                    "tool_choice": "auto"]
+            var body: [String: Any] = [
+                "model": model,
+                "messages": messages,
+                "tools": request.tools.map { tool in
+                    ["type": "function", "function": [
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": Self.parameters(tool),
+                    ] as [String: Any]]
+                },
+                "tool_choice": "auto",
+            ]
+            if includeTemperature { body["temperature"] = 0 }
+            return body
         }
         if let index = messages.firstIndex(where: { $0["role"] as? String == "system" }) {
             messages[index]["content"] = (messages[index]["content"] as? String ?? "") + AssistantAgentModelPrompt.structuredHint
         }
-        return ["model": model, "messages": messages, "temperature": 0,
-                "response_format": ["type": "json_object"]]
+        var body: [String: Any] = [
+            "model": model,
+            "messages": messages,
+            "response_format": ["type": "json_object"],
+        ]
+        if includeTemperature { body["temperature"] = 0 }
+        return body
     }
 
     static func parameters(_ tool: AssistantAgentToolDescriptor) -> [String: Any] {
@@ -238,6 +262,7 @@ struct OpenAIAssistantAgentModel: AssistantAgentModel {
              var schema: [String: Any] = ["type": argument.type == .integer ? "integer" :
                 argument.type == .number ? "number" : argument.type == .boolean ? "boolean" :
                 argument.type == .array ? "array" : argument.type == .object ? "object" : "string"]
+             if argument.type == .array { schema["items"] = ["type": "string"] }
              if !argument.description.isEmpty { schema["description"] = argument.description }
              if !argument.allowedValues.isEmpty { schema["enum"] = argument.allowedValues }
              return (argument.name, schema)
@@ -258,24 +283,48 @@ struct OpenAIAssistantAgentModel: AssistantAgentModel {
     private func completeMessage(_ object: [String: Any]) async throws -> (message: [String: Any], finishReason: String) {
         guard let endpoint = provider.endpoint, !provider.model.trimmed.isEmpty else { throw AttentionJudgeError.notConfigured }
         if provider.needsKey && (key ?? "").isEmpty { throw AttentionJudgeError.missingKey }
-        var urlRequest = URLRequest(url: endpoint, timeoutInterval: provider.onThisMac ? max(timeout, 60) : timeout)
-        urlRequest.httpMethod = "POST"
-        urlRequest.httpBody = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
-        urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        if let key, !key.isEmpty { urlRequest.setValue("Bearer " + key, forHTTPHeaderField: "Authorization") }
-        if provider.kind == .openRouter { urlRequest.setValue("Rock'N'Roll for Mac", forHTTPHeaderField: "X-Title") }
-        let data: Data, response: URLResponse
-        do { (data, response) = try await session.data(for: urlRequest) }
-        catch is CancellationError { throw CancellationError() }
-        catch { throw AttentionJudgeError.transport }
-        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-        guard (200..<300).contains(status) else { throw AttentionJudgeError.from(status: status, body: data) }
-        guard let body = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let choice = (body["choices"] as? [[String: Any]])?.first,
-              let message = choice["message"] as? [String: Any] else { throw AttentionJudgeError.emptyAnswer }
-        if let refusal = message["refusal"] as? String, !refusal.isEmpty { throw AttentionJudgeError.refused }
-        let finishReason = choice["finish_reason"] as? String ?? ""
-        return (message, finishReason)
+        var payload = object
+        for attempt in 0..<3 {
+            var urlRequest = URLRequest(url: endpoint, timeoutInterval: provider.onThisMac ? max(timeout, 60) : timeout)
+            urlRequest.httpMethod = "POST"
+            urlRequest.httpBody = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
+            urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            if let key, !key.isEmpty { urlRequest.setValue("Bearer " + key, forHTTPHeaderField: "Authorization") }
+            if provider.kind == .openRouter { urlRequest.setValue("Rock'N'Roll for Mac", forHTTPHeaderField: "X-Title") }
+            let data: Data, response: URLResponse
+            do { (data, response) = try await session.data(for: urlRequest) }
+            catch is CancellationError { throw CancellationError() }
+            catch { throw AttentionJudgeError.transport }
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            guard (200..<300).contains(status) else {
+                if attempt < 2, status == 400 || status == 422 {
+                    let rawText = (String(data: data, encoding: .utf8) ?? "").lowercased()
+                    var adjusted = false
+                    if rawText.contains("temperature"), payload["temperature"] != nil {
+                        payload.removeValue(forKey: "temperature")
+                        adjusted = true
+                    }
+                    if (rawText.contains("response_format") || rawText.contains("response format")
+                        || rawText.contains("json_object") || rawText.contains("json_schema")
+                        || rawText.contains("structured_output")),
+                       payload["response_format"] != nil {
+                        payload.removeValue(forKey: "response_format")
+                        adjusted = true
+                    }
+                    if adjusted {
+                        continue
+                    }
+                }
+                throw AttentionJudgeError.from(status: status, body: data)
+            }
+            guard let body = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let choice = (body["choices"] as? [[String: Any]])?.first,
+                  let message = choice["message"] as? [String: Any] else { throw AttentionJudgeError.emptyAnswer }
+            if let refusal = message["refusal"] as? String, !refusal.isEmpty { throw AttentionJudgeError.refused }
+            let finishReason = choice["finish_reason"] as? String ?? ""
+            return (message, finishReason)
+        }
+        throw AttentionJudgeError.emptyAnswer
     }
 }
 

@@ -5,6 +5,7 @@ import XCTest
 @MainActor
 private final class MockBoardWebEvaluator: JiraBoardWebEvaluating {
     var currentBoardURL: URL?
+    var isBoardLoading = false
     var cookies: [HTTPCookie] = []
     var refreshedHighlightKeys: [String?] = []
     var requests: [(endpoint: String, method: String, body: String?)] = []
@@ -419,6 +420,42 @@ final class JiraBoardAndIdentityTests: XCTestCase {
         evaluator.responder = { _, _, _ in (404, "{}") }
         let clearedKeys = await syncController.resolveBoardDerivedProjectKeys()
         XCTAssertTrue(clearedKeys.isEmpty, "Switching boards must clear stale cached project keys from the previous board")
+
+        // While the board is still loading, resolveBoardDerivedProjectKeys must NOT block on JS fetch.
+        evaluator.requests.removeAll()
+        evaluator.isBoardLoading = true
+        evaluator.currentBoardURL = URL(string: "https://tasks.sberdevices.ru/jira/secure/RapidBoard.jspa?rapidView=55&projectKey=SDBCTO")
+        let loadingKeys = await syncController.resolveBoardDerivedProjectKeys()
+        XCTAssertEqual(loadingKeys, ["SDBCTO"])
+        XCTAssertTrue(evaluator.requests.isEmpty, "Should not issue blocking JS fetch while board is still loading")
+    }
+
+    func testJiraBoardWebFetchScriptIncludesAbortTimeoutAndAsyncTimeoutHelperFailsFast() async throws {
+        let script = JiraBoardWebSessionConnector.webFetchScript()
+        XCTAssertTrue(script.contains("AbortController"))
+        XCTAssertTrue(script.contains("controller.abort()"))
+        XCTAssertTrue(script.contains("clearTimeout"))
+        XCTAssertTrue(script.contains("signal: controller.signal"))
+
+        let fast = try await JiraBoardAsyncTimeout.run(seconds: 1.0) {
+            "ok"
+        }
+        XCTAssertEqual(fast, "ok")
+
+        let started = Date()
+        do {
+            _ = try await JiraBoardAsyncTimeout.run(seconds: 0.12) {
+                try await Task.sleep(for: .seconds(5))
+                return "late"
+            }
+            XCTFail("Expected timeout error")
+        } catch let error as JiraConnectorError {
+            guard case .serverError(let code, _) = error else {
+                return XCTFail("Expected HTTP 408 timeout error, got \(error)")
+            }
+            XCTAssertEqual(code, 408)
+            XCTAssertLessThan(Date().timeIntervalSince(started), 1.5)
+        }
     }
 }
 

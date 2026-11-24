@@ -1634,4 +1634,319 @@ final class AssistantAgentTests: XCTestCase {
         }
         wait(for: [exp], timeout: 10.0)
     }
+
+    func testOpenAIParametersIncludeItemsAndOmitsTemperatureForOpenAIAndReasoningAndRetriesRejectedParam() async throws {
+        // 1. Every .array parameter exported for OpenAI native tool calling must define "items".
+        let defaults = UserDefaults(suiteName: "openai-schema-\(UUID().uuidString)")!
+        let keychain = AttentionKeychain(service: "dev.vsmirn0v.conferenceguest.openaischema.\(UUID().uuidString)")
+        let tempRoot = FileManager.default.temporaryDirectory.appendingPathComponent("openai-schema-\(UUID().uuidString)", isDirectory: true)
+        defer {
+            keychain.deleteAll()
+            try? FileManager.default.removeItem(at: tempRoot)
+        }
+        let store = AttentionStore(root: tempRoot, defaults: defaults, keychain: keychain)
+        let coordinator = AttentionCoordinator(store: store)
+        defer { coordinator.stop() }
+        let snapshot = fixture()
+        let fullRegistry = registry(snapshot: snapshot)
+        AssistantSkillToolRegistrar.registerTools(
+            into: fullRegistry,
+            attention: coordinator,
+            talk: coordinator.talk,
+            snapshot: snapshot,
+            allowPrivilegedActions: true,
+            allowPeopleIdentityBinding: true
+        )
+        XCTAssertFalse(fullRegistry.descriptors.isEmpty)
+        for descriptor in fullRegistry.descriptors {
+            let params = OpenAIAssistantAgentModel.parameters(descriptor)
+            if let props = params["properties"] as? [String: [String: Any]] {
+                for (propName, propSchema) in props where (propSchema["type"] as? String) == "array" {
+                    XCTAssertNotNil(propSchema["items"], "OpenAI tool \(descriptor.name).\(propName) array schema must include items")
+                }
+            }
+        }
+        XCTAssertFalse(
+            AssistantAgentModelPrompt.structuredHint.contains("Call no write or outward action unless the user explicitly asked for it."),
+            "structuredHint must allow explicit active skill instructions"
+        )
+
+        // 2. Request bodies omit "temperature" on .openAI and reasoning models, keeping it on local non-reasoning hosts.
+        let sampleReq = AssistantAgentModelRequest(
+            messages: [.user("Hello")],
+            tools: fullRegistry.descriptors,
+            context: [:]
+        )
+        let openAIGPT5 = OpenAIAssistantAgentModel.requestBody(
+            sampleReq,
+            provider: .init(kind: .openAI, baseURL: "", model: "gpt-5.4")
+        )
+        XCTAssertNil(openAIGPT5["temperature"])
+        let openAIGPT4o = OpenAIAssistantAgentModel.requestBody(
+            sampleReq,
+            provider: .init(kind: .openAI, baseURL: "", model: "gpt-4o")
+        )
+        XCTAssertNil(openAIGPT4o["temperature"])
+        let openRouterReasoning = OpenAIAssistantAgentModel.requestBody(
+            sampleReq,
+            provider: .init(kind: .openRouter, baseURL: "", model: "openai/o3-mini")
+        )
+        XCTAssertNil(openRouterReasoning["temperature"])
+        let localBody = OpenAIAssistantAgentModel.requestBody(
+            sampleReq,
+            provider: .init(kind: .local, baseURL: "http://127.0.0.1:18081/v1", model: "qwen2.5-7b")
+        )
+        XCTAssertEqual(localBody["temperature"] as? Int, 0)
+
+        // 3. HTTP 400 rejecting "temperature" on a custom host retries cleanly without "temperature".
+        final class RetryTempProtocol: URLProtocol, @unchecked Sendable {
+            nonisolated(unsafe) static var capturedBodies: [[String: Any]] = []
+            override class func canInit(with request: URLRequest) -> Bool { true }
+            override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+            override func startLoading() {
+                var bodyData = Data()
+                if let data = request.httpBody {
+                    bodyData = data
+                } else if let stream = request.httpBodyStream {
+                    stream.open()
+                    var buffer = [UInt8](repeating: 0, count: 4096)
+                    while stream.hasBytesAvailable {
+                        let read = stream.read(&buffer, maxLength: buffer.count)
+                        if read > 0 { bodyData.append(buffer, count: read) } else { break }
+                    }
+                    stream.close()
+                }
+                let json = (try? JSONSerialization.jsonObject(with: bodyData) as? [String: Any]) ?? [:]
+                Self.capturedBodies.append(json)
+                let attempt = Self.capturedBodies.count
+                let status = attempt == 1 ? 400 : 200
+                let responseBody: String
+                if attempt == 1 {
+                    responseBody = #"{"error":{"message":"Unsupported parameter: temperature is not supported","param":"temperature","code":"unsupported_value"}}"#
+                } else {
+                    responseBody = #"{"choices":[{"message":{"role":"assistant","content":"Ready for standup!"},"finish_reason":"stop"}]}"#
+                }
+                let resp = HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: nil, headerFields: ["Content-Type": "application/json"])!
+                client?.urlProtocol(self, didReceive: resp, cacheStoragePolicy: .notAllowed)
+                client?.urlProtocol(self, didLoad: Data(responseBody.utf8))
+                client?.urlProtocolDidFinishLoading(self)
+            }
+            override func stopLoading() {}
+        }
+        RetryTempProtocol.capturedBodies.removeAll()
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [RetryTempProtocol.self]
+        let retryModel = OpenAIAssistantAgentModel(
+            provider: .init(kind: .custom, baseURL: "https://llm.example.test/v1", model: "custom-model"),
+            key: "sk-test",
+            session: URLSession(configuration: config)
+        )
+        let step = try await retryModel.next(.init(messages: [.user("Start")], tools: [], context: [:]))
+        guard case .response(let reply, _) = step else {
+            return XCTFail("Expected .response after temperature retry, got \(step)")
+        }
+        XCTAssertEqual(reply, "Ready for standup!")
+        XCTAssertEqual(RetryTempProtocol.capturedBodies.count, 2)
+        XCTAssertNotNil(RetryTempProtocol.capturedBodies[0]["temperature"])
+        XCTAssertNil(RetryTempProtocol.capturedBodies[1]["temperature"])
+        await store.meetingLibrary.store.close()
+    }
+
+    func testScrumMasterKickOffAutoSharesBoardSpeaksHandlesWritesSayAndDisable() {
+        final class KickOffStandupEngine: NativeDesktopMeetingEngine {
+            var onState: ((NativeDesktopExternalSnapshot) -> Void)?
+            var onVideo: (([NativeDesktopExternalVideo]) -> Void)?
+            var onLocalCamera: ((LKRTCVideoTrack?) -> Void)?
+            var onTitle: ((String) -> Void)?
+            var factory: LKRTCPeerConnectionFactory? { nil }
+            var supportsVoiceReply: Bool { true }
+            private(set) var snapshot = NativeDesktopExternalSnapshot()
+            var incomingVideo: [NativeDesktopExternalVideo] { [] }
+            func connect(invitation: URL, name: String, quiet: Bool) async throws {
+                snapshot = .init(
+                    phase: .connected,
+                    playoutOn: !quiet,
+                    participants: [
+                        .init(id: "vitalii", name: name, isLocal: true, speaking: false),
+                        .init(id: "anna", name: "Анна", isLocal: false, speaking: false),
+                    ]
+                )
+                onState?(snapshot)
+            }
+            func reconnect() async throws {}
+            func setMicrophone(_ enabled: Bool) async throws { snapshot.microphoneOn = enabled; onState?(snapshot) }
+            func setCamera(_ enabled: Bool) async throws {}
+            func setPlayout(_ enabled: Bool) async throws { snapshot.playoutOn = enabled; onState?(snapshot) }
+            func setScreenTrack(_ track: LKRTCVideoTrack?) async throws {}
+            func leave() async -> Bool { snapshot.phase = .left; onState?(snapshot); return true }
+        }
+
+        @MainActor final class ClosureModel: AssistantAgentModel {
+            let handler: @MainActor (AssistantAgentModelRequest) async throws -> AssistantAgentModelStep
+            init(handler: @escaping @MainActor (AssistantAgentModelRequest) async throws -> AssistantAgentModelStep) {
+                self.handler = handler
+            }
+            func next(_ request: AssistantAgentModelRequest) async throws -> AssistantAgentModelStep {
+                try await handler(request)
+            }
+        }
+
+        let defaults = UserDefaults(suiteName: "mac-scrum-kickoff-\(UUID().uuidString)")!
+        let keychain = AttentionKeychain(service: "dev.vsmirn0v.conferenceguest.scrumkickoff.\(UUID().uuidString)")
+        let tempRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mac-scrum-kickoff-\(UUID().uuidString)", isDirectory: true)
+        addTeardownBlock {
+            keychain.deleteAll()
+            try? FileManager.default.removeItem(at: tempRoot)
+        }
+
+        let exp = expectation(description: "mac-scrum-kickoff")
+        Task { @MainActor in
+            let store = AttentionStore(root: tempRoot, defaults: defaults, keychain: keychain)
+            let coordinator = AttentionCoordinator(store: store)
+            defer { coordinator.stop() }
+            var spokenTexts: [String] = []
+            coordinator.synthesizeOverride = { text in
+                spokenTexts.append(text)
+                let fmt = AVAudioFormat(standardFormatWithSampleRate: 24_000, channels: 1)!
+                let buf = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: 512)!
+                buf.frameLength = 512
+                return buf
+            }
+            coordinator.deliverVoice = { _, _ in }
+
+            try await coordinator.saveTeamContext(.init(
+                defaultJiraBoardURL: "https://jira.example.com/secure/RapidBoard.jspa?rapidView=42",
+                defaultJiraProjectKey: "SDBCTO",
+                notes: ""
+            ))
+
+            let model = NativeDesktopMeetingModel(
+                destination: try .verified(URL(string: "https://meet.example.com/cto-daily-kickoff")!, engine: .guest),
+                name: "Виталий",
+                title: "CTO Daily",
+                engine: KickOffStandupEngine()
+            )
+            try await model.connect()
+            coordinator.meetings = { [model] }
+
+            let facilitator = try XCTUnwrap(coordinator.facilitator)
+            facilitator.wakeCoalesceDelay = .milliseconds(10)
+            facilitator.silencePollInterval = .milliseconds(10)
+            facilitator.maxSilenceWaitDuration = .milliseconds(50)
+
+            var autoSharedURLs: [URL] = []
+            facilitator.boardAutoShareOverrideForTesting = { meeting, url in
+                autoSharedURLs.append(url)
+                return L("Sharing Assistant Board window to “%@”.", meeting.title)
+            }
+
+            // A. Kickoff proactively shares Jira board + speaks LLM greeting.
+            facilitator.agentModelOverrideForTesting = {
+                ScriptedModel(steps: [.response("Привет! Открываю доску Jira. Кто начнёт стендап?", [])])
+            }
+            facilitator.enable(for: model, skillID: "scrum-master", trigger: "manual")
+            for _ in 0..<120 where spokenTexts.isEmpty || autoSharedURLs.isEmpty {
+                try await Task.sleep(for: .milliseconds(25))
+            }
+            XCTAssertEqual(autoSharedURLs.map(\.absoluteString), ["https://jira.example.com/secure/RapidBoard.jspa?rapidView=42"])
+            XCTAssertTrue(spokenTexts.contains("Привет! Открываю доску Jira. Кто начнёт стендап?"))
+
+            // B. Kickoff delivers fallback standup greeting and surfaces error status if LLM fails.
+            spokenTexts.removeAll()
+            facilitator.agentModelOverrideForTesting = {
+                ClosureModel { _ in throw AttentionJudgeError.http(400, "Schema failed") }
+            }
+            await facilitator.kickOffSkill(for: model, skillID: "scrum-master")
+            XCTAssertFalse(spokenTexts.isEmpty, "Kickoff failure must still speak a crisp fallback standup greeting")
+            XCTAssertTrue(facilitator.lastStatusBySession[model.sessionID]?.isEmpty == false)
+
+            // C. Mutating tool call marks didMutate == true so mid-turn human transcript line does NOT drop confirmation.
+            spokenTexts.removeAll()
+            facilitator.agentModelOverrideForTesting = {
+                var callStep = true
+                return ClosureModel { _ in
+                    if callStep {
+                        callStep = false
+                        return .toolCalls([.init(id: "tc1", name: "rocknroll_create_task", arguments: .object(["title": .string("Verify board share")]))])
+                    }
+                    model.receiveLocalLineForTesting(.init(
+                        id: "mid-turn-line-\(UUID().uuidString)",
+                        trackID: "anna",
+                        text: "Хорошо",
+                        start: Date(),
+                        end: Date()
+                    ))
+                    return .response("Создал задачу Verify board share.", [])
+                }
+            }
+            model.receiveLocalLineForTesting(.init(
+                id: "cmd-create-\(UUID().uuidString)",
+                trackID: MeetingTranscriber.localTrackID,
+                text: "Рок, создай задачу Verify board share",
+                start: Date(),
+                end: Date()
+            ))
+            for _ in 0..<120 where !spokenTexts.contains("Создал задачу Verify board share.") {
+                try await Task.sleep(for: .milliseconds(25))
+            }
+            XCTAssertTrue(spokenTexts.contains("Создал задачу Verify board share."))
+
+            // D. rocknroll_say during active facilitated turn is auto-approved (not stalled in approvalRequired) and not double-spoken.
+            spokenTexts.removeAll()
+            var sayStep = true
+            facilitator.agentModelOverrideForTesting = {
+                ClosureModel { _ in
+                    if sayStep {
+                        sayStep = false
+                        return .toolCalls([.init(id: "say1", name: "rocknroll_say", arguments: .object(["text": .string("Слово Анне.")]))])
+                    }
+                    return .response("Сказано.", [])
+                }
+            }
+            model.receiveLocalLineForTesting(.init(
+                id: "cmd-say-\(UUID().uuidString)",
+                trackID: MeetingTranscriber.localTrackID,
+                text: "Рок, передай слово Анне",
+                start: Date(),
+                end: Date()
+            ))
+            for _ in 0..<120 where !spokenTexts.contains("Слово Анне.") {
+                try await Task.sleep(for: .milliseconds(25))
+            }
+            XCTAssertEqual(spokenTexts.filter { $0 == "Слово Анне." }.count, 1)
+            XCTAssertFalse(spokenTexts.contains("Сказано."))
+
+            // E. disable(for:) cancels an in-flight turn cleanly and clears busySessions.
+            var hungEntered = false
+            facilitator.agentModelOverrideForTesting = {
+                ClosureModel { _ in
+                    hungEntered = true
+                    try await Task.sleep(for: .seconds(10))
+                    return .response("Never", [])
+                }
+            }
+            model.receiveLocalLineForTesting(.init(
+                id: "cmd-hang-\(UUID().uuidString)",
+                trackID: MeetingTranscriber.localTrackID,
+                text: "Рок, проверь статус",
+                start: Date(),
+                end: Date()
+            ))
+            for _ in 0..<120 where !hungEntered {
+                try await Task.sleep(for: .milliseconds(25))
+            }
+            XCTAssertTrue(facilitator.isSessionBusyForTesting(model.sessionID))
+            facilitator.disable(for: model.sessionID)
+            for _ in 0..<80 where facilitator.isSessionBusyForTesting(model.sessionID) {
+                try await Task.sleep(for: .milliseconds(25))
+            }
+            XCTAssertFalse(facilitator.isSessionBusyForTesting(model.sessionID))
+
+            _ = await model.leave()
+            await store.meetingLibrary.store.close()
+            exp.fulfill()
+        }
+        wait(for: [exp], timeout: 15.0)
+    }
 }

@@ -4199,3 +4199,6 @@
 "Scroll Down" = "Gulir ke bawah";
 "Task “%@” is already on the list." = "Tugas “%@” sudah ada di daftar.";
 "Task “%@” for %@ is already on the list." = "Tugas “%@” untuk %@ sudah ada di daftar.";
+"Assistant error: %@" = "Kesalahan asisten: %@";
+"Hi everyone, let's kick off our daily standup. Who would like to go first with updates and blockers?" = "Halo semuanya, mari kita mulai daily standup kita. Siapa yang ingin memulai lebih dulu dengan pembaruan dan kendala?";
+"Hi everyone, I'm ready to assist with %@." = "Halo semuanya, saya siap membantu dengan %@.";

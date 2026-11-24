@@ -2260,14 +2260,14 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
 
         let asksStop = lower.contains("останов") || lower.contains("прекрат") || lower.contains("выключ")
             || lower.contains("stop shar") || lower.contains("unshare")
-        if asksStop && hasBoardKeyword {
+        if asksStop && hasBoardKeyword && !hasJiraTaskAction {
             board.stopSharing()
             return L("Stopped sharing the Assistant Board.")
         }
 
         let asksShare = lower.contains("расшар") || lower.contains("пошар") || lower.contains("демонстр")
             || lower.contains("поделис") || lower.contains("share") || lower.contains("present")
-        if asksShare && hasBoardKeyword {
+        if asksShare && hasBoardKeyword && !hasJiraTaskAction {
             let trimmedDefault = defaultBoardURL.trimmingCharacters(in: .whitespacesAndNewlines)
             let urlOverride = board.currentURL == nil && !trimmedDefault.isEmpty ? trimmedDefault : nil
             do {

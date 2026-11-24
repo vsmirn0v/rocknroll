@@ -4199,3 +4199,6 @@
 "Scroll Down" = "Faire défiler vers le bas";
 "Task “%@” is already on the list." = "La tâche « %@ » figure déjà dans la liste.";
 "Task “%@” for %@ is already on the list." = "La tâche « %@ » pour %@ figure déjà dans la liste.";
+"Assistant error: %@" = "Erreur de l'assistant : %@";
+"Hi everyone, let's kick off our daily standup. Who would like to go first with updates and blockers?" = "Bonjour à tous, commençons notre point quotidien. Qui souhaite partager en premier ses avancées et blocages ?";
+"Hi everyone, I'm ready to assist with %@." = "Bonjour à tous, je suis prêt à vous aider pour %@.";

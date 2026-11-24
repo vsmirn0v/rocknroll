@@ -119,14 +119,27 @@ final class AutonomousMeetingFacilitator: ObservableObject {
     var followUpCoalesceDelay: Duration = .milliseconds(1500)
     var silencePollInterval: Duration = .milliseconds(180)
     var maxSilenceWaitDuration: Duration = .seconds(5)
+    var agentModelOverrideForTesting: (() -> any AssistantAgentModel)?
+    var boardAutoShareOverrideForTesting: ((NativeDesktopMeetingModel, URL) async throws -> String)?
+
+    func isSessionBusyForTesting(_ sessionID: UUID) -> Bool {
+        busySessions.contains(sessionID)
+    }
 
     private static let followUpWindowSeconds: TimeInterval = 90
 
     private weak var attention: AttentionCoordinator?
     private var processedLineIDsBySession: [UUID: Set<String>] = [:]
     private var processedLineOrderBySession: [UUID: [String]] = [:]
+    private var speechActivityObservedLineIDsBySession: [UUID: Set<String>] = [:]
     private var pendingTranscriptObservationSessions: Set<UUID> = []
     private var coalesceTasksBySession: [UUID: Task<Void, Never>] = [:]
+    private var enableTasksBySession: [UUID: Task<Void, Never>] = [:]
+    private var enableTaskTokensBySession: [UUID: UUID] = [:]
+    private var activeTurnTasksBySession: [UUID: Task<Void, Never>] = [:]
+    private var activeTurnTokensBySession: [UUID: UUID] = [:]
+    private var boardAutoShareTasksBySession: [UUID: Task<Void, Never>] = [:]
+    private var boardAutoShareTaskTokensBySession: [UUID: UUID] = [:]
     private var busySessions: Set<UUID> = []
     private var manuallyDisabledSessions: Set<UUID> = []
     private var lastSpokeAtBySession: [UUID: Date] = [:]
@@ -197,23 +210,48 @@ final class AutonomousMeetingFacilitator: ObservableObject {
         let initialIDs = model.transcript.map(\.id)
         processedLineIDsBySession[model.sessionID] = Set(initialIDs)
         processedLineOrderBySession[model.sessionID] = initialIDs
+        speechActivityObservedLineIDsBySession[model.sessionID] = Set(initialIDs)
         coalesceTasksBySession.removeValue(forKey: model.sessionID)?.cancel()
         model.onTranscriptChanged = { [weak self, weak model] in
             guard let self, let model else { return }
             self.observeTranscriptChanged(for: model)
         }
+        let sid = model.sessionID
+        enableTasksBySession.removeValue(forKey: sid)?.cancel()
+        enableTaskTokensBySession.removeValue(forKey: sid)
+        activeTurnTasksBySession.removeValue(forKey: sid)?.cancel()
+        activeTurnTokensBySession.removeValue(forKey: sid)
+        boardAutoShareTasksBySession.removeValue(forKey: sid)?.cancel()
+        boardAutoShareTaskTokensBySession.removeValue(forKey: sid)
+        busySessions.remove(sid)
         let initialTitle = cachedSkills.first(where: { $0.id == chosen })?.name ?? chosen
-        lastStatusBySession[model.sessionID] = L("Autonomous voice facilitator active (%@)", initialTitle)
-        Task { @MainActor [weak self, weak model] in
-            guard let self, let model, !model.isClosed else { return }
+        lastStatusBySession[sid] = L("Autonomous voice facilitator active (%@)", initialTitle)
+        let enableToken = UUID()
+        enableTaskTokensBySession[sid] = enableToken
+        enableTasksBySession[sid] = Task { @MainActor [weak self, weak model] in
+            guard let self, let model, !model.isClosed, !Task.isCancelled else { return }
+            defer {
+                if self.enableTaskTokensBySession[sid] == enableToken {
+                    self.enableTasksBySession.removeValue(forKey: sid)
+                    self.enableTaskTokensBySession.removeValue(forKey: sid)
+                }
+            }
             await self.refreshSkillsCache()
+            guard !Task.isCancelled,
+                  !model.isClosed,
+                  self.activeSessionSkills[sid] != nil,
+                  self.enableTaskTokensBySession[sid] == enableToken else { return }
             if skillID == nil {
                 chosen = self.resolveSkillID(explicitSkillID: nil, meetingTitle: model.title)
-                self.activeSessionSkills[model.sessionID] = chosen
+                self.activeSessionSkills[sid] = chosen
             }
             let skill = self.cachedSkills.first(where: { $0.id == chosen })
-            self.lastStatusBySession[model.sessionID] = L("Autonomous voice facilitator active (%@)", skill?.name ?? chosen)
+            self.lastStatusBySession[sid] = L("Autonomous voice facilitator active (%@)", skill?.name ?? chosen)
             await self.maybeConnectRealtime(for: model, skill: skill, skillID: chosen)
+            guard !Task.isCancelled,
+                  !model.isClosed,
+                  self.activeSessionSkills[sid] != nil,
+                  self.enableTaskTokensBySession[sid] == enableToken else { return }
             if !suppressAutoGreet, skill?.autoGreet == true {
                 await self.kickOffSkill(for: model, skillID: chosen)
             }
@@ -226,9 +264,16 @@ final class AutonomousMeetingFacilitator: ObservableObject {
         if let removedSkill {
             probeLog("assistant-facilitator-disable", ["skill": removedSkill])
         }
+        enableTasksBySession.removeValue(forKey: sessionID)?.cancel()
+        enableTaskTokensBySession.removeValue(forKey: sessionID)
+        activeTurnTasksBySession.removeValue(forKey: sessionID)?.cancel()
+        activeTurnTokensBySession.removeValue(forKey: sessionID)
+        boardAutoShareTasksBySession.removeValue(forKey: sessionID)?.cancel()
+        boardAutoShareTaskTokensBySession.removeValue(forKey: sessionID)
         coalesceTasksBySession.removeValue(forKey: sessionID)?.cancel()
         processedLineIDsBySession.removeValue(forKey: sessionID)
         processedLineOrderBySession.removeValue(forKey: sessionID)
+        speechActivityObservedLineIDsBySession.removeValue(forKey: sessionID)
         pendingTranscriptObservationSessions.remove(sessionID)
         lastStatusBySession.removeValue(forKey: sessionID)
         lastSpokeAtBySession.removeValue(forKey: sessionID)
@@ -258,34 +303,155 @@ final class AutonomousMeetingFacilitator: ObservableObject {
 
     /// Proactively introduces the bound skill into the meeting (e.g. starting a Daily Standup).
     func kickOffSkill(for model: NativeDesktopMeetingModel, skillID: String? = nil) async {
-        guard let attention, !model.isClosed, !busySessions.contains(model.sessionID) else { return }
-        busySessions.insert(model.sessionID)
-        let activeID = skillID ?? activeSessionSkills[model.sessionID] ?? "scrum-master"
+        let sid = model.sessionID
+        guard let attention, !model.isClosed, !Task.isCancelled, !busySessions.contains(sid) else { return }
+        let activeID = skillID ?? activeSessionSkills[sid] ?? "scrum-master"
         await refreshSkillsCache()
+        guard !Task.isCancelled, !model.isClosed, activeSessionSkills[sid] != nil else { return }
         let skill = cachedSkills.first(where: { $0.id == activeID })
+        let supportsAutoBoardShareOnKickOff = activeID == "scrum-master"
+            || (skill?.instructions.lowercased().contains("share_to_meeting") == true)
+        if supportsAutoBoardShareOnKickOff {
+            let jiraConfig = await attention.resolvedJiraBoardConfig(for: model)
+            let team = await attention.loadTeamContext()
+            let explicitURL = jiraConfig.boardURL.flatMap { url -> URL? in
+                guard url.absoluteString != attention.store.lastBoardURL else { return nil }
+                return AssistantBoardWindowController.validateBoardURL(url.absoluteString)
+            }
+            let candidateURL = jiraConfig.boardURL?.absoluteString ?? team.defaultJiraBoardURL
+            if let boardURL = AssistantBoardWindowController.validateBoardURL(candidateURL) {
+                startProactiveBoardShareIfNeeded(
+                    for: model,
+                    skillID: activeID,
+                    boardURL: boardURL,
+                    explicitConfiguredURL: explicitURL
+                )
+            }
+        }
+        guard !Task.isCancelled, !model.isClosed, activeSessionSkills[sid] != nil, !busySessions.contains(sid) else { return }
+        busySessions.insert(sid)
         let prompt = L("Briefly greet the meeting and kick off your role (%@) in 1–2 crisp sentences.", skill?.name ?? activeID)
-        await handleVoiceTurn(
-            model: model,
-            skillID: activeID,
-            speakerName: attention.store.profile.name.trimmed.isEmpty ? L("You") : attention.store.profile.name.trimmed,
-            isLocalSpeaker: true,
-            commandText: prompt
-        )
+        let speaker = attention.store.profile.name.trimmed.isEmpty ? L("You") : attention.store.profile.name.trimmed
+        await runTrackedTurn(for: sid) { [weak self, weak model] token in
+            guard let self, let model else { return }
+            await self.handleVoiceTurn(
+                model: model,
+                skillID: activeID,
+                speakerName: speaker,
+                isLocalSpeaker: true,
+                commandText: prompt,
+                isKickOff: true,
+                turnToken: token
+            )
+        }
+    }
+
+    private func runTrackedTurn(for sessionID: UUID, operation: @escaping @MainActor (UUID) async -> Void) async {
+        activeTurnTasksBySession.removeValue(forKey: sessionID)?.cancel()
+        let token = UUID()
+        activeTurnTokensBySession[sessionID] = token
+        let task = Task { @MainActor in
+            await operation(token)
+        }
+        activeTurnTasksBySession[sessionID] = task
+        await task.value
+        if activeTurnTokensBySession[sessionID] == token {
+            activeTurnTasksBySession.removeValue(forKey: sessionID)
+            activeTurnTokensBySession.removeValue(forKey: sessionID)
+        }
+    }
+
+    private func isTurnStillCurrent(sessionID: UUID, token: UUID?) -> Bool {
+        guard !Task.isCancelled,
+              activeSessionSkills[sessionID] != nil,
+              !manuallyDisabledSessions.contains(sessionID) else { return false }
+        if let token {
+            return activeTurnTokensBySession[sessionID] == token
+        }
+        return true
+    }
+
+    private func releaseBusyIfCurrent(sessionID: UUID, token: UUID?) {
+        if token == nil || activeTurnTokensBySession[sessionID] == token {
+            busySessions.remove(sessionID)
+        }
+    }
+
+    private func startProactiveBoardShareIfNeeded(
+        for model: NativeDesktopMeetingModel,
+        skillID: String,
+        boardURL: URL,
+        explicitConfiguredURL: URL? = nil
+    ) {
+        let sid = model.sessionID
+        guard let attention,
+              !model.isClosed,
+              model.connected,
+              !model.isSharingLive,
+              attention.boardController.sharingMeetingID != sid else { return }
+        boardAutoShareTasksBySession.removeValue(forKey: sid)?.cancel()
+        let token = UUID()
+        boardAutoShareTaskTokensBySession[sid] = token
+        boardAutoShareTasksBySession[sid] = Task { @MainActor [weak self, weak model, weak attention] in
+            guard let self, let model, let attention else { return }
+            defer {
+                if self.boardAutoShareTaskTokensBySession[sid] == token {
+                    self.boardAutoShareTasksBySession.removeValue(forKey: sid)
+                    self.boardAutoShareTaskTokensBySession.removeValue(forKey: sid)
+                }
+            }
+            guard !Task.isCancelled,
+                  self.boardAutoShareTaskTokensBySession[sid] == token,
+                  !model.isClosed,
+                  model.connected,
+                  self.activeSessionSkills[sid] != nil,
+                  !self.manuallyDisabledSessions.contains(sid),
+                  !model.isSharingLive,
+                  attention.boardController.sharingMeetingID != sid else { return }
+            do {
+                if let override = self.boardAutoShareOverrideForTesting {
+                    _ = try await override(model, boardURL)
+                } else {
+                    let board = attention.boardController
+                    let shouldOpenBoard = board.currentURL == nil
+                        || board.loadError != nil
+                        || (explicitConfiguredURL != nil && board.currentURL != explicitConfiguredURL)
+                    if shouldOpenBoard {
+                        _ = try await board.open(urlString: (explicitConfiguredURL ?? boardURL).absoluteString)
+                    }
+                    guard !Task.isCancelled,
+                          self.boardAutoShareTaskTokensBySession[sid] == token,
+                          !model.isClosed,
+                          model.connected,
+                          self.activeSessionSkills[sid] != nil,
+                          !self.manuallyDisabledSessions.contains(sid) else { return }
+                    _ = try await board.startSharing(to: model)
+                }
+                probeLog("assistant-facilitator-board-autoshare", [
+                    "status": "started",
+                    "skill": skillID
+                ])
+            } catch is CancellationError {
+                return
+            } catch {
+                probeLog("assistant-facilitator-board-autoshare", [
+                    "status": "error",
+                    "skill": skillID,
+                    "error": error.localizedDescription
+                ])
+            }
+        }
     }
 
     /// Event-driven trigger invoked when new transcript lines arrive on `@MainActor`,
     /// avoiding 0-2,000 ms polling latency before wake-phrase activation.
     func observeTranscriptChanged(for model: NativeDesktopMeetingModel) {
         let sid = model.sessionID
-        guard activeSessionSkills[sid] != nil, !model.isClosed, model.connected else { return }
+        guard !model.isClosed, model.connected,
+              let skillID = activeSessionSkills[sid] else { return }
         guard pendingTranscriptObservationSessions.insert(sid).inserted else { return }
-        Task { @MainActor [weak self, weak model] in
-            guard let self else { return }
-            self.pendingTranscriptObservationSessions.remove(sid)
-            guard let model, !model.isClosed, model.connected,
-                  let skillID = self.activeSessionSkills[sid] else { return }
-            self.evaluateTranscriptLines(for: model, skillID: skillID, now: Date())
-        }
+        defer { pendingTranscriptObservationSessions.remove(sid) }
+        evaluateTranscriptLines(for: model, skillID: skillID, now: Date())
     }
 
     func processTick(models: [NativeDesktopMeetingModel]) {
@@ -403,6 +569,7 @@ final class AutonomousMeetingFacilitator: ObservableObject {
         guard !lines.isEmpty else { return }
         var seen = processedLineIDsBySession[sessionID] ?? []
         var order = processedLineOrderBySession[sessionID] ?? []
+        var activityObserved = speechActivityObservedLineIDsBySession[sessionID] ?? []
         for line in lines where seen.insert(line.id).inserted {
             order.append(line.id)
         }
@@ -410,29 +577,33 @@ final class AutonomousMeetingFacilitator: ObservableObject {
             let overflow = order.count - 2_000
             for evicted in order.prefix(overflow) {
                 seen.remove(evicted)
+                activityObserved.remove(evicted)
             }
             order.removeFirst(overflow)
         }
         processedLineIDsBySession[sessionID] = seen
         processedLineOrderBySession[sessionID] = order
+        speechActivityObservedLineIDsBySession[sessionID] = activityObserved
     }
 
     private func evaluateTranscriptLines(for model: NativeDesktopMeetingModel, skillID: String, now: Date) {
-        let seen = processedLineIDsBySession[model.sessionID] ?? []
+        let sid = model.sessionID
+        let seen = processedLineIDsBySession[sid] ?? []
         let unseen = model.transcript.suffix(80).filter {
             !seen.contains($0.id) && !$0.text.trimmed.isEmpty
         }
         guard !unseen.isEmpty else { return }
 
-        let inFollowUpWindow = lastSpokeAtBySession[model.sessionID].map {
+        let inFollowUpWindow = lastSpokeAtBySession[sid].map {
             now.timeIntervalSince($0) <= Self.followUpWindowSeconds
         } ?? false
-        let inEchoWindow = isWithinEchoWindow(for: model.sessionID, at: now)
-        let recentAnswers = recentEchoCandidates(for: model.sessionID)
+        let inEchoWindow = isWithinEchoWindow(for: sid, at: now)
+        let recentAnswers = recentEchoCandidates(for: sid)
 
+        var activityObserved = speechActivityObservedLineIDsBySession[sid] ?? []
         var hasWake = false
         var hasFollowUp = false
-        var sawGenuineHumanSpeech = false
+        var sawNewHumanSpeech = false
         for line in unseen {
             if line.id.hasPrefix("assistant:") || AssistantSpeechLedger.isAssistantSpeaker(line.participantName, role: nil) {
                 continue
@@ -453,7 +624,9 @@ final class AutonomousMeetingFacilitator: ObservableObject {
                 withinEchoWindow: inEchoWindow
             )
             guard !text.isEmpty else { continue }
-            sawGenuineHumanSpeech = true
+            if activityObserved.insert(line.id).inserted {
+                sawNewHumanSpeech = true
+            }
             switch AssistantWakePhraseMatcher.match(text) {
             case .command(let cmd) where !cmd.trimmed.isEmpty:
                 hasWake = true
@@ -465,22 +638,22 @@ final class AutonomousMeetingFacilitator: ObservableObject {
                 }
             }
         }
+        speechActivityObservedLineIDsBySession[sid] = activityObserved
 
-        if sawGenuineHumanSpeech {
-            speechActivityEpochBySession[model.sessionID, default: 0] &+= 1
-            if speakingSessions.contains(model.sessionID) || realtimeSessions[model.sessionID]?.responseInProgress == true {
-                cancelActiveSpeechForBargeIn(sessionID: model.sessionID)
+        if sawNewHumanSpeech {
+            speechActivityEpochBySession[sid, default: 0] &+= 1
+            if speakingSessions.contains(sid) || realtimeSessions[sid]?.responseInProgress == true {
+                cancelActiveSpeechForBargeIn(sessionID: sid)
             }
         }
 
-        guard !busySessions.contains(model.sessionID) else { return }
+        guard !busySessions.contains(sid) else { return }
 
         if !hasWake && !hasFollowUp {
-            markLinesSeen(unseen, for: model.sessionID)
+            markLinesSeen(unseen, for: sid)
             return
         }
 
-        let sid = model.sessionID
         coalesceTasksBySession.removeValue(forKey: sid)?.cancel()
         let baseDelay = hasWake ? wakeCoalesceDelay : followUpCoalesceDelay
         let delay = model.participationSomeoneSpeaking ? max(baseDelay, silencePollInterval) : baseDelay
@@ -568,13 +741,17 @@ final class AutonomousMeetingFacilitator: ObservableObject {
         guard !commandText.isEmpty else { return }
 
         busySessions.insert(sid)
-        await handleVoiceTurn(
-            model: model,
-            skillID: skillID,
-            speakerName: trigger.participantName,
-            isLocalSpeaker: trigger.isOwn,
-            commandText: commandText
-        )
+        await runTrackedTurn(for: sid) { [weak self, weak model] token in
+            guard let self, let model else { return }
+            await self.handleVoiceTurn(
+                model: model,
+                skillID: skillID,
+                speakerName: trigger.participantName,
+                isLocalSpeaker: trigger.isOwn,
+                commandText: commandText,
+                turnToken: token
+            )
+        }
     }
 
     // MARK: - Turn Execution
@@ -584,17 +761,28 @@ final class AutonomousMeetingFacilitator: ObservableObject {
         skillID: String,
         speakerName: String,
         isLocalSpeaker: Bool,
-        commandText: String
+        commandText: String,
+        isKickOff: Bool = false,
+        turnToken: UUID? = nil
     ) async {
+        let targetSessionID = model.sessionID
         guard let attention else {
-            busySessions.remove(model.sessionID)
+            releaseBusyIfCurrent(sessionID: targetSessionID, token: turnToken)
             return
         }
         let localNames = attention.store.profile.aliases + model.participants.filter(\.isLocal).map(\.name)
         let directory = await attention.loadPeopleDirectory()
+        guard isTurnStillCurrent(sessionID: targetSessionID, token: turnToken), !model.isClosed else {
+            releaseBusyIfCurrent(sessionID: targetSessionID, token: turnToken)
+            return
+        }
         let approved = isLocalSpeaker || directory.isApprovedSpeaker(speakerName, localUserNames: localNames)
 
         let skill = await attention.withSkillRepository { repo, _ in repo.skill(id: skillID) }
+        guard isTurnStillCurrent(sessionID: targetSessionID, token: turnToken), !model.isClosed else {
+            releaseBusyIfCurrent(sessionID: targetSessionID, token: turnToken)
+            return
+        }
         let allowWrites = approved || (skill?.approvedSpeakersOnly == false)
         let allowedGroups: Set<AssistantSkillToolGroup>? = skill.map { Set($0.tools) }
 
@@ -603,13 +791,13 @@ final class AutonomousMeetingFacilitator: ObservableObject {
             .components(separatedBy: .newlines)
             .contains { AssistantWakePhraseMatcher.match($0) != .none }
         if !approved, !hasWakeInBatch {
-            if let lastSpoke = lastSpokeAtBySession[model.sessionID],
+            if let lastSpoke = lastSpokeAtBySession[targetSessionID],
                Date().timeIntervalSince(lastSpoke) <= Self.followUpWindowSeconds,
                !isLocalSpeaker {
                 // Only proceed without wake phrase in follow-up window if speaker is approved (or skill allows everyone).
                 if skill?.approvedSpeakersOnly != false {
-                    busySessions.remove(model.sessionID)
-                    if activeSessionSkills[model.sessionID] != nil {
+                    releaseBusyIfCurrent(sessionID: targetSessionID, token: turnToken)
+                    if activeSessionSkills[targetSessionID] != nil {
                         observeTranscriptChanged(for: model)
                     }
                     return
@@ -618,9 +806,13 @@ final class AutonomousMeetingFacilitator: ObservableObject {
         }
 
         // Direct deterministic board controls (share, stop share, quick/person filter, clear filters, open URL)
-        if allowWrites, (allowedGroups == nil || allowedGroups?.contains(.boardShare) == true) {
+        if !isKickOff, allowWrites, (allowedGroups == nil || allowedGroups?.contains(.boardShare) == true) {
             let jiraConfig = await attention.resolvedJiraBoardConfig(for: model)
             let team = await attention.loadTeamContext()
+            guard isTurnStillCurrent(sessionID: targetSessionID, token: turnToken), !model.isClosed else {
+                releaseBusyIfCurrent(sessionID: targetSessionID, token: turnToken)
+                return
+            }
             let defaultBoardURL = jiraConfig.boardURL?.absoluteString ?? team.defaultJiraBoardURL
             if let boardReply = await Self.handleDeterministicBoardCommand(
                 commandText,
@@ -634,11 +826,11 @@ final class AutonomousMeetingFacilitator: ObservableObject {
                     "route": "deterministic-board",
                     "allowWrites": allowWrites
                 ])
-                busySessions.remove(model.sessionID)
-                if !boardReply.isEmpty {
+                releaseBusyIfCurrent(sessionID: targetSessionID, token: turnToken)
+                if isTurnStillCurrent(sessionID: targetSessionID, token: turnToken), !boardReply.isEmpty {
                     await speakIntoMeeting(boardReply, model: model)
                 }
-                if activeSessionSkills[model.sessionID] != nil {
+                if activeSessionSkills[targetSessionID] != nil {
                     observeTranscriptChanged(for: model)
                 }
                 return
@@ -647,8 +839,12 @@ final class AutonomousMeetingFacilitator: ObservableObject {
 
         // Try Realtime WebSocket acceleration first if connected for this session;
         // falls back immediately to standard agent + local VoiceSynthesis otherwise.
-        if let rtState = realtimeSessions[model.sessionID],
+        if let rtState = realtimeSessions[targetSessionID],
            await rtState.router.isRealtimeConnected {
+            guard isTurnStillCurrent(sessionID: targetSessionID, token: turnToken), !model.isClosed else {
+                releaseBusyIfCurrent(sessionID: targetSessionID, token: turnToken)
+                return
+            }
             rtState.gate.setTurnApproval(allowWrites: allowWrites, approvedTranscriptAt: allowWrites ? Date() : nil)
             rtState.activeSkillID = skillID
             rtState.gate.setApprovedSpeakersOnly(skill?.approvedSpeakersOnly ?? true)
@@ -657,8 +853,8 @@ final class AutonomousMeetingFacilitator: ObservableObject {
                 || !rtState.transcriptBuffer.isEmpty
                 || rtState.gate.recentlyForwardedAudio(within: 3.0) {
                 if !rtState.responseInProgress {
-                    busySessions.remove(model.sessionID)
-                    if activeSessionSkills[model.sessionID] != nil {
+                    releaseBusyIfCurrent(sessionID: targetSessionID, token: turnToken)
+                    if activeSessionSkills[targetSessionID] != nil {
                         observeTranscriptChanged(for: model)
                     }
                 }
@@ -671,13 +867,13 @@ final class AutonomousMeetingFacilitator: ObservableObject {
                     "route": "realtime",
                     "allowWrites": allowWrites
                 ])
-                lastStatusBySession[model.sessionID] = L("Realtime model handling request…")
+                lastStatusBySession[targetSessionID] = L("Realtime model handling request…")
                 rtState.turnTimeoutTask?.cancel()
-                let sid = model.sessionID
+                let sid = targetSessionID
                 rtState.turnTimeoutTask = Task { @MainActor [weak self, weak rtState] in
                     try? await Task.sleep(for: .seconds(25))
                     guard let self, let rtState, !Task.isCancelled else { return }
-                    self.busySessions.remove(sid)
+                    self.releaseBusyIfCurrent(sessionID: sid, token: turnToken)
                     let buffered = AssistantSpeechLedger.sanitizeSpokenReply(rtState.transcriptBuffer)
                     rtState.transcriptBuffer = ""
                     if !buffered.isEmpty {
@@ -692,15 +888,15 @@ final class AutonomousMeetingFacilitator: ObservableObject {
         }
 
         defer {
-            busySessions.remove(model.sessionID)
-            if activeSessionSkills[model.sessionID] != nil {
+            releaseBusyIfCurrent(sessionID: targetSessionID, token: turnToken)
+            if activeSessionSkills[targetSessionID] != nil {
                 observeTranscriptChanged(for: model)
             }
         }
 
         // Standard pipeline fallback (works with local models, cloud chat completions, and Vox/macOS TTS)
         let talk = attention.talk
-        talk.targetMeetingID = model.sessionID
+        talk.targetMeetingID = targetSessionID
         let snapshot = talk.makeAgentSnapshot()
         let hooks = AssistantNativeToolProvider.Hooks(
             executeAction: { [weak talk] action in
@@ -727,19 +923,26 @@ final class AutonomousMeetingFacilitator: ObservableObject {
             attention: attention,
             explicitSkillIDs: [skillID],
             meetingTitle: model.title,
-            meetingID: model.sessionID,
+            meetingID: targetSessionID,
             commandText: commandText,
             speakerName: speakerName,
             isApprovedSpeaker: allowWrites
         )
+        guard isTurnStillCurrent(sessionID: targetSessionID, token: turnToken), !model.isClosed else { return }
 
+        let modelAdapter: any AssistantAgentModel = agentModelOverrideForTesting?()
+            ?? attention.store.provider.agentModel(key: attention.store.apiKey(for: attention.store.provider))
         let environment = AssistantAgentEnvironment(
             registry: registry,
-            model: attention.store.provider.agentModel(key: attention.store.apiKey(for: attention.store.provider)),
+            model: modelAdapter,
             context: context,
             approvalPolicy: { _, action in
                 if !allowWrites { return .ask }
                 if action.kind == .remember { return .allow }
+                if action.kind == .say,
+                   action.meetingID == nil || action.meetingID == targetSessionID {
+                    return .allow
+                }
                 return AssistantVoiceApprovalPolicy.shouldAutoApprove(
                     actionKind: action.kind.rawValue,
                     inputSource: .voiceWake,
@@ -752,51 +955,135 @@ final class AutonomousMeetingFacilitator: ObservableObject {
         )
 
         let runtime = AssistantRuntime()
-        let turnEpoch = speechActivityEpochBySession[model.sessionID, default: 0]
-        turnExecutedWriteToolBySession[model.sessionID] = false
-        let framedPrompt = "\(speakerName) says: \(commandText)\n" +
-            (allowWrites
-                ? "(Approved speaker. Answer concisely for voice playback in 1-3 sentences after running any needed tools.)"
-                : "(Read-only guest speaker. Do not create/update tasks, schedule meetings, or control the board unless an approved member confirms. Answer concisely for voice playback.)")
+        let turnEpoch = speechActivityEpochBySession[targetSessionID, default: 0]
+        turnExecutedWriteToolBySession[targetSessionID] = false
+        let framedPrompt: String
+        if isKickOff {
+            let boardNote = skillID == "scrum-master"
+                ? "Jira board sharing is handled separately for kickoff. Invite the first participant to share updates and blockers. "
+                : ""
+            framedPrompt = "Facilitator kickoff request: \(commandText)\n" +
+                "(\(boardNote)Return your spoken greeting in 1-2 crisp sentences directly as plain text in your final response. Do NOT call rocknroll_say.)"
+        } else {
+            framedPrompt = "\(speakerName) says: \(commandText)\n" +
+                (allowWrites
+                    ? "(Approved speaker. Answer concisely for voice playback in 1-3 sentences after running any needed tools. Return your spoken reply directly as final text instead of calling rocknroll_say.)"
+                    : "(Read-only guest speaker. Do not create/update tasks, schedule meetings, or control the board unless an approved member confirms. Answer concisely for voice playback.)")
+        }
         probeLog("assistant-facilitator-turn", [
             "skill": skillID,
             "route": "llm",
-            "allowWrites": allowWrites
+            "allowWrites": allowWrites,
+            "isKickOff": isKickOff
         ])
         let outcome = await runtime.submit(framedPrompt, environment: environment)
 
-        let spokenText: String?
+        let mutatingToolNames: Set<String> = [
+            "rocknroll_control_board",
+            "rocknroll_create_task",
+            "rocknroll_update_task",
+            "rocknroll_jira_action",
+            "rocknroll_update_meeting_artifacts",
+            "rocknroll_schedule_meeting",
+            "rocknroll_people_directory",
+            "rocknroll_say",
+            "rocknroll_send_chat",
+            "rocknroll_react",
+        ]
+
+        var spokenText: String?
         let didMutate: Bool
+        var saidViaTool = false
         switch outcome {
         case .success(.completed(let text, let sources, _)):
-            spokenText = text
-            let writeIndicators = ["create", "update", "task", "jira", "board", "schedule", "people", "summary", "artifacts"]
+            let executedMutatingTools = runtime.conversation.contains { item in
+                guard item.kind == .tool, !item.isError, let toolName = item.toolName else { return false }
+                return mutatingToolNames.contains(toolName)
+            }
+            saidViaTool = runtime.conversation.contains { item in
+                item.kind == .tool && !item.isError && item.toolName == "rocknroll_say"
+            }
+            spokenText = saidViaTool ? nil : text
+            let writeIndicators = ["create", "update", "task", "jira", "board", "schedule", "people", "summary", "artifacts", "say"]
             let sourceMutated = sources.contains { src in
                 let hay = (src.kind + " " + src.title).lowercased()
                 return writeIndicators.contains { hay.contains($0) }
             }
-            didMutate = sourceMutated || (turnExecutedWriteToolBySession[model.sessionID] ?? false)
+            didMutate = executedMutatingTools || sourceMutated || (turnExecutedWriteToolBySession[targetSessionID] ?? false)
+            if saidViaTool {
+                lastSpokeAtBySession[targetSessionID] = Date()
+            }
+            probeLog("assistant-facilitator-turn-result", [
+                "outcome": "completed",
+                "skill": skillID,
+                "didMutate": didMutate,
+                "saidViaTool": saidViaTool,
+                "hasText": !text.trimmed.isEmpty,
+                "isKickOff": isKickOff
+            ])
         case .success(.needsUserInput(let question)):
             spokenText = question
             didMutate = false
+            probeLog("assistant-facilitator-turn-result", [
+                "outcome": "needsUserInput",
+                "skill": skillID,
+                "hasText": !question.trimmed.isEmpty,
+                "isKickOff": isKickOff
+            ])
         case .success(.approvalRequired(let approval)):
-            lastStatusBySession[model.sessionID] = L("Approval required: %@", approval.title)
+            lastStatusBySession[targetSessionID] = L("Approval required: %@", approval.title)
             spokenText = nil
             didMutate = false
-        case .failure:
+            probeLog("assistant-facilitator-turn-result", [
+                "outcome": "approvalRequired",
+                "skill": skillID,
+                "actionKind": approval.action.kind.rawValue,
+                "isKickOff": isKickOff
+            ])
+        case .failure(let error):
+            let cancelled = (error is CancellationError) || Task.isCancelled
+            if !cancelled {
+                lastStatusBySession[targetSessionID] = L("Assistant error: %@", error.localizedDescription)
+            }
             spokenText = nil
             didMutate = false
+            probeLog("assistant-facilitator-turn-result", [
+                "outcome": cancelled ? "cancelled" : "failure",
+                "skill": skillID,
+                "error": error.localizedDescription,
+                "isKickOff": isKickOff
+            ])
+        }
+
+        let cancelledOutcome: Bool = {
+            if case .failure(let err) = outcome, err is CancellationError { return true }
+            return Task.isCancelled
+        }()
+        if isKickOff, !cancelledOutcome, !saidViaTool, (spokenText?.trimmed.isEmpty ?? true),
+           !model.isClosed, model.connected,
+           activeSessionSkills[targetSessionID] != nil,
+           !manuallyDisabledSessions.contains(targetSessionID) {
+            if skillID == "scrum-master" {
+                spokenText = L("Hi everyone, let's kick off our daily standup. Who would like to go first with updates and blockers?")
+            } else {
+                spokenText = L("Hi everyone, I'm ready to assist with %@.", skill?.name ?? skillID)
+            }
         }
 
         if let spokenText, !spokenText.trimmed.isEmpty {
             await waitForSpeakerSilence(for: model)
-            guard !model.isClosed, model.connected,
-                  activeSessionSkills[model.sessionID] != nil,
-                  !manuallyDisabledSessions.contains(model.sessionID) else { return }
-            let activityAdvanced = speechActivityEpochBySession[model.sessionID, default: 0] != turnEpoch
-            let seenNow = processedLineIDsBySession[model.sessionID] ?? []
+            guard !Task.isCancelled,
+                  !model.isClosed, model.connected,
+                  activeSessionSkills[targetSessionID] != nil,
+                  !manuallyDisabledSessions.contains(targetSessionID) else { return }
+            let activityAdvanced = speechActivityEpochBySession[targetSessionID, default: 0] != turnEpoch
+            let seenNow = processedLineIDsBySession[targetSessionID] ?? []
             let hasNewUnseen = model.transcript.contains { !seenNow.contains($0.id) && !$0.text.trimmed.isEmpty }
-            if !didMutate && ((activityAdvanced && hasNewUnseen) || model.participationSomeoneSpeaking) {
+            if !isKickOff && !didMutate && activityAdvanced && hasNewUnseen {
+                probeLog("assistant-facilitator-turn-skipped", [
+                    "reason": "newer-unseen-transcript",
+                    "skill": skillID
+                ])
                 return
             }
             await speakIntoMeeting(spokenText, model: model)
@@ -1430,14 +1717,14 @@ final class AutonomousMeetingFacilitator: ObservableObject {
 
         let asksStop = lower.contains("останов") || lower.contains("прекрат") || lower.contains("выключ")
             || lower.contains("stop shar") || lower.contains("unshare")
-        if asksStop && hasBoardKeyword {
+        if asksStop && hasBoardKeyword && !hasJiraTaskAction {
             board.stopSharing()
             return L("Stopped sharing the Assistant Board.")
         }
 
         let asksShare = lower.contains("расшар") || lower.contains("пошар") || lower.contains("демонстр")
             || lower.contains("поделис") || lower.contains("share") || lower.contains("present")
-        if asksShare && hasBoardKeyword {
+        if asksShare && hasBoardKeyword && !hasJiraTaskAction {
             let trimmedDefault = defaultBoardURL.trimmingCharacters(in: .whitespacesAndNewlines)
             if board.currentURL == nil && !trimmedDefault.isEmpty {
                 _ = try? await board.open(urlString: trimmedDefault)

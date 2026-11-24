@@ -70,6 +70,7 @@ enum AssistantSkillToolRegistrar {
             return (
                 open: board.currentURL != nil,
                 url: board.currentURL?.absoluteString ?? "none",
+                loading: board.isLoading,
                 sharing: board.sharingMeetingID != nil,
                 recovering: board.isRecoveringShare
             )
@@ -77,11 +78,12 @@ enum AssistantSkillToolRegistrar {
         let guidance = DefaultAssistantPrompts.jiraIdentityResolutionGuidance(meetingParticipants: identityGuidanceParticipants)
         let voiceConductRules = """
         Live Board & Voice Facilitation Rules:
-        - board_open: \(boardState.open), board_current_url: \(boardState.url), board_sharing: \(boardState.sharing), board_recovering: \(boardState.recovering)
+        - board_open: \(boardState.open), board_loading: \(boardState.loading), board_current_url: \(boardState.url), board_sharing: \(boardState.sharing), board_recovering: \(boardState.recovering)
         - effective_jira_board_url: \(resolvedBoardURLString.isEmpty ? "none" : resolvedBoardURLString)
         - effective_jira_project_keys: \(effectiveProjectKeys.isEmpty ? "none" : effectiveProjectKeys.joined(separator: ", "))
         - board_derived_project_keys: \(boardDerivedKeys.isEmpty ? "none" : boardDerivedKeys.joined(separator: ", "))
         - Keep spoken replies crisp (1-3 sentences) in the meeting language. Never repeat a sentence/paragraph or read Markdown syntax such as backticks (`KEY-1`) aloud.
+        - Return your spoken reply directly as your final message text (do NOT call rocknroll_say to speak in this meeting — your final reply is spoken automatically).
         - Conduct standups step-by-step across participants (yesterday, today, blockers) using the meeting transcript and move cleanly to the next person without repeating previous prompts.
         - For board person/quick filters, call rocknroll_control_board(command="select_person_filter", query="<name>") or clear_filters; for screen sharing, call share_to_meeting or stop_share.
         """

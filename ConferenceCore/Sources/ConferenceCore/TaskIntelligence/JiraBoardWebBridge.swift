@@ -3,9 +3,14 @@ import Foundation
 @MainActor
 public protocol JiraBoardWebEvaluating: AnyObject {
     var currentBoardURL: URL? { get }
+    var isBoardLoading: Bool { get }
     func callBoardAsyncJS(_ functionBody: String, arguments: [String: Any]) async throws -> String
     func cookiesForBoard(matching origin: URL) async -> [HTTPCookie]
     func refreshBoardAfterJiraMutation(highlightIssueKey: String?) async
+}
+
+public extension JiraBoardWebEvaluating {
+    var isBoardLoading: Bool { false }
 }
 
 public struct JiraBoardContextInfo: Equatable, Sendable {
@@ -827,6 +832,46 @@ public final class JiraBoardWebSessionConnector: JiraTaskConnecting, @unchecked 
         }
     }
 
+    public static let defaultFetchTimeoutMilliseconds = 6_000
+
+    public static func webFetchScript() -> String {
+        """
+        const metaCtx = document.querySelector('meta[name="ajs-context-path"]')?.getAttribute('content') || '';
+        const ctx = (metaCtx || fallbackContextPath || '').replace(/\\/+$/, '');
+        const cleanEndpoint = endpoint.startsWith('/') ? endpoint : ('/' + endpoint);
+        const url = (ctx && !cleanEndpoint.startsWith(ctx + '/')) ? (ctx + cleanEndpoint) : cleanEndpoint;
+        const effectiveTimeout = (typeof fetchTimeoutMs === 'number' && fetchTimeoutMs > 0) ? fetchTimeoutMs : 6000;
+        const headers = {
+            'Accept': 'application/json',
+            'X-Atlassian-Token': 'no-check'
+        };
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), effectiveTimeout);
+        const init = {
+            method: method,
+            credentials: 'include',
+            headers: headers,
+            signal: controller.signal
+        };
+        if (typeof bodyJSON !== 'undefined' && bodyJSON !== null && method !== 'GET') {
+            headers['Content-Type'] = 'application/json';
+            init.body = bodyJSON;
+        }
+        try {
+            const resp = await fetch(url, init);
+            const text = await resp.text();
+            return JSON.stringify({ ok: resp.ok, status: resp.status, body: text });
+        } catch (err) {
+            if (err && err.name === 'AbortError') {
+                return JSON.stringify({ ok: false, status: 408, body: 'Request timed out' });
+            }
+            throw err;
+        } finally {
+            clearTimeout(timer);
+        }
+        """
+    }
+
     @MainActor
     private func performAsyncJS(
         endpoint: String,
@@ -837,32 +882,12 @@ public final class JiraBoardWebSessionConnector: JiraTaskConnecting, @unchecked 
         guard let evaluator else {
             throw JiraConnectorError.badRequest(L("Assistant Board is unavailable."))
         }
-        let js = """
-        const metaCtx = document.querySelector('meta[name="ajs-context-path"]')?.getAttribute('content') || '';
-        const ctx = (metaCtx || fallbackContextPath || '').replace(/\\/+$/, '');
-        const cleanEndpoint = endpoint.startsWith('/') ? endpoint : ('/' + endpoint);
-        const url = (ctx && !cleanEndpoint.startsWith(ctx + '/')) ? (ctx + cleanEndpoint) : cleanEndpoint;
-        const headers = {
-            'Accept': 'application/json',
-            'X-Atlassian-Token': 'no-check'
-        };
-        const init = {
-            method: method,
-            credentials: 'include',
-            headers: headers
-        };
-        if (typeof bodyJSON !== 'undefined' && bodyJSON !== null && method !== 'GET') {
-            headers['Content-Type'] = 'application/json';
-            init.body = bodyJSON;
-        }
-        const resp = await fetch(url, init);
-        const text = await resp.text();
-        return JSON.stringify({ ok: resp.ok, status: resp.status, body: text });
-        """
+        let js = Self.webFetchScript()
         var args: [String: Any] = [
             "endpoint": endpoint,
             "fallbackContextPath": fallbackContextPath,
-            "method": method
+            "method": method,
+            "fetchTimeoutMs": Self.defaultFetchTimeoutMilliseconds
         ]
         args["bodyJSON"] = bodyJSONString ?? NSNull()
         return try await evaluator.callBoardAsyncJS(js, arguments: args)
@@ -1489,5 +1514,76 @@ public enum JiraBoardDOMScripts {
             return "\"\""
         }
         return text
+    }
+}
+
+/// Bounds asynchronous `@MainActor` WebView JavaScript calls with a single-resume timeout race
+/// so stuck pages cannot freeze the facilitator or board sharing pipeline indefinitely.
+@MainActor
+public enum JiraBoardAsyncTimeout {
+    @MainActor
+    private final class TimeoutOnceState {
+        var continuation: CheckedContinuation<String, Error>?
+        var timeoutTask: Task<Void, Never>?
+        var workTask: Task<Void, Never>?
+        var isCancelled = false
+
+        func install(_ cont: CheckedContinuation<String, Error>) {
+            if isCancelled {
+                cont.resume(throwing: CancellationError())
+                return
+            }
+            continuation = cont
+        }
+
+        func finish(with result: Result<String, Error>) {
+            timeoutTask?.cancel()
+            timeoutTask = nil
+            workTask?.cancel()
+            workTask = nil
+            guard let cont = continuation else { return }
+            continuation = nil
+            cont.resume(with: result)
+        }
+
+        func cancelExternally() {
+            isCancelled = true
+            workTask?.cancel()
+            finish(with: .failure(CancellationError()))
+        }
+    }
+
+    public static func run(
+        seconds: TimeInterval = 6,
+        timeoutError: (@Sendable () -> Error)? = nil,
+        operation: @escaping @MainActor () async throws -> String
+    ) async throws -> String {
+        try Task.checkCancellation()
+        let state = TimeoutOnceState()
+        let nanoseconds = UInt64(max(0.05, seconds) * 1_000_000_000)
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                state.install(continuation)
+                guard state.continuation != nil else { return }
+                state.timeoutTask = Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: nanoseconds)
+                    guard !Task.isCancelled else { return }
+                    let err = timeoutError?() ?? JiraConnectorError.serverError(408, "Assistant Board JavaScript evaluation timed out.")
+                    state.finish(with: .failure(err))
+                }
+                state.workTask = Task { @MainActor in
+                    do {
+                        let value = try await operation()
+                        state.finish(with: .success(value))
+                    } catch {
+                        state.finish(with: .failure(error))
+                    }
+                }
+            }
+        } onCancel: {
+            Task { @MainActor in
+                state.cancelExternally()
+            }
+        }
     }
 }

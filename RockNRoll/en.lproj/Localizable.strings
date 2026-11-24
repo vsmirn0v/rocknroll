@@ -4427,3 +4427,6 @@
 "Scroll Down" = "Scroll Down";
 "Task “%@” is already on the list." = "Task “%@” is already on the list.";
 "Task “%@” for %@ is already on the list." = "Task “%@” for %@ is already on the list.";
+"Assistant error: %@" = "Assistant error: %@";
+"Hi everyone, let's kick off our daily standup. Who would like to go first with updates and blockers?" = "Hi everyone, let's kick off our daily standup. Who would like to go first with updates and blockers?";
+"Hi everyone, I'm ready to assist with %@." = "Hi everyone, I'm ready to assist with %@.";

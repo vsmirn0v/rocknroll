@@ -4199,3 +4199,6 @@
 "Scroll Down" = "向下滚动";
 "Task “%@” is already on the list." = "任务“%@”已在列表中。";
 "Task “%@” for %@ is already on the list." = "任务“%@”（负责人：%@）已在列表中。";
+"Assistant error: %@" = "助手错误：%@";
+"Hi everyone, let's kick off our daily standup. Who would like to go first with updates and blockers?" = "大家好，我们开始今天的站会吧。谁先分享进展和阻塞问题？";
+"Hi everyone, I'm ready to assist with %@." = "大家好，我已准备好协助%@。";

@@ -4199,3 +4199,6 @@
 "Scroll Down" = "تمرير لأسفل";
 "Task “%@” is already on the list." = "المهمة «%@» موجودة بالفعل في القائمة.";
 "Task “%@” for %@ is already on the list." = "المهمة «%@» لـ %@ موجودة بالفعل في القائمة.";
+"Assistant error: %@" = "خطأ في المساعد: %@";
+"Hi everyone, let's kick off our daily standup. Who would like to go first with updates and blockers?" = "مرحبًا بالجميع، لنبدأ الاجتماع اليومي. من يود أن يبدأ بمشاركة التحديثات والعوائق؟";
+"Hi everyone, I'm ready to assist with %@." = "مرحبًا بالجميع، أنا جاهز للمساعدة في %@.";
