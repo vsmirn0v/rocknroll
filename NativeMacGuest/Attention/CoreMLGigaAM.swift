@@ -78,7 +78,7 @@ final class CoreMLGigaAMRecognizer {
         var start = 0
         while start < samples.count {
             let end = min(samples.count, start + Self.window)
-            ids += try decodeWindow(Array(samples[start..<end]))
+            ids += try autoreleasepool { try decodeWindow(Array(samples[start..<end])) }
             start = end
         }
         return Self.detokenize(ids, pieces: pieces)
@@ -86,33 +86,47 @@ final class CoreMLGigaAMRecognizer {
 
     private func decodeWindow(_ samples: [Float]) throws -> [Int] {
         guard samples.count >= 320 else { return [] }
-        let features = try front.features(samples, frames: Self.melFrames, window: Self.window)
-        let length = try MLMultiArray(shape: [1], dataType: .int32)
-        length[0] = NSNumber(value: Int32((samples.count - 320) / 160 + 1))
-        let out = try encoder.prediction(from: MLDictionaryFeatureProvider(dictionary: ["features": features, "length": length]))
-        guard let encoded = out.featureValue(for: "encoded")?.multiArrayValue,
-              let lengthValue = out.featureValue(for: "encoded_len")?.multiArrayValue else { throw CoreMLGigaAMError.badOutput("encoder") }
-        let frames = min(Int(Self.float(lengthValue, 0).rounded()), encoded.shape[2].intValue)
-        let hidden = encoded.shape[1].intValue
-        let encodedValues = Self.floats(encoded)
-        let strides = encoded.strides.map(\.intValue)
+        let (frames, hidden, encodedValues, strides): (Int, Int, [Float], [Int]) = try autoreleasepool {
+            let features = try front.features(samples, frames: Self.melFrames, window: Self.window)
+            let length = try MLMultiArray(shape: [1], dataType: .int32)
+            length.withUnsafeMutableBytes { raw, _ in
+                raw.bindMemory(to: Int32.self)[0] = Int32((samples.count - 320) / 160 + 1)
+            }
+            let out = try encoder.prediction(from: MLDictionaryFeatureProvider(dictionary: ["features": features, "length": length]))
+            guard let encoded = out.featureValue(for: "encoded")?.multiArrayValue,
+                  let lengthValue = out.featureValue(for: "encoded_len")?.multiArrayValue else { throw CoreMLGigaAMError.badOutput("encoder") }
+            let frames = min(Int(Self.float(lengthValue, 0).rounded()), encoded.shape[2].intValue)
+            let hidden = encoded.shape[1].intValue
+            return (frames, hidden, Self.floats(encoded), encoded.strides.map(\.intValue))
+        }
 
         let token = try MLMultiArray(shape: [1, 1], dataType: .int32)
         var h = try MLMultiArray(shape: [1, 1, 320], dataType: .float32)
         var c = try MLMultiArray(shape: [1, 1, 320], dataType: .float32)
-        for i in 0..<320 { h[i] = 0; c[i] = 0 }
+        h.withUnsafeMutableBytes { raw, _ in
+            let ptr = raw.bindMemory(to: Float.self)
+            for i in 0..<320 { ptr[i] = 0 }
+        }
+        c.withUnsafeMutableBytes { raw, _ in
+            let ptr = raw.bindMemory(to: Float.self)
+            for i in 0..<320 { ptr[i] = 0 }
+        }
         let encT = try MLMultiArray(shape: [1, NSNumber(value: hidden)], dataType: .float32)
         var last = Self.blank
         // The prediction network's output depends only on (last, h, c): rerun it only after an emission.
         var step = try predict(token: token, last: last, h: h, c: c)
         var ids: [Int] = []
         for t in 0..<frames {
-            let encPointer = encT.dataPointer.assumingMemoryBound(to: Float.self)
-            for d in 0..<hidden { encPointer[d] = encodedValues[d * strides[1] + t * strides[2]] }
+            encT.withUnsafeMutableBytes { raw, _ in
+                let encPointer = raw.bindMemory(to: Float.self)
+                for d in 0..<hidden { encPointer[d] = encodedValues[d * strides[1] + t * strides[2]] }
+            }
             for _ in 0..<Self.maxSymbolsPerFrame {
-                let logits = try joint.prediction(from: MLDictionaryFeatureProvider(dictionary: ["enc_t": encT, "dec_t": step.out]))
-                guard let values = logits.featureValue(for: "logits")?.multiArrayValue else { throw CoreMLGigaAMError.badOutput("joint") }
-                let k = Self.argmax(values)
+                let k: Int = try autoreleasepool {
+                    let logits = try joint.prediction(from: MLDictionaryFeatureProvider(dictionary: ["enc_t": encT, "dec_t": step.out]))
+                    guard let values = logits.featureValue(for: "logits")?.multiArrayValue else { throw CoreMLGigaAMError.badOutput("joint") }
+                    return Self.argmax(values)
+                }
                 if k == Self.blank { break }
                 ids.append(k)
                 last = k; h = step.h; c = step.c
@@ -123,28 +137,74 @@ final class CoreMLGigaAMRecognizer {
     }
 
     private func predict(token: MLMultiArray, last: Int, h: MLMultiArray, c: MLMultiArray) throws -> (out: MLMultiArray, h: MLMultiArray, c: MLMultiArray) {
-        token[0] = NSNumber(value: Int32(last))
-        let out = try decoder.prediction(from: MLDictionaryFeatureProvider(dictionary: ["token": token, "h_in": h, "c_in": c]))
-        guard let dec = out.featureValue(for: "dec_out")?.multiArrayValue,
-              let hOut = out.featureValue(for: "h_out")?.multiArrayValue,
-              let cOut = out.featureValue(for: "c_out")?.multiArrayValue else { throw CoreMLGigaAMError.badOutput("decoder") }
-        return (try Self.float32(dec), try Self.float32(hOut), try Self.float32(cOut))
+        token.withUnsafeMutableBytes { raw, _ in
+            raw.bindMemory(to: Int32.self)[0] = Int32(last)
+        }
+        return try autoreleasepool {
+            let out = try decoder.prediction(from: MLDictionaryFeatureProvider(dictionary: ["token": token, "h_in": h, "c_in": c]))
+            guard let dec = out.featureValue(for: "dec_out")?.multiArrayValue,
+                  let hOut = out.featureValue(for: "h_out")?.multiArrayValue,
+                  let cOut = out.featureValue(for: "c_out")?.multiArrayValue else { throw CoreMLGigaAMError.badOutput("decoder") }
+            return (try Self.float32(dec), try Self.float32(hOut), try Self.float32(cOut))
+        }
     }
 
     // MARK: Multi-array helpers (outputs may be fp16 or strided)
 
-    static func float(_ array: MLMultiArray, _ index: Int) -> Float { array[index].floatValue }
+    static func float(_ array: MLMultiArray, _ index: Int) -> Float {
+        let offset = storageOffset(array, flat: index)
+        switch array.dataType {
+        case .float16:
+            return array.withUnsafeBytes { Float($0.bindMemory(to: Float16.self)[offset]) }
+        case .float32:
+            return array.withUnsafeBytes { $0.bindMemory(to: Float.self)[offset] }
+        case .int32:
+            return array.withUnsafeBytes { Float($0.bindMemory(to: Int32.self)[offset]) }
+        case .double:
+            return array.withUnsafeBytes { Float($0.bindMemory(to: Double.self)[offset]) }
+        default:
+            return array[index].floatValue
+        }
+    }
+
+    private static func storageOffset(_ array: MLMultiArray, flat index: Int) -> Int {
+        if index == 0 { return 0 }
+        let shape = array.shape, strides = array.strides
+        var rest = index, offset = 0
+        for axis in stride(from: shape.count - 1, through: 0, by: -1) {
+            let dim = shape[axis].intValue
+            offset += (rest % dim) * strides[axis].intValue
+            rest /= dim
+        }
+        return offset
+    }
+
+    private static func isContiguous(_ array: MLMultiArray) -> Bool {
+        let shape = array.shape, strides = array.strides
+        var expected = 1
+        for axis in stride(from: shape.count - 1, through: 0, by: -1) {
+            let dim = shape[axis].intValue
+            if dim > 1 && strides[axis].intValue != expected { return false }
+            expected *= dim
+        }
+        return true
+    }
 
     /// All values in storage order (the caller indexes with `strides`).
     static func floats(_ array: MLMultiArray) -> [Float] {
+        guard array.count > 0 else { return [] }
         let count = zip(array.shape, array.strides).map { ($0.intValue - 1) * $1.intValue }.reduce(0, +) + 1
         switch array.dataType {
         case .float16:
-            let source = array.dataPointer.assumingMemoryBound(to: Float16.self)
-            return (0..<count).map { Float(source[$0]) }
+            return array.withUnsafeBytes { raw in
+                let source = raw.bindMemory(to: Float16.self)
+                return (0..<count).map { Float(source[$0]) }
+            }
         case .float32:
-            let source = array.dataPointer.assumingMemoryBound(to: Float.self)
-            return Array(UnsafeBufferPointer(start: source, count: count))
+            return array.withUnsafeBytes { raw in
+                let source = raw.bindMemory(to: Float.self)
+                return Array(source[..<count])
+            }
         default:
             return (0..<count).map { array[$0].floatValue }
         }
@@ -152,16 +212,18 @@ final class CoreMLGigaAMRecognizer {
 
     /// A contiguous float32 copy with the same shape (inputs are declared float32).
     static func float32(_ array: MLMultiArray) throws -> MLMultiArray {
-        if array.dataType == .float32, array.strides.last?.intValue == 1 { return array }
+        if array.dataType == .float32, array.pixelBuffer == nil, Self.isContiguous(array) { return array }
         let copy = try MLMultiArray(shape: array.shape, dataType: .float32)
         let values = floats(array)
         let shape = array.shape.map(\.intValue), strides = array.strides.map(\.intValue)
-        let target = copy.dataPointer.assumingMemoryBound(to: Float.self)
-        var index = [Int](repeating: 0, count: shape.count)
-        for flat in 0..<copy.count {
-            var rest = flat
-            for axis in stride(from: shape.count - 1, through: 0, by: -1) { index[axis] = rest % shape[axis]; rest /= shape[axis] }
-            target[flat] = values[zip(index, strides).map(*).reduce(0, +)]
+        copy.withUnsafeMutableBytes { raw, _ in
+            let target = raw.bindMemory(to: Float.self)
+            var index = [Int](repeating: 0, count: shape.count)
+            for flat in 0..<copy.count {
+                var rest = flat
+                for axis in stride(from: shape.count - 1, through: 0, by: -1) { index[axis] = rest % shape[axis]; rest /= shape[axis] }
+                target[flat] = values[zip(index, strides).map(*).reduce(0, +)]
+            }
         }
         return copy
     }
@@ -262,10 +324,11 @@ final class GigaAMMelFrontEnd {
         vvlogf(&energies, energies, &count)
         // Transposed into [1, mels, frames].
         let array = try MLMultiArray(shape: [1, NSNumber(value: Self.mels), NSNumber(value: frames)], dataType: .float32)
-        let target = array.dataPointer.assumingMemoryBound(to: Float.self)
-        let strides = array.strides.map(\.intValue)
-        for f in 0..<frames {
-            for m in 0..<Self.mels { target[m * strides[1] + f * strides[2]] = energies[f * Self.mels + m] }
+        array.withUnsafeMutableBytes { raw, strides in
+            let target = raw.bindMemory(to: Float.self)
+            for f in 0..<frames {
+                for m in 0..<Self.mels { target[m * strides[1] + f * strides[2]] = energies[f * Self.mels + m] }
+            }
         }
         return array
     }

@@ -114,7 +114,7 @@ enum IOSTranscriptionState: Equatable {
 /// Owns off-main-thread PCM routing and recognition pipelines so high-frequency audio frames
 /// never hop onto `@MainActor` before entering `workerQueue`.
 private final class AudioIngressRouter: @unchecked Sendable {
-    private let workerQueue = DispatchQueue(label: "dev.vsmirn0v.conferenceguest.ios-transcription")
+    private let workerQueue = DispatchQueue(label: "dev.vsmirn0v.conferenceguest.ios-transcription", autoreleaseFrequency: .workItem)
     private let lock = NSLock()
 
     private var running = false

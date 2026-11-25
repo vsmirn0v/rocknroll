@@ -80,7 +80,7 @@ final class LocalSpeechRecognizer: @unchecked Sendable {
         case audioBacklog, recognitionBacklog, modelUnavailable, decodeFailure
     }
     let runtime = CurrentValueSubject<LocalSpeechRecognizerRuntimeSnapshot, Never>(.init())
-    private let queue = DispatchQueue(label: "attention.listen.recognizer", qos: .utility)
+    private let queue = DispatchQueue(label: "attention.listen.recognizer", qos: .utility, autoreleaseFrequency: .workItem)
     private let lock = NSLock()
     private var pending = 0.0
     private var recognizer: (([Float]) throws -> String)?
@@ -346,7 +346,7 @@ final class MeetingTranscriber: @unchecked Sendable {
     }
 
     init(model: ListenRecognizerModel, vadModel: URL, recognizer: LocalSpeechRecognizer = .shared,
-         queue: DispatchQueue = DispatchQueue(label: "attention.listen.meeting", qos: .userInitiated),
+         queue: DispatchQueue = DispatchQueue(label: "attention.listen.meeting", qos: .userInitiated, autoreleaseFrequency: .workItem),
          onDropped: (@MainActor (Date, Date, LocalSpeechRecognizer.DropReason) -> Void)? = nil,
          onLine: @escaping @MainActor (Line) -> Void) {
         self.model = model; self.vadModel = vadModel; self.recognizer = recognizer; self.onLine = onLine

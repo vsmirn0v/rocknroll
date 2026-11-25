@@ -1,5 +1,6 @@
 import AVFoundation
 import CoreML
+import CoreVideo
 import XCTest
 @testable import MeetingEngine
 @testable import RockNativeDesktop
@@ -205,5 +206,102 @@ import XCTest
         XCTAssertEqual(configured.computeUnits, .cpuAndNeuralEngine)
         store.refresh()
         XCTAssertEqual(store.state(package), .installed, "Nested files count as present after a restart")
+    }
+
+    func testMultiArrayHelpersDoNotRetainPixelBufferBackedArraysOnBackgroundQueue() throws {
+        // Verify strided CVPixelBuffer-backed float16 reads and float32 copy detachment.
+        var stridedPixelBuffer: CVPixelBuffer?
+        let createStatus = CVPixelBufferCreate(
+            kCFAllocatorDefault,
+            5,
+            3,
+            kCVPixelFormatType_OneComponent16Half,
+            [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary,
+            &stridedPixelBuffer
+        )
+        XCTAssertEqual(createStatus, kCVReturnSuccess)
+        let strided = MLMultiArray(pixelBuffer: try XCTUnwrap(stridedPixelBuffer), shape: [1, 3, 5])
+        strided.withUnsafeMutableBytes { raw, strides in
+            let ptr = raw.bindMemory(to: Float16.self)
+            for row in 0..<3 {
+                for col in 0..<5 {
+                    ptr[row * strides[1] + col * strides[2]] = Float16(row * 10 + col)
+                }
+            }
+        }
+        let copied = try CoreMLGigaAMRecognizer.float32(strided)
+        XCTAssertNil(copied.pixelBuffer)
+        XCTAssertEqual(copied.dataType, .float32)
+        for row in 0..<3 {
+            for col in 0..<5 {
+                let flat = row * 5 + col
+                XCTAssertEqual(CoreMLGigaAMRecognizer.float(strided, flat), Float(row * 10 + col), accuracy: 1e-3)
+                XCTAssertEqual(CoreMLGigaAMRecognizer.float(copied, flat), Float(row * 10 + col), accuracy: 1e-3)
+            }
+        }
+        XCTAssertEqual(CoreMLGigaAMRecognizer.argmax(strided), 4)
+
+        // On a default (.inherit) GCD queue without an outer autoreleasepool, reading
+        // pixelBuffer-backed MLMultiArrays must not pin them until the block exits.
+        final class WeakBox: @unchecked Sendable {
+            weak var value: MLMultiArray?
+            init(_ value: MLMultiArray) { self.value = value }
+        }
+        final class ResultBox: @unchecked Sendable {
+            var aliveInBlock = -1
+            var errorMessage: String?
+        }
+        let expectation = expectation(description: "background helper pass")
+        let queue = DispatchQueue(label: "gigaam.retention.test", qos: .utility)
+        let result = ResultBox()
+
+        queue.async {
+            do {
+                let front = GigaAMMelFrontEnd()
+                let silence = [Float](repeating: 0, count: 1600)
+                var boxes: [WeakBox] = []
+                for iter in 0..<60 {
+                    var pb: CVPixelBuffer?
+                    let status = CVPixelBufferCreate(
+                        kCFAllocatorDefault,
+                        320,
+                        1,
+                        kCVPixelFormatType_OneComponent16Half,
+                        [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary,
+                        &pb
+                    )
+                    guard status == kCVReturnSuccess, let pb else {
+                        result.errorMessage = "CVPixelBufferCreate failed: \(status)"
+                        break
+                    }
+                    let arr = MLMultiArray(pixelBuffer: pb, shape: [1, 1, 320])
+                    arr.withUnsafeMutableBytes { raw, _ in
+                        let ptr = raw.bindMemory(to: Float16.self)
+                        for idx in 0..<320 { ptr[idx] = 0 }
+                        ptr[iter % 320] = 2.5
+                    }
+                    let floats = CoreMLGigaAMRecognizer.floats(arr)
+                    let best = CoreMLGigaAMRecognizer.argmax(arr)
+                    let first = CoreMLGigaAMRecognizer.float(arr, iter % 320)
+                    let f32 = try CoreMLGigaAMRecognizer.float32(arr)
+                    let mel = try front.features(silence, frames: 32, window: 32 * 160 + 160)
+                    guard floats.count >= 320, best == iter % 320, abs(first - 2.5) < 0.01 else {
+                        result.errorMessage = "Unexpected helper values"
+                        break
+                    }
+                    boxes.append(WeakBox(arr))
+                    boxes.append(WeakBox(f32))
+                    boxes.append(WeakBox(mel))
+                }
+                result.aliveInBlock = boxes.filter { $0.value != nil }.count
+            } catch {
+                result.errorMessage = String(describing: error)
+            }
+            expectation.fulfill()
+        }
+
+        wait(for: [expectation], timeout: 10)
+        XCTAssertNil(result.errorMessage)
+        XCTAssertEqual(result.aliveInBlock, 0, "MLMultiArray helpers must not autorelease-pin arrays inside GCD blocks")
     }
 }
