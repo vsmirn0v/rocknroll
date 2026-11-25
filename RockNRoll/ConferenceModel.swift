@@ -1852,6 +1852,7 @@ final class ConferenceModel: ObservableObject {
                     identifier: controller.destination.roomIdentifier,
                     engine: controller.kind
                 )
+                SiteAccountStore.shared.rememberOrigin(controller.invitationURL, engine: controller.kind)
                 if let room = history.matching(controller.invitationURL) {
                     calendar.noteJoined(room, invitation: controller.invitationURL)
                 }
@@ -2253,6 +2254,7 @@ final class ConferenceModel: ObservableObject {
         do {
             let created = try await createInstantRoomHandler(origin, resolvedEngine, options)
             InstantRoomPreferences.saveLastOrigin(origin, defaults: preferences)
+            SiteAccountStore.shared.rememberOrigin(origin, engine: created.engine, forceRestoreIfDismissed: true)
             copyInvitationToClipboard(created.invitationURL)
             UINotificationFeedbackGenerator().notificationOccurred(.success)
             joinCreatedRoom(created, saveFavorite: false, invitationAlreadyCopied: true)
@@ -2388,6 +2390,7 @@ final class ConferenceModel: ObservableObject {
                     identifier: identifier,
                     engine: activeRoute.engineKind
                 )
+                SiteAccountStore.shared.rememberOrigin(activeRoute.invitationURL, engine: activeRoute.engineKind)
                 if let room = history.matching(activeRoute.invitationURL) {
                     calendar.noteJoined(room, invitation: activeRoute.invitationURL)
                 }

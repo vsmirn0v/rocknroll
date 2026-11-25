@@ -4258,3 +4258,14 @@
 "Scan on iPhone to share link" = "लिंक शेयर करने के लिए iPhone पर स्कैन करें";
 "Press ⌘V to paste" = "पेस्ट करने के लिए ⌘V दबाएँ";
 "Share the invitation link so others can join this room." = "निमंत्रण लिंक शेयर करें ताकि अन्य लोग इस रूम में शामिल हो सकें।";
+
+"Manage websites & sign in…" = "वेबसाइट और साइन-इन प्रबंधित करें…";
+"Websites & logins" = "वेबसाइट और लॉगिन";
+"Signed in to %@ — login is saved." = "%@ में साइन इन हो गया — लॉगिन सहेजा गया है।";
+"No websites saved yet. Sign in to a meeting website to keep it available for 1-click Instant meetings." = "अभी तक कोई वेबसाइट सहेजी नहीं गई है। 1-क्लिक तुरंत मीटिंग के लिए मीटिंग वेबसाइट में साइन इन करें।";
+"Signed-in websites and remembered servers stay listed here even after recent room links expire." = "हाल के रूम लिंक समाप्त होने के बाद भी साइन-इन की गई वेबसाइटें और सहेजे गए सर्वर यहाँ रहते हैं।";
+"Saved website" = "सहेजी गई वेबसाइट";
+"Remove website" = "वेबसाइट हटाएँ";
+"Remove %@" = "%@ हटाएँ";
+"Re-sign in…" = "फिर से साइन इन करें…";
+"Websites" = "वेबसाइटें";

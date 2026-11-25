@@ -21,6 +21,7 @@ private enum ActiveHomeSheet: Identifiable {
     case renameRoom(RecentRoom)
     case createRoom(URL?)
     case signInSite(URL?)
+    case manageWebsites
 
     var id: String {
         switch self {
@@ -33,6 +34,7 @@ private enum ActiveHomeSheet: Identifiable {
         case .renameRoom(let room): "rename.\(room.id)"
         case .createRoom(let url): "createRoom.\(url?.absoluteString ?? "default")"
         case .signInSite(let url): "signInSite.\(url?.absoluteString ?? "default")"
+        case .manageWebsites: "manageWebsites"
         }
     }
 
@@ -95,21 +97,27 @@ struct JoinView: View {
         SiteOrigin.suggestedOrigins(
             rooms: history.rooms,
             calendarMeetings: calendar.meetings,
-            fallbackOrigin: model.guestWebsiteOrigin
+            fallbackOrigin: model.guestWebsiteOrigin,
+            additionalOrigins: model.workspace.sessions.compactMap(\.invitation),
+            excludeReservedTestHosts: true
         )
     }
     private var instantAvailableOrigins: [URL] {
         InstantRoomPreferences.availableOrigins(
             accounts: siteAccounts.accounts,
             suggestedOrigins: suggestedSiteOrigins,
-            lastOrigin: preferredOriginOverride ?? InstantRoomPreferences.loadLastOrigin()
+            lastOrigin: preferredOriginOverride ?? InstantRoomPreferences.loadLastOrigin(),
+            rememberedOrigins: siteAccounts.rememberedOrigins,
+            dismissedOriginKeys: siteAccounts.dismissedOriginKeys
         )
     }
     private var preferredInstantOrigin: URL? {
         InstantRoomPreferences.preferredOrigin(
             accounts: siteAccounts.accounts,
             suggestedOrigins: suggestedSiteOrigins,
-            lastOrigin: preferredOriginOverride ?? InstantRoomPreferences.loadLastOrigin()
+            lastOrigin: preferredOriginOverride ?? InstantRoomPreferences.loadLastOrigin(),
+            rememberedOrigins: siteAccounts.rememberedOrigins,
+            dismissedOriginKeys: siteAccounts.dismissedOriginKeys
         )
     }
 
@@ -755,6 +763,7 @@ struct JoinView: View {
                             let label = account.map { "\(host) · \($0.displayAccountSummary)" } ?? host
                             Button {
                                 InstantRoomPreferences.saveLastOrigin(candidate)
+                                SiteAccountStore.shared.rememberOrigin(candidate, forceRestoreIfDismissed: true)
                                 preferredOriginOverride = candidate
                                 model.instantRoomError = nil
                                 model.instantRoomAuthChallengeOrigin = nil
@@ -768,7 +777,23 @@ struct JoinView: View {
                         }
                     }
                 }
+                if let origin,
+                   siteAccounts.account(for: origin)?.needsReauthentication != false {
+                    Button {
+                        activeSheet = .signInSite(origin)
+                    } label: {
+                        Label(
+                            L("Sign in to %@…", origin.host ?? origin.absoluteString),
+                            systemImage: "person.crop.circle.badge.checkmark"
+                        )
+                    }
+                }
                 Divider()
+                Button {
+                    activeSheet = .manageWebsites
+                } label: {
+                    Label(L("Manage websites & sign in…"), systemImage: "globe")
+                }
                 Button {
                     activeSheet = .createRoom(origin)
                 } label: {
@@ -1168,6 +1193,10 @@ struct JoinView: View {
                 suggestedOrigins: suggestedSiteOrigins
             ) { account in
                 activeSheet = nil
+                if let url = account.originURL {
+                    preferredOriginOverride = url
+                    InstantRoomPreferences.saveLastOrigin(url)
+                }
                 if let pendingOrigin = model.pendingInstantRoomOrigin {
                     model.pendingInstantRoomOrigin = nil
                     model.instantRoomAuthChallengeOrigin = nil
@@ -1179,6 +1208,17 @@ struct JoinView: View {
                     model.join()
                 }
             }
+        case .manageWebsites:
+            ManageWebsitesSheet(
+                suggestedOrigins: suggestedSiteOrigins,
+                onSelectOrigin: { origin in
+                    InstantRoomPreferences.saveLastOrigin(origin)
+                    preferredOriginOverride = origin
+                },
+                onCreateRoom: { origin in
+                    activeSheet = .createRoom(origin)
+                }
+            )
         }
     }
 
@@ -1647,7 +1687,8 @@ private struct MeetingWebsitesSettingsView: View {
         SiteOrigin.suggestedOrigins(
             rooms: history.rooms,
             calendarMeetings: calendar.meetings,
-            fallbackOrigin: model.guestWebsiteOrigin
+            fallbackOrigin: model.guestWebsiteOrigin,
+            excludeReservedTestHosts: true
         )
     }
 

@@ -4258,3 +4258,14 @@
 "Scan on iPhone to share link" = "Scannez sur iPhone pour partager le lien";
 "Press ⌘V to paste" = "Appuyez sur ⌘V pour coller";
 "Share the invitation link so others can join this room." = "Partagez le lien d’invitation pour que d’autres personnes puissent rejoindre cette salle.";
+
+"Manage websites & sign in…" = "Gérer les sites et connexions…";
+"Websites & logins" = "Sites web et connexions";
+"Signed in to %@ — login is saved." = "Connecté à %@ — connexion enregistrée.";
+"No websites saved yet. Sign in to a meeting website to keep it available for 1-click Instant meetings." = "Aucun site enregistré. Connectez-vous à un site de réunion pour lancer des réunions instantanées en 1 clic.";
+"Signed-in websites and remembered servers stay listed here even after recent room links expire." = "Les sites connectés et serveurs mémorisés restent ici même après l’expiration des liens récents.";
+"Saved website" = "Site enregistré";
+"Remove website" = "Supprimer le site";
+"Remove %@" = "Supprimer %@";
+"Re-sign in…" = "Se reconnecter…";
+"Websites" = "Sites web";

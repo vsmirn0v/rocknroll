@@ -123,7 +123,8 @@ public struct SiteSignInSheet: View {
                     .navigationBarTitleDisplayMode(.inline)
                     .toolbar {
                         ToolbarItem(placement: .cancellationAction) {
-                            Button(L("Cancel")) { dismiss() }
+                            let isSignedIn = resolvedOrigin.flatMap({ store.account(for: $0)?.isSignedIn }) == true
+                            Button(isSignedIn ? L("Done") : L("Cancel")) { dismiss() }
                         }
                     }
             }
@@ -383,11 +384,18 @@ public struct SiteSignInSheet: View {
                               let targetHost = origin.host,
                               let currentHost = url.host,
                               SiteOrigin.hostMatches(currentHost, siteHost: targetHost) else {
+                            // Clear lastAutoVerifyURL when hopping off-origin to an IdP (e.g. passport.yandex.ru)
+                            // so returning to the same site URL triggers auto-verification.
+                            lastAutoVerifyURL = nil
                             return
                         }
                         let lowerPath = url.path.lowercased()
-                        let looksLikeLoginPage = lowerPath.contains("login") || lowerPath.contains("signin") || lowerPath.contains("sso")
-                        if !looksLikeLoginPage && lastAutoVerifyURL != url.absoluteString {
+                        let looksLikeLoginPage = lowerPath.contains("login") || lowerPath.contains("signin") || lowerPath.contains("sso") || lowerPath.contains("auth") || currentHost.lowercased().hasPrefix("passport.")
+                        if looksLikeLoginPage {
+                            lastAutoVerifyURL = nil
+                            return
+                        }
+                        if lastAutoVerifyURL != url.absoluteString {
                             lastAutoVerifyURL = url.absoluteString
                             await verifyWebSession(origin: origin, interactive: false)
                         }

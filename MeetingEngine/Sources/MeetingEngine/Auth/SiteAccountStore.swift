@@ -7,9 +7,15 @@ public final class SiteAccountStore: ObservableObject {
 
     @Published public private(set) var accounts: [SiteAccountRecord] = []
     @Published public private(set) var certificates: [ClientCertificateRecord] = []
+    @Published public private(set) var rememberedOrigins: [URL] = []
+    @Published public private(set) var dismissedOriginKeys: Set<String> = []
     #if os(macOS)
     @Published public private(set) var systemCertificates: [ClientCertificateRecord] = []
     #endif
+
+    private static let rememberedOriginsDefaultsKey = "siteAuth.rememberedOrigins.v1"
+    private static let dismissedOriginsDefaultsKey = "siteAuth.dismissedOrigins.v1"
+    private static let maxRememberedOrigins = 24
 
     public let registry: SiteClientIdentityRegistry
     public var secretStore: any SiteSecretStoring { registry.secretStore }
@@ -92,6 +98,9 @@ public final class SiteAccountStore: ObservableObject {
         }
         accounts.sort { $0.hostDisplayName.localizedCaseInsensitiveCompare($1.hostDisplayName) == .orderedAscending }
         persistAccounts()
+        if record.engine != .community, let url = record.originURL {
+            rememberOrigin(url, engine: record.engine, forceRestoreIfDismissed: true)
+        }
         if let host = URL(string: record.originKey)?.host {
             clearClientCertificateChallenge(host: host)
         }
@@ -164,6 +173,53 @@ public final class SiteAccountStore: ObservableObject {
             _ = upsertAccount(existing, preservingCertificate: false)
         } else {
             removeSite(originKey: key)
+        }
+    }
+
+    public func rememberOrigin(_ url: URL, engine: MeetingEngineKind? = nil, forceRestoreIfDismissed: Bool = false) {
+        guard engine != .community,
+              let canonical = SiteOrigin.canonicalOrigin(for: url),
+              let host = canonical.host?.lowercased(),
+              host != "rock.glowsoft.ru",
+              !SiteOrigin.isReservedTestHost(host) else {
+            return
+        }
+        let key = canonical.absoluteString
+        if !forceRestoreIfDismissed && dismissedOriginKeys.contains(key) {
+            return
+        }
+        if forceRestoreIfDismissed && dismissedOriginKeys.remove(key) != nil {
+            persistDismissedOrigins()
+        }
+        if let existingIdx = rememberedOrigins.firstIndex(where: { $0.absoluteString == key }) {
+            if existingIdx == 0 { return }
+            rememberedOrigins.remove(at: existingIdx)
+        }
+        rememberedOrigins.insert(canonical, at: 0)
+        if rememberedOrigins.count > Self.maxRememberedOrigins {
+            rememberedOrigins = Array(rememberedOrigins.prefix(Self.maxRememberedOrigins))
+        }
+        persistRememberedOrigins()
+    }
+
+    public func forgetSite(origin url: URL) {
+        guard let key = SiteOrigin.canonicalKey(for: url) else { return }
+        forgetSite(originKey: key)
+    }
+
+    public func forgetSite(originKey: String) {
+        let key = SiteOrigin.canonicalKey(normalizing: originKey) ?? originKey.lowercased()
+        removeSite(originKey: key)
+        if let idxList = rememberedOrigins.firstIndex(where: { $0.absoluteString == key }) {
+            _ = idxList
+            rememberedOrigins.removeAll { $0.absoluteString == key }
+            persistRememberedOrigins()
+        }
+        if dismissedOriginKeys.insert(key).inserted {
+            persistDismissedOrigins()
+        }
+        if InstantRoomPreferences.loadLastOrigin(defaults: preferences)?.absoluteString == key {
+            InstantRoomPreferences.clearLastOrigin(defaults: preferences)
         }
     }
 
@@ -283,6 +339,22 @@ public final class SiteAccountStore: ObservableObject {
            let decoded = try? JSONDecoder().decode([ClientCertificateRecord].self, from: data) {
             certificates = decoded
         }
+        if let rawList = preferences.array(forKey: Self.rememberedOriginsDefaultsKey) as? [String] {
+            var loaded: [URL] = []
+            var seen = Set<String>()
+            for raw in rawList {
+                guard let url = SiteOrigin.normalize(raw),
+                      let host = url.host?.lowercased(),
+                      host != "rock.glowsoft.ru",
+                      !SiteOrigin.isReservedTestHost(host),
+                      seen.insert(url.absoluteString).inserted else { continue }
+                loaded.append(url)
+            }
+            rememberedOrigins = loaded
+        }
+        if let dismissed = preferences.array(forKey: Self.dismissedOriginsDefaultsKey) as? [String] {
+            dismissedOriginKeys = Set(dismissed.compactMap { SiteOrigin.canonicalKey(normalizing: $0) })
+        }
         syncSnapshot()
     }
 
@@ -297,6 +369,14 @@ public final class SiteAccountStore: ObservableObject {
         if let data = try? JSONEncoder().encode(certificates) {
             preferences.set(data, forKey: SiteClientIdentityRegistry.certificatesDefaultsKey)
         }
+    }
+
+    private func persistRememberedOrigins() {
+        preferences.set(rememberedOrigins.map(\.absoluteString), forKey: Self.rememberedOriginsDefaultsKey)
+    }
+
+    private func persistDismissedOrigins() {
+        preferences.set(Array(dismissedOriginKeys).sorted(), forKey: Self.dismissedOriginsDefaultsKey)
     }
 
     private func syncSnapshot() {

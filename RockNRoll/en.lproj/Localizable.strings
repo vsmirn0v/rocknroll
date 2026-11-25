@@ -4486,3 +4486,14 @@
 "Scan on iPhone to share link" = "Scan on iPhone to share link";
 "Press ⌘V to paste" = "Press ⌘V to paste";
 "Share the invitation link so others can join this room." = "Share the invitation link so others can join this room.";
+
+"Manage websites & sign in…" = "Manage websites & sign in…";
+"Websites & logins" = "Websites & logins";
+"Signed in to %@ — login is saved." = "Signed in to %@ — login is saved.";
+"No websites saved yet. Sign in to a meeting website to keep it available for 1-click Instant meetings." = "No websites saved yet. Sign in to a meeting website to keep it available for 1-click Instant meetings.";
+"Signed-in websites and remembered servers stay listed here even after recent room links expire." = "Signed-in websites and remembered servers stay listed here even after recent room links expire.";
+"Saved website" = "Saved website";
+"Remove website" = "Remove website";
+"Remove %@" = "Remove %@";
+"Re-sign in…" = "Re-sign in…";
+"Websites" = "Websites";

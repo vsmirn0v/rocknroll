@@ -43,6 +43,7 @@ public struct CreateRoomSheet: View {
     @State private var lastAttemptJoinImmediately = true
     @State private var createdRoom: CreatedMeetingRoom?
     @State private var copiedFeedback = false
+    @State private var signedInHostBanner: String?
 
     public init(
         initialOrigin: URL? = nil,
@@ -66,9 +67,14 @@ public struct CreateRoomSheet: View {
         for account in store.accounts where account.engine != .community {
             if let url = account.originURL { candidates.append(url) }
         }
+        candidates.append(contentsOf: store.rememberedOrigins)
         candidates.append(contentsOf: suggestedOrigins)
         for url in candidates {
-            guard let canonical = SiteOrigin.canonicalOrigin(for: url) else { continue }
+            guard let canonical = SiteOrigin.canonicalOrigin(for: url),
+                  let host = canonical.host?.lowercased(),
+                  host != "rock.glowsoft.ru",
+                  !SiteOrigin.isReservedTestHost(host),
+                  !store.dismissedOriginKeys.contains(canonical.absoluteString) else { continue }
             if seen.insert(canonical.absoluteString).inserted {
                 result.append(canonical)
             }
@@ -106,7 +112,7 @@ public struct CreateRoomSheet: View {
                     Text(L("New room"))
                         .font(.headline)
                     Spacer()
-                    Button(createdRoom == nil ? L("Cancel") : L("Done")) { dismiss() }
+                    Button(createdRoom == nil && signedInHostBanner == nil ? L("Cancel") : L("Done")) { dismiss() }
                         .keyboardShortcut(.cancelAction)
                 }
                 .padding(.horizontal, 16)
@@ -123,7 +129,7 @@ public struct CreateRoomSheet: View {
                     .navigationBarTitleDisplayMode(.inline)
                     .toolbar {
                         ToolbarItem(placement: .cancellationAction) {
-                            Button(createdRoom == nil ? L("Cancel") : L("Done")) { dismiss() }
+                            Button(createdRoom == nil && signedInHostBanner == nil ? L("Cancel") : L("Done")) { dismiss() }
                         }
                     }
             }
@@ -160,6 +166,15 @@ public struct CreateRoomSheet: View {
 
     private var siteSelectionSection: some View {
         Section {
+            if let signedHost = signedInHostBanner {
+                Label(
+                    L("Signed in to %@ — login is saved.", signedHost),
+                    systemImage: "checkmark.circle.fill"
+                )
+                .font(.caption.weight(.medium))
+                .foregroundStyle(.green)
+                .accessibilityIdentifier("createRoom.signedInBanner")
+            }
             Picker(L("Website"), selection: $sitePickerValue) {
                 ForEach(availableSites, id: \.absoluteString) { origin in
                     let account = store.account(for: origin)
@@ -359,8 +374,9 @@ public struct CreateRoomSheet: View {
         if let url = account.originURL {
             sitePickerValue = url.absoluteString
             selectedEngineOverride = account.engine
-            UserDefaults.standard.set(url.absoluteString, forKey: Self.lastOriginKey)
+            InstantRoomPreferences.saveLastOrigin(url)
         }
+        signedInHostBanner = account.hostDisplayName
         errorMessage = nil
         signInRequiredOrigin = nil
         if retryAfterSignInJoin {

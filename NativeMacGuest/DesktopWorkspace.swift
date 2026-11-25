@@ -102,6 +102,14 @@ import UserNotifications
 
     var instantRoomPreferencesDefaults: UserDefaults = .standard
     var instantRoomAccountsProvider: @MainActor () -> [SiteAccountRecord] = { SiteAccountStore.shared.accounts }
+    var instantRoomRememberedOriginsProvider: @MainActor () -> [URL] = { SiteAccountStore.shared.rememberedOrigins }
+    var instantRoomDismissedOriginsProvider: @MainActor () -> Set<String> = { SiteAccountStore.shared.dismissedOriginKeys }
+    var rememberInstantOriginHandler: @MainActor (URL, MeetingEngineKind?, Bool) -> Void = { origin, engine, restore in
+        SiteAccountStore.shared.rememberOrigin(origin, engine: engine, forceRestoreIfDismissed: restore)
+    }
+    var forgetInstantOriginHandler: @MainActor (URL) -> Void = { origin in
+        SiteAccountStore.shared.forgetSite(origin: origin)
+    }
     var createInstantRoomHandler: (@MainActor (URL, MeetingEngineKind?) async throws -> CreatedMeetingRoom)?
     var copyInvitationToClipboard: (@MainActor (String) -> Void) = { text in
         NSPasteboard.general.clearContents()
@@ -198,6 +206,13 @@ import UserNotifications
         Task { [weak self] in
             guard let self else { return }
             await self.attention.store.waitForMeetingLibrary()
+            if let sessions = try? await self.attention.store.meetingLibrary.store.sessions() {
+                for session in sessions {
+                    if let invitation = session.invitation {
+                        self.rememberInstantOriginHandler(invitation, nil, false)
+                    }
+                }
+            }
             self.obsidian.load()
             await self.attention.store.seedTaskProfileWithMeetingName(self.library.displayName)
         }
@@ -818,6 +833,7 @@ import UserNotifications
                 library.recordJoin(invitation: model.invitation, title: model.title,
                     identifier: destination.roomIdentifier, engine: model.kind,
                     eventID: calendarMeeting?.id ?? eventID, endpoint: endpointString, since: connectedAt)
+                rememberInstantOriginHandler(model.invitation, model.kind, false)
                 library.continuation.targetDidConnect(invitation: model.invitation, sessionID: requestedSession)
                 updateContinuation()
                 library.calendar.reminders.activeConnectionsChanged()
@@ -872,7 +888,8 @@ import UserNotifications
         SiteOrigin.suggestedOrigins(
             rooms: library.history.rooms,
             calendarMeetings: library.calendar.meetings,
-            fallbackOrigin: library.guestWebsiteOrigin
+            fallbackOrigin: library.guestWebsiteOrigin,
+            excludeReservedTestHosts: true
         )
     }
 
@@ -880,7 +897,9 @@ import UserNotifications
         InstantRoomPreferences.availableOrigins(
             accounts: instantRoomAccountsProvider(),
             suggestedOrigins: suggestedSiteOrigins,
-            lastOrigin: instantRoomPreferredOrigin ?? InstantRoomPreferences.loadLastOrigin(defaults: instantRoomPreferencesDefaults)
+            lastOrigin: instantRoomPreferredOrigin ?? InstantRoomPreferences.loadLastOrigin(defaults: instantRoomPreferencesDefaults),
+            rememberedOrigins: instantRoomRememberedOriginsProvider(),
+            dismissedOriginKeys: instantRoomDismissedOriginsProvider()
         )
     }
 
@@ -888,14 +907,29 @@ import UserNotifications
         InstantRoomPreferences.preferredOrigin(
             accounts: instantRoomAccountsProvider(),
             suggestedOrigins: suggestedSiteOrigins,
-            lastOrigin: instantRoomPreferredOrigin ?? InstantRoomPreferences.loadLastOrigin(defaults: instantRoomPreferencesDefaults)
+            lastOrigin: instantRoomPreferredOrigin ?? InstantRoomPreferences.loadLastOrigin(defaults: instantRoomPreferencesDefaults),
+            rememberedOrigins: instantRoomRememberedOriginsProvider(),
+            dismissedOriginKeys: instantRoomDismissedOriginsProvider()
         )
     }
 
     func selectInstantOrigin(_ origin: URL) {
         let canonical = SiteOrigin.canonicalOrigin(for: origin) ?? origin
         InstantRoomPreferences.saveLastOrigin(canonical, defaults: instantRoomPreferencesDefaults)
+        rememberInstantOriginHandler(canonical, nil, true)
         instantRoomPreferredOrigin = canonical
+    }
+
+    func removeInstantOrigin(_ origin: URL) {
+        let canonical = SiteOrigin.canonicalOrigin(for: origin) ?? origin
+        forgetInstantOriginHandler(canonical)
+        if InstantRoomPreferences.loadLastOrigin(defaults: instantRoomPreferencesDefaults) == canonical {
+            InstantRoomPreferences.clearLastOrigin(defaults: instantRoomPreferencesDefaults)
+        }
+        if instantRoomPreferredOrigin == canonical {
+            instantRoomPreferredOrigin = nil
+        }
+        refreshMenu()
     }
 
     func startInstantRoom(on origin: URL? = nil, explicitEngine: MeetingEngineKind? = nil) async {
@@ -1798,7 +1832,7 @@ import UserNotifications
         library.objectWillChange.sink { [weak self] in
             Task { @MainActor in self?.refreshMenu() }
         }.store(in: &subscriptions)
-        SiteAccountStore.shared.$accounts.sink { [weak self] _ in
+        SiteAccountStore.shared.objectWillChange.sink { [weak self] _ in
             Task { @MainActor in self?.refreshMenu() }
         }.store(in: &subscriptions)
     }

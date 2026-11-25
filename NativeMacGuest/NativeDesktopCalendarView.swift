@@ -810,7 +810,8 @@ struct NativeDesktopCalendarView: View {
             let suggestedOrigins = SiteOrigin.suggestedOrigins(
                 rooms: roomHistory.rooms,
                 calendarMeetings: calendar.meetings,
-                fallbackOrigin: library.guestWebsiteOrigin
+                fallbackOrigin: library.guestWebsiteOrigin,
+                excludeReservedTestHosts: true
             )
             CreateCalendarMeetingSheet(
                 initialDate: selectedDate ?? Date(),

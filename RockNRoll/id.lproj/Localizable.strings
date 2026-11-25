@@ -4258,3 +4258,14 @@
 "Scan on iPhone to share link" = "Pindai di iPhone untuk membagikan tautan";
 "Press ⌘V to paste" = "Tekan ⌘V untuk menempel";
 "Share the invitation link so others can join this room." = "Bagikan tautan undangan agar orang lain dapat bergabung ke ruang ini.";
+
+"Manage websites & sign in…" = "Kelola situs & masuk…";
+"Websites & logins" = "Situs web & login";
+"Signed in to %@ — login is saved." = "Masuk ke %@ — login tersimpan.";
+"No websites saved yet. Sign in to a meeting website to keep it available for 1-click Instant meetings." = "Belum ada situs tersimpan. Masuk ke situs rapat agar tersedia untuk Rapat Instan 1 klik.";
+"Signed-in websites and remembered servers stay listed here even after recent room links expire." = "Situs yang sudah masuk dan server yang diingat tetap ada di sini meskipun tautan ruang terbaru kedaluwarsa.";
+"Saved website" = "Situs tersimpan";
+"Remove website" = "Hapus situs";
+"Remove %@" = "Hapus %@";
+"Re-sign in…" = "Masuk ulang…";
+"Websites" = "Situs web";

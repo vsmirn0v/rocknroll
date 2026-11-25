@@ -146,7 +146,7 @@ public struct SiteAccountsSection: View {
                     .contentShape(Rectangle())
                 }
                 Button(L("Remove"), role: .destructive) {
-                    store.removeSite(originKey: account.originKey)
+                    store.forgetSite(originKey: account.originKey)
                 }
                 .font(.caption)
                 .frame(minHeight: 36)
@@ -280,5 +280,213 @@ public struct SiteCertificatesSection: View {
             parts.append(cert.isExpired ? L("Expired %@", formatted) : L("Expires %@", formatted))
         }
         return parts.joined(separator: " · ")
+    }
+}
+
+public struct ManageWebsitesSheet: View {
+    private enum SheetRequest: Identifiable {
+        case blank
+        case origin(URL)
+
+        var id: String {
+            switch self {
+            case .blank: return "blank"
+            case .origin(let url): return "origin:\(url.absoluteString)"
+            }
+        }
+    }
+
+    public let suggestedOrigins: [URL]
+    public let onSelectOrigin: (@MainActor (URL) -> Void)?
+    public let onCreateRoom: (@MainActor (URL) -> Void)?
+
+    @Environment(\.dismiss) private var dismiss
+    @ObservedObject private var store = SiteAccountStore.shared
+    @State private var signInRequest: SheetRequest?
+    @State private var savedBannerHost: String?
+
+    public init(
+        suggestedOrigins: [URL] = [],
+        onSelectOrigin: (@MainActor (URL) -> Void)? = nil,
+        onCreateRoom: (@MainActor (URL) -> Void)? = nil
+    ) {
+        self.suggestedOrigins = suggestedOrigins
+        self.onSelectOrigin = onSelectOrigin
+        self.onCreateRoom = onCreateRoom
+    }
+
+    private var allKnownOrigins: [URL] {
+        InstantRoomPreferences.availableOrigins(
+            accounts: store.accounts,
+            suggestedOrigins: suggestedOrigins,
+            lastOrigin: nil,
+            rememberedOrigins: store.rememberedOrigins,
+            dismissedOriginKeys: store.dismissedOriginKeys
+        )
+    }
+
+    public var body: some View {
+        Group {
+            #if os(macOS)
+            VStack(spacing: 0) {
+                HStack {
+                    Text(L("Websites & logins"))
+                        .font(.headline)
+                    Spacer()
+                    Button(L("Done")) { dismiss() }
+                        .buttonStyle(.borderedProminent)
+                        .keyboardShortcut(.cancelAction)
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 12)
+                Divider()
+                contentForm
+                    .formStyle(.grouped)
+            }
+            .frame(minWidth: 500, idealWidth: 560, minHeight: 440, idealHeight: 520)
+            #else
+            NavigationStack {
+                contentForm
+                    .navigationTitle(L("Websites & logins"))
+                    .navigationBarTitleDisplayMode(.inline)
+                    .toolbar {
+                        ToolbarItem(placement: .confirmationAction) {
+                            Button(L("Done")) { dismiss() }
+                        }
+                    }
+            }
+            #endif
+        }
+        .sheet(item: $signInRequest) { request in
+            switch request {
+            case .blank:
+                SiteSignInSheet(initialOrigin: nil, suggestedOrigins: suggestedOrigins) { account in
+                    savedBannerHost = account.hostDisplayName
+                    if let url = account.originURL { onSelectOrigin?(url) }
+                }
+            case .origin(let origin):
+                SiteSignInSheet(initialOrigin: origin, suggestedOrigins: suggestedOrigins) { account in
+                    savedBannerHost = account.hostDisplayName
+                    if let url = account.originURL { onSelectOrigin?(url) }
+                }
+            }
+        }
+    }
+
+    private var contentForm: some View {
+        Form {
+            if let host = savedBannerHost {
+                Section {
+                    Label(L("Signed in to %@ — login is saved.", host), systemImage: "checkmark.circle.fill")
+                        .font(.subheadline.weight(.medium))
+                        .foregroundStyle(.green)
+                }
+            }
+
+            Section {
+                if allKnownOrigins.isEmpty {
+                    Text(L("No websites saved yet. Sign in to a meeting website to keep it available for 1-click Instant meetings."))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(allKnownOrigins, id: \.absoluteString) { origin in
+                        let account = store.account(for: origin)
+                        websiteRow(origin: origin, account: account)
+                    }
+                }
+
+                Button {
+                    signInRequest = .blank
+                } label: {
+                    Label(L("Sign in to another website…"), systemImage: "person.badge.plus")
+                }
+                .accessibilityIdentifier("manageWebsites.add")
+            } header: {
+                Text(L("Meeting websites"))
+            } footer: {
+                Text(L("Signed-in websites and remembered servers stay listed here even after recent room links expire."))
+                    .font(.caption)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func websiteRow(origin: URL, account: SiteAccountRecord?) -> some View {
+        let host = origin.host ?? origin.absoluteString
+        HStack(spacing: 10) {
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 6) {
+                    Text(host)
+                        .font(.headline)
+                    statusPill(account: account)
+                }
+                if let account {
+                    Text("\(SiteAuthEngineLabel.title(for: account.engine)) · \(account.displayAccountSummary)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text(L("Saved website"))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            Spacer(minLength: 8)
+            if let onCreateRoom {
+                Button(L("New room")) {
+                    dismiss()
+                    onCreateRoom(origin)
+                }
+                .font(.caption)
+            }
+            Button(account == nil || account?.needsReauthentication == true ? L("Sign in…") : L("Re-sign in…")) {
+                signInRequest = .origin(origin)
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+
+            Button(role: .destructive) {
+                store.forgetSite(origin: origin)
+            } label: {
+                Image(systemName: "trash")
+            }
+            .buttonStyle(.borderless)
+            .help(L("Remove website"))
+            .accessibilityLabel(L("Remove %@", host))
+        }
+        .padding(.vertical, 3)
+    }
+
+    @ViewBuilder
+    private func statusPill(account: SiteAccountRecord?) -> some View {
+        if let account {
+            if account.needsReauthentication {
+                Text(L("Expired"))
+                    .font(.caption2.weight(.semibold))
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 2)
+                    .background(Color.orange.opacity(0.2), in: Capsule())
+                    .foregroundStyle(.orange)
+            } else if account.authMethod == .mtlsOnly {
+                Text(L("mTLS"))
+                    .font(.caption2.weight(.semibold))
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 2)
+                    .background(Color.accentColor.opacity(0.18), in: Capsule())
+            } else {
+                Text(L("Signed in"))
+                    .font(.caption2.weight(.semibold))
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 2)
+                    .background(Color.green.opacity(0.18), in: Capsule())
+                    .foregroundStyle(.green)
+            }
+        } else {
+            Text(L("Saved website"))
+                .font(.caption2.weight(.medium))
+                .padding(.horizontal, 7)
+                .padding(.vertical, 2)
+                .background(.quaternary.opacity(0.6), in: Capsule())
+                .foregroundStyle(.secondary)
+        }
     }
 }

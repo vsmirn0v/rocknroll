@@ -7,7 +7,9 @@ public enum InstantRoomPreferences {
 
     private static func isSupportedCreationOrigin(_ url: URL) -> URL? {
         guard let canonical = SiteOrigin.canonicalOrigin(for: url),
-              canonical.host?.lowercased() != "rock.glowsoft.ru" else {
+              let host = canonical.host?.lowercased(),
+              host != "rock.glowsoft.ru",
+              !SiteOrigin.isReservedTestHost(host) else {
             return nil
         }
         return canonical
@@ -26,22 +28,30 @@ public enum InstantRoomPreferences {
         defaults.set(canonical.absoluteString, forKey: lastOriginKey)
     }
 
+    public static func clearLastOrigin(defaults: UserDefaults = .standard) {
+        defaults.removeObject(forKey: lastOriginKey)
+    }
+
     /// Ordered deduplicated list of candidate room-creation origins:
     /// 1. Remembered last origin
     /// 2. Signed-in non-community accounts (active sessions first)
     /// 3. Remaining non-community accounts
-    /// 4. Suggested origins from history/calendar/fallback
+    /// 4. Persisted remembered origins
+    /// 5. Suggested origins from history/calendar/fallback
     public static func availableOrigins(
         accounts: [SiteAccountRecord],
         suggestedOrigins: [URL],
-        lastOrigin: URL? = nil
+        lastOrigin: URL? = nil,
+        rememberedOrigins: [URL] = [],
+        dismissedOriginKeys: Set<String> = []
     ) -> [URL] {
         var result: [URL] = []
         var seen = Set<String>()
 
         func append(_ rawURL: URL?) {
             guard let rawURL,
-                  let canonical = isSupportedCreationOrigin(rawURL) else {
+                  let canonical = isSupportedCreationOrigin(rawURL),
+                  !dismissedOriginKeys.contains(canonical.absoluteString) else {
                 return
             }
             if seen.insert(canonical.absoluteString).inserted {
@@ -56,6 +66,9 @@ public enum InstantRoomPreferences {
         for account in accounts where account.engine != .community && account.needsReauthentication {
             append(account.originURL)
         }
+        for origin in rememberedOrigins {
+            append(origin)
+        }
         for origin in suggestedOrigins {
             append(origin)
         }
@@ -65,9 +78,17 @@ public enum InstantRoomPreferences {
     public static func preferredOrigin(
         accounts: [SiteAccountRecord],
         suggestedOrigins: [URL],
-        lastOrigin: URL? = nil
+        lastOrigin: URL? = nil,
+        rememberedOrigins: [URL] = [],
+        dismissedOriginKeys: Set<String> = []
     ) -> URL? {
-        availableOrigins(accounts: accounts, suggestedOrigins: suggestedOrigins, lastOrigin: lastOrigin).first
+        availableOrigins(
+            accounts: accounts,
+            suggestedOrigins: suggestedOrigins,
+            lastOrigin: lastOrigin,
+            rememberedOrigins: rememberedOrigins,
+            dismissedOriginKeys: dismissedOriginKeys
+        ).first
     }
 
     public static func defaultRoomTitle(displayName: String) -> String {

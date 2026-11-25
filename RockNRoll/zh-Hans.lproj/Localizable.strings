@@ -4258,3 +4258,14 @@
 "Scan on iPhone to share link" = "在 iPhone 上扫描以共享链接";
 "Press ⌘V to paste" = "按 ⌘V 粘贴";
 "Share the invitation link so others can join this room." = "共享邀请链接，以便其他人加入此房间。";
+
+"Manage websites & sign in…" = "管理网站与登录…";
+"Websites & logins" = "网站与登录";
+"Signed in to %@ — login is saved." = "已登录 %@ — 登录已保存。";
+"No websites saved yet. Sign in to a meeting website to keep it available for 1-click Instant meetings." = "尚无已保存的网站。登录会议网站即可一键发起快速会议。";
+"Signed-in websites and remembered servers stay listed here even after recent room links expire." = "即使最近的房间链接过期，已登录的网站和记住的服务器也会保留在此列表中。";
+"Saved website" = "已保存的网站";
+"Remove website" = "移除网站";
+"Remove %@" = "移除 %@";
+"Re-sign in…" = "重新登录…";
+"Websites" = "网站";

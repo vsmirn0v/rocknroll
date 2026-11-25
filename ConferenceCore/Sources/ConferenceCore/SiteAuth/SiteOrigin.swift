@@ -5,6 +5,18 @@ import Foundation
 public enum SiteOrigin {
     public static let telemostCanonicalOrigin = URL(string: "https://telemost.yandex.ru")!
 
+    /// True for RFC 2606 / RFC 6761 reserved local and test hostnames (`example.test`, `*.test`, `localhost`, `*.invalid`)
+    /// so test fixture URLs never leak into production website pickers.
+    public static func isReservedTestHost(_ host: String) -> Bool {
+        let lower = host.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return lower == "localhost"
+            || lower.hasSuffix(".localhost")
+            || lower == "test"
+            || lower.hasSuffix(".test")
+            || lower == "invalid"
+            || lower.hasSuffix(".invalid")
+    }
+
     /// Normalizes user-entered text or a URL into its canonical HTTPS origin.
     public static func normalize(_ raw: String) -> URL? {
         var text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -87,11 +99,14 @@ public enum SiteOrigin {
     }
 
     /// Combines unique canonical HTTPS origins from user-configured fallback website,
-    /// starred favorites, recent meeting history, and calendar invitations (excluding community jam hosts).
+    /// starred favorites, recent meeting history, calendar invitations, and optional extra origins
+    /// (excluding community jam hosts and optionally reserved test hosts).
     public static func suggestedOrigins(
         rooms: [RecentRoom],
         calendarMeetings: [CalendarMeeting] = [],
-        fallbackOrigin: String? = nil
+        fallbackOrigin: String? = nil,
+        additionalOrigins: [URL] = [],
+        excludeReservedTestHosts: Bool = false
     ) -> [URL] {
         var result: [URL] = []
         var seen = Set<String>()
@@ -101,8 +116,12 @@ public enum SiteOrigin {
             if explicitEngine == nil, (try? JamTarget.parse(url.absoluteString)) != nil {
                 return
             }
-            guard let canonical = canonicalOrigin(for: url) else { return }
-            if canonical.host?.lowercased() == "rock.glowsoft.ru" {
+            guard let canonical = canonicalOrigin(for: url),
+                  let host = canonical.host?.lowercased(),
+                  host != "rock.glowsoft.ru" else {
+                return
+            }
+            if excludeReservedTestHosts && isReservedTestHost(host) {
                 return
             }
             if seen.insert(canonical.absoluteString).inserted {
@@ -131,6 +150,9 @@ public enum SiteOrigin {
                     appendOrigin(parsed.invitationURL, explicitEngine: nil)
                 }
             }
+        }
+        for extra in additionalOrigins {
+            appendOrigin(extra, explicitEngine: nil)
         }
         return result
     }

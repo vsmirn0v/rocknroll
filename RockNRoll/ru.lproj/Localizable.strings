@@ -4485,3 +4485,14 @@
 "Scan on iPhone to share link" = "Отсканируйте на iPhone, чтобы поделиться ссылкой";
 "Press ⌘V to paste" = "Нажмите ⌘V, чтобы вставить";
 "Share the invitation link so others can join this room." = "Поделитесь ссылкой-приглашением, чтобы другие могли присоединиться к этой комнате.";
+
+"Manage websites & sign in…" = "Сайты и входы…";
+"Websites & logins" = "Сайты и входы";
+"Signed in to %@ — login is saved." = "Вход на %@ выполнен — данные сохранены.";
+"No websites saved yet. Sign in to a meeting website to keep it available for 1-click Instant meetings." = "Нет сохранённых сайтов. Войдите на сайт встреч, чтобы запускать быстрые встречи в 1 клик.";
+"Signed-in websites and remembered servers stay listed here even after recent room links expire." = "Сайты с сохранённым входом и недавние серверы остаются в списке даже после истечения старых ссылок.";
+"Saved website" = "Сохранённый сайт";
+"Remove website" = "Удалить сайт";
+"Remove %@" = "Удалить %@";
+"Re-sign in…" = "Войти снова…";
+"Websites" = "Сайты";

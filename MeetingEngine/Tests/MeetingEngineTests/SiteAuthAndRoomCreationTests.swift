@@ -1050,13 +1050,13 @@ final class SiteAuthAndRoomCreationTests: XCTestCase {
         XCTAssertEqual(InstantRoomPreferences.loadLastOrigin(defaults: defaults), URL(string: "https://meet.corp.ru")!)
 
         let activeAccount = SiteAccountRecord(
-            originKey: "https://jazz.active.test",
+            originKey: "https://jazz.active.example.org",
             engine: .guest,
             authMethod: .webSSO,
             needsReauthentication: false
         )
         let expiredAccount = SiteAccountRecord(
-            originKey: "https://jazz.expired.test",
+            originKey: "https://jazz.expired.example.org",
             engine: .guest,
             authMethod: .webSSO,
             needsReauthentication: true
@@ -1068,20 +1068,30 @@ final class SiteAuthAndRoomCreationTests: XCTestCase {
             needsReauthentication: false
         )
 
+        // Reserved .test / localhost domains never appear in user-facing website lists.
+        InstantRoomPreferences.saveLastOrigin(URL(string: "https://example.test/calls/probe")!, defaults: defaults)
+        XCTAssertEqual(InstantRoomPreferences.loadLastOrigin(defaults: defaults), URL(string: "https://meet.corp.ru")!)
+
         let origins = InstantRoomPreferences.availableOrigins(
             accounts: [expiredAccount, communityAccount, activeAccount],
             suggestedOrigins: [
                 URL(string: "https://rock.glowsoft.ru")!,
+                URL(string: "https://example.test/calls/leak")!,
                 URL(string: "https://telemost.yandex.ru")!,
-                URL(string: "https://jazz.active.test/ignored")!
+                URL(string: "https://jazz.active.example.org/ignored")!
             ],
-            lastOrigin: saved
+            lastOrigin: saved,
+            rememberedOrigins: [
+                URL(string: "https://tc.domrf.ru")!,
+                URL(string: "https://example.test")!
+            ],
+            dismissedOriginKeys: ["https://jazz.expired.example.org"]
         )
 
         XCTAssertEqual(origins, [
             URL(string: "https://meet.corp.ru")!,
-            URL(string: "https://jazz.active.test")!,
-            URL(string: "https://jazz.expired.test")!,
+            URL(string: "https://jazz.active.example.org")!,
+            URL(string: "https://tc.domrf.ru")!,
             URL(string: "https://telemost.yandex.ru")!
         ])
         XCTAssertEqual(
@@ -1090,10 +1100,37 @@ final class SiteAuthAndRoomCreationTests: XCTestCase {
                 suggestedOrigins: [URL(string: "https://telemost.yandex.ru")!],
                 lastOrigin: nil
             ),
-            URL(string: "https://jazz.active.test")!
+            URL(string: "https://jazz.active.example.org")!
         )
 
         XCTAssertEqual(InstantRoomPreferences.defaultRoomTitle(displayName: "   "), L("New meeting"))
         XCTAssertEqual(InstantRoomPreferences.defaultRoomTitle(displayName: "  Alex  "), L("%@’s meeting", "Alex"))
+    }
+
+    @MainActor
+    func testSiteAccountStoreRemembersAndForgetsSitesAcrossSessions() {
+        let suiteName = "SiteAccountRememberTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let store = SiteAccountStore(preferences: defaults, loadSystemIdentities: false)
+        store.rememberOrigin(URL(string: "https://telemost.360.yandex.ru/j/123")!)
+        store.rememberOrigin(URL(string: "https://example.test/calls/ignored")!)
+        store.rememberOrigin(URL(string: "https://rock.glowsoft.ru/jams/ignored")!, engine: .community)
+
+        XCTAssertEqual(store.rememberedOrigins, [URL(string: "https://telemost.yandex.ru")!])
+
+        store.forgetSite(origin: URL(string: "https://telemost.yandex.ru")!)
+        XCTAssertTrue(store.rememberedOrigins.isEmpty)
+        XCTAssertTrue(store.dismissedOriginKeys.contains("https://telemost.yandex.ru"))
+
+        // Passive discovery respects user removal until explicitly restored.
+        store.rememberOrigin(URL(string: "https://telemost.yandex.ru/j/456")!)
+        XCTAssertTrue(store.rememberedOrigins.isEmpty)
+
+        // Explicit user selection restores the site cleanly.
+        store.rememberOrigin(URL(string: "https://telemost.yandex.ru")!, forceRestoreIfDismissed: true)
+        XCTAssertEqual(store.rememberedOrigins, [URL(string: "https://telemost.yandex.ru")!])
+        XCTAssertFalse(store.dismissedOriginKeys.contains("https://telemost.yandex.ru"))
     }
 }

@@ -1010,26 +1010,6 @@ struct NativeDesktopParticipantTile: View, Equatable {
                     if !compact { Text(person.name).font(.headline).lineLimit(2).multilineTextAlignment(.center) }
                 }.frame(maxWidth: .infinity, maxHeight: .infinity)
             }
-            if hasLiveTileVideo {
-                VStack {
-                    HStack {
-                        Spacer()
-                        Button {
-                            model.snapshotController.capture(targetID: tileSourceID)
-                        } label: {
-                            Image(systemName: "camera.viewfinder")
-                                .font(.caption.weight(.semibold))
-                                .padding(6)
-                                .background(.black.opacity(0.62), in: Circle())
-                        }
-                        .buttonStyle(.plain)
-                        .help(L("Snap %@ to summary", person.name))
-                        .accessibilityLabel(L("Snap %@ to summary", person.name))
-                    }
-                    Spacer()
-                }
-                .padding(8)
-            }
             HStack(spacing: 7) {
                 VStack(alignment: .leading, spacing: 1) {
                     if presenter { Text(L("Presenting")).font(.caption2).foregroundStyle(.white.opacity(0.8)) }

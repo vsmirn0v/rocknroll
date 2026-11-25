@@ -55,6 +55,7 @@ struct NativeDesktopHomeView: View {
     @State private var bindingSeries = true
     @State private var showMultiJoinSheet = false
     @State private var showingCreateRoom = false
+    @State private var showingManageWebsites = false
     @State private var createRoomOrigin: URL?
     @State private var signInSheetOrigin: IdentifiableSiteOrigin?
     @State private var retryAfterSignIn: (url: URL, title: String?)?
@@ -68,7 +69,7 @@ struct NativeDesktopHomeView: View {
     private var blocksScheduledJoining: Bool {
         editingName || addingFavorite || editRoom != nil || library.calendar.choosingMeeting != nil ||
         library.calendar.reminders.editing != nil || library.setup.isPresented || showMultiJoinSheet ||
-        showingCreateRoom || signInSheetOrigin != nil
+        showingCreateRoom || showingManageWebsites || signInSheetOrigin != nil
     }
     private var suggestedSiteOrigins: [URL] {
         workspace.suggestedSiteOrigins
@@ -143,11 +144,20 @@ struct NativeDesktopHomeView: View {
         }
         .listStyle(.sidebar).navigationSplitViewColumnWidth(min: 190, ideal: 230, max: 320)
         .safeAreaInset(edge: .bottom) {
-            HStack {
-                Image(systemName: library.sync.enabled ? "icloud" : "internaldrive")
-                Text(library.sync.status).font(.caption).lineLimit(2)
-                Spacer()
-            }.foregroundStyle(.secondary).padding(12)
+            VStack(alignment: .leading, spacing: 8) {
+                LocalModelStatusIndicator(
+                    models: workspace.attention.localModels,
+                    onOpenTranscription: { workspace.settingsTab = 5; workspace.selection = .settings },
+                    onOpenVoice: { workspace.assistantSettingsArea = .voice; workspace.settingsTab = 6; workspace.selection = .settings },
+                    style: .sidebarFooter
+                )
+                HStack {
+                    Image(systemName: library.sync.enabled ? "icloud" : "internaldrive")
+                    Text(library.sync.status).font(.caption).lineLimit(2)
+                    Spacer()
+                }.foregroundStyle(.secondary).padding(.horizontal, 2)
+            }
+            .padding(10)
         }
     }
     var body: some View {
@@ -301,6 +311,18 @@ struct NativeDesktopHomeView: View {
                 }
             )
         }
+        .sheet(isPresented: $showingManageWebsites) {
+            ManageWebsitesSheet(
+                suggestedOrigins: suggestedSiteOrigins,
+                onSelectOrigin: { origin in
+                    workspace.selectInstantOrigin(origin)
+                },
+                onCreateRoom: { origin in
+                    createRoomOrigin = origin
+                    showingCreateRoom = true
+                }
+            )
+        }
         .sheet(item: $signInSheetOrigin, onDismiss: {
             retryAfterSignIn = nil
             retryInstantOriginAfterSignIn = nil
@@ -308,12 +330,15 @@ struct NativeDesktopHomeView: View {
             SiteSignInSheet(
                 initialOrigin: target.url,
                 suggestedOrigins: suggestedSiteOrigins
-            ) { _ in
+            ) { account in
                 let retry = retryAfterSignIn
                 let instantOrigin = retryInstantOriginAfterSignIn
                 retryAfterSignIn = nil
                 retryInstantOriginAfterSignIn = nil
                 signInSheetOrigin = nil
+                if let url = account.originURL {
+                    workspace.selectInstantOrigin(url)
+                }
                 if let retry {
                     workspace.join(retry.url, title: retry.title)
                 } else if let instantOrigin {
@@ -356,14 +381,22 @@ struct NativeDesktopHomeView: View {
                 NativeMeetingAssistantMenu(meeting: meeting, attention: workspace.attention)
             }
         }
-        // The chip sits in its own toolbar item: sharing the button group's
-        // capsule clips the chip's outline. Shown on every home screen (not only
-        // the Assistant) so the status is always one tap away.
         if workspace.selectedMeeting == nil {
             ToolbarItem(placement: .primaryAction) {
-                LocalModelStatusIndicator(models: workspace.attention.localModels,
-                    onOpenTranscription: { workspace.settingsTab = 5; workspace.selection = .settings },
-                    onOpenVoice: { workspace.assistantSettingsArea = .voice; workspace.settingsTab = 6; workspace.selection = .settings })
+                NativeDesktopInstantToolbarControl(
+                    workspace: workspace,
+                    onOpenOptions: { origin in
+                        createRoomOrigin = origin
+                        showingCreateRoom = true
+                    },
+                    onSignIn: { origin in
+                        retryInstantOriginAfterSignIn = nil
+                        signInSheetOrigin = IdentifiableSiteOrigin(origin)
+                    },
+                    onManageWebsites: {
+                        showingManageWebsites = true
+                    }
+                )
             }
         }
         ToolbarItemGroup(placement: .primaryAction) {
@@ -388,14 +421,8 @@ struct NativeDesktopHomeView: View {
                 Button { workspace.toggleWindow(meeting) } label: { Label(L("Open in New Window"), systemImage: "macwindow.on.rectangle") }
                     .help(L("Open in New Window"))
             } else if workspace.selectedMeeting == nil {
-                NativeDesktopInstantToolbarControl(workspace: workspace) { origin in
-                    createRoomOrigin = origin
-                    showingCreateRoom = true
-                }
                 Button { showMultiJoinSheet = true } label: { Label(L("Join with Rock…"), systemImage: "sparkles") }
                     .help(L("Join one or more meetings with an Obsidian skill"))
-                Button { addingFavorite = true } label: { Label(L("Add favorite"), systemImage: "plus") }
-                    .help(L("Save a meeting invitation"))
             }
         }
     }
@@ -466,7 +493,7 @@ struct NativeDesktopHomeView: View {
                 if homeSnapshot.hasUpdates {
                     Button(L("Show updated meetings")) { homeSnapshot.acceptUpdates() }.font(.callout)
                 }
-                homeCommandSurface
+                joinForm
                 if showsFirstLibraryGuidance { firstLibraryGuidance }
                 if let warning = library.persistenceWarning {
                     HStack { Label(warning, systemImage: "exclamationmark.triangle"); Spacer(); Button(L("Retry")) { library.retryPersistence() } }.font(.callout).foregroundStyle(.orange)
@@ -527,61 +554,37 @@ struct NativeDesktopHomeView: View {
             }.font(.callout).frame(maxWidth: .infinity, alignment: .leading)
         }.padding(18).background(.quaternary.opacity(0.2), in: RoundedRectangle(cornerRadius: 16))
     }
-    private var homeCommandSurface: some View {
-        ViewThatFits(in: .horizontal) {
-            HStack(alignment: .top, spacing: 16) {
-                NativeDesktopInstantMeetingCard(
-                    workspace: workspace,
-                    onOpenOptions: { origin in
-                        createRoomOrigin = origin
-                        showingCreateRoom = true
-                    },
-                    onSignIn: { origin in
-                        retryInstantOriginAfterSignIn = origin
-                        signInSheetOrigin = IdentifiableSiteOrigin(origin)
-                    }
-                )
-                .frame(minWidth: 340, maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-
-                joinForm
-                    .frame(minWidth: 340, maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-            }
-            .fixedSize(horizontal: false, vertical: true)
-
-            VStack(alignment: .leading, spacing: 16) {
-                NativeDesktopInstantMeetingCard(
-                    workspace: workspace,
-                    onOpenOptions: { origin in
-                        createRoomOrigin = origin
-                        showingCreateRoom = true
-                    },
-                    onSignIn: { origin in
-                        retryInstantOriginAfterSignIn = origin
-                        signInSheetOrigin = IdentifiableSiteOrigin(origin)
-                    }
-                )
-
-                joinForm
-            }
-        }
-    }
-
     private var joinForm: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text(L("Join a meeting")).font(.headline)
-                #if NATIVE_DIRECT_UPDATES
-                .accessibilityAddTraits(.isHeader)
-                .focusable().focused($homeHeadingFocused).accessibilityFocused($homeHeadingSpoken)
-                .onAppear {
-                    if workspace.focusHomeAfterSupport {
-                        workspace.focusHomeAfterSupport = false
-                        if NSApp.currentEvent?.type == .keyDown { homeHeadingFocused = true }
-                        if NSWorkspace.shared.isVoiceOverEnabled { homeHeadingSpoken = true }
-                    }
+        VStack(alignment: .leading, spacing: 12) {
+            NativeDesktopInstantMeetingBar(
+                workspace: workspace,
+                onOpenOptions: { origin in
+                    createRoomOrigin = origin
+                    showingCreateRoom = true
+                },
+                onSignIn: { origin in
+                    retryInstantOriginAfterSignIn = nil
+                    signInSheetOrigin = IdentifiableSiteOrigin(origin)
+                },
+                onManageWebsites: {
+                    showingManageWebsites = true
                 }
-                #endif
+            )
             HStack {
-                TextField(L("Invitation link"), text: $workspace.invitation).textFieldStyle(.roundedBorder).onSubmit { workspace.joinInput() }.accessibilityIdentifier("nativeGuest.invitation")
+                TextField(L("Invitation link"), text: $workspace.invitation)
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit { workspace.joinInput() }
+                    .accessibilityIdentifier("nativeGuest.invitation")
+                    #if NATIVE_DIRECT_UPDATES
+                    .focusable().focused($homeHeadingFocused).accessibilityFocused($homeHeadingSpoken)
+                    .onAppear {
+                        if workspace.focusHomeAfterSupport {
+                            workspace.focusHomeAfterSupport = false
+                            if NSApp.currentEvent?.type == .keyDown { homeHeadingFocused = true }
+                            if NSWorkspace.shared.isVoiceOverEnabled { homeHeadingSpoken = true }
+                        }
+                    }
+                    #endif
                 Button(L("Paste")) { workspace.invitation = NSPasteboard.general.string(forType: .string) ?? "" }
                 Button(workspace.joinSettingUp ? L("Connecting…") : L("Join")) { workspace.joinInput() }
                     .buttonStyle(.borderedProminent).disabled(workspace.joinSettingUp || workspace.invitation.isEmpty)
@@ -590,6 +593,8 @@ struct NativeDesktopHomeView: View {
                 Image(systemName: "person.crop.circle").foregroundStyle(.secondary)
                 TextField(L("Your name"), text: $library.displayName).focused($editingName).textFieldStyle(.plain).frame(maxWidth: 280).accessibilityIdentifier("nativeGuest.displayName")
                 Spacer()
+                Button { showingManageWebsites = true } label: { Label(L("Websites"), systemImage: "globe") }
+                    .accessibilityIdentifier("nativeGuest.manageWebsites")
                 Button { workspace.settingsTab = 3; workspace.selection = .settings } label: { Label(L("Camera & sound"), systemImage: "slider.horizontal.3") }
             }
             if let challenge = workspace.pendingAuthChallenge {
@@ -611,7 +616,7 @@ struct NativeDesktopHomeView: View {
             if let destination = try? library.normalizedDestination(workspace.invitation) {
                 AssistantLastOutcome(assistant: workspace.attention.store.assistant, invitation: destination.invitationURL, before: Date())
             }
-        }.padding(18).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading).background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 16))
+        }.padding(16).frame(maxWidth: .infinity, alignment: .topLeading).background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 16))
     }
     private func sectionTitle(_ title: String, action: @escaping () -> Void) -> some View {
         HStack { Text(title).font(.title3.bold()); Spacer(); Button(L("See all"), action: action) }
@@ -641,6 +646,10 @@ struct NativeDesktopHomeView: View {
             HStack {
                 TextField(L("Search rooms"), text: search).textFieldStyle(.roundedBorder)
                 if !query.isEmpty { Button(L("Clear")) { search.wrappedValue = "" } }
+                if reorder {
+                    Button { addingFavorite = true } label: { Label(L("Add favorite"), systemImage: "plus") }
+                        .accessibilityIdentifier("favorites.add")
+                }
             }.padding()
             List {
                 ForEach(matches) { room in

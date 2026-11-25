@@ -71,9 +71,26 @@ final class InstantMeetingParityTests: XCTestCase {
                 )
             }
         )
+        var remembered: [URL] = []
+        var forgotten: [URL] = []
+        var dismissed = Set<String>()
         workspace.instantRoomPreferencesDefaults = defaults
         workspace.instantRoomAccountsProvider = { [] }
+        workspace.instantRoomRememberedOriginsProvider = { remembered }
+        workspace.instantRoomDismissedOriginsProvider = { dismissed }
+        workspace.rememberInstantOriginHandler = { origin, _, restore in
+            if restore { dismissed.remove(origin.absoluteString) }
+            if !dismissed.contains(origin.absoluteString) && !remembered.contains(origin) {
+                remembered.insert(origin, at: 0)
+            }
+        }
+        workspace.forgetInstantOriginHandler = { origin in
+            remembered.removeAll { $0 == origin }
+            dismissed.insert(origin.absoluteString)
+            forgotten.append(origin)
+        }
         workspace.copyInvitationToClipboard = clipboard
+        _ = forgotten
         return workspace
     }
 
@@ -220,5 +237,22 @@ final class InstantMeetingParityTests: XCTestCase {
         }
         XCTAssertNil(NativeDesktopInvitationQR.image(for: ""))
         XCTAssertNil(NativeDesktopInvitationQR.image(for: "   "))
+    }
+
+    func testRemoveInstantOriginForgetsOriginAndExcludesReservedTestHosts() throws {
+        let defaults = try makeIsolatedDefaults()
+        let realURL = try XCTUnwrap(URL(string: "https://telemost.360.yandex.ru/j/room-99"))
+        let testURL = try XCTUnwrap(URL(string: "https://example.test/calls/leak"))
+        let workspace = makeWorkspace(historyURLs: [testURL, realURL], defaults: defaults)
+        let canonical = try XCTUnwrap(URL(string: "https://telemost.yandex.ru"))
+
+        XCTAssertEqual(workspace.instantAvailableOrigins, [canonical])
+        workspace.selectInstantOrigin(canonical)
+        XCTAssertEqual(workspace.preferredInstantOrigin, canonical)
+
+        workspace.removeInstantOrigin(canonical)
+        XCTAssertNil(workspace.preferredInstantOrigin)
+        XCTAssertTrue(workspace.instantAvailableOrigins.isEmpty)
+        XCTAssertNil(InstantRoomPreferences.loadLastOrigin(defaults: defaults))
     }
 }

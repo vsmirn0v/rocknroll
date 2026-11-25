@@ -1,14 +1,20 @@
 import SwiftUI
 
-/// Compact chip in the Assistant toolbar and in Settings → Assistant.
+/// Compact chip in Settings / Assistant or inset status card in the Sidebar footer.
 /// Tapping opens the memory/residency detail popover.
 struct LocalModelStatusIndicator: View {
+    enum Style {
+        case toolbar
+        case sidebarFooter
+    }
+
     @ObservedObject var models: LocalModelStatusStore
     /// Opens Settings → Transcription. Nil in Settings itself.
     var onOpenTranscription: (() -> Void)?
     /// Opens Settings → Assistant → Voice. Nil in Settings itself.
     var onOpenVoice: (() -> Void)?
     var settingsID: String? = nil
+    var style: Style = .toolbar
     @State private var showingPopover = false
 
     private var readinessColor: Color {
@@ -30,6 +36,8 @@ struct LocalModelStatusIndicator: View {
             if let settingsID {
                 NativeSettingsButton(title: models.overallSummary, id: settingsID,
                                      accessibilityID: "local-models.indicator") { showingPopover = true }
+            } else if style == .sidebarFooter {
+                sidebarFooterButton
             } else {
                 toolbarButton
             }
@@ -41,6 +49,34 @@ struct LocalModelStatusIndicator: View {
         .accessibilityIdentifier("local-models.indicator")
         .accessibilityLabel(models.accessibilitySummary)
         .help(L("On-device speech and voice models: readiness and memory"))
+    }
+
+    private var sidebarFooterButton: some View {
+        Button { showingPopover = true } label: {
+            HStack(spacing: 8) {
+                Circle()
+                    .fill(readinessColor)
+                    .frame(width: 7, height: 7)
+                Text(models.overallSummary)
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                Spacer(minLength: 4)
+                Image(systemName: "info.circle")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 7)
+            .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .strokeBorder(.primary.opacity(0.08), lineWidth: 1)
+            )
+            .contentShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+        }
+        .buttonStyle(.plain)
     }
 
     private var toolbarButton: some View {
@@ -55,7 +91,7 @@ struct LocalModelStatusIndicator: View {
             .font(.caption.weight(.medium))
             .padding(.horizontal, 9).padding(.vertical, 4)
             .foregroundStyle(readinessColor)
-            .overlay(Capsule().stroke(readinessColor.opacity(0.6), lineWidth: 1))
+            .overlay(Capsule().strokeBorder(readinessColor.opacity(0.6), lineWidth: 1))
             .contentShape(Capsule())
         }
         .buttonStyle(.plain)

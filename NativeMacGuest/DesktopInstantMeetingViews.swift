@@ -64,119 +64,172 @@ struct NativeDesktopSharingPickerButton<Label: View>: View {
     }
 }
 
-struct NativeDesktopInstantMeetingCard: View {
+struct NativeDesktopInstantSiteMenuContent: View {
+    @ObservedObject var workspace: NativeDesktopWorkspace
+    @ObservedObject private var accountStore = SiteAccountStore.shared
+    let onOpenOptions: (URL?) -> Void
+    let onSignIn: (URL) -> Void
+    let onManageWebsites: () -> Void
+
+    var body: some View {
+        let preferred = workspace.preferredInstantOrigin
+        let available = workspace.instantAvailableOrigins
+        if !available.isEmpty {
+            ForEach(available, id: \.absoluteString) { candidate in
+                let account = accountStore.account(for: candidate)
+                let host = candidate.host ?? candidate.absoluteString
+                let subtitle = account?.isSignedIn == true ? " · \(account?.displayAccountSummary ?? "")" : ""
+                Button {
+                    workspace.selectInstantOrigin(candidate)
+                } label: {
+                    if candidate == preferred {
+                        Label("\(host)\(subtitle)", systemImage: "checkmark")
+                    } else {
+                        Text("\(host)\(subtitle)")
+                    }
+                }
+            }
+            Divider()
+        }
+        if let active = preferred {
+            let activeAccount = accountStore.account(for: active)
+            if activeAccount == nil || activeAccount?.needsReauthentication == true {
+                Button {
+                    onSignIn(active)
+                } label: {
+                    Label(L("Sign in to %@…", active.host ?? active.absoluteString), systemImage: "person.crop.circle.badge.checkmark")
+                }
+            }
+        }
+        Button {
+            onManageWebsites()
+        } label: {
+            Label(L("Manage websites & sign in…"), systemImage: "globe")
+        }
+        Button {
+            onOpenOptions(preferred)
+        } label: {
+            Label(L("New room with options…"), systemImage: "plus.bubble")
+        }
+        .accessibilityIdentifier("nativeGuest.createRoom")
+    }
+}
+
+struct NativeDesktopInstantMeetingBar: View {
     @ObservedObject var workspace: NativeDesktopWorkspace
     let onOpenOptions: (URL?) -> Void
     let onSignIn: (URL) -> Void
+    let onManageWebsites: () -> Void
 
     @ObservedObject private var accountStore = SiteAccountStore.shared
-    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
     private var preferredOrigin: URL? {
         workspace.preferredInstantOrigin
     }
 
-    private var availableOrigins: [URL] {
-        workspace.instantAvailableOrigins
-    }
-
-    private var cardBackground: AnyShapeStyle {
-        if reduceTransparency {
-            return AnyShapeStyle(Color(nsColor: .controlBackgroundColor))
-        }
-        return AnyShapeStyle(.quaternary.opacity(0.32))
+    private var activeAccount: SiteAccountRecord? {
+        preferredOrigin.flatMap { accountStore.account(for: $0) }
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack(alignment: .firstTextBaseline, spacing: 8) {
-                Label(L("Instant meeting"), systemImage: "bolt.fill")
-                    .font(.headline)
-                    .foregroundStyle(.primary)
-                Spacer(minLength: 8)
-                Text("⇧⌘N")
-                    .font(.caption.monospaced())
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 7)
-                    .padding(.vertical, 2)
-                    .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
-                    .accessibilityHidden(true)
-            }
+        let origin = preferredOrigin
+        let isDisabled = workspace.isCreatingInstantRoom || workspace.joinSettingUp
+        let accentFill = Color(red: 1, green: 0.60, blue: 0.33)
 
-            Text(L("Create, copy link & join"))
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-
-            if let origin = preferredOrigin {
-                HStack(spacing: 6) {
-                    Button {
-                        Task { await workspace.startInstantRoom(on: origin) }
-                    } label: {
-                        HStack(spacing: 7) {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 0) {
+                Button {
+                    Task { await workspace.startInstantRoom(on: origin) }
+                } label: {
+                    HStack(spacing: 10) {
+                        ZStack {
+                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                .fill(Color.black.opacity(0.14))
+                                .frame(width: 30, height: 30)
                             if workspace.isCreatingInstantRoom {
                                 ProgressView()
                                     .controlSize(.small)
                             } else {
-                                Image(systemName: "bolt.fill")
+                                Image(systemName: "video.badge.plus")
+                                    .font(.system(size: 14, weight: .semibold))
+                                    .foregroundStyle(.black)
                             }
-                            Text(
-                                workspace.isCreatingInstantRoom
-                                    ? L("Creating room…")
-                                    : L("Join & copy link · %@", origin.host ?? origin.absoluteString)
-                            )
-                            .lineLimit(1)
-                            .truncationMode(.middle)
                         }
-                        .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.large)
-                    .disabled(workspace.isCreatingInstantRoom || workspace.joinSettingUp)
-                    .accessibilityIdentifier("nativeGuest.instantRoom.start")
+                        .accessibilityHidden(true)
 
-                    Menu {
-                        ForEach(availableOrigins, id: \.absoluteString) { candidate in
-                            Button {
-                                workspace.selectInstantOrigin(candidate)
-                            } label: {
-                                if candidate == origin {
-                                    Label(candidate.host ?? candidate.absoluteString, systemImage: "checkmark")
-                                } else {
-                                    Text(candidate.host ?? candidate.absoluteString)
+                        VStack(alignment: .leading, spacing: 1) {
+                            HStack(spacing: 6) {
+                                Text(workspace.isCreatingInstantRoom ? L("Creating room…") : L("Instant meeting"))
+                                    .font(.subheadline.weight(.semibold))
+                                    .foregroundStyle(.black)
+                                Text("⇧⌘N")
+                                    .font(.caption2.monospaced())
+                                    .foregroundStyle(Color.black.opacity(0.68))
+                                    .padding(.horizontal, 5)
+                                    .padding(.vertical, 1)
+                                    .background(Color.black.opacity(0.10), in: RoundedRectangle(cornerRadius: 4, style: .continuous))
+                                    .accessibilityHidden(true)
+                            }
+
+                            HStack(spacing: 5) {
+                                Text(
+                                    origin.flatMap(\.host).map { L("Join & copy link · %@", $0) }
+                                        ?? L("Choose website & start")
+                                )
+                                .font(.caption)
+                                .foregroundStyle(Color.black.opacity(0.75))
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+
+                                if let account = activeAccount, account.isSignedIn {
+                                    Circle()
+                                        .fill(Color(red: 0.08, green: 0.52, blue: 0.22))
+                                        .frame(width: 6, height: 6)
+                                        .accessibilityHidden(true)
                                 }
                             }
                         }
-                        if !availableOrigins.isEmpty {
-                            Divider()
-                        }
-                        Button {
-                            onOpenOptions(origin)
-                        } label: {
-                            Label(L("New room with options…"), systemImage: "slider.horizontal.3")
-                        }
-                    } label: {
-                        Image(systemName: "chevron.down")
-                            .frame(width: 18, height: 18)
+                        Spacer(minLength: 4)
                     }
-                    .menuStyle(.borderedButton)
-                    .controlSize(.large)
-                    .fixedSize()
-                    .disabled(workspace.isCreatingInstantRoom)
-                    .help(L("Choose meeting website"))
-                    .accessibilityLabel(L("Choose meeting website"))
-                    .accessibilityIdentifier("nativeGuest.instantRoom.menu")
+                    .padding(.horizontal, 11)
+                    .padding(.vertical, 8)
+                    .frame(maxWidth: .infinity, minHeight: 46, alignment: .leading)
+                    .contentShape(Rectangle())
                 }
-            } else {
-                Button {
-                    onOpenOptions(nil)
-                } label: {
-                    Label(L("Choose website & start"), systemImage: "globe")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.large)
+                .buttonStyle(.plain)
+                .disabled(isDisabled)
                 .accessibilityIdentifier("nativeGuest.instantRoom.start")
+
+                Rectangle()
+                    .fill(Color.black.opacity(0.16))
+                    .frame(width: 1, height: 26)
+
+                Menu {
+                    NativeDesktopInstantSiteMenuContent(
+                        workspace: workspace,
+                        onOpenOptions: onOpenOptions,
+                        onSignIn: onSignIn,
+                        onManageWebsites: onManageWebsites
+                    )
+                } label: {
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundStyle(Color.black.opacity(0.84))
+                        .frame(width: 36, height: 46)
+                        .contentShape(Rectangle())
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                .disabled(workspace.isCreatingInstantRoom)
+                .help(L("Choose meeting website"))
+                .accessibilityLabel(L("Choose meeting website"))
+                .accessibilityIdentifier("nativeGuest.instantRoom.menu")
             }
+            .background(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(accentFill.opacity(isDisabled ? 0.65 : 1))
+            )
+            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
 
             if let challenge = workspace.instantRoomAuthChallengeOrigin {
                 Button {
@@ -196,90 +249,90 @@ struct NativeDesktopInstantMeetingCard: View {
                     .foregroundStyle(.red)
                     .fixedSize(horizontal: false, vertical: true)
             }
-
-            Spacer(minLength: 0)
-
-            HStack(spacing: 12) {
-                Button {
-                    onOpenOptions(preferredOrigin)
-                } label: {
-                    Label(L("New room with options…"), systemImage: "plus.bubble")
-                }
-                .buttonStyle(.link)
-                .font(.caption)
-                .accessibilityIdentifier("nativeGuest.createRoom")
-
-                Spacer()
-
-                Label(L("Microphone and camera start off"), systemImage: "mic.slash")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
         }
-        .padding(18)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .background(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .fill(cardBackground)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 16, style: .continuous)
-                        .fill(Color.accentColor.opacity(reduceTransparency ? 0.03 : 0.06))
-                )
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .strokeBorder(Color.accentColor.opacity(0.24), lineWidth: 1)
-        )
     }
 }
 
 struct NativeDesktopInstantToolbarControl: View {
     @ObservedObject var workspace: NativeDesktopWorkspace
     let onOpenOptions: (URL?) -> Void
+    let onSignIn: (URL) -> Void
+    let onManageWebsites: () -> Void
+
+    @ObservedObject private var accountStore = SiteAccountStore.shared
 
     var body: some View {
-        HStack(spacing: 2) {
+        let origin = workspace.preferredInstantOrigin
+        let account = origin.flatMap { accountStore.account(for: $0) }
+        let signedIn = account?.isSignedIn == true
+        let labelText = workspace.isCreatingInstantRoom
+            ? L("Creating room…")
+            : (origin?.host ?? L("Instant meeting"))
+        let isDisabled = workspace.isCreatingInstantRoom || workspace.joinSettingUp
+
+        HStack(spacing: 0) {
             Button {
                 Task { await workspace.startInstantRoom() }
             } label: {
-                Label(
-                    workspace.isCreatingInstantRoom ? L("Creating room…") : L("Instant meeting"),
-                    systemImage: "bolt.fill"
-                )
-            }
-            .disabled(workspace.isCreatingInstantRoom || workspace.joinSettingUp)
-            .help(L("Create, copy link & join"))
-            .accessibilityIdentifier("nativeGuest.toolbar.instantRoom")
-
-            Menu {
-                let preferred = workspace.preferredInstantOrigin
-                ForEach(workspace.instantAvailableOrigins, id: \.absoluteString) { candidate in
-                    Button {
-                        workspace.selectInstantOrigin(candidate)
-                    } label: {
-                        if candidate == preferred {
-                            Label(candidate.host ?? candidate.absoluteString, systemImage: "checkmark")
-                        } else {
-                            Text(candidate.host ?? candidate.absoluteString)
-                        }
+                HStack(spacing: 6) {
+                    if workspace.isCreatingInstantRoom {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Image(systemName: "video.badge.plus")
+                            .foregroundStyle(.orange)
+                    }
+                    Text(labelText)
+                        .font(.callout.weight(.medium))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    if origin != nil {
+                        Circle()
+                            .fill(signedIn ? Color.green : Color.secondary.opacity(0.45))
+                            .frame(width: 6, height: 6)
+                            .accessibilityLabel(signedIn ? L("Signed in") : L("Saved website"))
                     }
                 }
-                if !workspace.instantAvailableOrigins.isEmpty {
-                    Divider()
-                }
-                Button {
-                    onOpenOptions(preferred)
-                } label: {
-                    Label(L("New room with options…"), systemImage: "plus.bubble")
-                }
+                .padding(.leading, 9)
+                .padding(.trailing, 7)
+                .padding(.vertical, 4)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(isDisabled)
+            .help(
+                origin?.host.map { L("Join & copy link · %@", $0) }
+                    ?? L("Create, copy link & join")
+            )
+            .accessibilityIdentifier("nativeGuest.toolbar.instantRoom")
+
+            Rectangle()
+                .fill(Color.primary.opacity(0.14))
+                .frame(width: 1, height: 14)
+
+            Menu {
+                NativeDesktopInstantSiteMenuContent(
+                    workspace: workspace,
+                    onOpenOptions: onOpenOptions,
+                    onSignIn: onSignIn,
+                    onManageWebsites: onManageWebsites
+                )
             } label: {
                 Image(systemName: "chevron.down")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 6)
+                    .contentShape(Rectangle())
             }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
             .disabled(workspace.isCreatingInstantRoom)
-            .help(L("New room with options…"))
-            .accessibilityLabel(L("New room with options…"))
+            .help(L("Choose meeting website"))
+            .accessibilityLabel(L("Choose meeting website"))
+            .accessibilityIdentifier("nativeGuest.toolbar.instantMenu")
         }
+        .background(Color.orange.opacity(0.13), in: Capsule())
+        .overlay(Capsule().strokeBorder(Color.orange.opacity(0.32), lineWidth: 1))
     }
 }
 
