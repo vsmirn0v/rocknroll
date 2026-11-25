@@ -3,6 +3,7 @@ import ConferenceCore
 import CoreMedia
 import CoreVideo
 import Network
+import SwiftUI
 import UIKit
 import XCTest
 @testable import RockNRoll
@@ -2320,5 +2321,69 @@ final class IOSAssistantTalkTests: XCTestCase {
         XCTAssertEqual(reloadedConfig.boardURL?.absoluteString, "https://jira.internal.ru/secure/RapidBoard.jspa?rapidView=77")
         XCTAssertEqual(reloadedConfig.projectKeys, ["SDBCTO", "SPS"])
         await store2.close()
+    }
+
+    func testIOSFacilitatorRoleDisplayNameAndRecommendationAndToggleState() async throws {
+        let suite = SuiteBox()
+        let tempRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ios-fac-role-ui-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempRoot) }
+
+        let (ws, store) = try await makeTestWorkspace(tempRoot: tempRoot, prefs: suite.defaults)
+        let skills = IOSAssistantSkillsController(
+            workspace: ws,
+            preferences: suite.defaults,
+            keychain: WorkspaceAPIKeychain(service: "dev.vsmirn0v.ios.facrole.\(UUID().uuidString)"),
+            customRootURL: tempRoot.appendingPathComponent("skills", isDirectory: true)
+        )
+        defer { skills.stopWatcher() }
+
+        let facilitator = IOSAutonomousMeetingFacilitator(
+            skills: skills,
+            workspace: ws,
+            board: nil,
+            resolveBridge: { _ in nil }
+        )
+        let assistant = IOSAssistantCoordinator(
+            workspace: ws,
+            preferences: suite.defaults,
+            modelAvailable: { false },
+            resolveBridge: { _ in nil }
+        )
+
+        XCTAssertEqual(facilitator.recommendedSkillID(for: "Daily Standup"), "scrum-master")
+        XCTAssertNil(facilitator.recommendedSkillID(for: "Quarterly Architecture Sync"))
+        XCTAssertEqual(facilitator.skillDisplayName(for: "task-manager"), "Task & Backlog Manager")
+        XCTAssertEqual(facilitator.skillDisplayName(for: "unknown-slug"), "unknown-slug")
+
+        let cid = UUID()
+        let host = UIHostingController(
+            rootView: IOSAssistantModeSheet(
+                controllerID: cid,
+                meetingTitle: "Daily Standup",
+                canSendChat: true,
+                assistant: assistant,
+                skills: skills,
+                facilitator: facilitator
+            )
+        )
+        host.loadViewIfNeeded()
+        host.view.frame = CGRect(x: 0, y: 0, width: 390, height: 844)
+        host.view.layoutIfNeeded()
+
+        XCTAssertNil(facilitator.activeSessionSkills[cid])
+        facilitator.enable(controllerID: cid, title: "Daily Standup", skillID: "task-manager", suppressAutoGreet: true)
+        XCTAssertEqual(facilitator.activeSessionSkills[cid], "task-manager")
+        XCTAssertEqual(facilitator.skillDisplayName(for: "task-manager"), "Task & Backlog Manager")
+        host.view.setNeedsLayout()
+        host.view.layoutIfNeeded()
+
+        facilitator.disable(controllerID: cid)
+        XCTAssertNil(facilitator.activeSessionSkills[cid])
+        XCTAssertNil(facilitator.lastStatusBySession[cid])
+        host.view.setNeedsLayout()
+        host.view.layoutIfNeeded()
+
+        await store.close()
     }
 }

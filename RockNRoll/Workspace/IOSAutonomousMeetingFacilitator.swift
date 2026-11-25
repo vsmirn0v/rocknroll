@@ -181,13 +181,23 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
         }
     }
 
+    func skillDisplayName(for skillID: String) -> String {
+        skills?.skills.first(where: { $0.id == skillID })?.name
+            ?? DefaultAssistantSkills.skill(id: skillID)?.name
+            ?? skillID
+    }
+
+    func recommendedSkillID(for meetingTitle: String) -> String? {
+        skills?.skills.first(where: {
+            $0.enabled && $0.matches(meetingTitle: meetingTitle, commandText: "")
+        })?.id
+    }
+
     private func resolveSkillID(explicitSkillID: String?, meetingTitle: String) -> String {
         if let explicit = explicitSkillID.map(AssistantSkill.sanitizedSlug(from:)), !explicit.isEmpty {
             return explicit
         }
-        if let autoMatched = skills?.skills.first(where: {
-            $0.enabled && $0.matches(meetingTitle: meetingTitle, commandText: "")
-        })?.id {
+        if let autoMatched = recommendedSkillID(for: meetingTitle) {
             return autoMatched
         }
         return skills?.selectedSkillIDs.first ?? "scrum-master"

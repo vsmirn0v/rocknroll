@@ -702,31 +702,40 @@ private struct IOSFacilitatorModeSection: View {
     var body: some View {
         let activeSkillID = facilitator.activeSessionSkills[controllerID]
         let isActive = activeSkillID != nil
+        let enabledSkills = skills.skills.filter(\.enabled)
+        let activeSkillName = activeSkillID.map { facilitator.skillDisplayName(for: $0) }
+        let recommendedSkillID = isActive ? nil : facilitator.recommendedSkillID(for: meetingTitle)
 
-        Section(L("Autonomous Voice Facilitator")) {
-            Toggle(L("Voice facilitator in this meeting"), isOn: Binding(
-                get: { isActive },
-                set: { enabled in
-                    if enabled {
-                        facilitator.enable(controllerID: controllerID, title: meetingTitle, skillID: nil)
-                    } else {
-                        facilitator.disable(controllerID: controllerID)
-                    }
+        Section {
+            radioRow(
+                title: L("Off"),
+                subtitle: nil,
+                badge: nil,
+                selected: !isActive,
+                useAccent: false,
+                accessibilityID: "assistant.facilitator.off"
+            ) {
+                if isActive {
+                    facilitator.disable(controllerID: controllerID)
                 }
-            ))
+            }
+
+            ForEach(enabledSkills) { skill in
+                let selected = skill.id == activeSkillID && isActive
+                let trimmedRole = skill.role.trimmingCharacters(in: .whitespacesAndNewlines)
+                radioRow(
+                    title: skill.name,
+                    subtitle: trimmedRole.isEmpty ? nil : trimmedRole,
+                    badge: skill.id == recommendedSkillID ? L("Recommended") : nil,
+                    selected: selected,
+                    useAccent: true,
+                    accessibilityID: "assistant.facilitator.skill.\(skill.id)"
+                ) {
+                    facilitator.enable(controllerID: controllerID, title: meetingTitle, skillID: skill.id)
+                }
+            }
 
             if isActive {
-                Picker(L("Skill Role"), selection: Binding(
-                    get: { activeSkillID ?? skills.selectedSkillIDs.first ?? "scrum-master" },
-                    set: { chosen in
-                        facilitator.enable(controllerID: controllerID, title: meetingTitle, skillID: chosen)
-                    }
-                )) {
-                    ForEach(skills.skills.filter(\.enabled)) { skill in
-                        Text(skill.name).tag(skill.id)
-                    }
-                }
-
                 Button {
                     Task {
                         await facilitator.kickOffSkill(controllerID: controllerID, title: meetingTitle, skillID: activeSkillID)
@@ -734,6 +743,7 @@ private struct IOSFacilitatorModeSection: View {
                 } label: {
                     Label(L("Kick off role in call"), systemImage: "waveform")
                 }
+                .accessibilityIdentifier("assistant.facilitator.kickoff")
             }
 
             if let board {
@@ -743,13 +753,99 @@ private struct IOSFacilitatorModeSection: View {
                     onOpenBoard: onOpenBoard
                 )
             }
-
-            if let note = facilitator.lastStatusBySession[controllerID] {
+        } header: {
+            HStack(alignment: .center, spacing: 8) {
+                Text(L("Autonomous Voice Facilitator"))
+                Spacer(minLength: 4)
+                statusPill(activeSkillName: activeSkillName)
+            }
+        } footer: {
+            if isActive, let note = facilitator.lastStatusBySession[controllerID], !note.isEmpty {
                 Text(note)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
             }
         }
+    }
+
+    @ViewBuilder
+    private func statusPill(activeSkillName: String?) -> some View {
+        if let activeSkillName {
+            HStack(spacing: 5) {
+                Circle()
+                    .fill(Color.accentColor)
+                    .frame(width: 6, height: 6)
+                Text(activeSkillName)
+                    .font(.caption2.weight(.semibold))
+                    .lineLimit(1)
+            }
+            .foregroundStyle(Color.accentColor)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
+            .background(Color.accentColor.opacity(0.16), in: Capsule())
+            .overlay(Capsule().strokeBorder(Color.accentColor.opacity(0.45), lineWidth: 1))
+            .textCase(nil)
+            .accessibilityElement(children: .combine)
+            .accessibilityIdentifier("assistant.facilitator.status")
+        } else {
+            Text(L("Off"))
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 3)
+                .background(Color.secondary.opacity(0.14), in: Capsule())
+                .textCase(nil)
+                .accessibilityIdentifier("assistant.facilitator.status")
+        }
+    }
+
+    private func radioRow(
+        title: String,
+        subtitle: String?,
+        badge: String?,
+        selected: Bool,
+        useAccent: Bool,
+        accessibilityID: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            HStack(alignment: subtitle == nil ? .center : .top, spacing: 10) {
+                Image(systemName: selected ? "checkmark.circle.fill" : "circle")
+                    .font(.title3)
+                    .foregroundStyle(selected ? (useAccent ? Color.accentColor : Color.primary) : Color.secondary.opacity(0.6))
+                    .frame(width: 24, alignment: .center)
+                    .padding(.top, subtitle == nil ? 0 : 1)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 6) {
+                        Text(title)
+                            .font(.body.weight(selected ? .semibold : .regular))
+                            .foregroundStyle(.primary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        if let badge {
+                            Text(badge)
+                                .font(.caption2.weight(.medium))
+                                .foregroundStyle(Color.accentColor)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(Color.accentColor.opacity(0.14), in: Capsule())
+                                .fixedSize()
+                        }
+                    }
+                    if let subtitle {
+                        Text(subtitle)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
+            .padding(.vertical, 2)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .listRowBackground(selected ? (useAccent ? Color.accentColor.opacity(0.14) : Color.primary.opacity(0.08)) : nil)
+        .accessibilityIdentifier(accessibilityID)
+        .accessibilityAddTraits(selected ? [.isSelected] : [])
     }
 }
 
