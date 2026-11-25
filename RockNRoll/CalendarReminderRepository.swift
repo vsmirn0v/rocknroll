@@ -61,29 +61,57 @@ struct CalendarReminderRepository: Codable {
         struct Copy: Hashable { let room: MeetingRoomIdentity; let start: Date; let end: Date }
         var seen: Set<Copy> = []
         let previous = occurrences
-        occurrences = meetings.filter { $0.end.addingTimeInterval(86400) > now }.sorted { $0.id < $1.id }.compactMap { meeting in
-            guard var incoming = ReminderOccurrence(meeting: meeting), let room = incoming.room,
-                  seen.insert(Copy(room: room, start: incoming.start, end: incoming.end)).inserted else { return nil }
-            if let old = previous.first(where: { $0.eventID == incoming.eventID }) ?? previous.first(where: {
-                $0.room == incoming.room && $0.start == incoming.start && $0.end == incoming.end
-            }) {
-                // A separate interval is a new opportunity; metadata/password edits retain attendance.
+        let candidates: [(meeting: CalendarMeeting, incoming: ReminderOccurrence)] = meetings
+            .filter { $0.end.addingTimeInterval(86400) > now }
+            .sorted { $0.id < $1.id }
+            .compactMap { meeting in
+                guard let incoming = ReminderOccurrence(meeting: meeting), let room = incoming.room,
+                      seen.insert(Copy(room: room, start: incoming.start, end: incoming.end)).inserted else { return nil }
+                return (meeting, incoming)
+            }
+        var claimedIDs: Set<String> = []
+        var matchedOld = Array<ReminderOccurrence?>(repeating: nil, count: candidates.count)
+        for index in candidates.indices {
+            let incoming = candidates[index].incoming
+            if let old = previous.first(where: { !claimedIDs.contains($0.id) && $0.eventID == incoming.eventID }) {
                 let moved = incoming.start >= old.end || incoming.end <= old.start
                 if !moved {
-                    let changed = incoming.room != old.room || incoming.start != old.start || incoming.end != old.end
-                    let preservedEndpoint = incoming.endpoint ?? (incoming.room == old.room ? old.endpoint : nil)
-                    incoming = ReminderOccurrence(meeting: meeting, id: old.id,
-                        reference: changed ? UUID().uuidString : old.reference)!
-                    incoming.endpoint = preservedEndpoint
-                    if incoming.room != old.room { states[old.id] = nil }
-                    else if incoming.start != old.start || incoming.end != old.end { states[old.id]?.consumed = [] }
+                    claimedIDs.insert(old.id)
+                    matchedOld[index] = old
                 }
+            }
+        }
+        for index in candidates.indices where matchedOld[index] == nil {
+            let incoming = candidates[index].incoming
+            if let old = previous.first(where: {
+                !claimedIDs.contains($0.id) && $0.room == incoming.room && $0.start == incoming.start && $0.end == incoming.end
+            }) {
+                let moved = incoming.start >= old.end || incoming.end <= old.start
+                if !moved {
+                    claimedIDs.insert(old.id)
+                    matchedOld[index] = old
+                }
+            }
+        }
+        occurrences = candidates.indices.map { index in
+            let meeting = candidates[index].meeting
+            var incoming = candidates[index].incoming
+            if let old = matchedOld[index] {
+                // Metadata/password edits retain attendance; overlapping edits keep occurrence ID.
+                let changed = incoming.room != old.room || incoming.start != old.start || incoming.end != old.end
+                let preservedEndpoint = incoming.endpoint ?? (incoming.room == old.room ? old.endpoint : nil)
+                incoming = ReminderOccurrence(meeting: meeting, id: old.id,
+                    reference: changed ? UUID().uuidString : old.reference)!
+                incoming.endpoint = preservedEndpoint
+                if incoming.room != old.room { states[old.id] = nil }
+                else if incoming.start != old.start || incoming.end != old.end { states[old.id]?.consumed = [] }
             }
             return incoming
         }
         // A transient resolver failure cancels alerts, but cannot erase a person's choices.
         let presentIDs = Set(meetings.map(\.id))
-        for var old in previous where presentIDs.contains(old.eventID) && old.end.addingTimeInterval(86400) > now && !occurrences.contains(where: { $0.id == old.id }) {
+        var emittedIDs = Set(occurrences.map(\.id))
+        for var old in previous where presentIDs.contains(old.eventID) && old.end.addingTimeInterval(86400) > now && emittedIDs.insert(old.id).inserted {
             old.eligible = false; occurrences.append(old)
         }
         let retained = Set(occurrences.map(\.id))
@@ -94,6 +122,13 @@ struct CalendarReminderRepository: Codable {
                 if request.phase == .snooze, states[request.occurrenceID]?.snooze == request.date { states[request.occurrenceID]?.snooze = nil }
             }
         }
+    }
+    @discardableResult
+    mutating func normalizeOccurrences() -> Bool {
+        let deduped = ReminderOccurrence.deduplicatedByID(occurrences)
+        let changed = deduped.count != occurrences.count || deduped != occurrences
+        if changed { occurrences = deduped }
+        return changed
     }
     @discardableResult
     mutating func joined(room: MeetingRoomIdentity, endpoint: String? = nil, eventID: String? = nil,

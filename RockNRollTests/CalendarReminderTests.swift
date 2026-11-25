@@ -683,4 +683,71 @@ import XCTest
         try await Task.sleep(for: .milliseconds(30))
         XCTAssertTrue(notifications.items.values.contains { $0.plan.occurrenceID == occRemote.id })
     }
+
+    func testOverlappingLocalEditWithStaleSyncedCopyDoesNotDuplicateOccurrenceIDs() throws {
+        for remoteID in ["remote|sync-key", "a-remote|sync-key"] {
+            var repository = CalendarReminderRepository()
+            let initial = meeting("local-1", offset: 600, end: 1800, room: "room-a")
+            repository.update([initial], at: now)
+            let original = try XCTUnwrap(repository.occurrences.first)
+
+            // Local meeting shifts by 60s (still overlapping); stale remote synced copy still has original time/room.
+            let shiftedLocal = meeting("local-1", offset: 660, end: 1800, room: "room-a")
+            let staleRemote = meeting(remoteID, offset: 600, end: 1800, room: "room-a")
+            repository.update([shiftedLocal, staleRemote], at: now)
+
+            XCTAssertEqual(repository.occurrences.count, 2)
+            XCTAssertEqual(Set(repository.occurrences.map(\.id)).count, 2)
+            let updatedLocal = try XCTUnwrap(repository.occurrences.first { $0.eventID == "local-1" })
+            let updatedRemote = try XCTUnwrap(repository.occurrences.first { $0.eventID == remoteID })
+            XCTAssertEqual(updatedLocal.id, original.id)
+            XCTAssertNotEqual(updatedRemote.id, original.id)
+        }
+    }
+
+    func testDuplicateEventIDsInSingleUpdateDoNotDuplicateOccurrenceIDs() {
+        var repository = CalendarReminderRepository()
+        let initial = meeting("dup-id", offset: 600, end: 1800, room: "room-a")
+        repository.update([initial], at: now)
+
+        let first = meeting("dup-id", offset: 600, end: 1800, room: "room-a")
+        let second = meeting("dup-id", offset: 660, end: 1800, room: "room-b")
+        repository.update([first, second], at: now)
+
+        XCTAssertEqual(repository.occurrences.count, 2)
+        XCTAssertEqual(Set(repository.occurrences.map(\.id)).count, 2)
+    }
+
+    func testPersistedDuplicateOccurrencesAreRepairedOnLoadAndDoNotCrashRefreshPresentation() async throws {
+        let storage = Storage()
+        let notifications = Notifications()
+        let prefs = preferences()
+        prefs.set(true, forKey: "calendarReminders.enabled")
+
+        let event = meeting("persisted-dup", offset: -30, end: 1800)
+        var ineligible = try XCTUnwrap(ReminderOccurrence(meeting: event, id: "shared-id", reference: "ref-ineligible"))
+        ineligible.eligible = false
+        let eligible = try XCTUnwrap(ReminderOccurrence(meeting: event, id: "shared-id", reference: "ref-eligible"))
+
+        var corrupted = CalendarReminderRepository()
+        corrupted.enabled = true
+        corrupted.occurrences = [ineligible, eligible]
+        storage.data = try JSONEncoder().encode(corrupted)
+
+        let coordinator = CalendarReminderCoordinator(preferences: prefs, storage: storage, notifications: notifications, clock: { self.now })
+        coordinator.scene = { .init(visible: true) }
+        coordinator.foregrounded()
+        coordinator.refreshPresentation()
+        await coordinator.waitForReconciliation()
+
+        XCTAssertEqual(coordinator.repository.occurrences.count, 1)
+        XCTAssertEqual(coordinator.repository.occurrences.first?.id, "shared-id")
+        XCTAssertEqual(coordinator.repository.occurrences.first?.eligible, true)
+        XCTAssertEqual(coordinator.repository.occurrences.first?.reference, "ref-eligible")
+
+        let persistedData = try XCTUnwrap(storage.data)
+        let decoded = try JSONDecoder().decode(CalendarReminderRepository.self, from: persistedData)
+        XCTAssertEqual(decoded.occurrences.count, 1)
+        XCTAssertEqual(decoded.occurrences.first?.eligible, true)
+    }
 }

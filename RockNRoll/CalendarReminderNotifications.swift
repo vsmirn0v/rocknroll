@@ -106,9 +106,9 @@ enum ReminderAuthorization { case notDetermined, allowed, denied }
         return try await center.requestAuthorization(options: options)
     }
     func pending() async -> [String: String] {
-        Dictionary(uniqueKeysWithValues: await center.pendingNotificationRequests().map {
+        Dictionary(await center.pendingNotificationRequests().map {
             ($0.identifier, $0.content.userInfo["fingerprint"] as? String ?? "")
-        })
+        }, uniquingKeysWith: { _, latest in latest })
     }
     func add(_ reminder: ReminderNotification) async throws { try await center.add(Self.request(reminder)) }
     static func request(_ reminder: ReminderNotification) -> UNNotificationRequest {

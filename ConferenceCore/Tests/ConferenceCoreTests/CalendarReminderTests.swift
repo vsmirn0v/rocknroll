@@ -130,4 +130,13 @@ final class CalendarReminderTests: XCTestCase {
         XCTAssertFalse(remoteOnly.contains { $0.occurrenceID == "m30" })
         XCTAssertTrue(remoteOnly.contains { $0.occurrenceID == "m95" })
     }
+
+    func testDuplicateOccurrenceIDsDoNotEmitDuplicatePlannedReminders() {
+        var ineligible = occurrence("dup", offset: 600)
+        ineligible.eligible = false
+        let eligible = occurrence("dup", offset: 600)
+        let plans = CalendarReminderPlanner.plan(occurrences: [ineligible, eligible, eligible], states: [:], profile: .init(), now: now)
+        XCTAssertEqual(plans.count, 1)
+        XCTAssertEqual(Set(plans.map(\.id)).count, plans.count)
+    }
 }

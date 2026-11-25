@@ -155,4 +155,34 @@ final class ReminderFollowUpTests: XCTestCase {
                                               enabled: true, scene: scene, now: now, remoteConnections: remote)
     }
 
+    func testDuplicateOccurrenceIDsDoNotTrapOrDuplicateForegroundEvents() {
+        var ineligible = occurrence("dup", start: 0)
+        ineligible.eligible = false
+        let eligible = occurrence("dup", start: 0)
+        var profile = ReminderProfile(); profile.timing.atStart = true
+        var state = ReminderOccurrenceState()
+        state.presentation = .init(plan: .init(occurrence: eligible, phase: .start, date: eligible.start), scope: .system)
+
+        let bothEligible = ReminderForegroundPlanner.decide(
+            occurrences: [eligible, eligible],
+            states: [eligible.id: state],
+            profile: profile,
+            enabled: true,
+            scene: ReminderScene(visible: true, room: current),
+            now: now
+        )
+        XCTAssertEqual(bothEligible.events.count, 1)
+
+        let ineligibleFirst = ReminderForegroundPlanner.decide(
+            occurrences: [ineligible, eligible],
+            states: [eligible.id: state],
+            profile: profile,
+            enabled: true,
+            scene: ReminderScene(visible: true, room: current),
+            now: now
+        )
+        XCTAssertEqual(ineligibleFirst.events.count, 1)
+        XCTAssertFalse(ineligibleFirst.invalidatedIDs.contains(eligible.id))
+    }
+
 }

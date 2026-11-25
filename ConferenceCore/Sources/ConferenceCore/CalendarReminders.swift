@@ -105,6 +105,23 @@ public struct ReminderOccurrence: Codable, Equatable, Identifiable, Sendable {
         guard let room else { return false }
         return connections.contains { $0.matches(room, endpoint: endpoint) }
     }
+
+    public static func deduplicatedByID(_ occurrences: [ReminderOccurrence]) -> [ReminderOccurrence] {
+        var indexByID: [String: Int] = [:]
+        var result: [ReminderOccurrence] = []
+        result.reserveCapacity(occurrences.count)
+        for occurrence in occurrences {
+            if let existingIndex = indexByID[occurrence.id] {
+                if !result[existingIndex].eligible && occurrence.eligible {
+                    result[existingIndex] = occurrence
+                }
+            } else {
+                indexByID[occurrence.id] = result.count
+                result.append(occurrence)
+            }
+        }
+        return result
+    }
 }
 
 public struct ReminderOccurrenceState: Codable, Equatable, Sendable {
@@ -149,7 +166,7 @@ public enum CalendarReminderPlanner {
         let localCutoff = now.addingTimeInterval(max(0, connectedHorizon))
         let remoteCutoff = now.addingTimeInterval(max(0, remoteHorizon))
         var first: [PlannedReminder] = [], rest: [PlannedReminder] = []
-        for occurrence in occurrences where occurrence.eligible && occurrence.end > now && occurrence.room != nil {
+        for occurrence in ReminderOccurrence.deduplicatedByID(occurrences) where occurrence.eligible && occurrence.end > now && occurrence.room != nil {
             let state = states[occurrence.id] ?? .init()
             guard !state.attended, state.remoteAccount == nil, !state.skipped,
                   !occurrence.tentative || state.override?.mode == .custom,
@@ -189,7 +206,7 @@ public enum CalendarReminderPlanner {
             guard candidate > now else { return }
             earliest = min(earliest ?? candidate, candidate)
         }
-        for occurrence in occurrences where occurrence.eligible && occurrence.end > now && occurrence.room != nil {
+        for occurrence in ReminderOccurrence.deduplicatedByID(occurrences) where occurrence.eligible && occurrence.end > now && occurrence.room != nil {
             let state = states[occurrence.id] ?? .init()
             guard !state.attended, state.remoteAccount == nil, !state.skipped,
                   !occurrence.tentative || state.override?.mode == .custom,

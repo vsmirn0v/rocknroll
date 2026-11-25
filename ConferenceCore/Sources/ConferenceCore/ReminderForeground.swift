@@ -45,11 +45,12 @@ public enum ReminderForegroundPlanner {
     public static func decide(occurrences: [ReminderOccurrence], states: [String: ReminderOccurrenceState],
                               profile: ReminderProfile, enabled: Bool, scene: ReminderScene, now: Date,
                               remoteConnections: [ActiveRoomConnection] = []) -> ReminderForegroundDecision {
+        let uniqueOccurrences = ReminderOccurrence.deduplicatedByID(occurrences)
         var result = ReminderForegroundDecision()
         func deadline(_ date: Date) {
             if date > now { result.nextDeadline = min(result.nextDeadline ?? date, date) }
         }
-        for occurrence in occurrences {
+        for occurrence in uniqueOccurrences {
             let state = states[occurrence.id] ?? .init()
             guard occurrence.eligible, occurrence.end > now, occurrence.room != nil,
                   !state.attended, state.remoteAccount == nil, !state.skipped,
@@ -99,7 +100,7 @@ public enum ReminderForegroundPlanner {
             }
             if scene.visible && scene.usable { result.events.append(event) }
         }
-        let starts = Dictionary(uniqueKeysWithValues: occurrences.map { ($0.id, $0.start) })
+        let starts = Dictionary(uniqueOccurrences.map { ($0.id, $0.start) }, uniquingKeysWith: min)
         result.events.sort {
             (starts[$0.plan.occurrenceID] ?? $0.plan.date, $0.plan.occurrenceID) <
             (starts[$1.plan.occurrenceID] ?? $1.plan.date, $1.plan.occurrenceID)

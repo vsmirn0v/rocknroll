@@ -96,18 +96,21 @@ final class CalendarReminderCoordinator: ObservableObject {
     private func load() {
         if let enabled = preferences.object(forKey: "calendarReminders.enabled") as? Bool { self.enabled = enabled }
         if let suppress = preferences.object(forKey: Self.suppressOtherDevicesKey) as? Bool { self.suppressOtherDevices = suppress }
+        var repaired = false
         do {
             if let data = try storage.read() {
                 let saved = try JSONDecoder().decode(CalendarReminderRepository.self, from: data)
                 guard (1...2).contains(saved.schema), (1...2).contains(saved.profile.schema) else { throw CocoaError(.coderReadCorrupt) }
                 repository = saved
                 repository.schema = 2; repository.profile.schema = 2
+                repaired = repository.normalizeOccurrences()
             }
             enabled = preferences.object(forKey: "calendarReminders.enabled") as? Bool ?? repository.enabled
             repository.enabled = enabled
             suppressOtherDevices = (preferences.object(forKey: Self.suppressOtherDevicesKey) as? Bool) ?? repository.suppressOtherDevices ?? true
             repository.suppressOtherDevices = suppressOtherDevices
             profile = repository.profile.value; loaded = true; error = nil
+            if repaired { _ = save() }
         } catch { self.error = L("Reminders could not be saved. Try again."); loaded = false }
     }
     @discardableResult private func save() -> Bool {
@@ -463,7 +466,7 @@ final class CalendarReminderCoordinator: ObservableObject {
             }
         }
         let ids = Set(desired.map { $0.plan.id })
-        let fingerprints = Dictionary(uniqueKeysWithValues: desired.map { ($0.plan.id, $0.fingerprint) })
+        let fingerprints = Dictionary(desired.map { ($0.plan.id, $0.fingerprint) }, uniquingKeysWith: { first, _ in first })
         notifications.removePending(pending.keys.filter { $0.hasPrefix(PlannedReminder.namespace) && (!ids.contains($0) || fingerprints[$0] != pending[$0]) })
         let localHorizonCutoff = now.addingTimeInterval(CalendarReminderPlanner.connectedSuppressionHorizon)
         let remoteHorizonCutoff = now.addingTimeInterval(CalendarReminderPlanner.remoteSuppressionHorizon)
