@@ -917,36 +917,55 @@ public struct PortableOutcomeService: PortableOutcomeWriting {
                 appLanguage: language
             )
             let allowedSources = [title, notes] + events.flatMap { [$0.speaker ?? "", $0.text] }
-            let initialTexts = [initial.summary] + initial.decisions + initial.tasks.map(\.text) + initial.openQuestions
-            if MeetingLanguageResolver.hasUnexpectedCyrillicLanguage(
-                in: initialTexts,
+            return await Self.finalizeWithCyrillicLanguageRetry(
+                initial: initial,
+                messages: messages,
                 expectedLanguage: expectedLanguage,
-                allowedSourceTexts: allowedSources
-            ) {
-                var retryMessages = messages
-                if let index = retryMessages.firstIndex(where: { $0["role"] == "system" }) {
-                    retryMessages[index]["content"] = (retryMessages[index]["content"] ?? "") + "\n\n"
-                        + MeetingLanguageResolver.correctiveLanguageInstruction(for: expectedLanguage)
-                }
-                if let retried = try? await performOutcomeRequest(
+                allowedSources: allowedSources
+            ) { retryMessages in
+                try await performOutcomeRequest(
                     endpoint: endpoint,
                     model: model,
                     key: key,
                     messages: retryMessages,
                     provider: configuration.providerKind
-                ) {
-                    let retriedTexts = [retried.summary] + retried.decisions + retried.tasks.map(\.text) + retried.openQuestions
-                    if !MeetingLanguageResolver.hasUnexpectedCyrillicLanguage(
-                        in: retriedTexts,
-                        expectedLanguage: expectedLanguage,
-                        allowedSourceTexts: allowedSources
-                    ) {
-                        return retried
-                    }
-                }
+                )
             }
+        }
+    }
+
+    private static func outcomeTexts(_ result: PortableOutcomeResult) -> [String] {
+        [result.summary] + result.decisions + result.tasks.map(\.text) + result.openQuestions
+    }
+
+    static func finalizeWithCyrillicLanguageRetry(
+        initial: PortableOutcomeResult,
+        messages: [[String: String]],
+        expectedLanguage: String,
+        allowedSources: [String],
+        retry: ([[String: String]]) async throws -> PortableOutcomeResult
+    ) async -> PortableOutcomeResult {
+        guard MeetingLanguageResolver.hasUnexpectedCyrillicLanguage(
+            in: outcomeTexts(initial),
+            expectedLanguage: expectedLanguage,
+            allowedSourceTexts: allowedSources
+        ) else {
             return initial
         }
+        var retryMessages = messages
+        if let index = retryMessages.firstIndex(where: { $0["role"] == "system" }) {
+            retryMessages[index]["content"] = (retryMessages[index]["content"] ?? "") + "\n\n"
+                + MeetingLanguageResolver.correctiveLanguageInstruction(for: expectedLanguage)
+        }
+        if let retried = try? await retry(retryMessages),
+           !MeetingLanguageResolver.hasUnexpectedCyrillicLanguage(
+               in: outcomeTexts(retried),
+               expectedLanguage: expectedLanguage,
+               allowedSourceTexts: allowedSources
+           ) {
+            return retried
+        }
+        return initial
     }
 
     private func performOutcomeRequest(
@@ -1127,7 +1146,24 @@ public struct PortableOutcomeService: PortableOutcomeWriting {
         )
         let session = LanguageModelSession(instructions: messages[0]["content"]!)
         let response = try await session.respond(to: messages[1]["content"]!)
-        return try PortableOutcomePrompt.parse(response.content)
+        let initial = try PortableOutcomePrompt.parse(response.content)
+        let expectedLanguage = MeetingLanguageResolver.resolve(
+            events: events,
+            notes: notes,
+            title: title,
+            appLanguage: language
+        )
+        let allowedSources = [title, notes] + events.flatMap { [$0.speaker ?? "", $0.text] }
+        return await Self.finalizeWithCyrillicLanguageRetry(
+            initial: initial,
+            messages: messages,
+            expectedLanguage: expectedLanguage,
+            allowedSources: allowedSources
+        ) { retryMessages in
+            let retrySession = LanguageModelSession(instructions: retryMessages[0]["content"]!)
+            let retryResponse = try await retrySession.respond(to: retryMessages[1]["content"]!)
+            return try PortableOutcomePrompt.parse(retryResponse.content)
+        }
     }
     #endif
 }

@@ -459,6 +459,73 @@ final class PortableOutcomeProviderTests: XCTestCase {
         XCTAssertTrue(retrySystem.contains("CRITICAL CORRECTION"))
         XCTAssertEqual(corrected.summary, "Обсудили план на следующую неделю и распределили задачи.")
     }
+
+    func testFinalizeWithCyrillicLanguageRetryCoversOnDeviceHelper() async {
+        let baseMessages = [
+            ["role": "system", "content": "Summarize in Russian."],
+            ["role": "user", "content": "Обсудим релиз."]
+        ]
+        let allowed = ["Синк", "Давайте обсудим план релиза."]
+
+        // 1. Wrong Cyrillic (Ukrainian) triggers retry once with CRITICAL CORRECTION and returns corrected Russian result.
+        let wrongUkrainian = PortableOutcomeResult(
+            summary: "Обговорили план релізу на наступний тиждень та визначили відповідальних."
+        )
+        var capturedRetrySystem = ""
+        var retryCalls1 = 0
+        let fixed = await PortableOutcomeService.finalizeWithCyrillicLanguageRetry(
+            initial: wrongUkrainian,
+            messages: baseMessages,
+            expectedLanguage: "ru",
+            allowedSources: allowed
+        ) { retryMessages in
+            retryCalls1 += 1
+            capturedRetrySystem = retryMessages.first?["content"] ?? ""
+            return PortableOutcomeResult(summary: "Обсудили план релиза на следующую неделю и назначили ответственных.")
+        }
+        XCTAssertEqual(retryCalls1, 1)
+        XCTAssertTrue(capturedRetrySystem.contains("CRITICAL CORRECTION"))
+        XCTAssertEqual(fixed.summary, "Обсудили план релиза на следующую неделю и назначили ответственных.")
+
+        // 2. When retry throws or still returns wrong Cyrillic, helper falls back to initial without throwing.
+        var retryCalls2 = 0
+        let fallbackOnThrow = await PortableOutcomeService.finalizeWithCyrillicLanguageRetry(
+            initial: wrongUkrainian,
+            messages: baseMessages,
+            expectedLanguage: "ru",
+            allowedSources: allowed
+        ) { _ in
+            retryCalls2 += 1
+            throw PortableOutcomeError.invalidResponse
+        }
+        XCTAssertEqual(retryCalls2, 1)
+        XCTAssertEqual(fallbackOnThrow, wrongUkrainian)
+
+        let fallbackOnStillWrong = await PortableOutcomeService.finalizeWithCyrillicLanguageRetry(
+            initial: wrongUkrainian,
+            messages: baseMessages,
+            expectedLanguage: "ru",
+            allowedSources: allowed
+        ) { _ in
+            PortableOutcomeResult(summary: "Обсъдихме плана за следващата седмица и кои задачи ще завършим.")
+        }
+        XCTAssertEqual(fallbackOnStillWrong, wrongUkrainian)
+
+        // 3. Clean Russian output never triggers a retry.
+        let cleanRussian = PortableOutcomeResult(summary: "Обсудили план релиза на следующую неделю.")
+        var retryCalls3 = 0
+        let untouched = await PortableOutcomeService.finalizeWithCyrillicLanguageRetry(
+            initial: cleanRussian,
+            messages: baseMessages,
+            expectedLanguage: "ru",
+            allowedSources: allowed
+        ) { _ in
+            retryCalls3 += 1
+            return PortableOutcomeResult(summary: "Should not be called.")
+        }
+        XCTAssertEqual(retryCalls3, 0)
+        XCTAssertEqual(untouched, cleanRussian)
+    }
 }
 
 private final class OutcomeStubProtocol: URLProtocol {
