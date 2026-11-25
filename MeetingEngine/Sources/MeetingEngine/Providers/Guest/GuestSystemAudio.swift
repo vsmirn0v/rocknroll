@@ -29,11 +29,9 @@ final class GuestPCMMeter: NSObject, LKRTCAudioRenderer, @unchecked Sendable {
     private func locked<T>(_ body: () -> T) -> T { lock.lock(); defer { lock.unlock() }; return body() }
     func reset() { locked { measured = GuestAudioSnapshot(); bufferCount = 0; lastLevel = nil; lastSampleTime = 0; callback = .init() } }
 
-    func render(pcmBuffer: AVAudioPCMBuffer) {
-        let receivedUptime = ProcessInfo.processInfo.systemUptime
+    static func bufferEnergy(_ pcmBuffer: AVAudioPCMBuffer) -> (samples: Int, energy: Double) {
         var samples = 0, energy = 0.0
         let format = pcmBuffer.format
-        let deliveredFormat = withExtendedLifetime(format) { GuestStartupAudioCallback.Format(format.streamDescription.pointee) }
         for buffer in UnsafeMutableAudioBufferListPointer(pcmBuffer.mutableAudioBufferList) {
             guard let data = buffer.mData else { continue }
             let expected = Int(pcmBuffer.frameLength) * Int(buffer.mNumberChannels)
@@ -83,6 +81,14 @@ final class GuestPCMMeter: NSObject, LKRTCAudioRenderer, @unchecked Sendable {
             default: break
             }
         }
+        return (samples, energy)
+    }
+
+    func render(pcmBuffer: AVAudioPCMBuffer) {
+        let receivedUptime = ProcessInfo.processInfo.systemUptime
+        let format = pcmBuffer.format
+        let deliveredFormat = withExtendedLifetime(format) { GuestStartupAudioCallback.Format(format.streamDescription.pointee) }
+        let (samples, energy) = Self.bufferEnergy(pcmBuffer)
         locked {
             callback.recordDelivery(frames: Int(pcmBuffer.frameLength), format: deliveredFormat, at: receivedUptime)
             measured.record(samples: samples, energy: energy, at: receivedUptime); bufferCount += 1
@@ -352,6 +358,89 @@ final class GuestAudioOperationTrace: @unchecked Sendable {
 
 /// This owner belongs only to the native probe process. Availability is an explicit privacy gate.
 /// Native ADM calls can block internally, so none run on the main actor and every caller has a deadline.
+/// Detects sustained exact-zero PCM from `AVAudioEngine.inputNode` while the microphone is
+/// logically unmuted and the send gate is open, firing at most once per engine generation.
+public struct GuestInputSilenceWatchdog: Sendable {
+    public let minimumCallbacks: UInt64
+    public let minimumSeconds: TimeInterval
+    public private(set) var totalNonSilentCallbacks: UInt64 = 0
+    public private(set) var lastNonSilentUptime: TimeInterval?
+    public private(set) var engineGeneration: UInt64 = 0
+    public private(set) var engineCallbacks: UInt64 = 0
+    public private(set) var engineNonSilentCallbacks: UInt64 = 0
+    public private(set) var consecutiveSilentCallbacks: UInt64 = 0
+    public private(set) var silentSinceUptime: TimeInterval?
+    public private(set) var unmutedSilentCallbacks: UInt64 = 0
+    public private(set) var unmutedSilentSinceUptime: TimeInterval?
+    private var reportedGeneration: UInt64?
+
+    public init(minimumCallbacks: UInt64 = 20, minimumSeconds: TimeInterval = 2.0) {
+        self.minimumCallbacks = minimumCallbacks
+        self.minimumSeconds = minimumSeconds
+    }
+
+    public mutating func resetEngine() {
+        engineGeneration &+= 1
+        engineCallbacks = 0
+        engineNonSilentCallbacks = 0
+        consecutiveSilentCallbacks = 0
+        silentSinceUptime = nil
+        unmutedSilentCallbacks = 0
+        unmutedSilentSinceUptime = nil
+        reportedGeneration = nil
+    }
+
+    public mutating func resetUnmutedStreak() {
+        unmutedSilentCallbacks = 0
+        unmutedSilentSinceUptime = nil
+    }
+
+    public mutating func observe(samples: Int, energy: Double, unmuted: Bool, gateOpen: Bool, at now: TimeInterval) -> Bool {
+        guard samples > 0, now.isFinite else { return false }
+        engineCallbacks &+= 1
+        if energy.isFinite && energy > 0 {
+            totalNonSilentCallbacks &+= 1
+            engineNonSilentCallbacks &+= 1
+            lastNonSilentUptime = now
+            consecutiveSilentCallbacks = 0
+            silentSinceUptime = nil
+            unmutedSilentCallbacks = 0
+            unmutedSilentSinceUptime = nil
+            return false
+        }
+        consecutiveSilentCallbacks &+= 1
+        if silentSinceUptime == nil { silentSinceUptime = now }
+        if unmuted && gateOpen {
+            unmutedSilentCallbacks &+= 1
+            let since = unmutedSilentSinceUptime ?? now
+            if unmutedSilentSinceUptime == nil { unmutedSilentSinceUptime = now }
+            if reportedGeneration != engineGeneration,
+               unmutedSilentCallbacks >= minimumCallbacks,
+               now - since >= minimumSeconds {
+                reportedGeneration = engineGeneration
+                return true
+            }
+        } else {
+            unmutedSilentCallbacks = 0
+            unmutedSilentSinceUptime = nil
+        }
+        return false
+    }
+
+    public func diagnosticFields(at now: TimeInterval = ProcessInfo.processInfo.systemUptime) -> [String: Any] {
+        [
+            "inputNonSilentCallbacks": totalNonSilentCallbacks,
+            "engineInputCallbacks": engineCallbacks,
+            "engineInputNonSilentCallbacks": engineNonSilentCallbacks,
+            "consecutiveSilentInputCallbacks": consecutiveSilentCallbacks,
+            "unmutedSilentInputCallbacks": unmutedSilentCallbacks,
+            "engineInputGeneration": engineGeneration,
+            "lastInputNonSilentAgeMs": lastNonSilentUptime.map { max(0, now - $0) * 1000 } ?? TimeInterval(-1),
+            "unmutedSilentSeconds": unmutedSilentSinceUptime.map { max(0, now - $0) } ?? TimeInterval(0),
+        ]
+    }
+}
+
 /// An engine stop or start the owner did not ask for (device or route change, sleep).
 public enum GuestEngineChange: Sendable { case stopped, started }
 
@@ -378,9 +467,39 @@ public final class GuestSystemAudio: NSObject, LKRTCAudioDeviceModuleDelegate, @
     private var participationInputMeterEnabled = false
     private let playoutMeter = GuestPCMMeter()
     private var inputCallback = GuestStartupAudioCallback()
+    private var inputSilenceWatchdog = GuestInputSilenceWatchdog()
+    private var watchdogInputUnmuted = false
+    private var watchdogGateOpen = true
+    private var silentInputHandler: (([String: Any]) -> Void)?
     private var inputMeterEnabled = false
     /// Local transcription of your own microphone: a copy of each input buffer.
     private var inputTranscriptionSink: ((AVAudioPCMBuffer) -> Void)?
+    /// Called off the audio thread when `AVAudioEngine.inputNode` delivers sustained exact-zero
+    /// PCM while logically unmuted and the send gate is open.
+    public var onSilentInputDetected: (([String: Any]) -> Void)? {
+        get { inputCallbackLock.lock(); defer { inputCallbackLock.unlock() }; return silentInputHandler }
+        set { inputCallbackLock.lock(); silentInputHandler = newValue; inputCallbackLock.unlock() }
+    }
+    private func setWatchdogInputUnmuted(_ unmuted: Bool) {
+        inputCallbackLock.lock()
+        if watchdogInputUnmuted != unmuted {
+            watchdogInputUnmuted = unmuted
+            inputSilenceWatchdog.resetUnmutedStreak()
+        }
+        inputCallbackLock.unlock()
+    }
+    private func setWatchdogGateOpen(_ open: Bool) {
+        inputCallbackLock.lock()
+        if watchdogGateOpen != open {
+            watchdogGateOpen = open
+            inputSilenceWatchdog.resetUnmutedStreak()
+        }
+        inputCallbackLock.unlock()
+    }
+    private func inputSilenceWatchdogSnapshot() -> GuestInputSilenceWatchdog {
+        inputCallbackLock.lock(); defer { inputCallbackLock.unlock() }
+        return inputSilenceWatchdog
+    }
     /// Voice replies are available whenever the meeting's audio route supports them.
     /// The assistant's own controls decide when a reply is spoken.
     public static var voiceRepliesEnabled: Bool {
@@ -584,8 +703,10 @@ public final class GuestSystemAudio: NSObject, LKRTCAudioDeviceModuleDelegate, @
     }
     public var snapshot: [String: Any] {
         let inputCount = inputCallbackSnapshot().count
+        let watchdog = inputSilenceWatchdogSnapshot().diagnosticFields()
         return locked { cached }
             .merging(["inputCallbacks": inputCount], uniquingKeysWith: { _, value in value })
+            .merging(watchdog, uniquingKeysWith: { _, value in value })
             .merging(operationTrace.snapshot()) { _, value in value }
             .merging(["sharedPlayoutGate": sharedPlayoutGate.evidence]) { _, value in value }
     }
@@ -690,6 +811,7 @@ public final class GuestSystemAudio: NSObject, LKRTCAudioDeviceModuleDelegate, @
                 locked { microphoneGateOpen = state.previousGateOpen }
                 return false
             }
+            setWatchdogGateOpen(open)
             update(["microphoneGateOpen": open])
 #if DEBUG
             update(["voiceReplyTopology": graph.evidence])
@@ -705,9 +827,11 @@ public final class GuestSystemAudio: NSObject, LKRTCAudioDeviceModuleDelegate, @
                 locked { microphoneGateOpen = state.previousGateOpen }
                 return false
             }
+            setWatchdogGateOpen(open)
             update(["microphoneGateOpen": open, "voiceReplyGraph": true])
             return true
         }
+        if open { setWatchdogGateOpen(true) }
         return open
     }
 
@@ -1133,6 +1257,7 @@ public final class GuestSystemAudio: NSObject, LKRTCAudioDeviceModuleDelegate, @
     public func prepareIdleInput(timeout: TimeInterval = 8) async -> Bool {
         let deadline = ProcessInfo.processInfo.systemUptime + timeout
         setPrivateInputMeterEnabled(false)
+        setWatchdogInputUnmuted(false)
         if sharedNativeOwner, !(await sharedPlayoutGate.reset(sound: false)) { _ = await shutdown(); return false }
         let remaining = deadline - ProcessInfo.processInfo.systemUptime
         guard remaining > 0 else { return false }
@@ -1153,6 +1278,55 @@ public final class GuestSystemAudio: NSObject, LKRTCAudioDeviceModuleDelegate, @
                 isMuted: { module.isMicrophoneMuted })
             self.readSnapshot(module)
             return success
+        }
+    }
+
+    /// Releases idle foreground input when no meetings are attached while the shared factory stays
+    /// pinned, stopping recording cleanly so the next prepare restarts via `initAndStartRecording`.
+    public func releaseIdleInput(timeout: TimeInterval = 8) async -> Bool {
+        setPrivateInputMeterEnabled(false)
+        setWatchdogInputUnmuted(false)
+        return await perform("idle-input-release", timeout: timeout) {
+            guard !self.closed, let module = self.currentModule else { return true }
+            self.startedRecordingForPrivateCheck = false
+            self.deferredActivation = false
+            self.inputPermitted = false
+            self.inputActivation = .init(persistent: false); self.microphoneOptIn = false
+            self.playoutEnabled = false
+            self.transcriptionOutput = false
+            self.update(["microphoneMutedRequested": true, "playoutEnabledRequested": false,
+                         "transcriptionOutput": false,
+                         "inputPermitted": false, "inputKeptWarm": false,
+                         "deferredActivation": false, "microphoneOptIn": false])
+            let muted = self.nativeCall("set-microphone-muted", { module.setMicrophoneMuted(true) }) == 0
+            let available = self.applyAvailability(module)
+            let stoppedRecording = !module.isRecording || self.nativeCall("stop-recording", { module.stopRecording() }) == 0
+            self.readSnapshot(module)
+            return muted && module.isMicrophoneMuted && available && stoppedRecording
+        }
+    }
+
+    /// Recycles a wedged `AVAudioEngine` / VPIO graph while muted when sustained exact-zero
+    /// input PCM is observed during an unmuted send session. Caller restores senders and unmute.
+    public func recoverSilentInput(timeout: TimeInterval = 8) async -> Bool {
+        setWatchdogInputUnmuted(false)
+        return await perform("silent-input-recover", timeout: timeout) {
+            guard !self.closed, let module = self.currentModule,
+                  self.inputPermitted, self.microphoneOptIn,
+                  GuestSystemAudio.microphoneAuthorized else { return false }
+            self.update(["microphoneMutedRequested": true])
+            let muted = self.nativeCall("set-microphone-muted", { module.setMicrophoneMuted(true) }) == 0
+            var unavailable = LKRTCAudioEngineAvailability()
+            unavailable.isInputAvailable = false; unavailable.isOutputAvailable = false
+            let gated = self.nativeCall("set-engine-unavailable", { module.setEngineAvailability(unavailable) }) == 0
+            let stoppedRecording = !module.isRecording || self.nativeCall("stop-recording", { module.stopRecording() }) == 0
+            let restarted = GuestMutedInputPreparation.start(
+                mute: { self.nativeCall("set-microphone-muted", { module.setMicrophoneMuted(true) }) == 0 },
+                makeAvailable: { self.applyAvailability(module) },
+                startRecording: { module.isRecording || self.nativeCall("start-recording", { module.initAndStartRecording(audioProcessingOptions: nil) }) == 0 },
+                isMuted: { module.isMicrophoneMuted })
+            self.readSnapshot(module)
+            return muted && gated && stoppedRecording && restarted
         }
     }
 
@@ -1270,6 +1444,7 @@ public final class GuestSystemAudio: NSObject, LKRTCAudioDeviceModuleDelegate, @
     /// Enqueue the privacy barrier immediately, before a later unmute can enqueue.
     /// The sender track is suppressed synchronously by the engine as well.
     public func suppressMicrophone() {
+        setWatchdogInputUnmuted(false)
         audioQueue.async {
             guard !self.closed, let module = self.currentModule else { return }
             self.update(["microphoneMutedRequested": true])
@@ -1281,6 +1456,7 @@ public final class GuestSystemAudio: NSObject, LKRTCAudioDeviceModuleDelegate, @
 
     /// Only opted-in capture remains available while muted. InputMixer avoids restarting playout.
     public func setMicrophoneMuted(_ muted: Bool, timeout: TimeInterval = 2) async -> Bool {
+        if muted { setWatchdogInputUnmuted(false) }
         // Re-activating released input first initializes the voice-processing unit again.
         let reactivates = !muted && snapshot["deferredActivation"] as? Bool == true
         return await perform("microphone-mute", timeout: reactivates ? max(timeout, 8) : timeout) {
@@ -1330,7 +1506,7 @@ public final class GuestSystemAudio: NSObject, LKRTCAudioDeviceModuleDelegate, @
     /// device and voice processing keep running, so moving back skips their
     /// restart. Unmuting is refused until the permit returns, as without it.
     public func setInputPermitted(_ permitted: Bool, keepWarm: Bool = false, timeout: TimeInterval = 8) async -> Bool {
-        if !permitted { setPrivateInputMeterEnabled(false) }
+        if !permitted { setPrivateInputMeterEnabled(false); setWatchdogInputUnmuted(false) }
         return await perform(permitted ? "input-permit" : keepWarm ? "input-release-warm" : "input-release", timeout: timeout) {
             guard !self.closed, let module = self.currentModule else { return !permitted }
             guard !permitted else {
@@ -1428,6 +1604,7 @@ public final class GuestSystemAudio: NSObject, LKRTCAudioDeviceModuleDelegate, @
 
     /// Close peers and remove track renderers first. A false result means cleanup is unproven.
     public func shutdown(timeout: TimeInterval = 2) async -> Bool {
+        setWatchdogInputUnmuted(false)
         if sharedNativeOwner { _ = await sharedPlayoutGate.close(retire: true) }
         let success = await perform("shutdown", timeout: timeout) {
             if self.closed { return self.snapshot["cleanupSucceeded"] as? Bool == true }
@@ -1555,10 +1732,12 @@ public final class GuestSystemAudio: NSObject, LKRTCAudioDeviceModuleDelegate, @
         } else {
             (inputDevices, outputDevices) = locked { (cachedInputDeviceCount, cachedOutputDeviceCount) }
         }
+        let micMuted = module.isMicrophoneMuted
+        setWatchdogInputUnmuted(!micMuted)
         update(["inputAvailable": availability.isInputAvailable.boolValue, "outputAvailable": availability.isOutputAvailable.boolValue,
                 "inputEnabled": state.inputEnabled.boolValue, "inputRunning": state.inputRunning.boolValue,
                 "outputEnabled": state.outputEnabled.boolValue, "outputRunning": state.outputRunning.boolValue,
-                "microphoneMuted": module.isMicrophoneMuted, "muteMode": state.muteMode.rawValue,
+                "microphoneMuted": micMuted, "muteMode": state.muteMode.rawValue,
                 "engineRunning": module.isEngineRunning, "recording": module.isRecording, "playing": module.isPlaying,
                 "inputDeviceCount": inputDevices, "outputDeviceCount": outputDevices,
                 "recordingAlwaysPrepared": module.isRecordingAlwaysPreparedMode,
@@ -1681,6 +1860,9 @@ public final class GuestSystemAudio: NSObject, LKRTCAudioDeviceModuleDelegate, @
         let forwarded = forwarding?.audioDeviceModule(audioDeviceModule, willReleaseEngine: engine) ?? 0
         if let tappedInput, tappedEngine === engine {
             tappedInput.removeTap(onBus: 0); self.tappedInput = nil; tappedEngine = nil
+            inputCallbackLock.lock()
+            inputSilenceWatchdog.resetEngine()
+            inputCallbackLock.unlock()
         }
         if let tappedPlayout, tappedPlayoutEngine === engine {
             sharedPlayoutGate.remove(identity: ObjectIdentifier(tappedPlayout))
@@ -1725,6 +1907,7 @@ public final class GuestSystemAudio: NSObject, LKRTCAudioDeviceModuleDelegate, @
             guard prove?(engine, source, inputMixer) == true else { return -1 }
             if let controller {
                 guard controller.setGateOpen(gateOpen) else { return -1 }
+                setWatchdogGateOpen(gateOpen)
                 update(["voiceReplyGraph": true, "microphoneGateOpen": gateOpen])
             }
             locked { _ = forwardedInputRoutes.insert(id) }
@@ -1733,13 +1916,33 @@ public final class GuestSystemAudio: NSObject, LKRTCAudioDeviceModuleDelegate, @
         if let source, source !== tappedInput, format.sampleRate > 0, format.channelCount > 0 {
             tappedInput?.removeTap(onBus: 0)
             tappedInput = source; tappedEngine = engine
+            inputCallbackLock.lock()
+            inputSilenceWatchdog.resetEngine()
+            inputCallbackLock.unlock()
             source.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
                 guard let self else { return }
                 let receivedUptime = ProcessInfo.processInfo.systemUptime, deliveredFormat = buffer.format
                 let signature = withExtendedLifetime(deliveredFormat) { GuestStartupAudioCallback.Format(deliveredFormat.streamDescription.pointee) }
+                let measured = GuestPCMMeter.bufferEnergy(buffer)
                 self.inputCallbackLock.lock()
                 self.inputCallback = .init(count: self.inputCallback.count + 1, frames: Int(buffer.frameLength),
                     format: signature, uptime: receivedUptime)
+                let triggered = self.inputSilenceWatchdog.observe(
+                    samples: measured.samples,
+                    energy: measured.energy,
+                    unmuted: !self.manualRenderingMode && self.watchdogInputUnmuted && LKRTCApplicationCaptureMuted() == 0,
+                    gateOpen: self.watchdogGateOpen,
+                    at: receivedUptime
+                )
+                let silentCallback: (([String: Any]) -> Void)?
+                let silentEvidence: [String: Any]?
+                if triggered {
+                    silentCallback = self.silentInputHandler
+                    silentEvidence = self.inputSilenceWatchdog.diagnosticFields(at: receivedUptime)
+                } else {
+                    silentCallback = nil
+                    silentEvidence = nil
+                }
                 let metering = self.inputMeterEnabled
                 let participationMetering = self.participationInputMeterEnabled
                 let sink = self.inputTranscriptionSink
@@ -1747,6 +1950,11 @@ public final class GuestSystemAudio: NSObject, LKRTCAudioDeviceModuleDelegate, @
                 sink?(buffer)
                 if metering { self.inputMeter.render(pcmBuffer: buffer) }
                 if participationMetering { self.participationInputMeter.render(pcmBuffer: buffer) }
+                if let silentCallback, let silentEvidence {
+                    DispatchQueue.global(qos: .utility).async {
+                        silentCallback(silentEvidence)
+                    }
+                }
             }
         }
         // Voice replies: microphone → gate → input mixer ← player.
@@ -1762,6 +1970,7 @@ public final class GuestSystemAudio: NSObject, LKRTCAudioDeviceModuleDelegate, @
             if let output = locked({ participationMonitorRoute(for: engine) }) {
                 graph.connectMonitor(to: output.mixer, format: output.format)
             }
+            setWatchdogGateOpen(graph.gateOpen)
             update(["voiceReplyGraph": connected, "microphoneGateOpen": graph.gateOpen])
             if connected { return 0 }
         }

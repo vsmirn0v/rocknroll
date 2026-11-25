@@ -578,6 +578,209 @@ import XCTest
         _ = await third.detach()
     }
 
+    func testInputSilenceWatchdogFiresOncePerWedgedUnmutedEngineAndResetsAcrossMutesAndRestarts() {
+        var watchdog = GuestInputSilenceWatchdog(minimumCallbacks: 3, minimumSeconds: 0.2)
+
+        // Works even when uptime starts at 0.0 (no zero-sentinel ambiguity).
+        XCTAssertFalse(watchdog.observe(samples: 480, energy: 0, unmuted: true, gateOpen: true, at: 0.0))
+        XCTAssertFalse(watchdog.observe(samples: 480, energy: 0, unmuted: true, gateOpen: true, at: 0.1))
+        XCTAssertTrue(watchdog.observe(samples: 480, energy: 0, unmuted: true, gateOpen: true, at: 0.2))
+        XCTAssertEqual(watchdog.diagnosticFields(at: 0.25)["lastInputNonSilentAgeMs"] as? Double, -1)
+        watchdog.resetEngine()
+
+        // Exact zeros while muted or with the voice gate closed must never fire.
+        for step in 0..<5 {
+            XCTAssertFalse(watchdog.observe(samples: 480, energy: 0, unmuted: false, gateOpen: true, at: Double(step) * 0.1))
+        }
+        XCTAssertEqual(watchdog.unmutedSilentCallbacks, 0)
+        for step in 5..<10 {
+            XCTAssertFalse(watchdog.observe(samples: 480, energy: 0, unmuted: true, gateOpen: false, at: Double(step) * 0.1))
+        }
+        XCTAssertEqual(watchdog.unmutedSilentCallbacks, 0)
+
+        // Non-zero input resets streak and records non-silent counts.
+        XCTAssertFalse(watchdog.observe(samples: 480, energy: 0, unmuted: true, gateOpen: true, at: 1.0))
+        XCTAssertFalse(watchdog.observe(samples: 480, energy: 0, unmuted: true, gateOpen: true, at: 1.1))
+        XCTAssertFalse(watchdog.observe(samples: 480, energy: 0.01, unmuted: true, gateOpen: true, at: 1.15))
+        XCTAssertEqual(watchdog.totalNonSilentCallbacks, 1)
+        XCTAssertEqual(watchdog.engineNonSilentCallbacks, 1)
+        XCTAssertEqual(watchdog.consecutiveSilentCallbacks, 0)
+        XCTAssertEqual(watchdog.unmutedSilentCallbacks, 0)
+
+        // Muting (resetUnmutedStreak) resets an in-progress unmuted silence streak.
+        XCTAssertFalse(watchdog.observe(samples: 480, energy: 0, unmuted: true, gateOpen: true, at: 2.0))
+        XCTAssertFalse(watchdog.observe(samples: 480, energy: 0, unmuted: true, gateOpen: true, at: 2.15))
+        XCTAssertEqual(watchdog.unmutedSilentCallbacks, 2)
+        watchdog.resetUnmutedStreak()
+        XCTAssertEqual(watchdog.unmutedSilentCallbacks, 0)
+
+        // Sustained exact zeros while unmuted + gateOpen fires once after both minimumCallbacks & minimumSeconds.
+        XCTAssertFalse(watchdog.observe(samples: 480, energy: 0, unmuted: true, gateOpen: true, at: 3.0))
+        XCTAssertFalse(watchdog.observe(samples: 480, energy: 0, unmuted: true, gateOpen: true, at: 3.1))
+        XCTAssertTrue(watchdog.observe(samples: 480, energy: 0, unmuted: true, gateOpen: true, at: 3.2))
+        // Does not re-fire in the same engine generation.
+        XCTAssertFalse(watchdog.observe(samples: 480, energy: 0, unmuted: true, gateOpen: true, at: 3.3))
+        XCTAssertFalse(watchdog.observe(samples: 480, energy: 0, unmuted: true, gateOpen: true, at: 4.0))
+
+        // Engine replacement allows fresh detection in the new generation.
+        let previousGeneration = watchdog.engineGeneration
+        watchdog.resetEngine()
+        XCTAssertEqual(watchdog.engineGeneration, previousGeneration + 1)
+        XCTAssertEqual(watchdog.engineCallbacks, 0)
+        XCTAssertEqual(watchdog.engineNonSilentCallbacks, 0)
+        XCTAssertEqual(watchdog.totalNonSilentCallbacks, 1)
+        XCTAssertFalse(watchdog.observe(samples: 480, energy: 0, unmuted: true, gateOpen: true, at: 5.0))
+        XCTAssertFalse(watchdog.observe(samples: 480, energy: 0, unmuted: true, gateOpen: true, at: 5.1))
+        XCTAssertTrue(watchdog.observe(samples: 480, energy: 0, unmuted: true, gateOpen: true, at: 5.2))
+    }
+
+    func testSilentInputRecoveryGuardsCooldownCapFailureAndPinnedIdleRelease() async throws {
+        var now = 100.0
+        var processMuted = false
+        let module = FakeModule()
+        let engine = SharedAudioEngine(
+            grace: .milliseconds(15),
+            authorized: { true },
+            reportFailedStop: {},
+            processCaptureMuted: { processMuted },
+            uptime: { now },
+            silentInputRecoveryCooldown: 60,
+            maxSilentInputRecoveriesPerTalkEpoch: 2
+        ) { module }
+
+        // Pinned foreground idle retirement uses releaseIdleInput instead of dangling recording availability.
+        engine.pinForProcess()
+        engine.setForeground(true, microphone: true)
+        await engine.waitForWork()
+        XCTAssertEqual(module.log, ["prepare-idle"])
+        engine.setForeground(false, microphone: true)
+        try await spin { module.log.contains("release-idle") }
+        await engine.waitForWork()
+
+        let talk = try await engine.attach(meetingID: UUID())
+        let listener = try await engine.attach(meetingID: UUID())
+        let talkSender = FakeSender(), listenerSender = FakeSender()
+        talk.addSender(talkSender); listener.addSender(listenerSender)
+        ok(await talk.assumeTalk()); ok(await talk.setMuted(false))
+        XCTAssertTrue(talkSender.isEnabled); XCTAssertFalse(listenerSender.isEnabled); XCTAssertFalse(module.muted)
+
+        // Process capture gate closed (hardware/headset mute): recovery must skip cleanly.
+        processMuted = true
+        module.log.removeAll()
+        XCTAssertNil(engine.silentInputDetected(["unmutedSilentInputCallbacks": 25]))
+        XCTAssertEqual(engine.silentInputRecoveries, 0)
+        XCTAssertFalse(module.log.contains("recover-silent"))
+        processMuted = false
+
+        // Unmuted talk meeting with sustained silent input recycles the engine and restores unmute.
+        var silencedBeforeRecover = false
+        module.onRecover = {
+            silencedBeforeRecover = !talkSender.isEnabled && module.muted
+        }
+        module.log.removeAll()
+        module.onSilentInputDetected?(["unmutedSilentInputCallbacks": 25])
+        try await spin { engine.silentInputRecoveries == 1 }
+        await engine.waitForWork()
+        XCTAssertTrue(silencedBeforeRecover, "Senders and module must be muted before recycling the engine during recovery")
+        XCTAssertTrue(module.log.contains("recover-silent"))
+        XCTAssertTrue(talkSender.isEnabled); XCTAssertFalse(listenerSender.isEnabled)
+        XCTAssertTrue(engine.talkUnmuted); XCTAssertFalse(module.muted)
+
+        // Cooldown prevents tight retry loops immediately after recovery.
+        now += 10
+        XCTAssertNil(engine.silentInputDetected())
+        XCTAssertEqual(engine.silentInputRecoveries, 1)
+
+        // After cooldown, a second recovery succeeds (up to cap = 2 per talk epoch).
+        now += 65
+        let secondRecovery = try XCTUnwrap(engine.silentInputDetected())
+        ok(await secondRecovery.value)
+        XCTAssertEqual(engine.silentInputRecoveries, 2)
+
+        // Third attempt in the same talk epoch hits maxSilentInputRecoveriesPerTalkEpoch = 2.
+        now += 65
+        XCTAssertNil(engine.silentInputDetected())
+        XCTAssertEqual(engine.silentInputRecoveries, 2)
+
+        // Moving talk role resets the per-epoch cap; failing recoverSilentInput fails closed & notifies.
+        ok(await listener.assumeTalk()); ok(await listener.setMuted(false))
+        var failedMeetings: [UUID] = []
+        engine.onRecoveryFailed = { failedMeetings.append($0) }
+        module.failRecover = true
+        module.log.removeAll()
+        now += 65
+        let failedRecovery = try XCTUnwrap(engine.silentInputDetected())
+        no(await failedRecovery.value)
+        let recoverIndex = try XCTUnwrap(module.log.firstIndex(of: "recover-silent"))
+        XCTAssertTrue(module.log.suffix(from: recoverIndex + 1).contains("mute:true"),
+                      "Failed silent-input recovery must clear muteConfirmed and re-mute natively")
+        XCTAssertFalse(listenerSender.isEnabled)
+        XCTAssertTrue(module.muted)
+        XCTAssertFalse(engine.talkUnmuted)
+        XCTAssertEqual(failedMeetings, [listener.meetingID])
+    }
+
+    func testLiveManualReleaseIdleInputStopsRecordingAndRecoverSilentInputRestartsEngine() async throws {
+        GuestSystemAudio.microphoneAuthorizationOverrideForTesting = true
+        defer { GuestSystemAudio.microphoneAuthorizationOverrideForTesting = nil }
+        let engine = SharedAudioEngine(grace: .milliseconds(15), authorized: { true }, reportFailedStop: {}) {
+            try await GuestSystemAudio.create(microphoneEnabled: false, playoutEnabled: false,
+                profile: .speech, concurrent: true, manualRendering: true, keepOutputAvailableWithInput: true,
+                makeFactory: { SharedAudioEngine.liveKitFactory(voiceProcessing: $0) })
+        }
+        engine.pinForProcess()
+        engine.setForeground(true, microphone: true)
+        await engine.waitForWork()
+
+        let owner = try XCTUnwrap(engine.guestOwner)
+        var snapshot = owner.snapshot
+        XCTAssertEqual(snapshot["recording"] as? Bool, true)
+        XCTAssertEqual(snapshot["enginesCreated"] as? Int, 1)
+
+        // Pinned retirement calls releaseIdleInput and stops recording cleanly instead of leaving recording=true.
+        engine.setForeground(false, microphone: true)
+        try await spin { owner.snapshot["recording"] as? Bool == false }
+        await engine.waitForWork()
+        snapshot = owner.snapshot
+        XCTAssertEqual(snapshot["recording"] as? Bool, false)
+        XCTAssertEqual(snapshot["inputAvailable"] as? Bool, false)
+        XCTAssertGreaterThanOrEqual(snapshot["engineStops"] as? Int ?? 0, 1)
+
+        // Attaching and activating starts cleanly again; recoverSilentInput recycles the AVAudioEngine.
+        let meeting = try await SharedGuestMeetingAudio.attach(to: engine)
+        ok(await meeting.beginAttempt(sound: true))
+        ok(await meeting.setInputPermitted(true))
+        ok(await meeting.activateMicrophone())
+        ok(await meeting.setMicrophoneMuted(false, timeout: 2))
+
+        let before = owner.snapshot
+        let createdBefore = before["enginesCreated"] as? Int ?? 0
+        let startsBefore = before["engineStarts"] as? Int ?? 0
+        let stopsBefore = before["engineStops"] as? Int ?? 0
+        let releasesBefore = before["enginesReleased"] as? Int ?? 0
+
+        ok(await owner.recoverSilentInput())
+        let after = owner.snapshot
+        XCTAssertGreaterThan(after["enginesCreated"] as? Int ?? 0, createdBefore)
+        XCTAssertGreaterThan(after["engineStarts"] as? Int ?? 0, startsBefore)
+        XCTAssertGreaterThan(after["engineStops"] as? Int ?? 0, stopsBefore)
+        XCTAssertGreaterThan(after["enginesReleased"] as? Int ?? 0, releasesBefore)
+        XCTAssertEqual(after["recording"] as? Bool, true)
+        XCTAssertEqual(after["inputRunning"] as? Bool, true)
+        XCTAssertEqual(after["microphoneMuted"] as? Bool, true, "Recovered engine stays muted until unmuteLocked restores senders")
+
+        let diagnostics = engine.ownershipDiagnostics
+        XCTAssertTrue(JSONSerialization.isValidJSONObject(diagnostics))
+        XCTAssertNotNil(diagnostics["inputNonSilentCallbacks"])
+        XCTAssertNotNil(diagnostics["engineInputCallbacks"])
+        XCTAssertNotNil(diagnostics["engineInputNonSilentCallbacks"])
+        XCTAssertNotNil(diagnostics["consecutiveSilentInputCallbacks"])
+        XCTAssertEqual(diagnostics["silentInputRecoveries"] as? Int, 0)
+
+        ok(await meeting.shutdown())
+        ok(await owner.shutdown())
+    }
+
     private func ok(_ value: Bool, _ message: String = "", file: StaticString = #filePath, line: UInt = #line) {
         XCTAssertTrue(value, message, file: file, line: line)
     }
@@ -605,8 +808,9 @@ private final class DiagnosticSender: MeetingAudioSender {
     var log: [String] = []
     var muted = true, playout = false, transcription = false, permitted = true, active = false
     var unmutes = 0, replies = 0
-    var failUnmute = false, failActivation = false, failShutdown = false
+    var failUnmute = false, failActivation = false, failShutdown = false, failRecover = false
     var onUnmute: (() -> Void)?
+    var onRecover: (() -> Void)?
     var participationGraph: GuestVoiceReplyGraph?
     private var sink: ((AVAudioPCMBuffer) -> Void)?
     lazy var factory = LKRTCPeerConnectionFactory(encoderFactory: LKRTCDefaultVideoEncoderFactory(), decoderFactory: LKRTCDefaultVideoDecoderFactory())
@@ -615,6 +819,13 @@ private final class DiagnosticSender: MeetingAudioSender {
     func prepareIdleInput(timeout: TimeInterval) async -> Bool {
         log.append("prepare-idle"); guard !failActivation else { return false }
         muted = true; permitted = true; active = true; return true
+    }
+    func releaseIdleInput(timeout: TimeInterval) async -> Bool {
+        log.append("release-idle"); muted = true; permitted = false; active = false; return true
+    }
+    func recoverSilentInput(timeout: TimeInterval) async -> Bool {
+        log.append("recover-silent"); onRecover?(); guard !failRecover else { return false }
+        muted = true; return true
     }
     func activateMicrophone(timeout: TimeInterval?) async -> Bool {
         log.append("activate"); guard !failActivation, permitted else { return false }; active = true; return true
@@ -646,4 +857,5 @@ private final class DiagnosticSender: MeetingAudioSender {
     }
     func shutdown(timeout: TimeInterval) async -> Bool { log.append("shutdown"); return !failShutdown }
     var onSpontaneousEngineChange: ((GuestEngineChange) -> Void)?
+    var onSilentInputDetected: (([String: Any]) -> Void)?
 }

@@ -15,6 +15,8 @@ import LiveKitWebRTC
 @MainActor public protocol SharedAudioModule: AnyObject {
     var factory: LKRTCPeerConnectionFactory { get }
     func prepareIdleInput(timeout: TimeInterval) async -> Bool
+    func releaseIdleInput(timeout: TimeInterval) async -> Bool
+    func recoverSilentInput(timeout: TimeInterval) async -> Bool
     func ensureAssistantMutedInput(timeout: TimeInterval) async -> Bool
     func activateMicrophone(timeout: TimeInterval?) async -> Bool
     func setMicrophoneMuted(_ muted: Bool, timeout: TimeInterval) async -> Bool
@@ -45,11 +47,21 @@ import LiveKitWebRTC
     func shutdown(timeout: TimeInterval) async -> Bool
     /// Engine stops/starts the owner did not ask for (device or route change); any thread.
     var onSpontaneousEngineChange: ((GuestEngineChange) -> Void)? { get set }
+    /// Sustained exact-zero input PCM observed while unmuted; any thread.
+    var onSilentInputDetected: (([String: Any]) -> Void)? { get set }
 }
 
 extension GuestSystemAudio: SharedAudioModule {}
 
 public extension SharedAudioModule {
+    func releaseIdleInput(timeout: TimeInterval) async -> Bool {
+        await setInputPermitted(false, keepWarm: false, timeout: timeout)
+    }
+    func recoverSilentInput(timeout: TimeInterval) async -> Bool { false }
+    var onSilentInputDetected: (([String: Any]) -> Void)? {
+        get { nil }
+        set {}
+    }
     func ensureAssistantMutedInput(timeout: TimeInterval) async -> Bool { false }
     func playVoiceReply(_ buffer: AVAudioPCMBuffer, localGain: Float) async -> Bool { await playVoiceReply(buffer) }
     func playVoiceReplyStream(_ chunks: AsyncThrowingStream<AVAudioPCMBuffer, Error>) async -> Bool {
@@ -184,6 +196,10 @@ public enum SharedAudioEngineError: LocalizedError, Equatable {
     public private(set) var rebuilding = false
     private var pendingRebuildStart = false
     public private(set) var recoveries = 0
+    public private(set) var silentInputRecoveries = 0
+    private var silentInputRecoveriesForTalkEpoch = 0
+    private var lastSilentInputRecoveryUptime: TimeInterval = -.infinity
+    private var recoveringSilentInput = false
     /// The talk meeting whose unmute could not be restored after a rebuild (it stays muted).
     public var onRecoveryFailed: ((UUID) -> Void)?
     private var sleepObservers: [NSObjectProtocol] = []
@@ -197,6 +213,10 @@ public enum SharedAudioEngineError: LocalizedError, Equatable {
 
     private let reportFailedStop: () -> Void
     private let installIntoLiveKitOnCreate: Bool
+    private let processCaptureMuted: () -> Bool
+    private let uptime: () -> TimeInterval
+    private let silentInputRecoveryCooldown: TimeInterval
+    private let maxSilentInputRecoveriesPerTalkEpoch: Int
 
     /// `reportFailedStop` blocks every new physical owner in the process (tests replace it).
     public init(timeouts: Timeouts = .init(), grace: Duration = .seconds(2),
@@ -204,9 +224,16 @@ public enum SharedAudioEngineError: LocalizedError, Equatable {
          sleep: @escaping (Duration) async throws -> Void = { try await Task.sleep(for: $0) },
          reportFailedStop: @escaping () -> Void = { GuestAudioOwnerLease.reportFailedStop() },
          installIntoLiveKitOnCreate: Bool = false,
+         processCaptureMuted: @escaping () -> Bool = { LKRTCApplicationCaptureMuted() != 0 },
+         uptime: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+         silentInputRecoveryCooldown: TimeInterval = 60,
+         maxSilentInputRecoveriesPerTalkEpoch: Int = 2,
          makeModule: @escaping @MainActor () async throws -> SharedAudioModule) {
         self.timeouts = timeouts; self.grace = grace; self.authorized = authorized; self.sleep = sleep
         self.reportFailedStop = reportFailedStop; self.installIntoLiveKitOnCreate = installIntoLiveKitOnCreate
+        self.processCaptureMuted = processCaptureMuted; self.uptime = uptime
+        self.silentInputRecoveryCooldown = silentInputRecoveryCooldown
+        self.maxSilentInputRecoveriesPerTalkEpoch = maxSilentInputRecoveriesPerTalkEpoch
         self.makeModule = makeModule
     }
 
@@ -255,6 +282,11 @@ public enum SharedAudioEngineError: LocalizedError, Equatable {
                 "graphCreateCount": ownerSnapshot["enginesCreated"] ?? NSNull(),
                 "graphStartCount": ownerSnapshot["engineStarts"] ?? NSNull(),
                 "graphReleaseCount": ownerSnapshot["enginesReleased"] ?? NSNull(),
+                "inputNonSilentCallbacks": ownerSnapshot["inputNonSilentCallbacks"] ?? NSNull(),
+                "engineInputCallbacks": ownerSnapshot["engineInputCallbacks"] ?? NSNull(),
+                "engineInputNonSilentCallbacks": ownerSnapshot["engineInputNonSilentCallbacks"] ?? NSNull(),
+                "consecutiveSilentInputCallbacks": ownerSnapshot["consecutiveSilentInputCallbacks"] ?? NSNull(),
+                "silentInputRecoveries": silentInputRecoveries,
                 "factoryPurpose": "shared-audio-and-native-peers",
                 "attachmentCount": attachments.count, "attachments": entries,
                 "attachmentsTruncated": max(0, order.count - entries.count),
@@ -470,7 +502,7 @@ public enum SharedAudioEngineError: LocalizedError, Equatable {
             }
             guard await muteEverythingLocked() else { return false }
             talkUnmuted = false
-            talkMeetingID = attachment.meetingID; talkEpoch &+= 1
+            talkMeetingID = attachment.meetingID; talkEpoch &+= 1; silentInputRecoveriesForTalkEpoch = 0
             inputSink.set(attachment.inputSinkHandler)
             _ = module?.setMicrophoneGate(open: true)
             let permitted = await module?.setInputPermitted(true, keepWarm: false, timeout: timeouts.mute) ?? false
@@ -565,6 +597,88 @@ public enum SharedAudioEngineError: LocalizedError, Equatable {
                 return restored
             } }
         }
+    }
+
+    /// Bounded self-healing when `AVAudioEngine.inputNode` delivers sustained exact-zero
+    /// PCM while a talk meeting is unmuted: mutes privacy-first, recycles the physical
+    /// engine via `recoverSilentInput`, and restores the talk meeting's unmute.
+    @discardableResult public func silentInputDetected(_ evidence: [String: Any] = [:]) -> Task<Bool, Never>? {
+        guard !recoveringSilentInput, talkUnmuted, !moduleMuted,
+              talkMeetingID != nil, !rebuilding, !privateCheckActive, !cleanupFailed,
+              participationSender == nil else { return nil }
+        if processCaptureMuted() {
+            var fields = evidence
+            fields["stage"] = "skipped"
+            fields["reason"] = "processCaptureMuted"
+            probeLog("silent-input-recovery", probeSafe(fields) as? [String: Any] ?? ["stage": "skipped", "reason": "processCaptureMuted"])
+            return nil
+        }
+        let now = uptime()
+        if now - lastSilentInputRecoveryUptime < silentInputRecoveryCooldown {
+            var fields = evidence
+            fields["stage"] = "persisted"
+            fields["reason"] = "cooldown"
+            probeLog("silent-input-recovery", probeSafe(fields) as? [String: Any] ?? ["stage": "persisted", "reason": "cooldown"])
+            return nil
+        }
+        if silentInputRecoveriesForTalkEpoch >= maxSilentInputRecoveriesPerTalkEpoch {
+            var fields = evidence
+            fields["stage"] = "persisted"
+            fields["reason"] = "maxRecoveriesReached"
+            probeLog("silent-input-recovery", probeSafe(fields) as? [String: Any] ?? ["stage": "persisted", "reason": "maxRecoveriesReached"])
+            return nil
+        }
+        recoveringSilentInput = true
+        return Task { await work.run { [self] in
+            defer { self.recoveringSilentInput = false }
+            guard let module, talkUnmuted, !moduleMuted,
+                  let id = talkMeetingID, let talk = attachments[id],
+                  !rebuilding, !privateCheckActive, !cleanupFailed,
+                  participationSender == nil, !processCaptureMuted() else { return false }
+            let runNow = uptime()
+            guard runNow - lastSilentInputRecoveryUptime >= silentInputRecoveryCooldown,
+                  silentInputRecoveriesForTalkEpoch < maxSilentInputRecoveriesPerTalkEpoch else { return false }
+            lastSilentInputRecoveryUptime = runNow
+            silentInputRecoveriesForTalkEpoch += 1
+            let epoch = talkEpoch
+            let before = guestOwner?.snapshot ?? [:]
+            var startFields = evidence
+            startFields["stage"] = "started"
+            startFields["attempt"] = silentInputRecoveriesForTalkEpoch
+            startFields["enginesCreated"] = before["enginesCreated"] ?? NSNull()
+            probeLog("silent-input-recovery", probeSafe(startFields) as? [String: Any] ?? ["stage": "started"])
+            for attachment in attachments.values { attachment.disableSenders() }
+            _ = await muteModuleLocked(module)
+            muteConfirmed = false
+            let recovered = await module.recoverSilentInput(timeout: timeouts.activation)
+            guard recovered, talkMeetingID == id, talkEpoch == epoch, talkUnmuted,
+                  attachments[id] === talk, !rebuilding, !privateCheckActive, !cleanupFailed else {
+                if talkMeetingID == id, talkEpoch == epoch, talkUnmuted {
+                    talkUnmuted = false
+                    if !(muteConfirmed && moduleMuted) { _ = await muteModuleLocked(module) }
+                    onRecoveryFailed?(id)
+                }
+                probeLog("silent-input-recovery", ["stage": "failed", "attempt": silentInputRecoveriesForTalkEpoch, "recovered": recovered])
+                return false
+            }
+            let restored = await unmuteLocked(talk, module: module, epoch: epoch)
+            guard restored else {
+                talkUnmuted = false
+                if !(muteConfirmed && moduleMuted) { _ = await muteModuleLocked(module) }
+                onRecoveryFailed?(id)
+                probeLog("silent-input-recovery", ["stage": "restore-failed", "attempt": silentInputRecoveriesForTalkEpoch])
+                return false
+            }
+            silentInputRecoveries += 1
+            let after = guestOwner?.snapshot ?? [:]
+            probeLog("silent-input-recovery", probeSafe([
+                "stage": "completed",
+                "attempt": silentInputRecoveriesForTalkEpoch,
+                "enginesCreatedBefore": before["enginesCreated"] ?? NSNull(),
+                "enginesCreatedAfter": after["enginesCreated"] ?? NSNull(),
+            ]) as? [String: Any] ?? ["stage": "completed"])
+            return true
+        } }
     }
 
     /// Sleep and wake go through the same path as an engine rebuild.
@@ -829,6 +943,9 @@ public enum SharedAudioEngineError: LocalizedError, Equatable {
             created.onSpontaneousEngineChange = { [weak self] change in
                 Task { @MainActor in self?.engineChanged(change) }
             }
+            created.onSilentInputDetected = { [weak self] evidence in
+                Task { @MainActor in _ = self?.silentInputDetected(evidence) }
+            }
             module = created
             if installIntoLiveKitOnCreate, !pinnedForProcess {
                 _ = installIntoLiveKit()
@@ -845,11 +962,11 @@ public enum SharedAudioEngineError: LocalizedError, Equatable {
         inputSink.set(nil)
         if pinnedForProcess {
             // LiveKit holds the factory: idle (the talk role already released input,
-            // or foreground preparation must now release input).
+            // or foreground preparation must now cleanly stop recording and release input).
             var success = true
             if foregroundPrepared {
                 foregroundPrepared = false
-                success = await module.setInputPermitted(false, keepWarm: false, timeout: timeouts.activation) && success
+                success = await module.releaseIdleInput(timeout: timeouts.activation) && success
             }
             moduleMuted = true
             let outputApplied = await applyOutputLocked()
@@ -859,6 +976,7 @@ public enum SharedAudioEngineError: LocalizedError, Equatable {
         foregroundPrepared = false
         self.module = nil
         module.onSpontaneousEngineChange = nil
+        module.onSilentInputDetected = nil
         playoutOn = false; transcriptionOutputOn = false; outputNeedsRetry = false
         moduleMuted = true; muteConfirmed = false; privateCheckActive = false
         let stopped = await module.shutdown(timeout: timeouts.shutdown)
@@ -869,7 +987,7 @@ public enum SharedAudioEngineError: LocalizedError, Equatable {
     private func releaseTalkLocked(keepForegroundWarm: Bool = false) async -> Bool {
         let muted = await muteEverythingLocked()
         talkUnmuted = false
-        talkMeetingID = nil; exclusiveTalkMeetingID = nil; talkEpoch &+= 1
+        talkMeetingID = nil; exclusiveTalkMeetingID = nil; talkEpoch &+= 1; silentInputRecoveriesForTalkEpoch = 0
         inputSink.set(nil)
         guard let module else { return muted }
         let released = await module.setInputPermitted(false, keepWarm: keepInputWarm || keepForegroundWarm, timeout: timeouts.activation)
