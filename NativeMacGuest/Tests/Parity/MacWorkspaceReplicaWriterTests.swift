@@ -55,4 +55,22 @@ final class MacWorkspaceReplicaWriterTests: XCTestCase {
 
         XCTAssertEqual(attempts.withLock { $0 }, [1, 1])
     }
+
+    func testDebounceCoalescesOrdinaryWritesWhileCheckpointsFlushImmediately() async throws {
+        let writes = OSAllocatedUnfairLock(initialState: [Int]())
+        let writer = MacWorkspaceReplicaWriter<Int>(persisted: nil, debounce: .seconds(5)) { value in
+            writes.withLock { $0.append(value) }
+        }
+
+        let start = ContinuousClock.now
+        writer.schedule(1)
+        writer.schedule(2)
+        writer.schedule(3)
+        // A checkpoint must cancel the pending 5s debounce and flush only the latest state.
+        try await writer.checkpoint(4)
+        let elapsed = start.duration(to: .now)
+
+        XCTAssertEqual(writes.withLock { $0 }, [4])
+        XCTAssertLessThan(elapsed, .seconds(2))
+    }
 }

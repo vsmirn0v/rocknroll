@@ -618,6 +618,26 @@ public struct MeetingWorkspaceSyncDocument: Codable, Equatable, Sendable {
         allLibraryRecords.filter { acknowledged[$0.syncRecordID] != $0 }
     }
 
+    public func pendingLibraryRecords(
+        acknowledgedDigests: [String: String]
+    ) -> [MeetingLibrarySyncRecord] {
+        allLibraryRecords.filter { acknowledgedDigests[$0.syncRecordID] != SyncRecordDigest.sha256($0) }
+    }
+
+    /// Returns a copy with inline transcript chunks cleared so metadata replica persistence stays small.
+    public func withoutTranscriptChunks() -> MeetingWorkspaceSyncDocument {
+        var copy = self
+        copy.transcriptChunks = [:]
+        return copy
+    }
+
+    /// Merges transcript chunks loaded from sidecar storage into this document.
+    public mutating func restoreTranscriptChunks(_ chunks: [String: SyncedTranscriptChunk]) {
+        for (id, chunk) in chunks {
+            transcriptChunks[id] = transcriptChunks[id]?.merging(chunk) ?? chunk
+        }
+    }
+
     /// Returns transcript records eligible for CloudKit upload under the configured retention window.
     public func transcriptRecordsForCloud(
         retention: TranscriptSyncRetention,

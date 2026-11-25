@@ -927,6 +927,43 @@ public struct SyncedCalendarOccurrence: Codable, Equatable, Identifiable, Sendab
 
     public var id: String { occurrenceKey }
 
+    private enum CodingKeys: String, CodingKey {
+        case occurrenceKey, seriesKey, title, calendarTitle, start, end
+        case originalOccurrenceStart, allDay, tentative, links, invitation
+        case engine, endpoint, requiresChoice, sourceDevices, boundInvitation
+        case reminderOverride, skipped, snoozeUntil, snoozeScope
+        case attendedDevices, linkedSessionID, isDeleted, updatedAt
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(occurrenceKey, forKey: .occurrenceKey)
+        try container.encode(seriesKey, forKey: .seriesKey)
+        try container.encode(title, forKey: .title)
+        try container.encode(calendarTitle, forKey: .calendarTitle)
+        try container.encode(start, forKey: .start)
+        try container.encode(end, forKey: .end)
+        try container.encodeIfPresent(originalOccurrenceStart, forKey: .originalOccurrenceStart)
+        try container.encode(allDay, forKey: .allDay)
+        try container.encode(tentative, forKey: .tentative)
+        try container.encode(links, forKey: .links)
+        try container.encodeIfPresent(invitation, forKey: .invitation)
+        try container.encodeIfPresent(engine, forKey: .engine)
+        try container.encodeIfPresent(endpoint, forKey: .endpoint)
+        try container.encode(requiresChoice, forKey: .requiresChoice)
+        try container.encode(sourceDevices, forKey: .sourceDevices)
+        try container.encodeIfPresent(boundInvitation, forKey: .boundInvitation)
+        try container.encodeIfPresent(reminderOverride, forKey: .reminderOverride)
+        try container.encodeIfPresent(skipped, forKey: .skipped)
+        try container.encodeIfPresent(snoozeUntil, forKey: .snoozeUntil)
+        try container.encodeIfPresent(snoozeScope, forKey: .snoozeScope)
+        // Encode sorted so record digests stay deterministic across Set hash seeds.
+        try container.encode(attendedDevices.sorted(), forKey: .attendedDevices)
+        try container.encodeIfPresent(linkedSessionID, forKey: .linkedSessionID)
+        try container.encode(isDeleted, forKey: .isDeleted)
+        try container.encode(updatedAt, forKey: .updatedAt)
+    }
+
     public init(
         occurrenceKey: String,
         seriesKey: String,

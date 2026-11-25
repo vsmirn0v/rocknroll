@@ -1,6 +1,7 @@
 import AppKit
 import Combine
 import ConferenceCore
+import LiveKitWebRTC
 import SwiftUI
 
 /// Hides a window without leaving an empty full-screen Space behind. A
@@ -690,11 +691,12 @@ struct NativeDesktopMeetingView: View {
                     presenterTile(presenter)
                 }
                 GeometryReader { viewport in
+                    let videoIndex = Self.indexVisibleVideos(model.visibleVideos)
                     ScrollView {
-                        VStack(spacing: 8) {
+                        LazyVStack(spacing: 8) {
                             ForEach(model.railParticipants) { person in
                                 Button { model.focus(participantID: person.id, source: person.sharing == true && person.cameraOn != true ? .screen : .camera) } label: {
-                                    participantTile(person, compact: true).frame(height: 112)
+                                    participantTile(person, compact: true, videosByKey: videoIndex).frame(height: 112)
                                 }.buttonStyle(.plain).help(L("Focus %@", person.name))
                                     .background {
                                         GeometryReader { tile in
@@ -776,8 +778,9 @@ struct NativeDesktopMeetingView: View {
                 let columns = geometry.size.width < 850 ? 2 : 3
                 let rows = max(1, Int(ceil(Double(model.galleryParticipants.count) / Double(columns))))
                 let height = max(70, (geometry.size.height - CGFloat(rows - 1) * 10) / CGFloat(rows))
+                let videoIndex = Self.indexVisibleVideos(model.visibleVideos)
                 LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 10), count: columns), spacing: 10) {
-                    ForEach(model.galleryParticipants) { person in participantTile(person, compact: height < 150).frame(height: height) }
+                    ForEach(model.galleryParticipants) { person in participantTile(person, compact: height < 150, videosByKey: videoIndex).frame(height: height) }
                 }
             }
             .overlay {
@@ -791,105 +794,57 @@ struct NativeDesktopMeetingView: View {
             }
         }
     }
-    private func participantTile(_ person: NativeDesktopParticipant, compact: Bool, presenter: Bool = false) -> some View {
+    private struct VideoTileLookupKey: Hashable {
+        let participantID: String
+        let source: NativeDesktopVideoSource
+    }
+
+    private static func indexVisibleVideos(_ videos: [NativeDesktopExternalVideo]) -> [VideoTileLookupKey: NativeDesktopExternalVideo] {
+        var result: [VideoTileLookupKey: NativeDesktopExternalVideo] = [:]
+        result.reserveCapacity(videos.count)
+        for video in videos {
+            let key = VideoTileLookupKey(participantID: video.participantID, source: video.source)
+            if result[key] == nil { result[key] = video }
+        }
+        return result
+    }
+
+    private func participantTile(
+        _ person: NativeDesktopParticipant,
+        compact: Bool,
+        presenter: Bool = false,
+        videosByKey: [VideoTileLookupKey: NativeDesktopExternalVideo]? = nil
+    ) -> some View {
         let source: NativeDesktopVideoSource = !presenter && model.display == .screenShares ? .screen : .camera
-        let tileScope: MeetingSnapshotScope = source == .screen ? .screenShare : .participantCamera
+        let allowRemoteVideo = !presenter || person.cameraOn != false
+        let matchedVideo: NativeDesktopExternalVideo? = {
+            guard allowRemoteVideo else { return nil }
+            if let videosByKey { return videosByKey[VideoTileLookupKey(participantID: person.id, source: source)] }
+            return model.visibleVideos.first { $0.participantID == person.id && $0.source == source }
+        }()
+        let localCamera: LKRTCVideoTrack? = (person.isLocal && (!presenter || (model.receivesCameras && person.cameraOn != false)))
+            ? model.localCamera : nil
         let tileSourceID: String = {
             if person.isLocal { return source == .screen ? "local-screen" : "local-camera" }
-            if let video = model.visibleVideos.first(where: {
-                $0.participantID == person.id && $0.source == source && (!presenter || person.cameraOn != false)
-            }) {
-                return video.id
-            }
+            if let matchedVideo { return matchedVideo.id }
             return "\(person.id)-\(source.rawValue)"
         }()
-        let hasLiveTileVideo: Bool = {
-            if person.isLocal, (!presenter || (model.receivesCameras && person.cameraOn != false)), model.localCamera != nil { return true }
-            return model.visibleVideos.contains(where: {
-                $0.participantID == person.id && $0.source == source && (!presenter || person.cameraOn != false)
-            })
-        }()
-        return ZStack(alignment: .bottomLeading) {
-            Color(white: 0.11)
-            if person.isLocal, (!presenter || (model.receivesCameras && person.cameraOn != false)), let track = model.localCamera {
-                NativeDesktopVideoView(
-                    track: track,
-                    mirrored: true,
-                    snapshotRegistry: model.snapshotRegistry,
-                    snapshotSourceID: tileSourceID,
-                    snapshotParticipantID: person.id,
-                    snapshotSourceName: person.name,
-                    snapshotScope: tileScope
-                )
-            } else if let video = model.visibleVideos.first(where: {
-                $0.participantID == person.id && $0.source == source && (!presenter || person.cameraOn != false)
-            }) {
-                NativeDesktopVideoView(
-                    track: video.track,
-                    crop: video.crop,
-                    snapshotRegistry: model.snapshotRegistry,
-                    snapshotSourceID: video.id,
-                    snapshotParticipantID: person.id,
-                    snapshotSourceName: person.name,
-                    snapshotScope: tileScope
-                )
-            } else {
-                VStack(spacing: 12) {
-                    Text(initials(person.name)).font(compact ? .body : .title).padding(compact ? 8 : 15).background(.white.opacity(0.08), in: Circle())
-                    if !compact { Text(person.name).font(.headline).lineLimit(2).multilineTextAlignment(.center) }
-                }.frame(maxWidth: .infinity, maxHeight: .infinity)
-            }
-            if hasLiveTileVideo {
-                VStack {
-                    HStack {
-                        Spacer()
-                        Button {
-                            model.snapshotController.capture(targetID: tileSourceID)
-                        } label: {
-                            Image(systemName: "camera.viewfinder")
-                                .font(.caption.weight(.semibold))
-                                .padding(6)
-                                .background(.black.opacity(0.62), in: Circle())
-                        }
-                        .buttonStyle(.plain)
-                        .help(L("Snap %@ to summary", person.name))
-                        .accessibilityLabel(L("Snap %@ to summary", person.name))
-                    }
-                    Spacer()
-                }
-                .padding(8)
-            }
-            HStack(spacing: 7) {
-                VStack(alignment: .leading, spacing: 1) {
-                    if presenter { Text(L("Presenting")).font(.caption2).foregroundStyle(.white.opacity(0.8)) }
-                    Text(person.name).lineLimit(1)
-                }
-                Spacer(minLength: 4)
-                if !person.isLocal, model.participantVolume(person.id) != 1 { NativeDesktopParticipantVolumeBadge(level: model.participantVolume(person.id)) }
-                if person.microphoneOn == false { Image(systemName: "mic.slash").accessibilityLabel(L("Microphone off")) }
-                else if person.speaking == true { NativeDesktopLevelMeter(level: person.isLocal ? model.snapshot.microphoneLevel ?? 0 : 0.7) }
-            }.font(.caption).padding(10).background(.black.opacity(0.45))
-        }.foregroundStyle(.white).clipShape(RoundedRectangle(cornerRadius: 14))
-        .overlay(
-            RoundedRectangle(cornerRadius: 14)
-                .stroke(person.speaking == true ? Color.green : Color.white.opacity(0.12),
-                        lineWidth: person.speaking == true ? 2 : 1)
+        let localMicLevel: Float? = (person.isLocal && person.speaking == true)
+            ? (model.snapshot.microphoneLevel ?? 0) : nil
+        return NativeDesktopParticipantTile(
+            person: person,
+            compact: compact,
+            presenter: presenter,
+            source: source,
+            tileSourceID: tileSourceID,
+            matchedVideo: matchedVideo,
+            localCamera: localCamera,
+            participantVolume: person.isLocal ? 1 : model.participantVolume(person.id),
+            supportsParticipantVolume: !person.isLocal && model.supportsParticipantVolume,
+            localMicLevel: localMicLevel,
+            model: model
         )
-        .overlay(NativeDesktopSnapshotFlashOverlay(controller: model.snapshotController, targetID: tileSourceID, cornerRadius: 14))
-        .contextMenu {
-            if hasLiveTileVideo {
-                Button(source == .screen ? L("Snap screen share") : L("Snap camera")) {
-                    model.snapshotController.capture(targetID: tileSourceID)
-                }
-                Button(L("Snap full meeting stage")) {
-                    model.snapshotController.captureFullStage()
-                }
-                Divider()
-            }
-            Button(L("Focus camera")) { model.focus(participantID: person.id, source: .camera) }
-            if person.sharing == true { Button(L("Focus screen")) { model.focus(participantID: person.id, source: .screen) } }
-            if !person.isLocal && model.supportsParticipantVolume { participantVolumeMenu(person) }
-        }
+        .equatable()
     }
     @ViewBuilder private func participantVolumeMenu(_ person: NativeDesktopParticipant) -> some View {
         let level = model.participantVolume(person.id)
@@ -956,6 +911,139 @@ struct NativeDesktopMeetingView: View {
                 .foregroundStyle(destructive ? Color.red : selected ? .orange : .primary)
         }.buttonStyle(.plain).accessibilityLabel(title).accessibilityValue(pending ? L("Starting…") : "")
             .disabled(!model.connected && title != L("Leave"))
+    }
+}
+
+struct NativeDesktopParticipantTile: View, Equatable {
+    let person: NativeDesktopParticipant
+    let compact: Bool
+    let presenter: Bool
+    let source: NativeDesktopVideoSource
+    let tileSourceID: String
+    let matchedVideo: NativeDesktopExternalVideo?
+    let localCamera: LKRTCVideoTrack?
+    let participantVolume: Double
+    let supportsParticipantVolume: Bool
+    let localMicLevel: Float?
+    let model: NativeDesktopMeetingModel
+
+    private var hasLiveTileVideo: Bool { localCamera != nil || matchedVideo != nil }
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.person == rhs.person &&
+            lhs.compact == rhs.compact &&
+            lhs.presenter == rhs.presenter &&
+            lhs.source == rhs.source &&
+            lhs.tileSourceID == rhs.tileSourceID &&
+            lhs.matchedVideo?.id == rhs.matchedVideo?.id &&
+            lhs.matchedVideo.map { ObjectIdentifier($0.track) } == rhs.matchedVideo.map { ObjectIdentifier($0.track) } &&
+            lhs.matchedVideo?.crop == rhs.matchedVideo?.crop &&
+            lhs.localCamera.map(ObjectIdentifier.init) == rhs.localCamera.map(ObjectIdentifier.init) &&
+            lhs.participantVolume == rhs.participantVolume &&
+            lhs.supportsParticipantVolume == rhs.supportsParticipantVolume &&
+            lhs.localMicLevel == rhs.localMicLevel
+    }
+
+    private func initials(_ name: String) -> String {
+        name.split(whereSeparator: \.isWhitespace).prefix(2).compactMap(\.first).map(String.init).joined().uppercased()
+    }
+
+    @ViewBuilder private var participantVolumeMenu: some View {
+        Divider()
+        Button(participantVolume == 0 ? L("Unmute for me") : L("Mute for me")) {
+            model.setParticipantVolume(participantVolume == 0 ? 1 : 0, participantID: person.id)
+        }
+        Menu(L("Volume for me")) {
+            ForEach([0.25, 0.5, 1, 1.5, 2], id: \.self) { preset in
+                Button { model.setParticipantVolume(preset, participantID: person.id) } label: {
+                    let title = "\(Int(preset * 100))%"
+                    if participantVolume == preset { Label(title, systemImage: "checkmark") } else { Text(title) }
+                }
+            }
+        }
+    }
+
+    var body: some View {
+        let tileScope: MeetingSnapshotScope = source == .screen ? .screenShare : .participantCamera
+        return ZStack(alignment: .bottomLeading) {
+            Color(white: 0.11)
+            if let track = localCamera {
+                NativeDesktopVideoView(
+                    track: track,
+                    mirrored: true,
+                    snapshotRegistry: model.snapshotRegistry,
+                    snapshotSourceID: tileSourceID,
+                    snapshotParticipantID: person.id,
+                    snapshotSourceName: person.name,
+                    snapshotScope: tileScope
+                )
+            } else if let video = matchedVideo {
+                NativeDesktopVideoView(
+                    track: video.track,
+                    crop: video.crop,
+                    snapshotRegistry: model.snapshotRegistry,
+                    snapshotSourceID: video.id,
+                    snapshotParticipantID: person.id,
+                    snapshotSourceName: person.name,
+                    snapshotScope: tileScope
+                )
+            } else {
+                VStack(spacing: 12) {
+                    Text(initials(person.name)).font(compact ? .body : .title).padding(compact ? 8 : 15).background(.white.opacity(0.08), in: Circle())
+                    if !compact { Text(person.name).font(.headline).lineLimit(2).multilineTextAlignment(.center) }
+                }.frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+            if hasLiveTileVideo {
+                VStack {
+                    HStack {
+                        Spacer()
+                        Button {
+                            model.snapshotController.capture(targetID: tileSourceID)
+                        } label: {
+                            Image(systemName: "camera.viewfinder")
+                                .font(.caption.weight(.semibold))
+                                .padding(6)
+                                .background(.black.opacity(0.62), in: Circle())
+                        }
+                        .buttonStyle(.plain)
+                        .help(L("Snap %@ to summary", person.name))
+                        .accessibilityLabel(L("Snap %@ to summary", person.name))
+                    }
+                    Spacer()
+                }
+                .padding(8)
+            }
+            HStack(spacing: 7) {
+                VStack(alignment: .leading, spacing: 1) {
+                    if presenter { Text(L("Presenting")).font(.caption2).foregroundStyle(.white.opacity(0.8)) }
+                    Text(person.name).lineLimit(1)
+                }
+                Spacer(minLength: 4)
+                if !person.isLocal, participantVolume != 1 { NativeDesktopParticipantVolumeBadge(level: participantVolume) }
+                if person.microphoneOn == false { Image(systemName: "mic.slash").accessibilityLabel(L("Microphone off")) }
+                else if person.speaking == true { NativeDesktopLevelMeter(level: person.isLocal ? (localMicLevel ?? 0) : 0.7) }
+            }.font(.caption).padding(10).background(.black.opacity(0.45))
+        }.foregroundStyle(.white).clipShape(RoundedRectangle(cornerRadius: 14))
+        .overlay(
+            RoundedRectangle(cornerRadius: 14)
+                .stroke(person.speaking == true ? Color.green : Color.white.opacity(0.12),
+                        lineWidth: person.speaking == true ? 2 : 1)
+        )
+        .overlay(NativeDesktopSnapshotFlashOverlay(controller: model.snapshotController, targetID: tileSourceID, cornerRadius: 14))
+        .contextMenu {
+            if hasLiveTileVideo {
+                Button(source == .screen ? L("Snap screen share") : L("Snap camera")) {
+                    model.snapshotController.capture(targetID: tileSourceID)
+                }
+                Button(L("Snap full meeting stage")) {
+                    model.snapshotController.captureFullStage()
+                }
+                Divider()
+            }
+            Button(L("Focus camera")) { model.focus(participantID: person.id, source: .camera) }
+            if person.sharing == true { Button(L("Focus screen")) { model.focus(participantID: person.id, source: .screen) } }
+            if !person.isLocal && supportsParticipantVolume { participantVolumeMenu }
+        }
     }
 }
 

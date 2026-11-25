@@ -3,6 +3,7 @@ import CloudKit
 import ConferenceCore
 import Foundation
 import Network
+import os
 
 @MainActor
 final class MacWorkspaceSyncCoordinator: ObservableObject {
@@ -33,7 +34,7 @@ final class MacWorkspaceSyncCoordinator: ObservableObject {
     private let scheduleTransport: AnyCloudZoneTransport<MeetingScheduleSyncRecord>
     let archiveStore: TranscriptArchiveStore
 
-    private let replicaWriter: MacWorkspaceReplicaWriter<ReplicaState>
+    private let replicaWriter: MacWorkspaceReplicaWriter<ReplicaWriteSnapshot>
     private var replica: ReplicaState {
         didSet { replicaRevision &+= 1 }
     }
@@ -60,10 +61,23 @@ final class MacWorkspaceSyncCoordinator: ObservableObject {
     private var cancellables: Set<AnyCancellable> = []
     private var pathMonitor: NWPathMonitor?
     private var reachabilityOnline = true
-    private let replicaIOQueue = DispatchQueue(label: "dev.vsmirn0v.mac.workspace.replica-io", qos: .utility)
     private var cloudBackoffUntil: Date = .distantPast
     private var consecutiveCloudBackoffs = 0
     private enum DeferredHistoryMerge: Error { case unsavedNotes }
+
+    private struct ReplicaWriteSnapshot: Equatable, Sendable {
+        let revision: UInt64
+        let state: ReplicaState
+
+        static func == (lhs: Self, rhs: Self) -> Bool {
+            lhs.revision == rhs.revision
+        }
+    }
+
+    private struct ReplicaDiskState: Sendable {
+        var metaDigest: String?
+        var chunkDigests: [String: String]
+    }
 
     private struct ReplicaState: Codable, Equatable, Sendable {
         var workspaceDoc: MeetingWorkspaceSyncDocument
@@ -72,9 +86,9 @@ final class MacWorkspaceSyncCoordinator: ObservableObject {
         var transcriptToken: Data?
         var scheduleToken: Data?
         var zoneGenerations: [String: String] = [:]
-        var acknowledgedLibrary: [String: MeetingLibrarySyncRecord] = [:]
-        var acknowledgedTranscripts: [String: MeetingTranscriptSyncRecord] = [:]
-        var acknowledgedSchedule: [String: MeetingScheduleSyncRecord] = [:]
+        var acknowledgedLibraryDigests: [String: String] = [:]
+        var acknowledgedTranscriptDigests: [String: String] = [:]
+        var acknowledgedScheduleDigests: [String: String] = [:]
         var knownLocalSessions: Set<UUID> = []
         var localAttendance: [UUID: DeviceParticipationLeg]?
         var calendarLinks: [UUID: SyncValue<MeetingCalendarAssociation?>]?
@@ -89,6 +103,126 @@ final class MacWorkspaceSyncCoordinator: ObservableObject {
         var lastExportedSettingsRaw: [String: SettingsFingerprint] = [:]
         var lastRemoteSettingsRaw: [String: SettingsFingerprint] = [:]
         var lastExportedAssistantBaseline: AssistantLocalSyncBaseline?
+        var migratedFromLegacyFormat: Bool = false
+
+        static func == (lhs: Self, rhs: Self) -> Bool {
+            lhs.workspaceDoc == rhs.workspaceDoc &&
+                lhs.scheduleDoc == rhs.scheduleDoc &&
+                lhs.libraryToken == rhs.libraryToken &&
+                lhs.transcriptToken == rhs.transcriptToken &&
+                lhs.scheduleToken == rhs.scheduleToken &&
+                lhs.zoneGenerations == rhs.zoneGenerations &&
+                lhs.acknowledgedLibraryDigests == rhs.acknowledgedLibraryDigests &&
+                lhs.acknowledgedTranscriptDigests == rhs.acknowledgedTranscriptDigests &&
+                lhs.acknowledgedScheduleDigests == rhs.acknowledgedScheduleDigests &&
+                lhs.knownLocalSessions == rhs.knownLocalSessions &&
+                lhs.localAttendance == rhs.localAttendance &&
+                lhs.calendarLinks == rhs.calendarLinks &&
+                lhs.historyGroups == rhs.historyGroups &&
+                lhs.pendingHistoryApply == rhs.pendingHistoryApply &&
+                lhs.pendingCloudSessions == rhs.pendingCloudSessions &&
+                lhs.pendingCloudSettings == rhs.pendingCloudSettings &&
+                lhs.lastExportedNoteMarkdown == rhs.lastExportedNoteMarkdown &&
+                lhs.lastExportedOutcomes == rhs.lastExportedOutcomes &&
+                lhs.lastExportedTaskIDs == rhs.lastExportedTaskIDs &&
+                lhs.lastExportedProfile == rhs.lastExportedProfile &&
+                lhs.lastExportedSettingsRaw == rhs.lastExportedSettingsRaw &&
+                lhs.lastRemoteSettingsRaw == rhs.lastRemoteSettingsRaw &&
+                lhs.lastExportedAssistantBaseline == rhs.lastExportedAssistantBaseline
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case workspaceDoc, scheduleDoc, libraryToken, transcriptToken, scheduleToken
+            case zoneGenerations
+            case acknowledgedLibraryDigests, acknowledgedTranscriptDigests, acknowledgedScheduleDigests
+            case acknowledgedLibrary, acknowledgedTranscripts, acknowledgedSchedule
+            case knownLocalSessions, localAttendance, calendarLinks, historyGroups
+            case pendingHistoryApply, pendingCloudSessions, pendingCloudSettings
+            case lastExportedNoteMarkdown, lastExportedOutcomes, lastExportedTaskIDs
+            case lastExportedProfile, lastExportedSettingsRaw, lastRemoteSettingsRaw
+            case lastExportedAssistantBaseline
+        }
+
+        init(
+            workspaceDoc: MeetingWorkspaceSyncDocument,
+            scheduleDoc: CalendarScheduleSyncDocument
+        ) {
+            self.workspaceDoc = workspaceDoc
+            self.scheduleDoc = scheduleDoc
+        }
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            workspaceDoc = try c.decode(MeetingWorkspaceSyncDocument.self, forKey: .workspaceDoc)
+            scheduleDoc = try c.decode(CalendarScheduleSyncDocument.self, forKey: .scheduleDoc)
+            libraryToken = try c.decodeIfPresent(Data.self, forKey: .libraryToken)
+            transcriptToken = try c.decodeIfPresent(Data.self, forKey: .transcriptToken)
+            scheduleToken = try c.decodeIfPresent(Data.self, forKey: .scheduleToken)
+            zoneGenerations = try c.decodeIfPresent([String: String].self, forKey: .zoneGenerations) ?? [:]
+
+            var migrated = false
+            if c.contains(.acknowledgedLibraryDigests) {
+                acknowledgedLibraryDigests = try c.decodeIfPresent([String: String].self, forKey: .acknowledgedLibraryDigests) ?? [:]
+            } else if let legacy = try c.decodeIfPresent([String: MeetingLibrarySyncRecord].self, forKey: .acknowledgedLibrary) {
+                acknowledgedLibraryDigests = legacy.mapValues { SyncRecordDigest.sha256($0) }
+                migrated = true
+            }
+            if c.contains(.acknowledgedTranscriptDigests) {
+                acknowledgedTranscriptDigests = try c.decodeIfPresent([String: String].self, forKey: .acknowledgedTranscriptDigests) ?? [:]
+            } else if let legacy = try c.decodeIfPresent([String: MeetingTranscriptSyncRecord].self, forKey: .acknowledgedTranscripts) {
+                acknowledgedTranscriptDigests = legacy.mapValues { SyncRecordDigest.sha256($0) }
+                migrated = true
+            }
+            if c.contains(.acknowledgedScheduleDigests) {
+                acknowledgedScheduleDigests = try c.decodeIfPresent([String: String].self, forKey: .acknowledgedScheduleDigests) ?? [:]
+            } else if let legacy = try c.decodeIfPresent([String: MeetingScheduleSyncRecord].self, forKey: .acknowledgedSchedule) {
+                acknowledgedScheduleDigests = legacy.mapValues { SyncRecordDigest.sha256($0) }
+                migrated = true
+            }
+
+            knownLocalSessions = try c.decodeIfPresent(Set<UUID>.self, forKey: .knownLocalSessions) ?? []
+            localAttendance = try c.decodeIfPresent([UUID: DeviceParticipationLeg].self, forKey: .localAttendance)
+            calendarLinks = try c.decodeIfPresent([UUID: SyncValue<MeetingCalendarAssociation?>].self, forKey: .calendarLinks)
+            historyGroups = try c.decodeIfPresent([UUID: SyncValue<UUID?>].self, forKey: .historyGroups)
+            pendingHistoryApply = try c.decodeIfPresent(Set<UUID>.self, forKey: .pendingHistoryApply)
+            pendingCloudSessions = try c.decodeIfPresent(Set<UUID>.self, forKey: .pendingCloudSessions)
+            pendingCloudSettings = try c.decodeIfPresent(Set<String>.self, forKey: .pendingCloudSettings)
+            lastExportedNoteMarkdown = try c.decodeIfPresent([UUID: String].self, forKey: .lastExportedNoteMarkdown) ?? [:]
+            lastExportedOutcomes = try c.decodeIfPresent([UUID: ExportedOutcomeSnapshot].self, forKey: .lastExportedOutcomes) ?? [:]
+            lastExportedTaskIDs = try c.decodeIfPresent([UUID: Set<UUID>].self, forKey: .lastExportedTaskIDs) ?? [:]
+            lastExportedProfile = try c.decodeIfPresent(PersonalTaskProfile.self, forKey: .lastExportedProfile)
+            lastExportedSettingsRaw = try c.decodeIfPresent([String: SettingsFingerprint].self, forKey: .lastExportedSettingsRaw) ?? [:]
+            lastRemoteSettingsRaw = try c.decodeIfPresent([String: SettingsFingerprint].self, forKey: .lastRemoteSettingsRaw) ?? [:]
+            lastExportedAssistantBaseline = try c.decodeIfPresent(AssistantLocalSyncBaseline.self, forKey: .lastExportedAssistantBaseline)
+            migratedFromLegacyFormat = migrated
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var c = encoder.container(keyedBy: CodingKeys.self)
+            try c.encode(workspaceDoc, forKey: .workspaceDoc)
+            try c.encode(scheduleDoc, forKey: .scheduleDoc)
+            try c.encodeIfPresent(libraryToken, forKey: .libraryToken)
+            try c.encodeIfPresent(transcriptToken, forKey: .transcriptToken)
+            try c.encodeIfPresent(scheduleToken, forKey: .scheduleToken)
+            try c.encode(zoneGenerations, forKey: .zoneGenerations)
+            try c.encode(acknowledgedLibraryDigests, forKey: .acknowledgedLibraryDigests)
+            try c.encode(acknowledgedTranscriptDigests, forKey: .acknowledgedTranscriptDigests)
+            try c.encode(acknowledgedScheduleDigests, forKey: .acknowledgedScheduleDigests)
+            try c.encode(knownLocalSessions, forKey: .knownLocalSessions)
+            try c.encodeIfPresent(localAttendance, forKey: .localAttendance)
+            try c.encodeIfPresent(calendarLinks, forKey: .calendarLinks)
+            try c.encodeIfPresent(historyGroups, forKey: .historyGroups)
+            try c.encodeIfPresent(pendingHistoryApply, forKey: .pendingHistoryApply)
+            try c.encodeIfPresent(pendingCloudSessions, forKey: .pendingCloudSessions)
+            try c.encodeIfPresent(pendingCloudSettings, forKey: .pendingCloudSettings)
+            try c.encode(lastExportedNoteMarkdown, forKey: .lastExportedNoteMarkdown)
+            try c.encode(lastExportedOutcomes, forKey: .lastExportedOutcomes)
+            try c.encode(lastExportedTaskIDs, forKey: .lastExportedTaskIDs)
+            try c.encodeIfPresent(lastExportedProfile, forKey: .lastExportedProfile)
+            try c.encode(lastExportedSettingsRaw, forKey: .lastExportedSettingsRaw)
+            try c.encode(lastRemoteSettingsRaw, forKey: .lastRemoteSettingsRaw)
+            try c.encodeIfPresent(lastExportedAssistantBaseline, forKey: .lastExportedAssistantBaseline)
+        }
     }
 
     private struct ExportedOutcomeSnapshot: Codable, Equatable, Sendable {
@@ -154,15 +288,44 @@ final class MacWorkspaceSyncCoordinator: ObservableObject {
             CloudEnvelopeTransport<MeetingScheduleSyncRecord>(zoneName: "MeetingSchedule", subscriptionID: "MeetingScheduleChanges")
         )
         let replicaURL = storageRoot.appendingPathComponent("workspace-sync-replica.json")
+        let transcriptSidecarURL = storageRoot.appendingPathComponent("workspace-sync-transcripts")
         let stored = (try? Data(contentsOf: replicaURL)).flatMap { try? JSONDecoder().decode(ReplicaState.self, from: $0) }
-        self.replica = stored ?? ReplicaState(
+        let sidecar = WorkspaceTranscriptChunkSidecar.loadChunksWithDigests(from: transcriptSidecarURL)
+        var initialState = stored ?? ReplicaState(
             workspaceDoc: MeetingWorkspaceSyncDocument(device: syncPreferences.deviceID),
             scheduleDoc: CalendarScheduleSyncDocument(device: syncPreferences.deviceID)
         )
-        self.replicaWriter = MacWorkspaceReplicaWriter(persisted: stored) { snapshot in
-            let data = try JSONEncoder().encode(snapshot)
-            try FileManager.default.createDirectory(at: storageRoot, withIntermediateDirectories: true)
-            try data.write(to: replicaURL, options: .atomic)
+        let initialMetaDigest: String?
+        if let stored, !stored.migratedFromLegacyFormat, stored.workspaceDoc.transcriptChunks.isEmpty {
+            initialMetaDigest = SyncRecordDigest.sha256(stored)
+        } else {
+            initialMetaDigest = nil
+        }
+        if !sidecar.chunks.isEmpty {
+            initialState.workspaceDoc.restoreTranscriptChunks(sidecar.chunks)
+        }
+        self.replica = initialState
+        let diskState = OSAllocatedUnfairLock(initialState: ReplicaDiskState(
+            metaDigest: initialMetaDigest,
+            chunkDigests: sidecar.digests
+        ))
+        self.replicaWriter = MacWorkspaceReplicaWriter(persisted: nil, debounce: .seconds(2)) { snapshot in
+            var metadata = snapshot.state
+            metadata.workspaceDoc = metadata.workspaceDoc.withoutTranscriptChunks()
+            let metadataData = try SyncRecordDigest.makeCanonicalEncoder().encode(metadata)
+            let metaDigest = SyncRecordDigest.sha256(metadataData)
+            var state = diskState.withLock { $0 }
+            if state.metaDigest != metaDigest {
+                try FileManager.default.createDirectory(at: storageRoot, withIntermediateDirectories: true)
+                try metadataData.write(to: replicaURL, options: .atomic)
+                state.metaDigest = metaDigest
+            }
+            try WorkspaceTranscriptChunkSidecar.sync(
+                chunks: snapshot.state.workspaceDoc.transcriptChunks,
+                persistedDigests: &state.chunkDigests,
+                to: transcriptSidecarURL
+            )
+            diskState.withLock { $0 = state }
         }
     }
 
@@ -489,7 +652,7 @@ final class MacWorkspaceSyncCoordinator: ObservableObject {
         do {
             let session = try await connectZone(name: "transcript", transport: transcriptTransport) {
                 self.replica.transcriptToken = nil
-                self.replica.acknowledgedTranscripts.removeAll()
+                self.replica.acknowledgedTranscriptDigests.removeAll()
             }
             let changes = try await transcriptTransport.fetch(session: session, after: replica.transcriptToken)
             replica.transcriptToken = changes.token
@@ -537,9 +700,9 @@ final class MacWorkspaceSyncCoordinator: ObservableObject {
         replica.transcriptToken = nil
         replica.scheduleToken = nil
         replica.zoneGenerations.removeAll()
-        replica.acknowledgedLibrary.removeAll()
-        replica.acknowledgedTranscripts.removeAll()
-        replica.acknowledgedSchedule.removeAll()
+        replica.acknowledgedLibraryDigests.removeAll()
+        replica.acknowledgedTranscriptDigests.removeAll()
+        replica.acknowledgedScheduleDigests.removeAll()
         replica.lastExportedAssistantBaseline = nil
         calendar?.applyRemoteSchedule([], localDeviceID: deviceID)
         persistReplica()
@@ -819,7 +982,7 @@ final class MacWorkspaceSyncCoordinator: ObservableObject {
         let preMergeLocalNoteMarkdown = replica.workspaceDoc.notes.mapValues(\.markdown)
         let zoneSession = try await connectZone(name: "library", transport: libraryTransport) {
             self.replica.libraryToken = nil
-            self.replica.acknowledgedLibrary.removeAll()
+            self.replica.acknowledgedLibraryDigests.removeAll()
         }
         let changes = try await libraryTransport.fetch(session: zoneSession, after: replica.libraryToken)
 
@@ -889,11 +1052,11 @@ final class MacWorkspaceSyncCoordinator: ObservableObject {
         let postExportSnapshot = try await meetingLibrary.store.localSyncSnapshot(exporterDeviceID: deviceID)
         refreshObsidianReceipts(from: postExportSnapshot)
 
-        let pending = replica.workspaceDoc.pendingLibraryRecords(acknowledged: replica.acknowledgedLibrary)
+        let pending = replica.workspaceDoc.pendingLibraryRecords(acknowledgedDigests: replica.acknowledgedLibraryDigests)
         if !pending.isEmpty {
             let saved = try await libraryTransport.save(pending, session: zoneSession)
             for record in saved {
-                replica.acknowledgedLibrary[record.syncRecordID] = record
+                replica.acknowledgedLibraryDigests[record.syncRecordID] = SyncRecordDigest.sha256(record)
                 if case .note(let note) = record {
                     try? await meetingLibrary.store.saveNoteSyncBase(note.sessionID, markdown: note.markdown)
                 }
@@ -905,7 +1068,7 @@ final class MacWorkspaceSyncCoordinator: ObservableObject {
     private func connectTranscriptZone() async throws -> CloudZoneSession {
         try await connectZone(name: "transcript", transport: transcriptTransport) {
             self.replica.transcriptToken = nil
-            self.replica.acknowledgedTranscripts.removeAll()
+            self.replica.acknowledgedTranscriptDigests.removeAll()
         }
     }
 
@@ -942,11 +1105,13 @@ final class MacWorkspaceSyncCoordinator: ObservableObject {
         }
 
         let eligible = replica.workspaceDoc.transcriptRecordsForCloud(retention: retention)
-        let pending = eligible.filter { replica.acknowledgedTranscripts[$0.syncRecordID] != $0 }
+        let pending = eligible.filter {
+            replica.acknowledgedTranscriptDigests[$0.syncRecordID] != SyncRecordDigest.sha256($0)
+        }
         if !pending.isEmpty {
             let saved = try await transcriptTransport.save(pending, session: zoneSession)
             for record in saved {
-                replica.acknowledgedTranscripts[record.syncRecordID] = record
+                replica.acknowledgedTranscriptDigests[record.syncRecordID] = SyncRecordDigest.sha256(record)
                 if case .chunk(let chunk) = record {
                     replica.workspaceDoc.markTranscriptUploaded(
                         recordID: record.syncRecordID,
@@ -961,7 +1126,7 @@ final class MacWorkspaceSyncCoordinator: ObservableObject {
             try await transcriptTransport.delete(syncRecordIDs: expiredIDs, session: zoneSession)
             for recordID in expiredIDs {
                 replica.workspaceDoc.markTranscriptDeleted(recordID: recordID)
-                replica.acknowledgedTranscripts.removeValue(forKey: recordID)
+                replica.acknowledgedTranscriptDigests.removeValue(forKey: recordID)
             }
         }
     }
@@ -971,7 +1136,7 @@ final class MacWorkspaceSyncCoordinator: ObservableObject {
 
         let zoneSession = try await connectZone(name: "schedule", transport: scheduleTransport) {
             self.replica.scheduleToken = nil
-            self.replica.acknowledgedSchedule.removeAll()
+            self.replica.acknowledgedScheduleDigests.removeAll()
         }
         let changes = try await scheduleTransport.fetch(session: zoneSession, after: replica.scheduleToken)
         replica.scheduleToken = changes.token
@@ -980,14 +1145,16 @@ final class MacWorkspaceSyncCoordinator: ObservableObject {
         let expiredIDs = replica.scheduleDoc.pruneExpired()
         if !expiredIDs.isEmpty {
             try? await scheduleTransport.delete(syncRecordIDs: expiredIDs, session: zoneSession)
-            for id in expiredIDs { replica.acknowledgedSchedule.removeValue(forKey: id) }
+            for id in expiredIDs { replica.acknowledgedScheduleDigests.removeValue(forKey: id) }
         }
 
-        let pending = replica.scheduleDoc.records.filter { replica.acknowledgedSchedule[$0.syncRecordID] != $0 }
+        let pending = replica.scheduleDoc.records.filter {
+            replica.acknowledgedScheduleDigests[$0.syncRecordID] != SyncRecordDigest.sha256($0)
+        }
         if !pending.isEmpty {
             let saved = try await scheduleTransport.save(pending, session: zoneSession)
             for record in saved {
-                replica.acknowledgedSchedule[record.syncRecordID] = record
+                replica.acknowledgedScheduleDigests[record.syncRecordID] = SyncRecordDigest.sha256(record)
             }
         }
 
@@ -1988,11 +2155,11 @@ final class MacWorkspaceSyncCoordinator: ObservableObject {
     }
 
     private func persistReplica() {
-        replicaWriter.schedule(replica)
+        replicaWriter.schedule(ReplicaWriteSnapshot(revision: replicaRevision, state: replica))
     }
 
     func persistReplicaCheckpoint() async throws {
-        try await replicaWriter.checkpoint(replica)
+        try await replicaWriter.checkpoint(ReplicaWriteSnapshot(revision: replicaRevision, state: replica))
     }
 }
 
@@ -2004,12 +2171,15 @@ final class MacWorkspaceReplicaWriter<State: Equatable & Sendable> {
     }
 
     private let write: @Sendable (State) throws -> Void
+    private let debounce: Duration
     private var persisted: State?
     private var pending: [Request] = []
     private var writing = false
+    private var debounceSleepTask: Task<Void, Never>?
 
-    init(persisted: State?, write: @escaping @Sendable (State) throws -> Void) {
+    init(persisted: State?, debounce: Duration = .zero, write: @escaping @Sendable (State) throws -> Void) {
         self.persisted = persisted
+        self.debounce = debounce
         self.write = write
     }
 
@@ -2028,10 +2198,20 @@ final class MacWorkspaceReplicaWriter<State: Equatable & Sendable> {
         // before its caller applies the pending merge to the local library.
         if let last = pending.last, last.checkpoint == nil { pending.removeLast() }
         pending.append(request)
+        if request.checkpoint != nil {
+            debounceSleepTask?.cancel()
+        }
         guard !writing else { return }
         writing = true
         Task {
             while !pending.isEmpty {
+                if pending.first?.checkpoint == nil, debounce > .zero {
+                    let sleepTask = Task<Void, Never> { try? await Task.sleep(for: debounce) }
+                    debounceSleepTask = sleepTask
+                    await sleepTask.value
+                    debounceSleepTask = nil
+                }
+                guard !pending.isEmpty else { break }
                 let next = pending.removeFirst()
                 let snapshot = next.snapshot
                 let result = await Task.detached(priority: .utility) { [write, persisted] in

@@ -58,6 +58,7 @@ final class MacWorkspaceSyncAndObsidianTests: XCTestCase {
     @MainActor
     private final class MockZoneTransport<Record: SyncZoneRecord>: CloudZoneTransporting {
         var records: [String: Record] = [:]
+        var savedRecordIDs: [String] = []
         var deletedIDs: [String] = []
         var generation = "zone-gen-1"
         var failure: Error?
@@ -80,6 +81,7 @@ final class MacWorkspaceSyncAndObsidianTests: XCTestCase {
         func save(_ values: [Record], session: CloudZoneSession) async throws -> [Record] {
             values.map { record in
                 let id = record.syncRecordID
+                savedRecordIDs.append(id)
                 let merged = records[id]?.merging(record) ?? record
                 records[id] = merged
                 return merged
@@ -201,12 +203,15 @@ final class MacWorkspaceSyncAndObsidianTests: XCTestCase {
     ) async throws -> MeetingWorkspaceSyncDocument {
         struct StoredReplica: Decodable { let workspaceDoc: MeetingWorkspaceSyncDocument }
         let url = temp.appendingPathComponent("AppSupport/workspace-sync-replica.json")
-        let deadline = ContinuousClock.now + .seconds(6)
+        let sidecarURL = temp.appendingPathComponent("AppSupport/workspace-sync-transcripts")
+        let deadline = ContinuousClock.now + .seconds(8)
         repeat {
             if let data = try? Data(contentsOf: url),
-               let doc = try? JSONDecoder().decode(StoredReplica.self, from: data).workspaceDoc,
-               predicate(doc) {
-                return doc
+               var doc = try? JSONDecoder().decode(StoredReplica.self, from: data).workspaceDoc {
+                doc.restoreTranscriptChunks(WorkspaceTranscriptChunkSidecar.loadChunks(from: sidecarURL))
+                if predicate(doc) {
+                    return doc
+                }
             }
             try await Task.sleep(for: .milliseconds(20))
         } while ContinuousClock.now < deadline
@@ -1130,5 +1135,74 @@ final class MacWorkspaceSyncAndObsidianTests: XCTestCase {
         // Removing a parent card must stop resolving children to the removed card.
         await f.library.deleteSession(addedID)
         XCTAssertEqual(f.sync.historySessionID(sessionIDs[12]), sessionIDs[12])
+    }
+
+    func testLegacyReplicaMigratesToDigestsAndSidecarChunksWithoutReuploadingOrRewritingIdle() async throws {
+        var f = try await makeFixture()
+        let now = Date(timeIntervalSince1970: 1_795_000_000)
+        let session = MeetingSessionRecord(title: "Legacy Sync", startedAt: now - 120, endedAt: now, state: .ended)
+        try await f.library.store.upsertSession(session)
+        await f.library.refresh()
+        let journal = f.library.workspaceJournal
+        journal.begin(sessionID: session.id, title: session.title, calendarSeriesID: nil, roomIdentity: nil, at: session.startedAt)
+        journal.observe(sessionID: session.id, events: [
+            MeetingWorkspaceEvent(id: "legacy-1", kind: .transcript, occurredAt: now - 30, source: "local", text: "Migrated transcript line")
+        ])
+        journal.end(sessionID: session.id, at: now)
+
+        await f.sync.synchronizeNow()
+        try await f.sync.persistReplicaCheckpoint()
+
+        let url = temp.appendingPathComponent("AppSupport/workspace-sync-replica.json")
+        let sidecarDir = temp.appendingPathComponent("AppSupport/workspace-sync-transcripts")
+        let sidecarChunks = WorkspaceTranscriptChunkSidecar.loadChunks(from: sidecarDir)
+        XCTAssertEqual(sidecarChunks.count, 1)
+
+        // Build a legacy replica JSON with inline transcriptChunks and full acknowledged records.
+        var raw = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
+        var docDict = try XCTUnwrap(raw["workspaceDoc"] as? [String: Any])
+        let encodedChunks = try JSONSerialization.jsonObject(with: JSONEncoder().encode(sidecarChunks))
+        docDict["transcriptChunks"] = encodedChunks
+        raw["workspaceDoc"] = docDict
+        raw.removeValue(forKey: "acknowledgedLibraryDigests")
+        raw.removeValue(forKey: "acknowledgedTranscriptDigests")
+        raw.removeValue(forKey: "acknowledgedScheduleDigests")
+        raw["acknowledgedLibrary"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(f.libraryCloud.records))
+        raw["acknowledgedTranscripts"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(f.transcriptCloud.records))
+        raw["acknowledgedSchedule"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(f.scheduleCloud.records))
+        try JSONSerialization.data(withJSONObject: raw).write(to: url, options: .atomic)
+        try? FileManager.default.removeItem(at: sidecarDir)
+
+        f.libraryCloud.savedRecordIDs.removeAll()
+        f.transcriptCloud.savedRecordIDs.removeAll()
+        f.scheduleCloud.savedRecordIDs.removeAll()
+        coordinators.removeAll()
+
+        f.sync = f.reopenSync()
+        await f.sync.synchronizeNow(localChanges: false)
+        try await f.sync.persistReplicaCheckpoint()
+
+        XCTAssertTrue(f.libraryCloud.savedRecordIDs.isEmpty, "Migrated records must not re-upload")
+        XCTAssertTrue(f.transcriptCloud.savedRecordIDs.isEmpty, "Migrated transcript chunks must not re-upload")
+
+        let migratedRaw = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
+        XCTAssertNil(migratedRaw["acknowledgedLibrary"])
+        XCTAssertNil(migratedRaw["acknowledgedTranscripts"])
+        let migratedDoc = try XCTUnwrap(migratedRaw["workspaceDoc"] as? [String: Any])
+        XCTAssertEqual((migratedDoc["transcriptChunks"] as? [String: Any])?.isEmpty, true)
+        XCTAssertEqual(WorkspaceTranscriptChunkSidecar.loadChunks(from: sidecarDir).count, 1)
+
+        // Subsequent no-op sync (offline/no new server tokens) + checkpoint must not rewrite either file.
+        f.roomSync.setEnabled(false)
+        let replicaInode = try FileManager.default.attributesOfItem(atPath: url.path)[.systemFileNumber] as? NSNumber
+        let chunkID = try XCTUnwrap(sidecarChunks.keys.first)
+        let chunkURL = WorkspaceTranscriptChunkSidecar.fileURL(for: chunkID, in: sidecarDir)
+        let chunkInode = try FileManager.default.attributesOfItem(atPath: chunkURL.path)[.systemFileNumber] as? NSNumber
+
+        await f.sync.synchronizeNow(localChanges: false)
+        try await f.sync.persistReplicaCheckpoint()
+
+        XCTAssertEqual(try FileManager.default.attributesOfItem(atPath: url.path)[.systemFileNumber] as? NSNumber, replicaInode)
+        XCTAssertEqual(try FileManager.default.attributesOfItem(atPath: chunkURL.path)[.systemFileNumber] as? NSNumber, chunkInode)
     }
 }

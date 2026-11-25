@@ -3,6 +3,7 @@ import ConferenceCore
 import CryptoKit
 import Foundation
 import Network
+import os
 import UserNotifications
 
 enum IOSRemoteAIConsentError: LocalizedError {
@@ -103,7 +104,12 @@ final class IOSWorkspaceCoordinator: ObservableObject {
     private let cancelTaskNotification: (UUID) -> Void
 
     private let replicaURL: URL
-    private var replica: ReplicaState
+    private let transcriptSidecarURL: URL
+    private var replica: ReplicaState {
+        didSet { replicaRevision &+= 1 }
+    }
+    private var replicaRevision: UInt64 = 0
+    private var lastPersistedRevision: UInt64?
     private var started = false
     private var activeSyncTask: Task<Void, Never>?
     private var pendingSyncTask: Task<Void, Never>?
@@ -130,6 +136,13 @@ final class IOSWorkspaceCoordinator: ObservableObject {
     private var consecutiveCloudBackoffs = 0
     internal var cloudBackoffUntilForTesting: Date { cloudBackoffUntil }
 
+    private struct ReplicaDiskState: Sendable {
+        var metaDigest: String?
+        var chunkDigests: [String: String] = [:]
+    }
+
+    private let replicaDiskState = OSAllocatedUnfairLock(initialState: ReplicaDiskState())
+
     private struct ReplicaState: Codable, Sendable {
         var workspaceDoc: MeetingWorkspaceSyncDocument
         var scheduleDoc: CalendarScheduleSyncDocument
@@ -137,13 +150,84 @@ final class IOSWorkspaceCoordinator: ObservableObject {
         var transcriptToken: Data?
         var scheduleToken: Data?
         var zoneGenerations: [String: String] = [:]
-        var acknowledgedLibrary: [String: MeetingLibrarySyncRecord] = [:]
-        var acknowledgedTranscripts: [String: MeetingTranscriptSyncRecord] = [:]
-        var acknowledgedSchedule: [String: MeetingScheduleSyncRecord] = [:]
+        var acknowledgedLibraryDigests: [String: String] = [:]
+        var acknowledgedTranscriptDigests: [String: String] = [:]
+        var acknowledgedScheduleDigests: [String: String] = [:]
         var pendingCloudSessions: Set<UUID>?
         var pendingCloudSettings: Set<String>?
         var lastExportedNoteMarkdown: [UUID: String]?
         var lastExportedAssistantBaseline: AssistantLocalSyncBaseline?
+        var migratedFromLegacyFormat: Bool = false
+
+        private enum CodingKeys: String, CodingKey {
+            case workspaceDoc, scheduleDoc, libraryToken, transcriptToken, scheduleToken
+            case zoneGenerations
+            case acknowledgedLibraryDigests, acknowledgedTranscriptDigests, acknowledgedScheduleDigests
+            case acknowledgedLibrary, acknowledgedTranscripts, acknowledgedSchedule
+            case pendingCloudSessions, pendingCloudSettings
+            case lastExportedNoteMarkdown, lastExportedAssistantBaseline
+        }
+
+        init(
+            workspaceDoc: MeetingWorkspaceSyncDocument,
+            scheduleDoc: CalendarScheduleSyncDocument
+        ) {
+            self.workspaceDoc = workspaceDoc
+            self.scheduleDoc = scheduleDoc
+        }
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            workspaceDoc = try c.decode(MeetingWorkspaceSyncDocument.self, forKey: .workspaceDoc)
+            scheduleDoc = try c.decode(CalendarScheduleSyncDocument.self, forKey: .scheduleDoc)
+            libraryToken = try c.decodeIfPresent(Data.self, forKey: .libraryToken)
+            transcriptToken = try c.decodeIfPresent(Data.self, forKey: .transcriptToken)
+            scheduleToken = try c.decodeIfPresent(Data.self, forKey: .scheduleToken)
+            zoneGenerations = try c.decodeIfPresent([String: String].self, forKey: .zoneGenerations) ?? [:]
+
+            var migrated = false
+            if c.contains(.acknowledgedLibraryDigests) {
+                acknowledgedLibraryDigests = try c.decodeIfPresent([String: String].self, forKey: .acknowledgedLibraryDigests) ?? [:]
+            } else if let legacy = try c.decodeIfPresent([String: MeetingLibrarySyncRecord].self, forKey: .acknowledgedLibrary) {
+                acknowledgedLibraryDigests = legacy.mapValues { SyncRecordDigest.sha256($0) }
+                migrated = true
+            }
+            if c.contains(.acknowledgedTranscriptDigests) {
+                acknowledgedTranscriptDigests = try c.decodeIfPresent([String: String].self, forKey: .acknowledgedTranscriptDigests) ?? [:]
+            } else if let legacy = try c.decodeIfPresent([String: MeetingTranscriptSyncRecord].self, forKey: .acknowledgedTranscripts) {
+                acknowledgedTranscriptDigests = legacy.mapValues { SyncRecordDigest.sha256($0) }
+                migrated = true
+            }
+            if c.contains(.acknowledgedScheduleDigests) {
+                acknowledgedScheduleDigests = try c.decodeIfPresent([String: String].self, forKey: .acknowledgedScheduleDigests) ?? [:]
+            } else if let legacy = try c.decodeIfPresent([String: MeetingScheduleSyncRecord].self, forKey: .acknowledgedSchedule) {
+                acknowledgedScheduleDigests = legacy.mapValues { SyncRecordDigest.sha256($0) }
+                migrated = true
+            }
+
+            pendingCloudSessions = try c.decodeIfPresent(Set<UUID>.self, forKey: .pendingCloudSessions)
+            pendingCloudSettings = try c.decodeIfPresent(Set<String>.self, forKey: .pendingCloudSettings)
+            lastExportedNoteMarkdown = try c.decodeIfPresent([UUID: String].self, forKey: .lastExportedNoteMarkdown)
+            lastExportedAssistantBaseline = try c.decodeIfPresent(AssistantLocalSyncBaseline.self, forKey: .lastExportedAssistantBaseline)
+            migratedFromLegacyFormat = migrated
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var c = encoder.container(keyedBy: CodingKeys.self)
+            try c.encode(workspaceDoc, forKey: .workspaceDoc)
+            try c.encode(scheduleDoc, forKey: .scheduleDoc)
+            try c.encodeIfPresent(libraryToken, forKey: .libraryToken)
+            try c.encodeIfPresent(transcriptToken, forKey: .transcriptToken)
+            try c.encodeIfPresent(scheduleToken, forKey: .scheduleToken)
+            try c.encode(zoneGenerations, forKey: .zoneGenerations)
+            try c.encode(acknowledgedLibraryDigests, forKey: .acknowledgedLibraryDigests)
+            try c.encode(acknowledgedTranscriptDigests, forKey: .acknowledgedTranscriptDigests)
+            try c.encode(acknowledgedScheduleDigests, forKey: .acknowledgedScheduleDigests)
+            try c.encodeIfPresent(pendingCloudSessions, forKey: .pendingCloudSessions)
+            try c.encodeIfPresent(pendingCloudSettings, forKey: .pendingCloudSettings)
+            try c.encodeIfPresent(lastExportedNoteMarkdown, forKey: .lastExportedNoteMarkdown)
+            try c.encodeIfPresent(lastExportedAssistantBaseline, forKey: .lastExportedAssistantBaseline)
+        }
     }
 
     init(
@@ -196,6 +280,7 @@ final class IOSWorkspaceCoordinator: ObservableObject {
         }
 
         self.replicaURL = store.root.appendingPathComponent("ios-workspace-sync-replica.json")
+        self.transcriptSidecarURL = store.root.appendingPathComponent("ios-workspace-sync-transcripts")
         self.replica = ReplicaState(
             workspaceDoc: MeetingWorkspaceSyncDocument(device: syncPreferences.deviceID),
             scheduleDoc: CalendarScheduleSyncDocument(device: syncPreferences.deviceID)
@@ -2063,9 +2148,9 @@ final class IOSWorkspaceCoordinator: ObservableObject {
         replica.transcriptToken = nil
         replica.scheduleToken = nil
         replica.zoneGenerations.removeAll()
-        replica.acknowledgedLibrary.removeAll()
-        replica.acknowledgedTranscripts.removeAll()
-        replica.acknowledgedSchedule.removeAll()
+        replica.acknowledgedLibraryDigests.removeAll()
+        replica.acknowledgedTranscriptDigests.removeAll()
+        replica.acknowledgedScheduleDigests.removeAll()
         replica.lastExportedAssistantBaseline = nil
         calendar?.applyRemoteSchedule([], localDeviceID: deviceID)
         persistReplica()
@@ -2153,6 +2238,7 @@ final class IOSWorkspaceCoordinator: ObservableObject {
         // Rehydrate missing/newer task fields without retimestamping unchanged ones.
         let storedTasks = try await store.allTasks()
         let storedSessions = try await store.allSessions()
+        var mutated = false
         for task in storedTasks {
             if replica.workspaceDoc.tasks[task.id]?.isDeleted.value == true {
                 try await store.deleteTask(task.id)
@@ -2170,8 +2256,11 @@ final class IOSWorkspaceCoordinator: ObservableObject {
                 upsertSessionIntoDoc(session, fieldChanges: .all)
             }
             updateTaskInDocument(task)
+            mutated = true
         }
-        try await persistReplicaCheckpoint()
+        if mutated {
+            try await persistReplicaCheckpoint()
+        }
     }
 
     private func applyPendingCloudChanges(preMergeLocalNoteMarkdown: [UUID: String] = [:]) async throws {
@@ -2206,7 +2295,7 @@ final class IOSWorkspaceCoordinator: ObservableObject {
         let preMergeLocalNoteMarkdown = replica.workspaceDoc.notes.mapValues(\.markdown)
         let session = try await connectZone(name: "library", transport: libraryTransport) {
             self.replica.libraryToken = nil
-            self.replica.acknowledgedLibrary.removeAll()
+            self.replica.acknowledgedLibraryDigests.removeAll()
         }
         let changes = try await libraryTransport.fetch(session: session, after: replica.libraryToken)
         replica.libraryToken = changes.token
@@ -2241,11 +2330,11 @@ final class IOSWorkspaceCoordinator: ObservableObject {
             try await applyPendingCloudChanges(preMergeLocalNoteMarkdown: preMergeLocalNoteMarkdown)
         }
 
-        let pending = replica.workspaceDoc.pendingLibraryRecords(acknowledged: replica.acknowledgedLibrary)
+        let pending = replica.workspaceDoc.pendingLibraryRecords(acknowledgedDigests: replica.acknowledgedLibraryDigests)
         if !pending.isEmpty {
             let saved = try await libraryTransport.save(pending, session: session)
             for record in saved {
-                replica.acknowledgedLibrary[record.syncRecordID] = record
+                replica.acknowledgedLibraryDigests[record.syncRecordID] = SyncRecordDigest.sha256(record)
                 if case .note(let note) = record {
                     try? await store.saveNoteSyncBase(note.sessionID, markdown: note.markdown)
                 }
@@ -2258,7 +2347,7 @@ final class IOSWorkspaceCoordinator: ObservableObject {
         if retention == .off && replica.workspaceDoc.expiredCloudTranscriptRecordIDs(retention: retention).isEmpty { return }
         let session = try await connectZone(name: "transcript", transport: transcriptTransport) {
             self.replica.transcriptToken = nil
-            self.replica.acknowledgedTranscripts.removeAll()
+            self.replica.acknowledgedTranscriptDigests.removeAll()
         }
         if retention != .off {
             let changes = try await transcriptTransport.fetch(session: session, after: replica.transcriptToken)
@@ -2278,11 +2367,13 @@ final class IOSWorkspaceCoordinator: ObservableObject {
         }
 
         let eligible = replica.workspaceDoc.transcriptRecordsForCloud(retention: retention)
-        let pending = eligible.filter { replica.acknowledgedTranscripts[$0.syncRecordID] != $0 }
+        let pending = eligible.filter {
+            replica.acknowledgedTranscriptDigests[$0.syncRecordID] != SyncRecordDigest.sha256($0)
+        }
         if !pending.isEmpty {
             let saved = try await transcriptTransport.save(pending, session: session)
             for record in saved {
-                replica.acknowledgedTranscripts[record.syncRecordID] = record
+                replica.acknowledgedTranscriptDigests[record.syncRecordID] = SyncRecordDigest.sha256(record)
                 if case .chunk(let chunk) = record {
                     replica.workspaceDoc.markTranscriptUploaded(
                         recordID: record.syncRecordID,
@@ -2297,7 +2388,7 @@ final class IOSWorkspaceCoordinator: ObservableObject {
             try await transcriptTransport.delete(syncRecordIDs: expiredIDs, session: session)
             for id in expiredIDs {
                 replica.workspaceDoc.markTranscriptDeleted(recordID: id)
-                replica.acknowledgedTranscripts.removeValue(forKey: id)
+                replica.acknowledgedTranscriptDigests.removeValue(forKey: id)
             }
         }
     }
@@ -2306,7 +2397,7 @@ final class IOSWorkspaceCoordinator: ObservableObject {
         updateScheduleFromLocalCalendar()
         let session = try await connectZone(name: "schedule", transport: scheduleTransport) {
             self.replica.scheduleToken = nil
-            self.replica.acknowledgedSchedule.removeAll()
+            self.replica.acknowledgedScheduleDigests.removeAll()
         }
         let changes = try await scheduleTransport.fetch(session: session, after: replica.scheduleToken)
         replica.scheduleToken = changes.token
@@ -2315,14 +2406,16 @@ final class IOSWorkspaceCoordinator: ObservableObject {
         let expired = replica.scheduleDoc.pruneExpired()
         if !expired.isEmpty {
             try? await scheduleTransport.delete(syncRecordIDs: expired, session: session)
-            for id in expired { replica.acknowledgedSchedule.removeValue(forKey: id) }
+            for id in expired { replica.acknowledgedScheduleDigests.removeValue(forKey: id) }
         }
 
-        let pending = replica.scheduleDoc.records.filter { replica.acknowledgedSchedule[$0.syncRecordID] != $0 }
+        let pending = replica.scheduleDoc.records.filter {
+            replica.acknowledgedScheduleDigests[$0.syncRecordID] != SyncRecordDigest.sha256($0)
+        }
         if !pending.isEmpty {
             let saved = try await scheduleTransport.save(pending, session: session)
             for record in saved {
-                replica.acknowledgedSchedule[record.syncRecordID] = record
+                replica.acknowledgedScheduleDigests[record.syncRecordID] = SyncRecordDigest.sha256(record)
             }
         }
 
@@ -2655,47 +2748,91 @@ final class IOSWorkspaceCoordinator: ObservableObject {
         guard !replicaLoaded else { return }
         replicaLoaded = true
         let url = replicaURL
-        let loaded = await Task.detached(priority: .userInitiated) {
-            guard let data = try? Data(contentsOf: url) else { return Optional<ReplicaState>.none }
-            return try? JSONDecoder().decode(ReplicaState.self, from: data)
+        let sidecarURL = transcriptSidecarURL
+        let result = await Task.detached(priority: .userInitiated) { () -> (loaded: ReplicaState?, sidecarChunks: [String: SyncedTranscriptChunk], sidecarDigests: [String: String]) in
+            let loaded: ReplicaState? = (try? Data(contentsOf: url)).flatMap { try? JSONDecoder().decode(ReplicaState.self, from: $0) }
+            let sidecar = WorkspaceTranscriptChunkSidecar.loadChunksWithDigests(from: sidecarURL)
+            return (loaded, sidecar.chunks, sidecar.digests)
         }.value
-        guard let loaded else { return }
-        if replica.workspaceDoc.sessions.isEmpty &&
-            replica.workspaceDoc.notes.isEmpty &&
-            replica.workspaceDoc.outcomes.isEmpty &&
-            replica.workspaceDoc.tasks.isEmpty &&
-            replica.workspaceDoc.taskLinks.isEmpty &&
-            replica.workspaceDoc.taskProfiles.isEmpty &&
-            replica.workspaceDoc.contextSettings.isEmpty &&
-            replica.workspaceDoc.transcriptChunks.isEmpty {
-            replica.workspaceDoc = loaded.workspaceDoc
+
+        let initialMetaDigest: String?
+        if let loaded = result.loaded, !loaded.migratedFromLegacyFormat, loaded.workspaceDoc.transcriptChunks.isEmpty {
+            initialMetaDigest = SyncRecordDigest.sha256(loaded)
         } else {
-            _ = replica.workspaceDoc.mergeLibraryRecords(loaded.workspaceDoc.allLibraryRecords)
-            _ = replica.workspaceDoc.mergeTranscriptRecords(loaded.workspaceDoc.transcriptChunks.values.map { .chunk($0) })
+            initialMetaDigest = nil
         }
-        if replica.scheduleDoc.occurrences.isEmpty {
-            replica.scheduleDoc = loaded.scheduleDoc
-        } else {
-            _ = replica.scheduleDoc.merge(loaded.scheduleDoc.records)
+        replicaDiskState.withLock { state in
+            if state.metaDigest == nil { state.metaDigest = initialMetaDigest }
+            for (id, digest) in result.sidecarDigests where state.chunkDigests[id] == nil {
+                state.chunkDigests[id] = digest
+            }
         }
-        if replica.libraryToken == nil { replica.libraryToken = loaded.libraryToken }
-        if replica.transcriptToken == nil { replica.transcriptToken = loaded.transcriptToken }
-        if replica.scheduleToken == nil { replica.scheduleToken = loaded.scheduleToken }
-        for (k, v) in loaded.zoneGenerations where replica.zoneGenerations[k] == nil {
-            replica.zoneGenerations[k] = v
+
+        if let loaded = result.loaded {
+            if replica.workspaceDoc.sessions.isEmpty &&
+                replica.workspaceDoc.notes.isEmpty &&
+                replica.workspaceDoc.outcomes.isEmpty &&
+                replica.workspaceDoc.tasks.isEmpty &&
+                replica.workspaceDoc.taskLinks.isEmpty &&
+                replica.workspaceDoc.taskProfiles.isEmpty &&
+                replica.workspaceDoc.contextSettings.isEmpty &&
+                replica.workspaceDoc.transcriptChunks.isEmpty {
+                replica.workspaceDoc = loaded.workspaceDoc
+            } else {
+                _ = replica.workspaceDoc.mergeLibraryRecords(loaded.workspaceDoc.allLibraryRecords)
+                _ = replica.workspaceDoc.mergeTranscriptRecords(loaded.workspaceDoc.transcriptChunks.values.map { .chunk($0) })
+            }
+            if replica.scheduleDoc.occurrences.isEmpty {
+                replica.scheduleDoc = loaded.scheduleDoc
+            } else {
+                _ = replica.scheduleDoc.merge(loaded.scheduleDoc.records)
+            }
+            if replica.libraryToken == nil { replica.libraryToken = loaded.libraryToken }
+            if replica.transcriptToken == nil { replica.transcriptToken = loaded.transcriptToken }
+            if replica.scheduleToken == nil { replica.scheduleToken = loaded.scheduleToken }
+            for (k, v) in loaded.zoneGenerations where replica.zoneGenerations[k] == nil {
+                replica.zoneGenerations[k] = v
+            }
+            for (k, v) in loaded.acknowledgedLibraryDigests where replica.acknowledgedLibraryDigests[k] == nil {
+                replica.acknowledgedLibraryDigests[k] = v
+            }
+            for (k, v) in loaded.acknowledgedTranscriptDigests where replica.acknowledgedTranscriptDigests[k] == nil {
+                replica.acknowledgedTranscriptDigests[k] = v
+            }
+            for (k, v) in loaded.acknowledgedScheduleDigests where replica.acknowledgedScheduleDigests[k] == nil {
+                replica.acknowledgedScheduleDigests[k] = v
+            }
+            if replica.lastExportedAssistantBaseline == nil {
+                replica.lastExportedAssistantBaseline = loaded.lastExportedAssistantBaseline
+            }
         }
-        for (k, v) in loaded.acknowledgedLibrary where replica.acknowledgedLibrary[k] == nil {
-            replica.acknowledgedLibrary[k] = v
+        if !result.sidecarChunks.isEmpty {
+            replica.workspaceDoc.restoreTranscriptChunks(result.sidecarChunks)
         }
-        for (k, v) in loaded.acknowledgedTranscripts where replica.acknowledgedTranscripts[k] == nil {
-            replica.acknowledgedTranscripts[k] = v
+    }
+
+    private static func writeReplicaToDisk(
+        _ snapshot: ReplicaState,
+        replicaURL: URL,
+        sidecarURL: URL,
+        diskState: OSAllocatedUnfairLock<ReplicaDiskState>
+    ) throws {
+        var metadata = snapshot
+        metadata.workspaceDoc = metadata.workspaceDoc.withoutTranscriptChunks()
+        let metadataData = try SyncRecordDigest.makeCanonicalEncoder().encode(metadata)
+        let metaDigest = SyncRecordDigest.sha256(metadataData)
+        var state = diskState.withLock { $0 }
+        if state.metaDigest != metaDigest {
+            try FileManager.default.createDirectory(at: replicaURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try metadataData.write(to: replicaURL, options: .atomic)
+            state.metaDigest = metaDigest
         }
-        for (k, v) in loaded.acknowledgedSchedule where replica.acknowledgedSchedule[k] == nil {
-            replica.acknowledgedSchedule[k] = v
-        }
-        if replica.lastExportedAssistantBaseline == nil {
-            replica.lastExportedAssistantBaseline = loaded.lastExportedAssistantBaseline
-        }
+        try WorkspaceTranscriptChunkSidecar.sync(
+            chunks: snapshot.workspaceDoc.transcriptChunks,
+            persistedDigests: &state.chunkDigests,
+            to: sidecarURL
+        )
+        diskState.withLock { $0 = state }
     }
 
     func persistReplicaCheckpoint() async throws {
@@ -2703,32 +2840,42 @@ final class IOSWorkspaceCoordinator: ObservableObject {
         replicaSaveTask = nil
         await loadReplicaFromDiskIfNeeded()
         let snapshot = replica
+        let revision = replicaRevision
         let url = replicaURL
+        let sidecarURL = transcriptSidecarURL
+        let diskState = replicaDiskState
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             replicaIOQueue.async {
                 do {
-                    let data = try JSONEncoder().encode(snapshot)
-                    try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-                    try data.write(to: url, options: .atomic)
+                    try Self.writeReplicaToDisk(snapshot, replicaURL: url, sidecarURL: sidecarURL, diskState: diskState)
                     continuation.resume()
                 } catch { continuation.resume(throwing: error) }
             }
         }
+        lastPersistedRevision = revision
     }
 
     private func persistReplica() {
         replicaSaveTask?.cancel()
         replicaSaveTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(for: .milliseconds(350))
+            try? await Task.sleep(for: .seconds(2))
             guard !Task.isCancelled, let self else { return }
             await self.loadReplicaFromDiskIfNeeded()
+            let revision = self.replicaRevision
+            if let lastPersistedRevision, lastPersistedRevision == revision { return }
             let snapshot = self.replica
             let url = self.replicaURL
+            let sidecarURL = self.transcriptSidecarURL
+            let diskState = self.replicaDiskState
             self.replicaIOQueue.async {
-                guard let data = try? JSONEncoder().encode(snapshot) else { return }
-                try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-                try? data.write(to: url, options: .atomic)
+                do {
+                    try Self.writeReplicaToDisk(snapshot, replicaURL: url, sidecarURL: sidecarURL, diskState: diskState)
+                } catch {
+                    let ns = error as NSError
+                    AppDiagnostics.log("workspace-replica-write-failed", ["domain": ns.domain, "code": ns.code])
+                }
             }
+            self.lastPersistedRevision = revision
         }
     }
 

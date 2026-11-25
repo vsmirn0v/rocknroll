@@ -1045,4 +1045,116 @@ final class MeetingWorkspaceSyncTests: XCTestCase {
         XCTAssertNil(afterReset.jiraProjectKeys?.value ?? nil)
         XCTAssertFalse(afterReset.autoExportSettings?.hasAnyExplicitOverride ?? true)
     }
+
+    func testSyncRecordDigestIsDeterministicAcrossSetOrderingAndSidecarWritesIncrementally() throws {
+        let now = Date(timeIntervalSince1970: 1_795_000_000)
+        let v1 = SyncVersion(counter: 1, device: "mac-1")
+        let occA = SyncedCalendarOccurrence(
+            occurrenceKey: "cal:series:1",
+            seriesKey: "series",
+            title: "Standup",
+            calendarTitle: "Work",
+            start: now,
+            end: now.addingTimeInterval(1800),
+            attendedDevices: ["ios-b", "mac-a", "mac-c"],
+            isDeleted: SyncValue(false, version: v1),
+            updatedAt: now
+        )
+        var occB = occA
+        occB.attendedDevices = Set(["mac-c", "mac-a", "ios-b"])
+
+        XCTAssertEqual(
+            SyncRecordDigest.sha256(MeetingScheduleSyncRecord.occurrence(occA)),
+            SyncRecordDigest.sha256(MeetingScheduleSyncRecord.occurrence(occB))
+        )
+
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("sidecar-test-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let sid1 = UUID()
+        let sid2 = UUID()
+        let chunk1 = SyncedTranscriptChunk(
+            sessionID: sid1,
+            deviceID: "mac",
+            chunkIndex: 0,
+            sessionStartedAt: now,
+            events: [SyncedTranscriptEvent(id: "e1", kind: "transcript", occurredAt: now, text: "First", deviceID: "mac")],
+            updatedAt: now
+        )
+        var chunk2 = SyncedTranscriptChunk(
+            sessionID: sid2,
+            deviceID: "mac",
+            chunkIndex: 0,
+            sessionStartedAt: now,
+            events: [SyncedTranscriptEvent(id: "e2", kind: "transcript", occurredAt: now, text: "Second", deviceID: "mac")],
+            updatedAt: now
+        )
+        var digests: [String: String] = [:]
+        var chunks = [chunk1.id: chunk1, chunk2.id: chunk2]
+        try WorkspaceTranscriptChunkSidecar.sync(chunks: chunks, persistedDigests: &digests, to: dir)
+
+        let url1 = WorkspaceTranscriptChunkSidecar.fileURL(for: chunk1.id, in: dir)
+        let url2 = WorkspaceTranscriptChunkSidecar.fileURL(for: chunk2.id, in: dir)
+        let inode1Before = try FileManager.default.attributesOfItem(atPath: url1.path)[.systemFileNumber] as? NSNumber
+        let inode2Before = try FileManager.default.attributesOfItem(atPath: url2.path)[.systemFileNumber] as? NSNumber
+
+        // Unchanged sync must not rewrite any sidecar files.
+        try WorkspaceTranscriptChunkSidecar.sync(chunks: chunks, persistedDigests: &digests, to: dir)
+        XCTAssertEqual(try FileManager.default.attributesOfItem(atPath: url1.path)[.systemFileNumber] as? NSNumber, inode1Before)
+        XCTAssertEqual(try FileManager.default.attributesOfItem(atPath: url2.path)[.systemFileNumber] as? NSNumber, inode2Before)
+
+        // Updating only chunk2 must leave chunk1 untouched on disk.
+        chunk2.events.append(SyncedTranscriptEvent(id: "e3", kind: "transcript", occurredAt: now.addingTimeInterval(5), text: "Updated", deviceID: "mac"))
+        chunks[chunk2.id] = chunk2
+        try WorkspaceTranscriptChunkSidecar.sync(chunks: chunks, persistedDigests: &digests, to: dir)
+        XCTAssertEqual(try FileManager.default.attributesOfItem(atPath: url1.path)[.systemFileNumber] as? NSNumber, inode1Before)
+        XCTAssertNotEqual(try FileManager.default.attributesOfItem(atPath: url2.path)[.systemFileNumber] as? NSNumber, inode2Before)
+
+        let loaded = WorkspaceTranscriptChunkSidecar.loadChunksWithDigests(from: dir)
+        XCTAssertEqual(loaded.chunks, chunks)
+        XCTAssertEqual(loaded.digests, digests)
+
+        // Removing chunk1 deletes its sidecar file while preserving chunk2.
+        chunks.removeValue(forKey: chunk1.id)
+        try WorkspaceTranscriptChunkSidecar.sync(chunks: chunks, persistedDigests: &digests, to: dir)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url1.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: url2.path))
+
+        var doc = MeetingWorkspaceSyncDocument(device: "mac")
+        doc.restoreTranscriptChunks(loaded.chunks)
+        XCTAssertEqual(doc.transcriptChunks.count, 2)
+        XCTAssertTrue(doc.withoutTranscriptChunks().transcriptChunks.isEmpty)
+        let record = MeetingLibrarySyncRecord.session(SyncedMeetingSession(
+            id: sid1,
+            occurrenceKey: "room:test",
+            title: SyncValue("Test", version: v1),
+            hasTitleOverride: SyncValue(false, version: v1),
+            invitation: SyncValue(nil, version: v1),
+            roomIdentity: "room:test",
+            startedAt: now,
+            endedAt: SyncValue(nil, version: v1),
+            timeZoneID: "UTC",
+            state: SyncValue("active", version: v1),
+            isDeleted: SyncValue(false, version: v1),
+            createdAt: now,
+            updatedAt: now
+        ))
+        doc.upsertSession(SyncedMeetingSession(
+            id: sid1,
+            occurrenceKey: "room:test",
+            title: SyncValue("Test", version: v1),
+            hasTitleOverride: SyncValue(false, version: v1),
+            invitation: SyncValue(nil, version: v1),
+            roomIdentity: "room:test",
+            startedAt: now,
+            endedAt: SyncValue(nil, version: v1),
+            timeZoneID: "UTC",
+            state: SyncValue("active", version: v1),
+            isDeleted: SyncValue(false, version: v1),
+            createdAt: now,
+            updatedAt: now
+        ))
+        XCTAssertTrue(doc.pendingLibraryRecords(acknowledgedDigests: [record.syncRecordID: SyncRecordDigest.sha256(record)]).isEmpty)
+    }
 }

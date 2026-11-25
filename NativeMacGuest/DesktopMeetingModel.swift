@@ -46,7 +46,16 @@ import UniformTypeIdentifiers
     @Published var title: String {
         didSet { workspaceJournal?.rename(sessionID: workspaceSessionID, title: title) }
     }
-    @Published private(set) var snapshot = NativeDesktopExternalSnapshot()
+    @Published private(set) var snapshot = NativeDesktopExternalSnapshot() {
+        didSet { updateOrderedParticipantsCache(for: snapshot.participants) }
+    }
+    private struct RosterSortKey: Equatable {
+        let id: String
+        let name: String
+        let isLocal: Bool
+    }
+    private var cachedRosterSortKeys: [RosterSortKey] = []
+    private var cachedOrderedParticipantIDs: [String] = []
     @Published private(set) var videos: [NativeDesktopExternalVideo] = []
     @Published private(set) var localCamera: LKRTCVideoTrack?
     @Published private(set) var localShare: LKRTCVideoTrack?
@@ -121,7 +130,24 @@ import UniformTypeIdentifiers
     }
     @Published private(set) var sharingPending = false
     @Published var controlsHidden = false
+    @Published var invitationCopiedOnJoin = false
+    @Published private(set) var copiedToastRevision: Int = 0
     @Published var floatingReactions: [MeetingReactionEvent] = []
+
+    @MainActor
+    func copyInvitationLink() {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(invitation.absoluteString, forType: .string)
+        copiedToastRevision &+= 1
+        NSAccessibility.post(
+            element: NSApp as Any,
+            notification: .announcementRequested,
+            userInfo: [
+                .announcement: L("Invitation link copied"),
+                .priority: NSAccessibilityPriorityLevel.high.rawValue
+            ]
+        )
+    }
     var presenter: NativeDesktopPresenterSession {
         captureCoordinator.presenter(
             engine: { [weak self] in self?.engine },
@@ -1682,12 +1708,23 @@ import UniformTypeIdentifiers
     var activeSpeaker: NativeDesktopParticipant? {
         participants.first { $0.speaking == true && !$0.isLocal } ?? participants.first { $0.speaking == true }
     }
-    var orderedParticipants: [NativeDesktopParticipant] {
-        participants.sorted {
+    private func updateOrderedParticipantsCache(for participants: [NativeDesktopParticipant]) {
+        let keys = participants.map { RosterSortKey(id: $0.id, name: $0.name, isLocal: $0.isLocal) }
+        guard keys != cachedRosterSortKeys else { return }
+        cachedRosterSortKeys = keys
+        cachedOrderedParticipantIDs = participants.sorted {
             if $0.isLocal != $1.isLocal { return $0.isLocal }
             let order = $0.name.localizedStandardCompare($1.name)
             return order == .orderedSame ? $0.id < $1.id : order == .orderedAscending
-        }
+        }.map(\.id)
+    }
+
+    var orderedParticipants: [NativeDesktopParticipant] {
+        let participants = self.participants
+        guard !cachedOrderedParticipantIDs.isEmpty else { return participants }
+        let byID = Dictionary(participants.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        let ordered = cachedOrderedParticipantIDs.compactMap { byID[$0] }
+        return ordered.count == participants.count ? ordered : participants
     }
     /// The tile follows the share on stage, including while its stream reconnects.
     var focusedSharePresenter: NativeDesktopParticipant? {
@@ -1854,7 +1891,7 @@ import UniformTypeIdentifiers
         engine.setMicrophoneReadinessForRecovery(microphonePreparationEligible)
     }
     private func update(_ value: NativeDesktopExternalSnapshot) {
-        guard !closed else { return }
+        guard !closed, value != snapshot else { return }
         let previous = snapshot; snapshot = value
         if value.phase == .connected && !everConnected {
             let now = Date()
@@ -1879,10 +1916,14 @@ import UniformTypeIdentifiers
         for person in value.participants where person.speaking == true {
             if lastSpokeAt[person.id].map({ now.timeIntervalSince($0) > 5 }) ?? true { lastSpokeAt[person.id] = now }
         }
-        noteShareState()
+        if previous.sharing != value.sharing || previous.phase != value.phase {
+            noteShareState()
+        }
         if value.phase == .reconnecting || value.phase == .failed { cancelJoinCameraPrime() }
         if previous.phase != .reconnecting, value.phase == .reconnecting { updateMicrophoneRecoveryReadiness() }
-        captureCoordinator.updateVP9Support(engine: engine)
+        if previous.phase != value.phase || previous.cameraOn != value.cameraOn || previous.sharing != value.sharing {
+            captureCoordinator.updateVP9Support(engine: engine)
+        }
         if value.phase == .connected { connection?.finish(.success(())) }
         if value.phase == .failed { connection?.finish(.failure(NativeDesktopError.unavailable(value.lastError ?? L("Could not connect to meeting.")))) }
         // A reply held the gate closed because the mute after it was not confirmed:
@@ -1915,7 +1956,8 @@ import UniformTypeIdentifiers
                 if pinnedID == affinity.participant { unpin(); if viewMode == .focused { viewMode = .automatic } }
             }
         }
-        updateFloatingAnchor(); updateDemand(); refreshSystemReactions()
+        updateFloatingAnchor(); updateDemand()
+        if previous.cameraOn != value.cameraOn || previous.phase != value.phase { refreshSystemReactions() }
         if galleryPage >= galleryPages { galleryPage = max(0, galleryPages - 1) }
         if value.phase == .failed && value.endedByOrganizer {
             guard !endedByOrganizer else { return }

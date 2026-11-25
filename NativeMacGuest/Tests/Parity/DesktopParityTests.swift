@@ -2082,4 +2082,82 @@ private final class DesktopActivitySpy: NSUserActivity {
         XCTAssertEqual(engine.leaves, 1); XCTAssertNil(workspace.meeting)
         XCTAssertTrue(library.recent.isEmpty); XCTAssertEqual(finished, 1)
     }
+
+    func testRemoteSpeakerUpdatesDoNotInvalidateWorkspaceAndMeetingIgnoresDuplicateSnapshots() async throws {
+        let preferences = UserDefaults(suiteName: "native-speaker-storm-\(UUID())")!
+        let history = RoomHistoryStore(storage: DesktopMemoryStorage())
+        let library = NativeDesktopLibrary(preferences: preferences, history: history, syncStorage: DesktopMemoryStorage())
+        library.displayName = "Host"
+        let engine = DesktopTestEngine()
+        let workspace = NativeDesktopWorkspace(library: library, detect: { _ in .verified(.guest(endpoint: self.url)) },
+            makeMeeting: { destination, name, title, quiet in
+                NativeDesktopMeetingModel(destination: destination, name: name, title: title, quiet: quiet, engine: engine)
+            }, attention: desktopTestAttention())
+        workspace.join(url)
+        try await spin { workspace.meeting?.connected == true }
+        let model = try XCTUnwrap(workspace.meeting)
+
+        let participants = [
+            NativeDesktopParticipant(id: "local", name: "Host", isLocal: true, microphoneOn: false, cameraOn: false, speaking: false),
+            NativeDesktopParticipant(id: "p2", name: "Zoya", isLocal: false, microphoneOn: true, cameraOn: false, speaking: false),
+            NativeDesktopParticipant(id: "p1", name: "Alex", isLocal: false, microphoneOn: true, cameraOn: false, speaking: false)
+        ]
+        engine.snapshot.participants = participants
+        engine.onState?(engine.snapshot)
+        try await spin { model.orderedParticipants.map(\.id) == ["local", "p1", "p2"] }
+        // Let workspace's initial async store/profile setup settle before measuring speaker updates.
+        try await Task.sleep(for: .milliseconds(150))
+
+        var workspaceChanges = 0
+        var modelChanges = 0
+        let wsToken = workspace.objectWillChange.sink { workspaceChanges += 1 }
+        let modelToken = model.objectWillChange.sink { modelChanges += 1 }
+        defer { wsToken.cancel(); modelToken.cancel() }
+
+        // Duplicate snapshot emits zero model invalidations.
+        engine.onState?(engine.snapshot)
+        try await Task.sleep(for: .milliseconds(30))
+        XCTAssertEqual(modelChanges, 0)
+        XCTAssertEqual(workspaceChanges, 0)
+
+        // Remote speaker toggles must update the meeting model without invalidating the workspace.
+        engine.snapshot.participants[1].speaking = true
+        engine.onState?(engine.snapshot)
+        try await Task.sleep(for: .milliseconds(40))
+        XCTAssertGreaterThanOrEqual(modelChanges, 1)
+        XCTAssertEqual(workspaceChanges, 0)
+        XCTAssertEqual(model.orderedParticipants.map(\.id), ["local", "p1", "p2"])
+
+        let beforeSecondToggle = modelChanges
+        engine.snapshot.participants[1].speaking = false
+        engine.onState?(engine.snapshot)
+        try await Task.sleep(for: .milliseconds(40))
+        XCTAssertEqual(modelChanges, beforeSecondToggle + 1)
+        XCTAssertEqual(workspaceChanges, 0)
+
+        // Unaffected participant tiles compare equal across another participant's speaking change.
+        let p1Quiet = NativeDesktopParticipant(id: "p1", name: "Alex", isLocal: false, microphoneOn: true, cameraOn: false, speaking: false)
+        let p2Quiet = NativeDesktopParticipant(id: "p2", name: "Zoya", isLocal: false, microphoneOn: true, cameraOn: false, speaking: false)
+        let p2Speaking = NativeDesktopParticipant(id: "p2", name: "Zoya", isLocal: false, microphoneOn: true, cameraOn: false, speaking: true)
+
+        func makeTile(_ person: NativeDesktopParticipant) -> NativeDesktopParticipantTile {
+            NativeDesktopParticipantTile(
+                person: person,
+                compact: true,
+                presenter: false,
+                source: .camera,
+                tileSourceID: "\(person.id)-camera",
+                matchedVideo: nil,
+                localCamera: nil,
+                participantVolume: 1,
+                supportsParticipantVolume: true,
+                localMicLevel: nil,
+                model: model
+            )
+        }
+        XCTAssertEqual(makeTile(p1Quiet), makeTile(p1Quiet))
+        XCTAssertNotEqual(makeTile(p2Quiet), makeTile(p2Speaking))
+
+        _ = await workspace.leave()
+    }
 }

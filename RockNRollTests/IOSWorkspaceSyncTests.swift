@@ -30,6 +30,7 @@ final class IOSWorkspaceSyncTests: XCTestCase {
     @MainActor
     private final class MockZoneTransport<Record: SyncZoneRecord>: CloudZoneTransporting {
         var records: [String: Record] = [:]
+        var savedRecordIDs: [String] = []
         var deletedIDs: [String] = []
         var generation = "zone-gen-1"
         var connectError: Error?
@@ -48,6 +49,7 @@ final class IOSWorkspaceSyncTests: XCTestCase {
         func save(_ values: [Record], session: CloudZoneSession) async throws -> [Record] {
             values.map { record in
                 let id = record.syncRecordID
+                savedRecordIDs.append(id)
                 let merged = records[id]?.merging(record) ?? record
                 records[id] = merged
                 return merged
@@ -1453,5 +1455,86 @@ final class IOSWorkspaceSyncTests: XCTestCase {
         XCTAssertTrue(synced.summaryEdited)
         XCTAssertTrue(synced.decisionsEdited)
         XCTAssertTrue(synced.questionsEdited)
+    }
+
+    func testLegacyReplicaMigratesToDigestsAndSidecarWithoutReuploadOrIdleRewrite() async throws {
+        var f = try await makeCoordinator()
+        let url = try XCTUnwrap(URL(string: "https://rock.glowsoft.ru/jams/legacy-ios"))
+        let controllerID = UUID()
+        let sid = f.workspace.beginSession(
+            controllerID: controllerID,
+            requestedWorkspaceID: nil,
+            title: "iOS Legacy Sync",
+            invitation: url,
+            roomIdentity: url.absoluteString,
+            calendarMeeting: nil
+        )
+        f.workspace.recordLiveEvents(
+            controllerID: controllerID,
+            events: [
+                SyncedTranscriptEvent(
+                    id: "ios-ev-1",
+                    kind: "transcript",
+                    occurredAt: Date(),
+                    speaker: "Vlad",
+                    isOwn: true,
+                    text: "Testing iOS incremental sidecar persistence",
+                    deviceID: f.roomSync.deviceID
+                )
+            ],
+            micIntervals: []
+        )
+        f.workspace.finishSession(controllerID: controllerID, endedAt: Date())
+        await f.workspace.synchronizeNow()
+        try await f.workspace.persistReplicaCheckpoint()
+
+        let replicaURL = temp.appendingPathComponent("DB/ios-workspace-sync-replica.json")
+        let sidecarDir = temp.appendingPathComponent("DB/ios-workspace-sync-transcripts")
+        let sidecarChunks = WorkspaceTranscriptChunkSidecar.loadChunks(from: sidecarDir)
+        XCTAssertEqual(sidecarChunks.count, 1)
+
+        var raw = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: replicaURL)) as? [String: Any])
+        var docDict = try XCTUnwrap(raw["workspaceDoc"] as? [String: Any])
+        docDict["transcriptChunks"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(sidecarChunks))
+        raw["workspaceDoc"] = docDict
+        raw.removeValue(forKey: "acknowledgedLibraryDigests")
+        raw.removeValue(forKey: "acknowledgedTranscriptDigests")
+        raw.removeValue(forKey: "acknowledgedScheduleDigests")
+        raw["acknowledgedLibrary"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(f.libraryCloud.records))
+        raw["acknowledgedTranscripts"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(f.transcriptCloud.records))
+        raw["acknowledgedSchedule"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(f.scheduleCloud.records))
+        try JSONSerialization.data(withJSONObject: raw).write(to: replicaURL, options: .atomic)
+        try? FileManager.default.removeItem(at: sidecarDir)
+
+        f.libraryCloud.savedRecordIDs.removeAll()
+        f.transcriptCloud.savedRecordIDs.removeAll()
+        f.scheduleCloud.savedRecordIDs.removeAll()
+
+        f.workspace = f.reopenWorkspace()
+        await f.workspace.synchronizeNow()
+        try await f.workspace.persistReplicaCheckpoint()
+
+        XCTAssertTrue(f.libraryCloud.savedRecordIDs.isEmpty, "Migrated iOS library records must not re-upload")
+        XCTAssertTrue(f.transcriptCloud.savedRecordIDs.isEmpty, "Migrated iOS transcript chunks must not re-upload")
+
+        let migratedRaw = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: replicaURL)) as? [String: Any])
+        XCTAssertNil(migratedRaw["acknowledgedLibrary"])
+        XCTAssertNil(migratedRaw["acknowledgedTranscripts"])
+        let migratedDoc = try XCTUnwrap(migratedRaw["workspaceDoc"] as? [String: Any])
+        XCTAssertEqual((migratedDoc["transcriptChunks"] as? [String: Any])?.isEmpty, true)
+        XCTAssertEqual(WorkspaceTranscriptChunkSidecar.loadChunks(from: sidecarDir).count, 1)
+
+        f.roomSync.setEnabled(false)
+        let replicaInode = try FileManager.default.attributesOfItem(atPath: replicaURL.path)[.systemFileNumber] as? NSNumber
+        let chunkID = try XCTUnwrap(sidecarChunks.keys.first)
+        let chunkURL = WorkspaceTranscriptChunkSidecar.fileURL(for: chunkID, in: sidecarDir)
+        let chunkInode = try FileManager.default.attributesOfItem(atPath: chunkURL.path)[.systemFileNumber] as? NSNumber
+
+        await f.workspace.synchronizeNow()
+        try await f.workspace.persistReplicaCheckpoint()
+
+        XCTAssertEqual(try FileManager.default.attributesOfItem(atPath: replicaURL.path)[.systemFileNumber] as? NSNumber, replicaInode)
+        XCTAssertEqual(try FileManager.default.attributesOfItem(atPath: chunkURL.path)[.systemFileNumber] as? NSNumber, chunkInode)
+        XCTAssertEqual(f.workspace.sessions.first?.id, sid)
     }
 }

@@ -1,6 +1,7 @@
 import AppKit
 import Combine
 import ConferenceCore
+import MeetingEngine
 import SwiftUI
 import UserNotifications
 
@@ -92,6 +93,19 @@ import UserNotifications
     @Published var assistantSettingsArea: NativeDesktopAssistantSettingsArea = .overview
     @Published var error: String?
     @Published var pendingAuthChallenge: (origin: URL, retryURL: URL, title: String?)?
+    @Published var isCreatingInstantRoom = false { didSet { refreshMenu() } }
+    @Published var instantRoomError: String?
+    @Published var instantRoomAuthChallengeOrigin: URL?
+    @Published var pendingInstantRoomOrigin: URL?
+    @Published var instantRoomPreferredOrigin: URL? { didSet { refreshMenu() } }
+    @Published var showCreateRoomSheetRequested = false
+
+    var instantRoomPreferencesDefaults: UserDefaults = .standard
+    var createInstantRoomHandler: (@MainActor (URL, MeetingEngineKind?) async throws -> CreatedMeetingRoom)?
+    var copyInvitationToClipboard: (@MainActor (String) -> Void) = { text in
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+    }
     /// An informational alert, such as a meeting the organizer ended.
     @Published var notice: (title: String, message: String)?
     /// A join is in flight (setting up or connecting), or every meeting is being left.
@@ -119,6 +133,9 @@ import UserNotifications
     private var meetingWindows: [UUID: NativeDesktopMeetingWindow] = [:]
     private var meetingSubscriptions: [UUID: AnyCancellable] = [:]
     private var renderedMeetingStates: [UUID: String] = [:]
+    private var renderedMenuState: String?
+    private var renderedSpeechState: String?
+    private var lastPublishedHandoffKey: String?
     private var continuationSessions: [UUID: UUID] = [:]
     private var meetingLeaves: [UUID: Task<Bool, Never>] = [:] { didSet { onUpdateActivityChanged() } }
     private var handover: Task<Bool, Never>?
@@ -1508,11 +1525,25 @@ import UserNotifications
         let state = [meeting.sessionID.uuidString, meeting.title, meeting.snapshot.phase.rawValue,
             String(meeting.snapshot.microphoneOn), String(meeting.snapshot.cameraOn), String(meeting.snapshot.sharing),
             String(meeting.snapshot.playoutOn), String(meeting.participants.count), String(meeting.ownsMicrophone),
-            String(meeting.participants.contains { !$0.isLocal && $0.speaking == true }),
             String(describing: meeting.localCamera.map(ObjectIdentifier.init))].joined(separator: "|")
         guard state != renderedMeetingStates[meeting.sessionID] else { return }
-        renderedMeetingStates[meeting.sessionID] = state; objectWillChange.send(); refreshMenu(); updateContinuation()
-        attention.speech.refreshState()
+        renderedMeetingStates[meeting.sessionID] = state; objectWillChange.send()
+        let menuState = meetings.map {
+            [$0.sessionID.uuidString, $0.title, $0.snapshot.phase.rawValue,
+             String($0.snapshot.microphoneOn), String($0.snapshot.playoutOn), String($0.ownsMicrophone)].joined(separator: "|")
+        }.joined(separator: ";")
+        if menuState != renderedMenuState {
+            renderedMenuState = menuState
+            refreshMenu()
+        }
+        updateContinuation()
+        let speechState = meetings.map {
+            "\($0.sessionID.uuidString)|\($0.isClosed)|\($0.snapshot.microphoneOn)"
+        }.joined(separator: ";")
+        if speechState != renderedSpeechState {
+            renderedSpeechState = speechState
+            attention.speech.refreshState()
+        }
         if meeting.snapshot.phase == .connected {
             workspaceSync.noteLocalSessionJoined(
                 sessionID: meeting.workspaceSessionID,
@@ -1532,6 +1563,14 @@ import UserNotifications
         if snapshot == nil { publishHandoff(nil) }
     }
     private func publishHandoff(_ jam: ActiveJam?) {
+        let handoffKey = jam.map {
+            [$0.deviceID, $0.sessionID.uuidString, $0.invitation.absoluteString, $0.title,
+             $0.name, $0.deviceLabel, String($0.connected), String($0.isSharingScreen),
+             String($0.supportsCompanion), String(describing: $0.audioPaused),
+             $0.engineIdentifier ?? "", $0.workspaceSessionID?.uuidString ?? ""].joined(separator: "|")
+        }
+        if handoffKey == lastPublishedHandoffKey { return }
+        lastPublishedHandoffKey = handoffKey
         activity?.invalidate(); activity = nil
         guard library.continuation.isAvailable, let jam else { return }
         let value = makeHandoffActivity(jam)
