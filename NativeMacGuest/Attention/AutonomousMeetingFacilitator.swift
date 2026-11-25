@@ -189,6 +189,12 @@ final class AutonomousMeetingFacilitator: ObservableObject {
         return attention?.store.selectedSkillIDs.first ?? "scrum-master"
     }
 
+    func skillDisplayName(for skillID: String) -> String {
+        cachedSkills.first(where: { $0.id == skillID })?.name
+            ?? DefaultAssistantSkills.skill(id: skillID)?.name
+            ?? skillID
+    }
+
     func enable(
         for model: NativeDesktopMeetingModel,
         skillID: String? = nil,

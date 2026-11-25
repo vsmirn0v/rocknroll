@@ -814,8 +814,16 @@ struct NativeMeetingAssistantMenu: View {
         self._facilitator = ObservedObject(wrappedValue: attention.facilitator ?? AutonomousMeetingFacilitator(attention: attention))
     }
 
+    private var activeSkillID: String? {
+        facilitator.activeSessionSkills[meeting.sessionID]
+    }
+
     private var isFacilitatorActive: Bool {
-        facilitator.activeSessionSkills[meeting.sessionID] != nil
+        activeSkillID != nil
+    }
+
+    private var activeSkillName: String? {
+        activeSkillID.map { facilitator.skillDisplayName(for: $0) }
     }
 
     var body: some View {
@@ -825,11 +833,20 @@ struct NativeMeetingAssistantMenu: View {
                 .foregroundStyle(isFacilitatorActive ? Color.accentColor : Color.primary)
                 .frame(width: compactChrome ? 36 : 28, height: compactChrome ? 36 : 28)
                 .contentShape(Circle())
+                .overlay(alignment: .topTrailing) {
+                    if isFacilitatorActive {
+                        Circle()
+                            .fill(Color.accentColor)
+                            .frame(width: 6, height: 6)
+                            .padding(compactChrome ? 5 : 2)
+                    }
+                }
         }
         .buttonStyle(.plain)
         .accessibilityLabel(L("Rock Assistant"))
+        .accessibilityValue(activeSkillName ?? L("Off"))
         .accessibilityIdentifier("meeting.assistant.menu")
-        .help(L("Facilitate this meeting with Rock skills & Jira Board"))
+        .help(activeSkillName.map { L("Voice facilitator: %@", $0) } ?? L("Facilitate this meeting with Rock skills & Jira Board"))
         .popover(isPresented: $open, arrowEdge: .bottom) {
             NativeMeetingAssistantPopover(
                 meeting: meeting,
@@ -851,6 +868,7 @@ private struct NativeMeetingAssistantPopover: View {
 
     @State private var skills: [AssistantSkill] = []
     @State private var loadedSkills = false
+    @State private var hoveredRowID: String?
 
     private var activeSkillID: String? {
         facilitator.activeSessionSkills[meeting.sessionID]
@@ -868,46 +886,39 @@ private struct NativeMeetingAssistantPopover: View {
         activeSkillID ?? enabledSkills.first?.id ?? "scrum-master"
     }
 
+    private var activeSkillName: String? {
+        activeSkillID.map { id in
+            skills.first(where: { $0.id == id })?.name ?? facilitator.skillDisplayName(for: id)
+        }
+    }
+
+    private var recommendedSkillID: String? {
+        guard !isFacilitatorActive else { return nil }
+        return enabledSkills.first(where: { $0.matches(meetingTitle: meeting.title, commandText: "") })?.id
+    }
+
     private var boardSharing: Bool {
         board.sharingMeetingID == meeting.sessionID || board.isRecoveringShare
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(L("Rock Assistant"))
-                    .font(.headline)
-                if let status = facilitator.lastStatusBySession[meeting.sessionID], !status.isEmpty {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(alignment: .center, spacing: 8) {
+                    Text(L("Rock Assistant"))
+                        .font(.headline)
+                        .lineLimit(1)
+                        .layoutPriority(1)
+                    Spacer(minLength: 4)
+                    statusPill
+                }
+                if isFacilitatorActive,
+                   let status = facilitator.lastStatusBySession[meeting.sessionID],
+                   !status.isEmpty {
                     Text(status)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
-                }
-            }
-
-            VStack(spacing: 2) {
-                actionRow(
-                    title: isFacilitatorActive ? L("Stop Voice Facilitator") : L("Start Voice Facilitator"),
-                    symbol: isFacilitatorActive ? "stop.circle" : "waveform",
-                    accessibilityID: "meeting.facilitator.toggle"
-                ) {
-                    if isFacilitatorActive {
-                        facilitator.disable(for: meeting.sessionID)
-                    } else {
-                        facilitator.enable(for: meeting, skillID: nil)
-                    }
-                }
-
-                if isFacilitatorActive {
-                    actionRow(
-                        title: L("Kick off skill now"),
-                        symbol: "play.circle",
-                        accessibilityID: "meeting.facilitator.kickoff"
-                    ) {
-                        let targetSkillID = resolvedActiveSkillID
-                        close()
-                        Task { await facilitator.kickOffSkill(for: meeting, skillID: targetSkillID) }
-                    }
                 }
             }
 
@@ -918,17 +929,47 @@ private struct NativeMeetingAssistantPopover: View {
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
 
-                if !loadedSkills && enabledSkills.isEmpty {
-                    ProgressView()
-                        .controlSize(.small)
-                        .padding(.vertical, 4)
-                } else if enabledSkills.count > 6 {
-                    ScrollView {
+                VStack(spacing: 3) {
+                    radioRow(
+                        hoverID: "__off__",
+                        title: L("Off"),
+                        subtitle: nil,
+                        badge: nil,
+                        selected: !isFacilitatorActive,
+                        useAccent: false,
+                        accessibilityID: "meeting.facilitator.off"
+                    ) {
+                        if isFacilitatorActive {
+                            facilitator.disable(for: meeting.sessionID)
+                        }
+                        close()
+                    }
+
+                    if !loadedSkills && enabledSkills.isEmpty {
+                        ProgressView()
+                            .controlSize(.small)
+                            .padding(.vertical, 4)
+                    } else if enabledSkills.count > 6 {
+                        ScrollView {
+                            skillList
+                        }
+                        .frame(maxHeight: 240)
+                    } else {
                         skillList
                     }
-                    .frame(maxHeight: 220)
-                } else {
-                    skillList
+                }
+            }
+
+            if isFacilitatorActive {
+                actionRow(
+                    title: L("Kick off skill now"),
+                    symbol: "play.circle",
+                    hoverID: "__kickoff__",
+                    accessibilityID: "meeting.facilitator.kickoff"
+                ) {
+                    let targetSkillID = resolvedActiveSkillID
+                    close()
+                    Task { await facilitator.kickOffSkill(for: meeting, skillID: targetSkillID) }
                 }
             }
 
@@ -937,7 +978,8 @@ private struct NativeMeetingAssistantPopover: View {
             VStack(spacing: 2) {
                 actionRow(
                     title: L("Open Assistant Board"),
-                    symbol: "macwindow"
+                    symbol: "macwindow",
+                    hoverID: "__open_board__"
                 ) {
                     close()
                     Task {
@@ -953,7 +995,8 @@ private struct NativeMeetingAssistantPopover: View {
 
                 actionRow(
                     title: boardSharing ? L("Stop Board Share") : L("Share Board to Meeting"),
-                    symbol: boardSharing ? "stop.circle" : "rectangle.on.rectangle"
+                    symbol: boardSharing ? "stop.circle" : "rectangle.on.rectangle",
+                    hoverID: "__share_board__"
                 ) {
                     close()
                     Task {
@@ -972,11 +1015,40 @@ private struct NativeMeetingAssistantPopover: View {
             }
         }
         .padding(12)
-        .frame(width: 290)
+        .frame(width: 310)
         .foregroundStyle(.primary)
         .task {
             skills = await attention.listAssistantSkills()
             loadedSkills = true
+        }
+    }
+
+    @ViewBuilder
+    private var statusPill: some View {
+        if let activeSkillName {
+            HStack(spacing: 5) {
+                Circle()
+                    .fill(Color.accentColor)
+                    .frame(width: 6, height: 6)
+                Text(activeSkillName)
+                    .font(.caption2.weight(.semibold))
+                    .lineLimit(1)
+            }
+            .foregroundStyle(Color.accentColor)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
+            .background(Color.accentColor.opacity(0.16), in: Capsule())
+            .overlay(Capsule().strokeBorder(Color.accentColor.opacity(0.45), lineWidth: 1))
+            .accessibilityElement(children: .combine)
+            .accessibilityIdentifier("meeting.facilitator.status")
+        } else {
+            Text(L("Off"))
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 3)
+                .background(Color.secondary.opacity(0.14), in: Capsule())
+                .accessibilityIdentifier("meeting.facilitator.status")
         }
     }
 
@@ -988,49 +1060,106 @@ private struct NativeMeetingAssistantPopover: View {
     }
 
     private var skillList: some View {
-        VStack(spacing: 2) {
+        VStack(spacing: 3) {
             ForEach(enabledSkills) { skill in
                 let selected = skill.id == activeSkillID && isFacilitatorActive
                 let trimmedRole = skill.role.trimmingCharacters(in: .whitespacesAndNewlines)
-                Button {
+                radioRow(
+                    hoverID: skill.id,
+                    title: skill.name,
+                    subtitle: trimmedRole.isEmpty ? nil : trimmedRole,
+                    badge: skill.id == recommendedSkillID ? L("Recommended") : nil,
+                    selected: selected,
+                    useAccent: true,
+                    accessibilityID: "meeting.facilitator.skill.\(skill.id)"
+                ) {
                     facilitator.enable(for: meeting, skillID: skill.id)
                     close()
-                } label: {
-                    HStack(spacing: 8) {
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text(skill.name)
-                                .font(.callout.weight(selected ? .semibold : .regular))
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                            if !trimmedRole.isEmpty {
-                                Text(trimmedRole)
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                    .lineLimit(2)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                            }
-                        }
-                        if selected {
-                            Image(systemName: "checkmark")
-                                .font(.caption.weight(.bold))
-                                .foregroundStyle(Color.accentColor)
-                        }
-                    }
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 6)
-                    .contentShape(Rectangle())
-                    .background(selected ? Color.accentColor.opacity(0.12) : .clear, in: RoundedRectangle(cornerRadius: 8))
                 }
-                .buttonStyle(.plain)
-                .accessibilityIdentifier("meeting.facilitator.skill.\(skill.id)")
-                .accessibilityAddTraits(selected ? .isSelected : [])
             }
         }
+    }
+
+    private func radioRow(
+        hoverID: String,
+        title: String,
+        subtitle: String?,
+        badge: String?,
+        selected: Bool,
+        useAccent: Bool,
+        accessibilityID: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        let hovered = hoveredRowID == hoverID
+        let fill: Color = if selected {
+            useAccent ? Color.accentColor.opacity(0.18) : Color.primary.opacity(0.10)
+        } else if hovered {
+            Color.primary.opacity(0.07)
+        } else {
+            .clear
+        }
+        let stroke: Color = if selected {
+            useAccent ? Color.accentColor.opacity(0.6) : Color.primary.opacity(0.24)
+        } else {
+            .clear
+        }
+
+        return Button(action: action) {
+            HStack(alignment: subtitle == nil ? .center : .top, spacing: 8) {
+                Image(systemName: selected ? "checkmark.circle.fill" : "circle")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(selected ? (useAccent ? Color.accentColor : Color.primary) : Color.secondary.opacity(0.65))
+                    .frame(width: 18)
+                    .padding(.top, subtitle == nil ? 0 : 1)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 6) {
+                        Text(title)
+                            .font(.callout.weight(selected ? .semibold : .regular))
+                            .lineLimit(2)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        if let badge {
+                            Text(badge)
+                                .font(.caption2.weight(.medium))
+                                .foregroundStyle(Color.accentColor)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(Color.accentColor.opacity(0.14), in: Capsule())
+                                .fixedSize()
+                        }
+                    }
+                    if let subtitle {
+                        Text(subtitle)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
+            .contentShape(Rectangle())
+            .background(fill, in: RoundedRectangle(cornerRadius: 8))
+            .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(stroke, lineWidth: 1))
+        }
+        .buttonStyle(.plain)
+        .onHover { isHovering in
+            if isHovering {
+                hoveredRowID = hoverID
+            } else if hoveredRowID == hoverID {
+                hoveredRowID = nil
+            }
+        }
+        .accessibilityIdentifier(accessibilityID)
+        .accessibilityAddTraits(selected ? .isSelected : [])
     }
 
     @ViewBuilder
     private func actionRow(
         title: String,
         symbol: String,
+        hoverID: String,
         accessibilityID: String? = nil,
         action: @escaping () -> Void
     ) -> some View {
@@ -1045,8 +1174,16 @@ private struct NativeMeetingAssistantPopover: View {
             .padding(.horizontal, 8)
             .padding(.vertical, 6)
             .contentShape(Rectangle())
+            .background(hoveredRowID == hoverID ? Color.primary.opacity(0.07) : .clear, in: RoundedRectangle(cornerRadius: 8))
         }
         .buttonStyle(.plain)
+        .onHover { isHovering in
+            if isHovering {
+                hoveredRowID = hoverID
+            } else if hoveredRowID == hoverID {
+                hoveredRowID = nil
+            }
+        }
 
         if let accessibilityID {
             button.accessibilityIdentifier(accessibilityID)

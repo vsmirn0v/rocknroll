@@ -1199,6 +1199,10 @@ import XCTest
         XCTAssertTrue(hasPopoverWindow(), "Rock Assistant popover must open on click")
 
         try await wait { findElement("meeting.facilitator.skill.task-manager") != nil }
+        XCTAssertNotNil(findElement("meeting.facilitator.off"), "Off choice must appear in the role selector")
+        XCTAssertNil(findElement("meeting.facilitator.kickoff"), "Kick off button must stay hidden while Off")
+        let initialStatus = try XCTUnwrap(findElement("meeting.facilitator.status"))
+        XCTAssertTrue(strings(initialStatus).contains(L("Off")), "Header pill must show Off when inactive")
 
         for index in 1...4 {
             model.receiveLocalLineForTesting(.init(
@@ -1227,6 +1231,21 @@ import XCTest
         let taskManagerButton = try XCTUnwrap(findElement("meeting.facilitator.skill.task-manager"))
         XCTAssertEqual(AXUIElementPerformAction(taskManagerButton, kAXPressAction as CFString), .success)
         try await wait { coordinator.facilitator?.activeSessionSkills[model.sessionID] == "task-manager" }
+        try await wait { !hasPopoverWindow() }
+
+        XCTAssertEqual(AXUIElementPerformAction(try XCTUnwrap(findElement("meeting.assistant.menu")), kAXPressAction as CFString), .success)
+        await settle()
+        XCTAssertTrue(hasPopoverWindow(), "Rock Assistant popover must re-open after selecting a role")
+        try await wait { findElement("meeting.facilitator.kickoff") != nil }
+        let activeStatus = try XCTUnwrap(findElement("meeting.facilitator.status"))
+        XCTAssertTrue(
+            strings(activeStatus).contains("Task & Backlog Manager"),
+            "Header pill must show the active role name"
+        )
+
+        let offButton = try XCTUnwrap(findElement("meeting.facilitator.off"))
+        XCTAssertEqual(AXUIElementPerformAction(offButton, kAXPressAction as CFString), .success)
+        try await wait { coordinator.facilitator?.activeSessionSkills[model.sessionID] == nil }
         try await wait { !hasPopoverWindow() }
     }
 
