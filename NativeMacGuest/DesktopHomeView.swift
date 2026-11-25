@@ -92,9 +92,9 @@ struct NativeDesktopHomeView: View {
             showingCreateRoom = true
         }
         #if NATIVE_DIRECT_UPDATES
-        NativeDesktopSettingsView(library: library, meeting: workspace.meeting, tab: $workspace.settingsTab, assistantArea: $workspace.assistantSettingsArea, attention: workspace.attention, updates: workspace.updates, focusSupportOnEntry: $focusSupportOnEntry, mcpService: workspace.mcpService, obsidian: workspace.obsidian, suggestedOrigins: suggestedSiteOrigins, onCreateRoom: onCreateRoom)
+        NativeDesktopSettingsView(library: library, meeting: workspace.meeting, tab: $workspace.settingsTab, assistantArea: $workspace.assistantSettingsArea, attention: workspace.attention, updates: workspace.updates, focusSupportOnEntry: $focusSupportOnEntry, mcpService: workspace.mcpService, obsidian: workspace.obsidian, suggestedOrigins: suggestedSiteOrigins, onCreateRoom: onCreateRoom, externalRevealID: $workspace.settingsRevealID)
         #else
-        NativeDesktopSettingsView(library: library, meeting: workspace.meeting, tab: $workspace.settingsTab, assistantArea: $workspace.assistantSettingsArea, attention: workspace.attention, mcpService: workspace.mcpService, obsidian: workspace.obsidian, suggestedOrigins: suggestedSiteOrigins, onCreateRoom: onCreateRoom)
+        NativeDesktopSettingsView(library: library, meeting: workspace.meeting, tab: $workspace.settingsTab, assistantArea: $workspace.assistantSettingsArea, attention: workspace.attention, mcpService: workspace.mcpService, obsidian: workspace.obsidian, suggestedOrigins: suggestedSiteOrigins, onCreateRoom: onCreateRoom, externalRevealID: $workspace.settingsRevealID)
         #endif
     }
     private func favoriteSidebarRow(_ room: RecentRoom) -> some View {
@@ -151,11 +151,12 @@ struct NativeDesktopHomeView: View {
                     onOpenVoice: { workspace.assistantSettingsArea = .voice; workspace.settingsTab = 6; workspace.selection = .settings },
                     style: .sidebarFooter
                 )
-                HStack {
-                    Image(systemName: library.sync.enabled ? "icloud" : "internaldrive")
-                    Text(library.sync.status).font(.caption).lineLimit(2)
-                    Spacer()
-                }.foregroundStyle(.secondary).padding(.horizontal, 2)
+                MacSyncStatusIndicator(
+                    sync: library.sync,
+                    continuation: library.continuation,
+                    workspaceSync: workspace.workspaceSync,
+                    onOpenSettings: { workspace.openSyncSettings() }
+                )
             }
             .padding(10)
         }
@@ -549,7 +550,7 @@ struct NativeDesktopHomeView: View {
                 Text(L("Already have favorites on another device? Open iCloud settings to connect your library.")).foregroundStyle(.secondary)
                 HStack(spacing: 12) {
                     Button(L("Add favorite")) { addingFavorite = true }
-                    Button(L("Open iCloud settings")) { workspace.settingsTab = 0; workspace.selection = .settings }
+                    Button(L("Open iCloud settings")) { workspace.openSyncSettings() }
                 }
             }.font(.callout).frame(maxWidth: .infinity, alignment: .leading)
         }.padding(18).background(.quaternary.opacity(0.2), in: RoundedRectangle(cornerRadius: 16))
@@ -738,6 +739,7 @@ struct NativeDesktopSettingsView: View {
     var obsidian: ObsidianExportCoordinator? = nil
     var suggestedOrigins: [URL] = []
     var onCreateRoom: (@MainActor (URL) -> Void)? = nil
+    var externalRevealID: Binding<String?> = .constant(nil)
     @State private var editingName = false
     @AppStorage(UniversalMeetingEngine.forceTCPRelayKey) private var forceTCPRelay = false
     @AppStorage(MeetingSnapshotPreferences.imageFormatKey) private var snapshotImageFormatRaw = MeetingSnapshotImageFormat.jpeg.rawValue
@@ -840,8 +842,24 @@ struct NativeDesktopSettingsView: View {
                 }
             }
         }.navigationTitle(L("Settings"))
+            .onAppear { consumeExternalReveal() }
+            .onChange(of: externalRevealID.wrappedValue) { _ in consumeExternalReveal() }
             .onChange(of: editingName) { if $0 { library.sync.beginNameEditing() } else { library.sync.endNameEditing() } }
             .onDisappear { if editingName { library.sync.endNameEditing() } }
+    }
+
+    private func consumeExternalReveal() {
+        guard let target = externalRevealID.wrappedValue else { return }
+        externalRevealID.wrappedValue = nil
+        settingsQuery = ""
+        previousQuery = ""
+        revealTarget = nil
+        if revealID == target {
+            revealID = nil
+            Task { @MainActor in revealID = target }
+        } else {
+            revealID = target
+        }
     }
     private var detail: some View {
         VStack(alignment: .leading, spacing: 0) {

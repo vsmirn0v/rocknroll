@@ -12,6 +12,19 @@ import AppKit
 @MainActor
 final class RoomSyncCoordinator: ObservableObject {
     static weak var active: RoomSyncCoordinator?
+    enum SyncState: Equatable {
+        case off
+        case connecting
+        case syncing
+        case upToDate
+        case pending
+        case nameConflict
+        case unavailable
+        case restricted
+        case accountChanged
+        case incompatible
+        case failed
+    }
     struct NameChoice: Identifiable {
         let id = UUID()
         let local: String
@@ -36,6 +49,7 @@ final class RoomSyncCoordinator: ObservableObject {
     @Published private(set) var transcriptRetention: TranscriptSyncRetention = .days30
     @Published private(set) var archiveFolderName: String?
     @Published private(set) var status = L("Stored on this device")
+    @Published private(set) var syncState: SyncState = .off
     @Published private(set) var nameChoice: NameChoice?
     @Published private(set) var needsFreshAccount = false
     @Published private(set) var busy = false
@@ -90,6 +104,7 @@ final class RoomSyncCoordinator: ObservableObject {
         if let local = state.conflictingLocalName {
             nameChoice = NameChoice(local: local, cloud: state.conflictingCloudName ?? state.document.name?.value ?? "")
         }
+        syncState = nameChoice != nil ? .nameConflict : (enabled ? .pending : .off)
         history.onLocalChange = { [weak self] change in self?.localChange(change) }
         observers.append(NotificationCenter.default.addObserver(forName: .CKAccountChanged, object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor in self?.requestSync(immediate: true) }
@@ -149,11 +164,13 @@ final class RoomSyncCoordinator: ObservableObject {
         if !value { activeCloudSession = nil; onCloudAccessChanged?(nil) }
         if value {
             status = L("Connecting to iCloud…")
+            syncState = .connecting
             state.needsInitialNameCheck = state.needsInitialNameCheck || state.generation == nil
             registerForCloudNotifications()
             monitorNetwork()
         } else {
             status = L("Stored on this device")
+            syncState = .off
             networkMonitor?.cancel(); networkMonitor = nil
             keepLocalNameWhenPausing()
         }
@@ -275,7 +292,10 @@ final class RoomSyncCoordinator: ObservableObject {
     }
 
     private func changed() {
-        if enabled { status = L("Changes pending") }
+        if enabled {
+            status = L("Changes pending")
+            syncState = .pending
+        }
         if persist() { requestSync() }
     }
 
@@ -298,6 +318,7 @@ final class RoomSyncCoordinator: ObservableObject {
     private func synchronize(revision expected: Int) async {
         guard persist() else { return }
         busy = true; anotherPass = false
+        syncState = state.owner == nil ? .connecting : .syncing
         defer {
             busy = false
             if expected == revision {
@@ -313,6 +334,7 @@ final class RoomSyncCoordinator: ObservableObject {
             if let owner = state.owner, owner != session.account {
                 needsFreshAccount = true
                 pause(L("Apple Account changed. Start fresh to sync with this account."))
+                syncState = .accountChanged
                 return
             }
             if let generation = state.generation, generation != session.generation {
@@ -355,6 +377,7 @@ final class RoomSyncCoordinator: ObservableObject {
                 let outgoing = pendingRecords
                 guard !outgoing.isEmpty else {
                     status = nameChoice == nil ? L("Up to date") : L("Choose the name to use across devices")
+                    syncState = nameChoice == nil ? .upToDate : .nameConflict
                     return
                 }
                 do {
@@ -366,6 +389,7 @@ final class RoomSyncCoordinator: ObservableObject {
                     applyRooms(); applyName()
                     if pendingRecords.isEmpty {
                         status = nameChoice == nil ? L("Up to date") : L("Choose the name to use across devices")
+                        syncState = nameChoice == nil ? .upToDate : .nameConflict
                         return
                     }
                 } catch RoomCloudError.conflict where attempt < 2 {
@@ -373,16 +397,25 @@ final class RoomSyncCoordinator: ObservableObject {
                 }
             }
             status = L("Changes pending. Sync again when convenient.")
+            syncState = .pending
         } catch {
             guard expected == revision else { return }
             switch error {
-            case RoomCloudError.noAccount: status = L("iCloud unavailable. Your changes stay on this device.")
-            case RoomCloudError.restricted: status = L("iCloud is restricted on this device.")
+            case RoomCloudError.noAccount:
+                status = L("iCloud unavailable. Your changes stay on this device.")
+                syncState = .unavailable
+            case RoomCloudError.restricted:
+                status = L("iCloud is restricted on this device.")
+                syncState = .restricted
             case RoomCloudError.generationChanged:
                 state.generation = nil; state.token = nil; state.acknowledged = [:]
                 pause(L("Synced data was deleted. Sync is off; your local data remains."))
-            case RoomCloudError.incompatibleData: status = L("Update the app on all devices before syncing.")
-            default: status = L("Changes pending. iCloud will retry when the app opens or you tap Sync now.")
+            case RoomCloudError.incompatibleData:
+                status = L("Update the app on all devices before syncing.")
+                syncState = .incompatible
+            default:
+                status = L("Changes pending. iCloud will retry when the app opens or you tap Sync now.")
+                syncState = .failed
             }
             _ = persist()
         }
@@ -425,7 +458,7 @@ final class RoomSyncCoordinator: ObservableObject {
     }
 
     private func pause(_ message: String) {
-        enabled = false; state.enabled = false; status = message
+        enabled = false; state.enabled = false; status = message; syncState = .off
         activeCloudSession = nil
         onCloudAccessChanged?(nil)
         networkMonitor?.cancel(); networkMonitor = nil
@@ -456,6 +489,9 @@ final class RoomSyncCoordinator: ObservableObject {
             guard expected == revision else { return }
             state.generation = nil; state.token = nil; state.acknowledged = [:]
             pause(L("Synced data deleted. Your local rooms and name remain on this device."))
-        } catch { status = L("Could not delete synced data. Check iCloud and try again.") }
+        } catch {
+            status = L("Could not delete synced data. Check iCloud and try again.")
+            syncState = .failed
+        }
     }
 }

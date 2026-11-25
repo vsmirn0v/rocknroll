@@ -90,6 +90,7 @@ import UserNotifications
     }
     @Published var invitation = ""
     @Published var settingsTab = 0
+    @Published var settingsRevealID: String?
     @Published var assistantSettingsArea: NativeDesktopAssistantSettingsArea = .overview
     @Published var error: String?
     @Published var pendingAuthChallenge: (origin: URL, retryURL: URL, title: String?)?
@@ -501,6 +502,12 @@ import UserNotifications
 
     func openCalendarSettings() {
         settingsTab = 1
+        selection = .settings
+    }
+
+    func openSyncSettings() {
+        settingsTab = 0
+        settingsRevealID = "settings.sync"
         selection = .settings
     }
 
