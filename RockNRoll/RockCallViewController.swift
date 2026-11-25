@@ -115,6 +115,7 @@ final class RockCallViewController: UIViewController, UIScrollViewDelegate, UICo
         let localShareIdentity: ObjectIdentifier?
         let roomIdentifier: String?
         let hasInvitationURL: Bool
+        let invitationCopiedOnJoin: Bool
         let layoutMode: MeetingLayoutMode
         let explicitLayout: Bool
         let displayMode: ConferenceDisplayMode
@@ -193,6 +194,11 @@ final class RockCallViewController: UIViewController, UIScrollViewDelegate, UICo
     }
     private var actionsMenu: UIMenu?
     private let shareOffer = UIButton(type: .system)
+    private let copiedLinkToast = UIView()
+    private let copiedLinkToastLabel = UILabel()
+    private var copiedToastDismissTask: Task<Void, Never>?
+    private var invitationCopiedOnJoin = false
+    private var hasShownInitialCopiedToast = false
     private var textCapture: SharedTextOverlay?
     var workspaceSessionIDProvider: (() -> UUID)?
     private let snapshotController = IOSMeetingSnapshotController()
@@ -323,7 +329,11 @@ final class RockCallViewController: UIViewController, UIScrollViewDelegate, UICo
         }
     }
     var sharePreview: LocalSharePreview { localSharePreview }
-    func setRoomTitle(_ title: String) { titleLabel.text = title; view.setNeedsLayout() }
+    func setRoomTitle(_ title: String) {
+        titleLabel.text = title
+        workspace.meetingTitle = title
+        view.setNeedsLayout()
+    }
     #if DEBUG
     var snapshotForTesting: CallMediaSnapshot? { displayedSnapshot }
     var primarySourceForTesting: String? { currentPrimaryTarget.map(streamID) }
@@ -356,18 +366,22 @@ final class RockCallViewController: UIViewController, UIScrollViewDelegate, UICo
     @objc private func keyFitScreen() { if let textCapture { textCapture.toggleFit(); return }; primaryZoom?.setZoomScale(1, animated: true) }
 
     init(title: String, catchUp: CatchUpStore, chat: ChatStore,
-         invitationURL: URL? = nil, roomIdentifier: String? = nil) {
+         invitationURL: URL? = nil, roomIdentifier: String? = nil,
+         invitationCopiedOnJoin: Bool = false) {
         store = catchUp
         self.chat = chat
+        self.invitationCopiedOnJoin = invitationCopiedOnJoin
         super.init(nibName: nil, bundle: nil)
         modalPresentationStyle = .fullScreen
         titleLabel.text = title
         workspace.invitationURL = invitationURL
         workspace.roomIdentifier = roomIdentifier
+        workspace.meetingTitle = title
     }
 
     required init?(coder: NSCoder) { nil }
     deinit {
+        copiedToastDismissTask?.cancel()
         snapshotStateObserver?.cancel()
         stageVisibilityObservers.forEach(NotificationCenter.default.removeObserver)
     }
@@ -382,6 +396,10 @@ final class RockCallViewController: UIViewController, UIScrollViewDelegate, UICo
         reminderHost.changed()
         floatingVideo?.refreshPreference()
         focus.interaction()
+        if invitationCopiedOnJoin && !hasShownInitialCopiedToast && workspace.invitationURL != nil {
+            hasShownInitialCopiedToast = true
+            showCopiedLinkToast()
+        }
     }
 
     override func viewDidDisappear(_ animated: Bool) {
@@ -429,6 +447,8 @@ final class RockCallViewController: UIViewController, UIScrollViewDelegate, UICo
         shareSpeakerCue.layer.cornerCurve = .continuous
         view.addSubview(shareSpeakerCue)
         view.addSubview(reactionOverlay)
+        configureCopiedLinkToast()
+        view.addSubview(copiedLinkToast)
         installSnapshotUI()
         sourceSelector.onMenuVisibilityChanged = { [weak self] in self?.focus.menuVisible = $0 }
         layoutControls.onMenuVisibilityChanged = { [weak self] in self?.focus.menuVisible = $0 }
@@ -797,6 +817,7 @@ final class RockCallViewController: UIViewController, UIScrollViewDelegate, UICo
         shareReconnectNotice.isHidden = !sharing || !reconnectingShares.contains(currentPrimaryTarget?.participantID ?? "")
         shareReconnectNotice.frame = CGRect(x: stage.midX - min(150, stage.width / 2), y: stage.minY + 8,
             width: min(300, stage.width), height: 44)
+        layoutCopiedLinkToast(stage: stage, headerBottom: geometry.header.maxY)
         layoutSnapshotOverlays(stage: stage, headerBottom: geometry.header.maxY, access: access)
         updateShareSpeakerCue()
         for entry in videoTiles.values {
@@ -1380,6 +1401,7 @@ final class RockCallViewController: UIViewController, UIScrollViewDelegate, UICo
         workspace.toggleSpeaker = { [weak self] in self?.speaker.sendActions(for: .touchUpInside) }
         workspace.willChooseAudioOutput = { [weak self] in self?.onChooseAudioOutput?() }
         workspace.leave = { [weak self] in leave.sendActions(for: .touchUpInside); self?.workspace.onHold = false }
+        workspace.onInvitationCopied = { [weak self] in self?.showCopiedLinkToast() }
 
         configure(audioControl, symbol: "speaker.wave.2.fill", label: L("Audio"), title: L("Audio"))
         audioControl.accessibilityIdentifier = "call.output"
@@ -1741,6 +1763,7 @@ final class RockCallViewController: UIViewController, UIScrollViewDelegate, UICo
             localShareIdentity: snapshot.localShare?.identity,
             roomIdentifier: workspace.roomIdentifier,
             hasInvitationURL: workspace.invitationURL != nil,
+            invitationCopiedOnJoin: invitationCopiedOnJoin,
             layoutMode: layoutMode,
             explicitLayout: explicitLayout,
             displayMode: displayMode,
@@ -1930,8 +1953,144 @@ final class RockCallViewController: UIViewController, UIScrollViewDelegate, UICo
         configureMoreMenu(); view.setNeedsLayout()
     }
 
+    private func configureCopiedLinkToast() {
+        copiedLinkToast.isHidden = true
+        copiedLinkToast.alpha = 0
+        copiedLinkToast.isUserInteractionEnabled = false
+        copiedLinkToast.layer.cornerRadius = 18
+        copiedLinkToast.layer.cornerCurve = .continuous
+        copiedLinkToast.layer.borderWidth = 1
+        copiedLinkToast.layer.borderColor = UIColor.systemGreen.withAlphaComponent(0.35).cgColor
+        copiedLinkToast.clipsToBounds = true
+        copiedLinkToast.accessibilityIdentifier = "call.copied-link-toast"
+
+        let surface = MeetingChromeSurface(cornerRadius: 18)
+        surface.frame = copiedLinkToast.bounds
+        surface.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        copiedLinkToast.addSubview(surface)
+
+        let tintOverlay = UIView()
+        tintOverlay.backgroundColor = UIColor.systemGreen.withAlphaComponent(0.14)
+        tintOverlay.isUserInteractionEnabled = false
+        tintOverlay.frame = copiedLinkToast.bounds
+        tintOverlay.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        copiedLinkToast.addSubview(tintOverlay)
+
+        let icon = UIImageView(image: UIImage(systemName: "checkmark.circle.fill"))
+        icon.tintColor = .systemGreen
+        icon.contentMode = .scaleAspectFit
+        icon.setContentHuggingPriority(.required, for: .horizontal)
+        icon.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+        copiedLinkToastLabel.text = L("Invitation link copied")
+        copiedLinkToastLabel.font = UIFontMetrics(forTextStyle: .footnote).scaledFont(for: .systemFont(ofSize: 13, weight: .semibold))
+        copiedLinkToastLabel.adjustsFontForContentSizeCategory = true
+        copiedLinkToastLabel.textColor = .white
+        copiedLinkToastLabel.numberOfLines = 1
+        copiedLinkToastLabel.lineBreakMode = .byTruncatingTail
+
+        let stack = UIStackView(arrangedSubviews: [icon, copiedLinkToastLabel])
+        stack.axis = .horizontal
+        stack.alignment = .center
+        stack.spacing = 6
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        copiedLinkToast.addSubview(stack)
+        NSLayoutConstraint.activate([
+            icon.widthAnchor.constraint(equalToConstant: 16),
+            icon.heightAnchor.constraint(equalToConstant: 16),
+            stack.leadingAnchor.constraint(equalTo: copiedLinkToast.leadingAnchor, constant: 12),
+            stack.trailingAnchor.constraint(equalTo: copiedLinkToast.trailingAnchor, constant: -14),
+            stack.topAnchor.constraint(equalTo: copiedLinkToast.topAnchor, constant: 8),
+            stack.bottomAnchor.constraint(equalTo: copiedLinkToast.bottomAnchor, constant: -8)
+        ])
+    }
+
+    private func layoutCopiedLinkToast(stage: CGRect, headerBottom: CGFloat) {
+        guard !copiedLinkToast.isHidden else { return }
+        let maxWidth = max(120, stage.width - 24)
+        let size = copiedLinkToast.systemLayoutSizeFitting(
+            CGSize(width: maxWidth, height: 0),
+            withHorizontalFittingPriority: .fittingSizeLevel,
+            verticalFittingPriority: .fittingSizeLevel
+        )
+        var minY = max(headerBottom + 8, stage.minY + 8)
+        if !compactTalkHereButton.isHidden {
+            minY = max(minY, compactTalkHereButton.frame.maxY + 8)
+        }
+        if !shareOffer.isHidden && shareOffer.alpha > 0 {
+            minY = max(minY, shareOffer.frame.maxY + 8)
+        }
+        let width = min(maxWidth, ceil(size.width))
+        let height = max(36, ceil(size.height))
+        copiedLinkToast.frame = CGRect(
+            x: floor(stage.midX - width / 2),
+            y: minY,
+            width: width,
+            height: height
+        )
+        view.bringSubviewToFront(copiedLinkToast)
+    }
+
+    func showCopiedLinkToast() {
+        guard isViewLoaded else { return }
+        copiedToastDismissTask?.cancel()
+        copiedLinkToast.layer.removeAllAnimations()
+        copiedLinkToast.isHidden = false
+        view.bringSubviewToFront(copiedLinkToast)
+        view.setNeedsLayout()
+        view.layoutIfNeeded()
+        UIAccessibility.post(notification: .announcement, argument: L("Invitation link copied"))
+        if UIAccessibility.isReduceMotionEnabled {
+            copiedLinkToast.alpha = 1
+            copiedLinkToast.transform = .identity
+        } else {
+            copiedLinkToast.alpha = 0
+            copiedLinkToast.transform = CGAffineTransform(translationX: 0, y: -8).scaledBy(x: 0.96, y: 0.96)
+            UIView.animate(
+                withDuration: 0.25,
+                delay: 0,
+                usingSpringWithDamping: 0.85,
+                initialSpringVelocity: 0.4,
+                options: [.allowUserInteraction]
+            ) {
+                self.copiedLinkToast.alpha = 1
+                self.copiedLinkToast.transform = .identity
+            }
+        }
+        copiedToastDismissTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(4))
+            guard !Task.isCancelled, let self else { return }
+            if UIAccessibility.isReduceMotionEnabled {
+                self.copiedLinkToast.alpha = 0
+                self.copiedLinkToast.isHidden = true
+            } else {
+                UIView.animate(withDuration: 0.22, animations: {
+                    self.copiedLinkToast.alpha = 0
+                    self.copiedLinkToast.transform = CGAffineTransform(translationX: 0, y: -6)
+                }, completion: { _ in
+                    guard self.copiedLinkToast.alpha == 0 else { return }
+                    self.copiedLinkToast.isHidden = true
+                    self.copiedLinkToast.transform = .identity
+                })
+            }
+        }
+    }
+
     private func waitingRoomView() -> UIView {
         let view = UIView()
+        let card = UIView()
+        card.layer.cornerRadius = 24
+        card.layer.cornerCurve = .continuous
+        card.layer.borderWidth = 1
+        card.layer.borderColor = UIColor.white.withAlphaComponent(0.14).cgColor
+        card.clipsToBounds = true
+        card.translatesAutoresizingMaskIntoConstraints = false
+
+        let surface = MeetingChromeSurface(cornerRadius: 24)
+        surface.frame = card.bounds
+        surface.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        card.addSubview(surface)
+
         let title = UILabel()
         title.text = L("You're connected. Waiting for others.")
         title.textColor = .white
@@ -1939,36 +2098,129 @@ final class RockCallViewController: UIViewController, UIScrollViewDelegate, UICo
         title.adjustsFontForContentSizeCategory = true
         title.numberOfLines = 0
         title.textAlignment = .center
+
         let column = UIStackView(arrangedSubviews: [title])
         column.axis = .vertical
-        column.alignment = .center
-        column.spacing = 12
-        if workspace.invitationURL != nil {
+        column.alignment = .fill
+        column.spacing = 10
+
+        if let url = workspace.invitationURL {
+            let linkLabel = UILabel()
+            let hostAndPath = (url.host() ?? "") + url.path()
+            linkLabel.text = hostAndPath.isEmpty ? url.absoluteString : hostAndPath
+            linkLabel.textColor = .secondaryLabel
+            linkLabel.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+            linkLabel.lineBreakMode = .byTruncatingMiddle
+            linkLabel.textAlignment = .center
+            linkLabel.numberOfLines = 1
+            column.addArrangedSubview(linkLabel)
+
+            if invitationCopiedOnJoin {
+                let badgeContainer = UIView()
+                badgeContainer.backgroundColor = UIColor.systemGreen.withAlphaComponent(0.16)
+                badgeContainer.layer.cornerRadius = 12
+                badgeContainer.layer.cornerCurve = .continuous
+                badgeContainer.layer.borderWidth = 1
+                badgeContainer.layer.borderColor = UIColor.systemGreen.withAlphaComponent(0.35).cgColor
+                badgeContainer.accessibilityIdentifier = "waiting.copied-badge"
+
+                let badgeIcon = UIImageView(image: UIImage(systemName: "checkmark.circle.fill"))
+                badgeIcon.tintColor = .systemGreen
+                badgeIcon.contentMode = .scaleAspectFit
+
+                let badgeLabel = UILabel()
+                badgeLabel.text = L("Link copied · Ready to paste")
+                badgeLabel.font = UIFontMetrics(forTextStyle: .caption1).scaledFont(for: .systemFont(ofSize: 12, weight: .semibold))
+                badgeLabel.adjustsFontForContentSizeCategory = true
+                badgeLabel.textColor = UIColor.systemGreen
+                badgeLabel.numberOfLines = 1
+                badgeLabel.lineBreakMode = .byTruncatingTail
+
+                let badgeRow = UIStackView(arrangedSubviews: [badgeIcon, badgeLabel])
+                badgeRow.axis = .horizontal
+                badgeRow.alignment = .center
+                badgeRow.spacing = 6
+                badgeRow.translatesAutoresizingMaskIntoConstraints = false
+                badgeContainer.addSubview(badgeRow)
+                NSLayoutConstraint.activate([
+                    badgeIcon.widthAnchor.constraint(equalToConstant: 14),
+                    badgeIcon.heightAnchor.constraint(equalToConstant: 14),
+                    badgeRow.leadingAnchor.constraint(equalTo: badgeContainer.leadingAnchor, constant: 10),
+                    badgeRow.trailingAnchor.constraint(equalTo: badgeContainer.trailingAnchor, constant: -10),
+                    badgeRow.topAnchor.constraint(equalTo: badgeContainer.topAnchor, constant: 6),
+                    badgeRow.bottomAnchor.constraint(equalTo: badgeContainer.bottomAnchor, constant: -6)
+                ])
+                let badgeWrapper = UIStackView(arrangedSubviews: [badgeContainer])
+                badgeWrapper.axis = .vertical
+                badgeWrapper.alignment = .center
+                column.addArrangedSubview(badgeWrapper)
+            }
+
             let invite = UIButton(type: .system)
-            invite.configuration = .tinted()
-            invite.configuration?.title = L("Invite musicians")
-            invite.configuration?.image = UIImage(systemName: "square.and.arrow.up")
-            invite.tintColor = accent
+            var inviteConfig = UIButton.Configuration.filled()
+            inviteConfig.title = L("Invite musicians")
+            inviteConfig.image = UIImage(systemName: "square.and.arrow.up")
+            inviteConfig.imagePadding = 8
+            inviteConfig.cornerStyle = .large
+            inviteConfig.baseBackgroundColor = accent
+            inviteConfig.baseForegroundColor = .black
+            inviteConfig.contentInsets = NSDirectionalEdgeInsets(top: 12, leading: 16, bottom: 12, trailing: 16)
+            invite.configuration = inviteConfig
             invite.addAction(UIAction { [weak self] _ in
                 guard let self else { return }
                 self.workspace.shareInvitation(from: invite)
             }, for: .touchUpInside)
+
             let copy = UIButton(type: .system)
-            copy.configuration = .plain()
-            copy.configuration?.title = L("Copy link")
-            copy.tintColor = accent
-            copy.addAction(UIAction { [weak self] _ in self?.workspace.copyInvitation() },
-                           for: .touchUpInside)
+            var copyConfig = UIButton.Configuration.tinted()
+            copyConfig.title = L("Copy link")
+            copyConfig.image = UIImage(systemName: "doc.on.doc")
+            copyConfig.imagePadding = 8
+            copyConfig.cornerStyle = .large
+            copyConfig.baseBackgroundColor = UIColor.white.withAlphaComponent(0.14)
+            copyConfig.baseForegroundColor = .white
+            copyConfig.contentInsets = NSDirectionalEdgeInsets(top: 11, leading: 16, bottom: 11, trailing: 16)
+            copy.configuration = copyConfig
+            copy.addAction(UIAction { [weak self, weak copy] _ in
+                self?.workspace.copyInvitation()
+                guard let copy else { return }
+                copy.configuration?.image = UIImage(systemName: "checkmark")
+                Task { @MainActor [weak copy] in
+                    try? await Task.sleep(for: .seconds(1.5))
+                    copy?.configuration?.image = UIImage(systemName: "doc.on.doc")
+                }
+            }, for: .touchUpInside)
+
+            let spacer = UIView()
+            spacer.translatesAutoresizingMaskIntoConstraints = false
+            spacer.heightAnchor.constraint(equalToConstant: 2).isActive = true
+            column.addArrangedSubview(spacer)
             column.addArrangedSubview(invite)
             column.addArrangedSubview(copy)
+            NSLayoutConstraint.activate([
+                invite.heightAnchor.constraint(greaterThanOrEqualToConstant: 46),
+                copy.heightAnchor.constraint(greaterThanOrEqualToConstant: 44)
+            ])
         }
+
         column.translatesAutoresizingMaskIntoConstraints = false
-        view.addSubview(column)
+        card.addSubview(column)
+        view.addSubview(card)
+        let preferredWidth = card.widthAnchor.constraint(equalToConstant: 340)
+        preferredWidth.priority = .defaultHigh
         NSLayoutConstraint.activate([
-            column.centerXAnchor.constraint(equalTo: view.centerXAnchor),
-            column.centerYAnchor.constraint(equalTo: view.centerYAnchor),
-            column.leadingAnchor.constraint(greaterThanOrEqualTo: view.leadingAnchor, constant: 16),
-            column.trailingAnchor.constraint(lessThanOrEqualTo: view.trailingAnchor, constant: -16)
+            column.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 20),
+            column.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -20),
+            column.topAnchor.constraint(equalTo: card.topAnchor, constant: 20),
+            column.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -20),
+            preferredWidth,
+            card.widthAnchor.constraint(lessThanOrEqualToConstant: 340),
+            card.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            card.centerYAnchor.constraint(equalTo: view.centerYAnchor),
+            card.leadingAnchor.constraint(greaterThanOrEqualTo: view.leadingAnchor, constant: 16),
+            card.trailingAnchor.constraint(lessThanOrEqualTo: view.trailingAnchor, constant: -16),
+            card.topAnchor.constraint(greaterThanOrEqualTo: view.topAnchor, constant: 8),
+            card.bottomAnchor.constraint(lessThanOrEqualTo: view.bottomAnchor, constant: -8)
         ])
         return view
     }

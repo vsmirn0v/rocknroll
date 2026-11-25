@@ -4242,3 +4242,12 @@
 "%@ · %ld meetings" = "%@ · %ld 场会议";
 "Could not save the meeting to Calendar." = "无法将会议保存到日历。";
 "Show earlier (%ld)" = "显示更早内容 (%ld)";
+
+"Instant meeting" = "快速会议";
+"Create, copy link & join" = "创建、复制链接并加入";
+"Join & copy link · %@" = "加入并复制链接 · %@";
+"Choose website & start" = "选择网站并开始";
+"New room with options…" = "带选项的新房间…";
+"Choose meeting website" = "选择会议网站";
+"Invitation link copied" = "邀请链接已复制";
+"Link copied · Ready to paste" = "链接已复制 · 可直接粘贴";

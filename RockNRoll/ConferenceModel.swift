@@ -21,6 +21,7 @@ final class ConferenceModel: ObservableObject {
         let knownEngine: MeetingEngineKind?
         let title: String?
         let allowAlongside: Bool
+        var invitationCopiedOnJoin: Bool = false
         var admission: (() -> Bool)? = nil
     }
 
@@ -28,6 +29,7 @@ final class ConferenceModel: ObservableObject {
         let target: JoinDestination
         let autoJoin: Bool
         var title: String? = nil
+        var invitationCopiedOnJoin: Bool = false
     }
 
     private struct SessionRecord {
@@ -84,6 +86,11 @@ final class ConferenceModel: ObservableObject {
     @Published var siteSelection: LinkSiteSelection?
     @Published var engineSelection: MeetingEngineSelection?
     @Published var pendingAuthChallengeOrigin: URL?
+    @Published var isCreatingInstantRoom = false
+    @Published var instantRoomError: String?
+    @Published var instantRoomAuthChallengeOrigin: URL?
+    @Published var pendingInstantRoomOrigin: URL?
+    @Published var instantRoomShortcutRequested = false
     @Published private var joinAwaitingName: JoinDestination?
     var isNameRequiredForJoin: Bool { joinAwaitingName != nil }
     var namePolicy: MeetingInputPolicy { joinAwaitingName?.inputPolicy ?? MeetingInputPolicy(maximumNameScalars: 80) }
@@ -445,6 +452,13 @@ final class ConferenceModel: ObservableObject {
     @Published var testSwitchSequenceCompleted = false
     #endif
 
+    var createInstantRoomHandler: @MainActor (URL, MeetingEngineKind?, RoomCreationOptions) async throws -> CreatedMeetingRoom = { origin, engine, options in
+        try await MeetingRoomCreator(auth: .shared).createRoom(on: origin, engine: engine, options: options)
+    }
+    var copyInvitationToClipboard: @MainActor (URL) -> Void = { url in
+        UIPasteboard.general.url = url
+    }
+
     private let resolver = VendorEndpointResolver.make()
     private let engineDetector: MeetingEngineDetector
     private var engineChoiceRequest: JoinRequest?
@@ -453,6 +467,7 @@ final class ConferenceModel: ObservableObject {
     private weak var container: UIViewController?
     private var pendingTarget: JoinDestination?
     private var pendingTitle: String?
+    private var pendingInvitationCopiedOnJoin = false
     private var nameRequiredTitle: (invitation: URL, title: String)?
     private var replacementAfterLeave: PendingInvitation?
     private var activeRoute: JoinDestination?
@@ -1155,10 +1170,11 @@ final class ConferenceModel: ObservableObject {
     private func receive(target: JoinDestination,
                          autoJoin: Bool,
                          title: String? = nil,
-                         replaceDirectlyIfBusy: Bool = false) {
+                         replaceDirectlyIfBusy: Bool = false,
+                         invitationCopiedOnJoin: Bool = false) {
         if setup.needsDismissal {
             setup.performMeetingIntent { [weak self] in
-                self?.receive(target: target, autoJoin: autoJoin, title: title, replaceDirectlyIfBusy: replaceDirectlyIfBusy)
+                self?.receive(target: target, autoJoin: autoJoin, title: title, replaceDirectlyIfBusy: replaceDirectlyIfBusy, invitationCopiedOnJoin: invitationCopiedOnJoin)
             }
             return
         }
@@ -1193,7 +1209,7 @@ final class ConferenceModel: ObservableObject {
         }
 
         if phase == .leaving || isLeaving {
-            replacementAfterLeave = PendingInvitation(target: target, autoJoin: autoJoin, title: title)
+            replacementAfterLeave = PendingInvitation(target: target, autoJoin: autoJoin, title: title, invitationCopiedOnJoin: invitationCopiedOnJoin)
             return
         }
 
@@ -1213,10 +1229,11 @@ final class ConferenceModel: ObservableObject {
             }
             if target == activeRoute && sessions.isEmpty { return }
             if replaceDirectlyIfBusy {
-                replaceActiveForDirectOpen(target: target, title: title)
+                replaceActiveForDirectOpen(target: target, title: title, invitationCopiedOnJoin: invitationCopiedOnJoin)
             } else {
                 pendingTarget = target
                 pendingTitle = title
+                pendingInvitationCopiedOnJoin = invitationCopiedOnJoin
                 showSwitchConfirmation = true
             }
             return
@@ -1224,19 +1241,20 @@ final class ConferenceModel: ObservableObject {
 
         set(target: target)
         if autoJoin {
-            startJoin(target, title: title)
+            startJoin(target, title: title, invitationCopiedOnJoin: invitationCopiedOnJoin)
         }
     }
 
-    private func replaceActiveForDirectOpen(target: JoinDestination, title: String?) {
+    private func replaceActiveForDirectOpen(target: JoinDestination, title: String?, invitationCopiedOnJoin: Bool = false) {
         pendingTarget = nil
         pendingTitle = nil
+        pendingInvitationCopiedOnJoin = false
         showSwitchConfirmation = false
         if phase != .idle || !nonLeavingSessions.isEmpty || joinTask != nil {
-            replacementAfterLeave = PendingInvitation(target: target, autoJoin: true, title: title)
+            replacementAfterLeave = PendingInvitation(target: target, autoJoin: true, title: title, invitationCopiedOnJoin: invitationCopiedOnJoin)
             leave()
         } else {
-            startJoin(target, title: title, allowAlongside: true)
+            startJoin(target, title: title, allowAlongside: true, invitationCopiedOnJoin: invitationCopiedOnJoin)
         }
     }
 
@@ -1334,6 +1352,7 @@ final class ConferenceModel: ObservableObject {
                            allowWhileLeaving: Bool = false,
                            allowConcurrentSessionConnect: Bool = false,
                            requestedWorkspaceID: UUID? = nil,
+                           invitationCopiedOnJoin: Bool = false,
                            scheduledAdmission: (() -> Bool)? = nil) {
         if !allowAlongside {
             guard !isJoining && !isInConference && (!isLeaving || allowWhileLeaving) else {
@@ -1364,6 +1383,7 @@ final class ConferenceModel: ObservableObject {
                     backgroundJoin: backgroundJoin,
                     allowAlongside: allowAlongside,
                     allowConcurrentSessionConnect: allowConcurrentSessionConnect,
+                    invitationCopiedOnJoin: invitationCopiedOnJoin,
                     scheduledAdmission: scheduledAdmission
                 )
             }
@@ -1435,6 +1455,7 @@ final class ConferenceModel: ObservableObject {
             knownEngine: knownEngine,
             title: visitTitle,
             allowAlongside: allowAlongside,
+            invitationCopiedOnJoin: invitationCopiedOnJoin,
             admission: scheduledAdmission
         )
         scheduledJoinPending = scheduledAdmission != nil
@@ -1598,7 +1619,8 @@ final class ConferenceModel: ObservableObject {
                     catchUp: sessionCatchUp,
                     workspaceAudio: workspaceAudio,
                     initialTitle: initialTitle,
-                    preferences: preferences
+                    preferences: preferences,
+                    invitationCopiedOnJoin: request.invitationCopiedOnJoin
                 )
                 let controllerID = controller.id
                 let reminderTarget = calendarReminderTarget
@@ -2059,7 +2081,8 @@ final class ConferenceModel: ObservableObject {
                 quiet: request.quiet,
                 title: request.title,
                 engineWasChosen: true,
-                allowAlongside: request.allowAlongside
+                allowAlongside: request.allowAlongside,
+                invitationCopiedOnJoin: request.invitationCopiedOnJoin
             )
         } catch {
             status = error.localizedDescription
@@ -2075,10 +2098,12 @@ final class ConferenceModel: ObservableObject {
     func joinAlongsidePending() {
         guard let target = pendingTarget, canJoinAlongsidePending else { return }
         let title = pendingTitle
+        let copiedOnJoin = pendingInvitationCopiedOnJoin
         pendingTarget = nil
         pendingTitle = nil
+        pendingInvitationCopiedOnJoin = false
         showSwitchConfirmation = false
-        startJoin(target, title: title, allowAlongside: true)
+        startJoin(target, title: title, allowAlongside: true, invitationCopiedOnJoin: copiedOnJoin)
     }
 
     func joinCandidatesAlongside(_ candidates: [JoinableMeetingCandidate]) async {
@@ -2129,20 +2154,23 @@ final class ConferenceModel: ObservableObject {
     func replaceWithPending() {
         guard let target = pendingTarget else { return }
         let title = pendingTitle
+        let copiedOnJoin = pendingInvitationCopiedOnJoin
         pendingTarget = nil
         pendingTitle = nil
+        pendingInvitationCopiedOnJoin = false
         showSwitchConfirmation = false
         if phase != .idle || !nonLeavingSessions.isEmpty || joinTask != nil {
-            replacementAfterLeave = PendingInvitation(target: target, autoJoin: true, title: title)
+            replacementAfterLeave = PendingInvitation(target: target, autoJoin: true, title: title, invitationCopiedOnJoin: copiedOnJoin)
             leave()
         } else {
-            startJoin(target, title: title, allowAlongside: true)
+            startJoin(target, title: title, allowAlongside: true, invitationCopiedOnJoin: copiedOnJoin)
         }
     }
 
     func dismissPending() {
         pendingTarget = nil
         pendingTitle = nil
+        pendingInvitationCopiedOnJoin = false
         showSwitchConfirmation = false
     }
 
@@ -2164,7 +2192,7 @@ final class ConferenceModel: ObservableObject {
         )
     }
 
-    func joinCreatedRoom(_ created: CreatedMeetingRoom, saveFavorite: Bool) {
+    func joinCreatedRoom(_ created: CreatedMeetingRoom, saveFavorite: Bool, invitationAlreadyCopied: Bool = false) {
         if saveFavorite {
             saveCreatedRoomFavorite(created)
         }
@@ -2174,9 +2202,67 @@ final class ConferenceModel: ObservableObject {
         invite = created.invitationURL.absoluteString
         rejoinEvidence = (created.invitationURL, created.engine)
         if !nonLeavingSessions.isEmpty || phase != .idle {
-            receive(target: created.destination, autoJoin: true, title: roomTitle)
+            receive(target: created.destination, autoJoin: true, title: roomTitle, invitationCopiedOnJoin: invitationAlreadyCopied)
         } else {
-            startJoin(created.destination, title: roomTitle, engineWasChosen: true)
+            startJoin(created.destination, title: roomTitle, engineWasChosen: true, invitationCopiedOnJoin: invitationAlreadyCopied)
+        }
+    }
+
+    func requestInstantRoomShortcut() {
+        if !isCallMinimized && !sessions.isEmpty {
+            minimizeActiveCall()
+        }
+        instantRoomShortcutRequested = true
+    }
+
+    func startInstantRoom(on rawOrigin: URL, explicitEngine: MeetingEngineKind? = nil) async {
+        guard !isCreatingInstantRoom,
+              !isJoining,
+              !isLeaving,
+              (isCallMinimized || !isInConference) else {
+            return
+        }
+        guard let origin = SiteOrigin.canonicalOrigin(for: rawOrigin) else {
+            instantRoomError = RoomCreationError.invalidSiteURL.localizedDescription
+            return
+        }
+        calendar.cancelAutomaticJoin(suppress: true)
+        isCreatingInstantRoom = true
+        instantRoomError = nil
+        instantRoomAuthChallengeOrigin = nil
+        pendingInstantRoomOrigin = nil
+        defer { isCreatingInstantRoom = false }
+
+        let resolvedEngine: MeetingEngineKind?
+        if let explicitEngine {
+            resolvedEngine = explicitEngine
+        } else if let saved = SiteAccountStore.shared.account(for: origin)?.engine {
+            resolvedEngine = saved
+        } else if let host = origin.host?.lowercased(), TelemostTarget.hosts.contains(host) {
+            resolvedEngine = .telemost
+        } else {
+            resolvedEngine = nil
+        }
+
+        let options = RoomCreationOptions(
+            title: InstantRoomPreferences.defaultRoomTitle(displayName: displayName),
+            allowGuests: true,
+            enableLobby: false
+        )
+
+        do {
+            let created = try await createInstantRoomHandler(origin, resolvedEngine, options)
+            InstantRoomPreferences.saveLastOrigin(origin, defaults: preferences)
+            copyInvitationToClipboard(created.invitationURL)
+            UINotificationFeedbackGenerator().notificationOccurred(.success)
+            joinCreatedRoom(created, saveFavorite: false, invitationAlreadyCopied: true)
+        } catch {
+            UINotificationFeedbackGenerator().notificationOccurred(.error)
+            if let challengeOrigin = SiteAuthError.challengeOrigin(from: error, attemptedURL: origin, store: .shared) {
+                instantRoomAuthChallengeOrigin = challengeOrigin
+                pendingInstantRoomOrigin = origin
+            }
+            instantRoomError = error.localizedDescription
         }
     }
 
@@ -2230,7 +2316,7 @@ final class ConferenceModel: ObservableObject {
         replacementAfterLeave = nil
         set(target: invitation.target)
         if invitation.autoJoin {
-            startJoin(invitation.target, title: invitation.title, allowAlongside: true, allowWhileLeaving: true)
+            startJoin(invitation.target, title: invitation.title, allowAlongside: true, allowWhileLeaving: true, invitationCopiedOnJoin: invitation.invitationCopiedOnJoin)
         }
     }
 

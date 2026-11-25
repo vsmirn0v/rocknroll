@@ -4242,3 +4242,12 @@
 "%@ · %ld meetings" = "%@ · %ld rapat";
 "Could not save the meeting to Calendar." = "Tidak dapat menyimpan rapat ke Kalender.";
 "Show earlier (%ld)" = "Tampilkan sebelumnya (%ld)";
+
+"Instant meeting" = "Rapat instan";
+"Create, copy link & join" = "Buat, salin tautan & gabung";
+"Join & copy link · %@" = "Gabung & salin tautan · %@";
+"Choose website & start" = "Pilih situs web & mulai";
+"New room with options…" = "Ruang baru dengan opsi…";
+"Choose meeting website" = "Pilih situs web rapat";
+"Invitation link copied" = "Tautan undangan disalin";
+"Link copied · Ready to paste" = "Tautan disalin · Siap ditempel";

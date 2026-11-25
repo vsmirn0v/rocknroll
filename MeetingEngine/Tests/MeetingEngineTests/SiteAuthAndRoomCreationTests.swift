@@ -1032,4 +1032,68 @@ final class SiteAuthAndRoomCreationTests: XCTestCase {
         XCTAssertEqual(context.evaluateScript("window.__messages.length")?.toInt32(), 4)
     }
     #endif
+
+    func testInstantRoomPreferencesOriginResolutionPersistenceAndDefaultTitle() {
+        let suiteName = "InstantRoomPreferencesTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        XCTAssertNil(InstantRoomPreferences.loadLastOrigin(defaults: defaults))
+
+        let corpOrigin = URL(string: "https://MEET.CORP.RU/some/path?x=1")!
+        InstantRoomPreferences.saveLastOrigin(corpOrigin, defaults: defaults)
+        let saved = InstantRoomPreferences.loadLastOrigin(defaults: defaults)
+        XCTAssertEqual(saved, URL(string: "https://meet.corp.ru")!)
+
+        // Community host rock.glowsoft.ru is never persisted as a room-creation origin.
+        InstantRoomPreferences.saveLastOrigin(URL(string: "https://rock.glowsoft.ru/jams/test")!, defaults: defaults)
+        XCTAssertEqual(InstantRoomPreferences.loadLastOrigin(defaults: defaults), URL(string: "https://meet.corp.ru")!)
+
+        let activeAccount = SiteAccountRecord(
+            originKey: "https://jazz.active.test",
+            engine: .guest,
+            authMethod: .webSSO,
+            needsReauthentication: false
+        )
+        let expiredAccount = SiteAccountRecord(
+            originKey: "https://jazz.expired.test",
+            engine: .guest,
+            authMethod: .webSSO,
+            needsReauthentication: true
+        )
+        let communityAccount = SiteAccountRecord(
+            originKey: "https://rock.glowsoft.ru",
+            engine: .community,
+            authMethod: .token,
+            needsReauthentication: false
+        )
+
+        let origins = InstantRoomPreferences.availableOrigins(
+            accounts: [expiredAccount, communityAccount, activeAccount],
+            suggestedOrigins: [
+                URL(string: "https://rock.glowsoft.ru")!,
+                URL(string: "https://telemost.yandex.ru")!,
+                URL(string: "https://jazz.active.test/ignored")!
+            ],
+            lastOrigin: saved
+        )
+
+        XCTAssertEqual(origins, [
+            URL(string: "https://meet.corp.ru")!,
+            URL(string: "https://jazz.active.test")!,
+            URL(string: "https://jazz.expired.test")!,
+            URL(string: "https://telemost.yandex.ru")!
+        ])
+        XCTAssertEqual(
+            InstantRoomPreferences.preferredOrigin(
+                accounts: [expiredAccount, activeAccount],
+                suggestedOrigins: [URL(string: "https://telemost.yandex.ru")!],
+                lastOrigin: nil
+            ),
+            URL(string: "https://jazz.active.test")!
+        )
+
+        XCTAssertEqual(InstantRoomPreferences.defaultRoomTitle(displayName: "   "), L("New meeting"))
+        XCTAssertEqual(InstantRoomPreferences.defaultRoomTitle(displayName: "  Alex  "), L("%@’s meeting", "Alex"))
+    }
 }

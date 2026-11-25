@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import LinkPresentation
 import UIKit
 
 /// Shared actions and visible media state for the call and its conversation view.
@@ -20,6 +21,8 @@ final class CallWorkspaceControls: ObservableObject {
 
     var invitationURL: URL?
     var roomIdentifier: String?
+    var meetingTitle: String?
+    var onInvitationCopied: (() -> Void)?
     var toggleMicrophone: (() -> Void)?
     var toggleCamera: (() -> Void)?
     var toggleSpeaker: (() -> Void)?
@@ -36,12 +39,15 @@ final class CallWorkspaceControls: ObservableObject {
     func copyInvitation() {
         guard let invitationURL else { return }
         UIPasteboard.general.url = invitationURL
+        UINotificationFeedbackGenerator().notificationOccurred(.success)
+        onInvitationCopied?()
     }
 
     func shareInvitation(from view: UIView) {
         guard let invitationURL else { return }
         guard let presenter = view.callActionPresenter else { return }
-        let sheet = UIActivityViewController(activityItems: [invitationURL], applicationActivities: nil)
+        let source = InvitationActivityItemSource(url: invitationURL, title: meetingTitle)
+        let sheet = UIActivityViewController(activityItems: [source], applicationActivities: nil)
         if let popover = sheet.popoverPresentationController { popover.sourceView = view.callActionPresentationAnchor }
         presenter.present(sheet, animated: true) { [weak sheet] in
             sheet?.view.accessibilityIdentifier = "Invitation sharing"
@@ -72,5 +78,33 @@ final class CallWorkspaceControls: ObservableObject {
         sheet.popoverPresentationController?.sourceView = anchor
         sheet.popoverPresentationController?.sourceRect = anchor.bounds
         presenter.present(sheet, animated: true)
+    }
+}
+
+private final class InvitationActivityItemSource: NSObject, UIActivityItemSource {
+    private let url: URL
+    private let title: String?
+
+    init(url: URL, title: String?) {
+        self.url = url
+        self.title = title?.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    func activityViewControllerPlaceholderItem(_ activityViewController: UIActivityViewController) -> Any {
+        url
+    }
+
+    func activityViewController(_ activityViewController: UIActivityViewController, itemForActivityType activityType: UIActivity.ActivityType?) -> Any? {
+        url
+    }
+
+    func activityViewControllerLinkMetadata(_ activityViewController: UIActivityViewController) -> LPLinkMetadata? {
+        let metadata = LPLinkMetadata()
+        metadata.originalURL = url
+        metadata.url = url
+        if let title, !title.isEmpty {
+            metadata.title = title
+        }
+        return metadata
     }
 }

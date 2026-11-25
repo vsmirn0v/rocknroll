@@ -81,7 +81,11 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
         if configureFixtures(model: model, controller: controller, window: window) { return }
         #endif
 
-        if let url = connectionOptions.urlContexts.first?.url {
+        let isInstantShortcut = connectionOptions.shortcutItem?.type == AppDelegate.instantMeetingShortcutType
+        if isInstantShortcut {
+            BackgroundAudioJoinPrototype.shared.supersedeForForeground()
+            model.requestInstantRoomShortcut()
+        } else if let url = connectionOptions.urlContexts.first?.url {
             BackgroundAudioJoinPrototype.shared.supersedeForForeground()
             model.receive(url: url)
         } else if let activity = connectionOptions.userActivities.first {
@@ -94,8 +98,22 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
             ((environment.keys.contains { $0.hasPrefix("CONFERENCE_TEST_") } && environment["CONFERENCE_TEST_MEETING_SETUP"] == nil) ||
              NSClassFromString("XCTestCase") != nil) { model.setup.suspendForMeeting() }
         #endif
-        model.setup.finishLaunch(hasMeetingIntent: !connectionOptions.urlContexts.isEmpty || !connectionOptions.userActivities.isEmpty ||
+        model.setup.finishLaunch(hasMeetingIntent: isInstantShortcut || !connectionOptions.urlContexts.isEmpty || !connectionOptions.userActivities.isEmpty ||
             CalendarReminderBroker.shared.hasPendingIntent || model.calendar.reminders.hasOpenIntent)
+    }
+
+    func windowScene(
+        _ windowScene: UIWindowScene,
+        performActionFor shortcutItem: UIApplicationShortcutItem,
+        completionHandler: @escaping (Bool) -> Void
+    ) {
+        guard shortcutItem.type == AppDelegate.instantMeetingShortcutType else {
+            completionHandler(false)
+            return
+        }
+        BackgroundAudioJoinPrototype.shared.supersedeForForeground()
+        conference?.requestInstantRoomShortcut()
+        completionHandler(true)
     }
 
     func scene(_ scene: UIScene, openURLContexts URLContexts: Set<UIOpenURLContext>) {

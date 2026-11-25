@@ -41,7 +41,7 @@ public struct CreateCalendarMeetingSheet: View {
         }
     }
 
-    private static let lastOriginKey = "siteAuth.lastCreateRoomOrigin"
+    private static var lastOriginKey: String { InstantRoomPreferences.lastOriginKey }
 
     public let initialDate: Date
     public let suggestedOrigins: [URL]

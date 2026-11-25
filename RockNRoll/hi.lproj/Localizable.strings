@@ -4242,3 +4242,12 @@
 "%@ · %ld meetings" = "%@ · %ld मीटिंग";
 "Could not save the meeting to Calendar." = "मीटिंग कैलेंडर में सहेजी नहीं जा सकी।";
 "Show earlier (%ld)" = "पहले की मीटिंग दिखाएँ (%ld)";
+
+"Instant meeting" = "त्वरित मीटिंग";
+"Create, copy link & join" = "बनाएँ, लिंक कॉपी करें और जुड़ें";
+"Join & copy link · %@" = "जुड़ें और लिंक कॉपी करें · %@";
+"Choose website & start" = "वेबसाइट चुनें और शुरू करें";
+"New room with options…" = "विकल्पों के साथ नया रूम…";
+"Choose meeting website" = "मीटिंग वेबसाइट चुनें";
+"Invitation link copied" = "निमंत्रण लिंक कॉपी हो गया";
+"Link copied · Ready to paste" = "लिंक कॉपी किया गया · पेस्ट करने के लिए तैयार";

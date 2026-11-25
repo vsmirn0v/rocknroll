@@ -4469,3 +4469,12 @@
 "%@ · %ld meetings" = "%@ · %ld встреч";
 "Could not save the meeting to Calendar." = "Не удалось сохранить встречу в Календарь.";
 "Show earlier (%ld)" = "Показать более ранние (%ld)";
+
+"Instant meeting" = "Быстрая встреча";
+"Create, copy link & join" = "Создать, скопировать и войти";
+"Join & copy link · %@" = "Войти и скопировать · %@";
+"Choose website & start" = "Выбрать сайт и начать";
+"New room with options…" = "Новая комната с настройками…";
+"Choose meeting website" = "Выбрать сайт для встречи";
+"Invitation link copied" = "Ссылка на встречу скопирована";
+"Link copied · Ready to paste" = "Ссылка скопирована · Можно вставлять";

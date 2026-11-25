@@ -84,6 +84,8 @@ struct JoinView: View {
     @State private var staleContinuation: ActiveJam?
     @State private var confirmingStaleContinuation = false
     @State private var activeSheet: ActiveHomeSheet?
+    @ObservedObject private var siteAccounts = SiteAccountStore.shared
+    @State private var preferredOriginOverride: URL? = InstantRoomPreferences.loadLastOrigin()
     private let accent = Color.rockProminentFill
     private let linkAccent = Color.rockBrandTint
 
@@ -94,6 +96,20 @@ struct JoinView: View {
             rooms: history.rooms,
             calendarMeetings: calendar.meetings,
             fallbackOrigin: model.guestWebsiteOrigin
+        )
+    }
+    private var instantAvailableOrigins: [URL] {
+        InstantRoomPreferences.availableOrigins(
+            accounts: siteAccounts.accounts,
+            suggestedOrigins: suggestedSiteOrigins,
+            lastOrigin: preferredOriginOverride ?? InstantRoomPreferences.loadLastOrigin()
+        )
+    }
+    private var preferredInstantOrigin: URL? {
+        InstantRoomPreferences.preferredOrigin(
+            accounts: siteAccounts.accounts,
+            suggestedOrigins: suggestedSiteOrigins,
+            lastOrigin: preferredOriginOverride ?? InstantRoomPreferences.loadLastOrigin()
         )
     }
 
@@ -318,9 +334,25 @@ struct JoinView: View {
                 } else if oldID == "devices" && newID != "devices" {
                     if staleContinuation != nil { confirmingStaleContinuation = true }
                 }
+                if oldID?.hasPrefix("createRoom.") == true || oldID?.hasPrefix("signInSite.") == true {
+                    preferredOriginOverride = InstantRoomPreferences.loadLastOrigin()
+                }
+                if oldID?.hasPrefix("signInSite.") == true && newID == nil {
+                    model.pendingInstantRoomOrigin = nil
+                }
             }
             .onChange(of: model.focusJoinLinkTrigger) { _, _ in
                 linkFocused = true
+            }
+            .onChange(of: model.instantRoomAuthChallengeOrigin) { _, challengeOrigin in
+                if let challengeOrigin, activeSheet == nil {
+                    activeSheet = .signInSite(challengeOrigin)
+                }
+            }
+            .onChange(of: model.instantRoomShortcutRequested) { _, requested in
+                if requested {
+                    handleInstantRoomShortcutIfRequested()
+                }
             }
             .onChange(of: model.isJoining) {
                 if $0 { setup.suspendForMeeting(); nameFocused = false; linkFocused = false; sync.endNameEditing(); mediaCheck.close() }
@@ -384,6 +416,7 @@ struct JoinView: View {
                     return homeInteraction.isAnchorVisible("urgent." + item.id.homeAnchorID)
                 }
                 if model.isNameRequiredForJoin { nameFocused = true }
+                handleInstantRoomShortcutIfRequested()
             }
             .onDisappear {
                 homeVisible = false; calendar.reminders.isEventVisible = { _ in false }
@@ -553,15 +586,38 @@ struct JoinView: View {
         // AnyLayout preserves child identity when window/text size changes.
         let row = stacked ? AnyLayout(VStackLayout(alignment: .leading, spacing: 4)) :
                             AnyLayout(HStackLayout(spacing: 8))
-        return VStack(alignment: .leading, spacing: 4) {
-            row {
-                invitationEntry.frame(maxWidth: .infinity)
-                joinButton.frame(maxWidth: stacked ? .infinity : nil).fixedSize(horizontal: !stacked, vertical: true)
+        return VStack(alignment: .leading, spacing: 8) {
+            instantMeetingBar
+            if let instantError = model.instantRoomError {
+                Text(instantError)
+                    .font(.footnote)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("home.instant-room.error")
             }
-            row {
-                nameEntry.frame(minWidth: 90, maxWidth: .infinity)
-                studioButton.fixedSize(horizontal: !stacked, vertical: true)
-                    .frame(maxWidth: stacked ? .infinity : nil, alignment: .leading)
+            if let challengeOrigin = model.instantRoomAuthChallengeOrigin {
+                Button {
+                    activeSheet = .signInSite(challengeOrigin)
+                } label: {
+                    Label(
+                        L("Sign in to %@…", challengeOrigin.host ?? challengeOrigin.absoluteString),
+                        systemImage: "person.crop.circle.badge.checkmark"
+                    )
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .accessibilityIdentifier("home.instant-room.signin")
+            }
+            VStack(alignment: .leading, spacing: 4) {
+                row {
+                    invitationEntry.frame(maxWidth: .infinity)
+                    joinButton.frame(maxWidth: stacked ? .infinity : nil).fixedSize(horizontal: !stacked, vertical: true)
+                }
+                row {
+                    nameEntry.frame(minWidth: 90, maxWidth: .infinity)
+                    studioButton.fixedSize(horizontal: !stacked, vertical: true)
+                        .frame(maxWidth: stacked ? .infinity : nil, alignment: .leading)
+                }
             }
             if (model.isNameRequiredForJoin || !model.displayName.isEmpty) && !validDisplayName {
                 Text(L("Enter a name of up to %ld characters before joining.", model.namePolicy.maximumNameScalars))
@@ -636,6 +692,124 @@ struct JoinView: View {
         #if DEBUG
         .accessibilityValue(model.testSwitchSequenceCompleted ? "Switch sequence connected" : "")
         #endif
+    }
+
+    private var instantMeetingBar: some View {
+        let origin = preferredInstantOrigin
+        let isDisabled = busy || model.isCreatingInstantRoom
+        return HStack(spacing: 0) {
+            Button {
+                triggerInstantRoom()
+            } label: {
+                HStack(spacing: 10) {
+                    ZStack {
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .fill(Color.black.opacity(0.14))
+                            .frame(width: 34, height: 34)
+                        if model.isCreatingInstantRoom {
+                            ProgressView()
+                                .tint(.black)
+                                .controlSize(.small)
+                        } else {
+                            Image(systemName: "video.badge.plus")
+                                .font(.system(size: 16, weight: .semibold))
+                                .foregroundStyle(.black)
+                        }
+                    }
+                    .accessibilityHidden(true)
+
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(model.isCreatingInstantRoom ? L("Creating room…") : L("Instant meeting"))
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(.black)
+                            .lineLimit(textSize.isAccessibilitySize ? 2 : 1)
+                        Text(origin.flatMap(\.host).map { L("Join & copy link · %@", $0) } ?? L("Choose website & start"))
+                            .font(.caption)
+                            .foregroundStyle(Color.black.opacity(0.76))
+                            .lineLimit(textSize.isAccessibilitySize ? 2 : 1)
+                    }
+                    Spacer(minLength: 4)
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 9)
+                .frame(maxWidth: .infinity, minHeight: 52, alignment: .leading)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(isDisabled)
+            .accessibilityIdentifier("home.instant-room")
+            .accessibilityLabel(model.isCreatingInstantRoom ? L("Creating room…") : L("Instant meeting"))
+            .accessibilityHint(origin.flatMap(\.host).map { L("Join & copy link · %@", $0) } ?? L("Choose website & start"))
+
+            Rectangle()
+                .fill(Color.black.opacity(0.16))
+                .frame(width: 1)
+                .padding(.vertical, 10)
+
+            Menu {
+                if !instantAvailableOrigins.isEmpty {
+                    Section(L("Meeting website")) {
+                        ForEach(instantAvailableOrigins, id: \.absoluteString) { candidate in
+                            let account = siteAccounts.account(for: candidate)
+                            let host = candidate.host ?? candidate.absoluteString
+                            let label = account.map { "\(host) · \($0.displayAccountSummary)" } ?? host
+                            Button {
+                                InstantRoomPreferences.saveLastOrigin(candidate)
+                                preferredOriginOverride = candidate
+                                model.instantRoomError = nil
+                                model.instantRoomAuthChallengeOrigin = nil
+                            } label: {
+                                if candidate == origin {
+                                    Label(label, systemImage: "checkmark")
+                                } else {
+                                    Text(label)
+                                }
+                            }
+                        }
+                    }
+                }
+                Divider()
+                Button {
+                    activeSheet = .createRoom(origin)
+                } label: {
+                    Label(L("New room with options…"), systemImage: "slider.horizontal.3")
+                }
+            } label: {
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 13, weight: .bold))
+                    .foregroundStyle(.black.opacity(0.85))
+                    .frame(minWidth: 44, minHeight: 52)
+                    .frame(maxHeight: .infinity)
+                    .contentShape(Rectangle())
+            }
+            .disabled(isDisabled)
+            .accessibilityIdentifier("home.instant-room.menu")
+            .accessibilityLabel(L("Choose meeting website"))
+        }
+        .background(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(accent.opacity(isDisabled ? 0.65 : 1))
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+    }
+
+    private func triggerInstantRoom() {
+        nameFocused = false
+        linkFocused = false
+        sync.endNameEditing()
+        if let origin = preferredInstantOrigin {
+            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+            Task { await model.startInstantRoom(on: origin) }
+        } else {
+            activeSheet = .createRoom(nil)
+        }
+    }
+
+    private func handleInstantRoomShortcutIfRequested() {
+        guard model.instantRoomShortcutRequested else { return }
+        model.instantRoomShortcutRequested = false
+        activeSheet = nil
+        triggerInstantRoom()
     }
     @ViewBuilder private func library(wide: Bool) -> some View {
         if !favorites.isEmpty { favoriteSection(wide: wide) }
@@ -981,7 +1155,8 @@ struct JoinView: View {
                 defaultDisplayName: model.displayName,
                 onJoinCreatedRoom: { created, saveFavorite in
                     activeSheet = nil
-                    model.joinCreatedRoom(created, saveFavorite: saveFavorite)
+                    preferredOriginOverride = InstantRoomPreferences.loadLastOrigin()
+                    model.joinCreatedRoom(created, saveFavorite: saveFavorite, invitationAlreadyCopied: true)
                 },
                 onSaveFavoriteOnly: { created in
                     model.saveCreatedRoomFavorite(created)
@@ -991,9 +1166,16 @@ struct JoinView: View {
             SiteSignInSheet(
                 initialOrigin: origin,
                 suggestedOrigins: suggestedSiteOrigins
-            ) { _ in
+            ) { account in
                 activeSheet = nil
-                if !model.invite.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                if let pendingOrigin = model.pendingInstantRoomOrigin {
+                    model.pendingInstantRoomOrigin = nil
+                    model.instantRoomAuthChallengeOrigin = nil
+                    model.instantRoomError = nil
+                    let targetOrigin = account.originURL ?? pendingOrigin
+                    preferredOriginOverride = targetOrigin
+                    Task { await model.startInstantRoom(on: targetOrigin, explicitEngine: account.engine) }
+                } else if !model.invite.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     model.join()
                 }
             }

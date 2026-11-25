@@ -4242,3 +4242,12 @@
 "%@ · %ld meetings" = "%@ · %ld اجتماعات";
 "Could not save the meeting to Calendar." = "تعذر حفظ الاجتماع في التقويم.";
 "Show earlier (%ld)" = "عرض الأقدم (%ld)";
+
+"Instant meeting" = "اجتماع فوري";
+"Create, copy link & join" = "إنشاء ونسخ الرابط والانضمام";
+"Join & copy link · %@" = "الانضمام ونسخ الرابط · %@";
+"Choose website & start" = "اختر موقعاً وابدأ";
+"New room with options…" = "غرفة جديدة مع خيارات…";
+"Choose meeting website" = "اختر موقع الاجتماع";
+"Invitation link copied" = "تم نسخ رابط الدعوة";
+"Link copied · Ready to paste" = "تم نسخ الرابط · جاهز للصق";

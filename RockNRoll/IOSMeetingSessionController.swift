@@ -78,6 +78,7 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
     var supportsParticipantVolume: Bool { session.supportsParticipantVolume }
     private let volumePreferences: UserDefaults
     private let meetingVolumeKey: String
+    private let invitationCopiedOnJoin: Bool
     @Published private(set) var lastDemand: MeetingEngine.MeetingVideoDemand?
 
     var callWorkspacePublisher: AnyPublisher<CallWorkspaceControls?, Never> {
@@ -286,13 +287,15 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
          catchUp: CatchUpStore,
          workspaceAudio: IOSWorkspaceAudioCoordinator,
          initialTitle: String?,
-         preferences: UserDefaults = .standard) {
+         preferences: UserDefaults = .standard,
+         invitationCopiedOnJoin: Bool = false) {
         self.id = session.id
         self.destination = destination
         self.session = session
         self.chat = chat
         self.catchUp = catchUp
         self.workspaceAudio = workspaceAudio
+        self.invitationCopiedOnJoin = invitationCopiedOnJoin
         volumePreferences = preferences
         meetingVolumeKey = "ios.meetingVolume." + destination.engineKind.rawValue
         let savedVolume = preferences.object(forKey: meetingVolumeKey) as? Double ?? 1
@@ -376,7 +379,8 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
             catchUp: catchUp,
             chat: chat,
             invitationURL: destination.invitationURL,
-            roomIdentifier: destination.roomIdentifier
+            roomIdentifier: destination.roomIdentifier,
+            invitationCopiedOnJoin: invitationCopiedOnJoin
         )
         view.reactions = reactions
         view.supportsChat = session.capabilities.supportsChatRead || session.capabilities.supportsChatSend

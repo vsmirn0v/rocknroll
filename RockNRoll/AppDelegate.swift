@@ -1,8 +1,11 @@
 import UIKit
 import CloudKit
+import ConferenceCore
 
 @main
 final class AppDelegate: UIResponder, UIApplicationDelegate {
+    static let instantMeetingShortcutType = "dev.vsmirn0v.conferenceguest.instantRoom"
+
     func application(_ application: UIApplication, didFinishLaunchingWithOptions options: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
         AppDiagnostics.start()
         #if DEBUG
@@ -10,6 +13,14 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
         #endif
         NativeH264ColorEncoder.prepare()
         CalendarReminderBroker.shared.install()
+        application.shortcutItems = [
+            UIApplicationShortcutItem(
+                type: Self.instantMeetingShortcutType,
+                localizedTitle: L("Instant meeting"),
+                localizedSubtitle: L("Create, copy link & join"),
+                icon: UIApplicationShortcutIcon(systemImageName: "video.badge.plus")
+            )
+        ]
         return true
     }
     func application(_ application: UIApplication, didReceiveRemoteNotification userInfo: [AnyHashable: Any],

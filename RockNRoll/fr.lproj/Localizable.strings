@@ -4242,3 +4242,12 @@
 "%@ · %ld meetings" = "%@ · %ld réunions";
 "Could not save the meeting to Calendar." = "Impossible d’enregistrer la réunion dans Calendrier.";
 "Show earlier (%ld)" = "Afficher plus anciens (%ld)";
+
+"Instant meeting" = "Réunion instantanée";
+"Create, copy link & join" = "Créer, copier le lien et rejoindre";
+"Join & copy link · %@" = "Rejoindre et copier le lien · %@";
+"Choose website & start" = "Choisir un site web et démarrer";
+"New room with options…" = "Nouvelle salle avec options…";
+"Choose meeting website" = "Choisir le site de réunion";
+"Invitation link copied" = "Lien d’invitation copié";
+"Link copied · Ready to paste" = "Lien copié · Prêt à coller";

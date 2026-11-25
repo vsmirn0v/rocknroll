@@ -15,7 +15,7 @@ public struct CreateRoomSheet: View {
         }
     }
 
-    private static let lastOriginKey = "siteAuth.lastCreateRoomOrigin"
+    private static var lastOriginKey: String { InstantRoomPreferences.lastOriginKey }
 
     public let initialOrigin: URL?
     public let suggestedOrigins: [URL]

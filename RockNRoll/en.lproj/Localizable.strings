@@ -4470,3 +4470,12 @@
 "%@ · %ld meetings" = "%@ · %ld meetings";
 "Could not save the meeting to Calendar." = "Could not save the meeting to Calendar.";
 "Show earlier (%ld)" = "Show earlier (%ld)";
+
+"Instant meeting" = "Instant meeting";
+"Create, copy link & join" = "Create, copy link & join";
+"Join & copy link · %@" = "Join & copy link · %@";
+"Choose website & start" = "Choose website & start";
+"New room with options…" = "New room with options…";
+"Choose meeting website" = "Choose meeting website";
+"Invitation link copied" = "Invitation link copied";
+"Link copied · Ready to paste" = "Link copied · Ready to paste";
