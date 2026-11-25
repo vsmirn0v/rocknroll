@@ -201,8 +201,8 @@ struct NativeDesktopInstantMeetingBar: View {
                 .accessibilityIdentifier("nativeGuest.instantRoom.start")
 
                 Rectangle()
-                    .fill(Color.black.opacity(0.16))
-                    .frame(width: 1, height: 26)
+                    .fill(Color.black.opacity(0.22))
+                    .frame(width: 1, height: 28)
 
                 Menu {
                     NativeDesktopInstantSiteMenuContent(
@@ -213,12 +213,16 @@ struct NativeDesktopInstantMeetingBar: View {
                     )
                 } label: {
                     Image(systemName: "chevron.down")
-                        .font(.system(size: 11, weight: .bold))
-                        .foregroundStyle(Color.black.opacity(0.84))
-                        .frame(width: 36, height: 46)
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(Color.black.opacity(0.88))
+                        .frame(width: 38, height: 46)
+                        .background(Color.black.opacity(0.08))
                         .contentShape(Rectangle())
                 }
-                .menuStyle(.borderlessButton)
+                .menuStyle(.button)
+                .buttonStyle(.plain)
+                .menuIndicator(.hidden)
+                .tint(.black)
                 .fixedSize()
                 .disabled(workspace.isCreatingInstantRoom)
                 .help(L("Choose meeting website"))
@@ -283,6 +287,7 @@ struct NativeDesktopInstantToolbarControl: View {
                     }
                     Text(labelText)
                         .font(.callout.weight(.medium))
+                        .foregroundStyle(.primary)
                         .lineLimit(1)
                         .truncationMode(.middle)
                     if origin != nil {
@@ -292,7 +297,7 @@ struct NativeDesktopInstantToolbarControl: View {
                             .accessibilityLabel(signedIn ? L("Signed in") : L("Saved website"))
                     }
                 }
-                .padding(.leading, 9)
+                .padding(.leading, 8)
                 .padding(.trailing, 7)
                 .padding(.vertical, 4)
                 .contentShape(Rectangle())
@@ -306,7 +311,7 @@ struct NativeDesktopInstantToolbarControl: View {
             .accessibilityIdentifier("nativeGuest.toolbar.instantRoom")
 
             Rectangle()
-                .fill(Color.primary.opacity(0.14))
+                .fill(Color.primary.opacity(0.16))
                 .frame(width: 1, height: 14)
 
             Menu {
@@ -318,21 +323,35 @@ struct NativeDesktopInstantToolbarControl: View {
                 )
             } label: {
                 Image(systemName: "chevron.down")
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 7)
+                    .font(.system(size: 10.5, weight: .semibold))
+                    .foregroundStyle(.primary.opacity(0.75))
+                    .padding(.horizontal, 8)
                     .padding(.vertical, 6)
                     .contentShape(Rectangle())
             }
-            .menuStyle(.borderlessButton)
+            .menuStyle(.button)
+            .buttonStyle(.plain)
+            .menuIndicator(.hidden)
+            .tint(.primary)
             .fixedSize()
             .disabled(workspace.isCreatingInstantRoom)
             .help(L("Choose meeting website"))
             .accessibilityLabel(L("Choose meeting website"))
             .accessibilityIdentifier("nativeGuest.toolbar.instantMenu")
         }
-        .background(Color.orange.opacity(0.13), in: Capsule())
-        .overlay(Capsule().strokeBorder(Color.orange.opacity(0.32), lineWidth: 1))
+        .modifier(NativeDesktopToolbarPillSurface())
+    }
+}
+
+private struct NativeDesktopToolbarPillSurface: ViewModifier {
+    func body(content: Content) -> some View {
+        if #available(macOS 26.0, *) {
+            content
+        } else {
+            content
+                .background(.quaternary.opacity(0.35), in: Capsule())
+                .overlay(Capsule().strokeBorder(.primary.opacity(0.12), lineWidth: 1))
+        }
     }
 }
 
