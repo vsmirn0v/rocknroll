@@ -2249,6 +2249,33 @@ import XCTest
         XCTAssertTrue(versions.contains { $0.outcome.summary == "Новый итог на русском языке." })
     }
 
+    func testOpenAIChatJudgeOutcomeRetriesOnceWhenModelOutputsWrongCyrillicLanguage() async throws {
+        let now = Date()
+        let window = sampleWindow()
+        let outcomeRequest = MeetingOutcomeRequest(
+            meetingTitle: "Синк",
+            endedAt: now,
+            window: window,
+            language: "ru"
+        )
+        let customProvider = AttentionProvider(kind: .custom, baseURL: "https://litellm.example.test/v1", model: "qwen3.5-4b")
+        var bodies: [[String: Any]] = []
+        let session = StubProtocol.session { urlRequest in
+            if let parsed = try JSONSerialization.jsonObject(with: StubProtocol.body(urlRequest)) as? [String: Any] {
+                bodies.append(parsed)
+            }
+            if bodies.count == 1 {
+                return (200, StubProtocol.answer(#"{"summary":"Обсъдихме плана за следващата седмица и кои задачи ще завършим.","decisions":[],"tasks":[],"open_questions":[]}"#))
+            }
+            return (200, StubProtocol.answer(#"{"summary":"Обсудили план на следующую неделю и обновили задачи.","decisions":[],"tasks":[],"open_questions":[]}"#))
+        }
+        let result = try await OpenAIChatJudge(provider: customProvider, key: "k", session: session, retryDelays: [0, 0]).outcome(outcomeRequest)
+        XCTAssertEqual(bodies.count, 2)
+        let retrySystem = ((bodies[1]["messages"] as? [[String: String]])?.first?["content"]) ?? ""
+        XCTAssertTrue(retrySystem.contains("CRITICAL CORRECTION"))
+        XCTAssertEqual(result.summary, "Обсудили план на следующую неделю и обновили задачи.")
+    }
+
     func testSyncedWindowAssistantChatAttributionMultiLegNotesAndStaleCandidateReplacement() async throws {
         let now = Date()
         let syncedChatWithAssistantRole = [

@@ -157,15 +157,48 @@ struct OpenAIChatJudge: AttentionJudge, ReplyWriter, MomentSummarizer, MeetingOu
         var writer = self
         writer.timeout = 120
         writer.diagnoseOutcomeTransport = true
-        let (parsed, _) = try await writer.complete(
-            requestBody(messages: MeetingOutcomePrompt.messages(request),
-                        name: MeetingOutcomePrompt.schemaName, schema: MeetingOutcomePrompt.schema, hint: MeetingOutcomePrompt.hint),
-            fallbackHint: MeetingOutcomePrompt.hint
-        ) { content in
+        let expectedLanguage = MeetingOutcomePrompt.resolvedLanguageCode(for: request)
+        let messages = MeetingOutcomePrompt.messages(request)
+        let parseOutcome: (String) throws -> MeetingOutcomeContent = { content in
             do { return try MeetingOutcomePrompt.parse(content) }
             catch {
                 probeLog("assistant-outcome-response", ["reason": "unusableContent", "contentBytes": content.utf8.count])
                 throw error
+            }
+        }
+        let (parsed, _) = try await writer.complete(
+            requestBody(messages: messages,
+                        name: MeetingOutcomePrompt.schemaName, schema: MeetingOutcomePrompt.schema, hint: MeetingOutcomePrompt.hint),
+            fallbackHint: MeetingOutcomePrompt.hint,
+            parse: parseOutcome
+        )
+        let allowedSources = [request.meetingTitle, request.notes ?? ""] + request.window.lines.flatMap { [$0.speaker, $0.text] }
+        let outputTexts = [parsed.summary] + parsed.decisions + parsed.tasks.map(\.text) + parsed.openQuestions
+        if MeetingLanguageResolver.hasUnexpectedCyrillicLanguage(
+            in: outputTexts,
+            expectedLanguage: expectedLanguage,
+            allowedSourceTexts: allowedSources
+        ) {
+            probeLog("assistant-outcome-language-retry", ["expected": expectedLanguage, "model": provider.model])
+            var retryMessages = messages
+            if let index = retryMessages.firstIndex(where: { $0["role"] == "system" }) {
+                retryMessages[index]["content"] = (retryMessages[index]["content"] ?? "") + "\n\n"
+                    + MeetingLanguageResolver.correctiveLanguageInstruction(for: expectedLanguage)
+            }
+            if let (retried, _) = try? await writer.complete(
+                requestBody(messages: retryMessages,
+                            name: MeetingOutcomePrompt.schemaName, schema: MeetingOutcomePrompt.schema, hint: MeetingOutcomePrompt.hint),
+                fallbackHint: MeetingOutcomePrompt.hint,
+                parse: parseOutcome
+            ) {
+                let retriedTexts = [retried.summary] + retried.decisions + retried.tasks.map(\.text) + retried.openQuestions
+                if !MeetingLanguageResolver.hasUnexpectedCyrillicLanguage(
+                    in: retriedTexts,
+                    expectedLanguage: expectedLanguage,
+                    allowedSourceTexts: allowedSources
+                ) {
+                    return retried
+                }
             }
         }
         return parsed

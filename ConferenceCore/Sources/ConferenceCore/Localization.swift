@@ -79,14 +79,23 @@ public enum Localization {
     }
 
     public static func outputLanguageDirective(for identifier: String) -> String {
-        let label = languageLabel(for: identifier)
-        return """
+        let code = normalizedLanguageCode(identifier)
+        let label = languageLabel(for: code)
+        var directive = """
         Language rule (highest priority): Write all human-readable output text in \(label). \
         Follow this target language even when system prompts, team guidelines, or custom instructions \
         above are written in English or another language. Keep JSON property keys and enum/reference \
         tokens in exact English/ASCII, and preserve person names, ticket IDs, and code identifiers \
         as spoken or written.
         """
+        if MeetingLanguageResolver.isCyrillicLanguage(code) {
+            if code == "ru" {
+                directive += " Use strictly standard Russian (русский) orthography and vocabulary; never mix in or switch to Ukrainian, Bulgarian, Belarusian, Serbian, Kazakh, or any other Cyrillic language."
+            } else {
+                directive += " Use strictly standard \(label) orthography and vocabulary; never mix in or switch to Russian or any other Cyrillic language."
+            }
+        }
+        return directive
     }
 
     /// App language governs grammatical rules; device region governs formatting.
@@ -119,9 +128,120 @@ public enum Localization {
 /// chat, notes, and title before falling back to the app UI language.
 public enum MeetingLanguageResolver {
     private static let cyrillicLanguages: Set<String> = ["ru", "uk", "bg", "sr", "be", "kk", "mk", "mn"]
+    private static let ukMarkers: Set<UInt32> = [0x0456, 0x0457, 0x0454, 0x0491] // і, ї, є, ґ
+    private static let beExclusive: Set<UInt32> = [0x045E] // ў
+    private static let beMarkers: Set<UInt32> = [0x045E, 0x0456] // ў, і
+    private static let kkExclusive: Set<UInt32> = [0x04D9, 0x0493, 0x049B, 0x04A3, 0x04E9, 0x04B1, 0x04AF, 0x04BB] // ә, ғ, қ, ң, ө, ұ, ү, һ
+    private static let srExclusive: Set<UInt32> = [0x0452, 0x045B] // ђ, ћ
+    private static let srMarkers: Set<UInt32> = [0x0452, 0x0458, 0x0459, 0x045A, 0x045B, 0x045F] // ђ, ј, љ, њ, ћ, џ
+    private static let mkExclusive: Set<UInt32> = [0x0453, 0x0455, 0x045C] // ѓ, ѕ, ќ
+    private static let mkMarkers: Set<UInt32> = [0x0453, 0x0455, 0x0458, 0x0459, 0x045A, 0x045C, 0x045F] // ѓ, ѕ, ј, љ, њ, ќ, џ
+    private static let mnMarkers: Set<UInt32> = [0x04E9, 0x04AF] // ө, ү
+    private static let nonRussianCyrillicScalars: Set<UInt32> = ukMarkers
+        .union(beExclusive)
+        .union(kkExclusive)
+        .union(srMarkers)
+        .union(mkMarkers)
+        .union(mnMarkers)
+    private static let ruAbsentInBg: Set<UInt32> = [0x044B, 0x044D, 0x0451] // ы, э, ё
+    private static let ruAbsentInUk: Set<UInt32> = [0x044B, 0x044D, 0x044A, 0x0451] // ы, э, ъ, ё
+    private static let ruAbsentInBe: Set<UInt32> = [0x0438, 0x0449, 0x044A] // и, щ, ъ
+    private static let ruAbsentInSrMk: Set<UInt32> = [0x0439, 0x0449, 0x044A, 0x044B, 0x044C, 0x044D, 0x044E, 0x044F, 0x0451] // й, щ, ъ, ы, ь, э, ю, я, ё
+    private static let bulgarianExclusiveWords: Set<String> = [
+        "ще", "със", "към", "още", "вече", "трябва", "защото", "които", "която", "което",
+        "също", "няма", "беше", "тази", "тези", "всички", "може", "можем", "съм", "сме",
+        "сте", "среща", "срещата", "имаме", "нещо", "какво", "защо", "обаче", "седмица", "следващата"
+    ]
     private static let noiseRegex = try? NSRegularExpression(
         pattern: #"https?://\S+|[^\s@]+@[^\s@]+\.[^\s@]+|\b[A-Z][A-Z0-9_]{1,9}-\d+\b"#
     )
+
+    public static func isCyrillicLanguage(_ code: String) -> Bool {
+        cyrillicLanguages.contains(Localization.normalizedLanguageCode(code))
+    }
+
+    public static func correctiveLanguageInstruction(for identifier: String) -> String {
+        let code = Localization.normalizedLanguageCode(identifier)
+        let label = Localization.languageLabel(for: code)
+        if code == "ru" {
+            return "CRITICAL CORRECTION: Your previous draft used the wrong Cyrillic language. Rewrite ALL human-readable text values strictly in standard Russian (русский). Do not use Bulgarian, Ukrainian, Belarusian, Serbian, Kazakh, or any non-Russian words or letters (keep JSON keys, [L#] citations if requested, person names, ticket IDs, and code identifiers intact)."
+        }
+        return "CRITICAL CORRECTION: Your previous draft used the wrong language. Rewrite ALL human-readable text values strictly in \(label). Do not switch to or mix in Russian or another Cyrillic language (keep JSON keys, [L#] citations if requested, person names, ticket IDs, and code identifiers intact)."
+    }
+
+    public static func hasUnexpectedCyrillicLanguage(
+        in outputTexts: [String],
+        expectedLanguage: String,
+        allowedSourceTexts: [String] = []
+    ) -> Bool {
+        let expected = Localization.normalizedLanguageCode(expectedLanguage)
+        guard cyrillicLanguages.contains(expected) else { return false }
+
+        let joinedOutput = outputTexts
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: "\n")
+        let cleanedOutput = stripNoise(from: joinedOutput)
+        guard !cleanedOutput.isEmpty else { return false }
+
+        let allowedSourceJoined = stripNoise(from: allowedSourceTexts.joined(separator: "\n")).precomposedStringWithCanonicalMapping
+        let allowedTokens = Set(cyrillicWordTokens(in: allowedSourceJoined))
+        let normalizedOutput = cleanedOutput.precomposedStringWithCanonicalMapping
+        let outputTokens = cyrillicWordTokens(in: normalizedOutput)
+        let outputCyrillicLetters = countCyrillicLetters(in: normalizedOutput)
+        guard outputCyrillicLetters >= 4 else { return false }
+
+        if expected == "ru" {
+            let unallowedTokens = outputTokens.filter { !allowedTokens.contains($0) }
+            let unallowedText = unallowedTokens.joined(separator: " ")
+            let unallowedStats = CyrillicOrthographyStats(tokens: unallowedTokens, text: unallowedText)
+            let foreignScalarCount = unallowedTokens.reduce(0) { count, token in
+                count + token.unicodeScalars.filter { nonRussianCyrillicScalars.contains($0.value) }.count
+            }
+            if foreignScalarCount >= 2 {
+                return true
+            }
+            if foreignScalarCount >= 1 && unallowedStats.ruAbsentInUk == 0 {
+                let recognizer = NLLanguageRecognizer()
+                recognizer.languageConstraints = ["ru", "uk", "bg", "kk"].map { NLLanguage(rawValue: $0) }
+                recognizer.processString(unallowedText.isEmpty ? normalizedOutput : unallowedText)
+                if let top = recognizer.languageHypotheses(withMaximum: 2)
+                    .map({ (Localization.normalizedLanguageCode($0.key.rawValue), $0.value) })
+                    .max(by: { $0.1 < $1.1 }),
+                   top.0 != "ru", top.1 >= 0.65 {
+                    return true
+                }
+            }
+            if unallowedStats.ruAbsentInBg == 0
+                && (unallowedStats.bgWordHits >= 2
+                    || (unallowedStats.bgWordHits >= 1 && unallowedStats.bgStemHardSigns >= 1)
+                    || unallowedStats.bgStemHardSigns >= 2) {
+                return true
+            }
+            let unallowedLetters = countCyrillicLetters(in: unallowedText)
+            if unallowedLetters >= 36 {
+                let resolved = resolveCyrillicLanguage(
+                    cyrillicText: unallowedText,
+                    cyrillicLetters: unallowedLetters,
+                    minimumConfidence: 0.70,
+                    fallbackAppCode: "ru"
+                )
+                return resolved != "ru"
+            }
+            return false
+        }
+
+        if outputCyrillicLetters >= 50 {
+            let resolved = resolveCyrillicLanguage(
+                cyrillicText: outputTokens.joined(separator: " "),
+                cyrillicLetters: outputCyrillicLetters,
+                minimumConfidence: 0.70,
+                fallbackAppCode: expected
+            )
+            return resolved != expected
+        }
+        return false
+    }
 
     public static func resolve(
         events: [SyncedTranscriptEvent],
@@ -253,23 +373,12 @@ public enum MeetingLanguageResolver {
                     token.unicodeScalars.contains { (0x0400...0x052F).contains($0.value) }
                 }
             let cyrillicText = cyrillicTokens.joined(separator: " ")
-            // NLLanguageRecognizer frequently misclassifies tiny Cyrillic loanwords (e.g. "Синк" -> "kk").
-            if cyrillicLetters >= 12, !cyrillicText.isEmpty {
-                let recognizer = NLLanguageRecognizer()
-                recognizer.processString(cyrillicText)
-                let hypotheses = recognizer.languageHypotheses(withMaximum: 3)
-                if let bestCyrillic = hypotheses
-                    .compactMap({ key, score -> (String, Double)? in
-                        let code = Localization.normalizedLanguageCode(key.rawValue)
-                        guard cyrillicLanguages.contains(code) else { return nil }
-                        return (code, score)
-                    })
-                    .max(by: { $0.1 < $1.1 }),
-                   bestCyrillic.1 >= 0.40 {
-                    return bestCyrillic.0
-                }
-            }
-            return cyrillicLanguages.contains(fallbackAppCode) ? fallbackAppCode : "ru"
+            return resolveCyrillicLanguage(
+                cyrillicText: cyrillicText,
+                cyrillicLetters: cyrillicLetters,
+                minimumConfidence: minimumConfidence,
+                fallbackAppCode: fallbackAppCode
+            )
         }
 
         if hanScalars >= 4 && Double(hanScalars) / Double(totalLetters) >= 0.20 {
@@ -332,5 +441,202 @@ public enum MeetingLanguageResolver {
         guard let noiseRegex else { return text }
         let range = NSRange(text.startIndex..<text.endIndex, in: text)
         return noiseRegex.stringByReplacingMatches(in: text, range: range, withTemplate: " ")
+    }
+
+    private struct CyrillicOrthographyStats {
+        var ukMarkers = 0
+        var beExclusive = 0
+        var beMarkers = 0
+        var kkExclusive = 0
+        var srExclusive = 0
+        var srMarkers = 0
+        var mkExclusive = 0
+        var mkMarkers = 0
+        var mnMarkers = 0
+        var ruAbsentInBg = 0
+        var ruAbsentInUk = 0
+        var ruAbsentInBe = 0
+        var ruAbsentInSrMk = 0
+        var bgWordHits = 0
+        var bgStemHardSigns = 0
+
+        init(tokens: [String], text: String) {
+            for scalar in text.unicodeScalars {
+                let v = scalar.value
+                if MeetingLanguageResolver.ukMarkers.contains(v) { ukMarkers += 1 }
+                if MeetingLanguageResolver.beExclusive.contains(v) { beExclusive += 1 }
+                if MeetingLanguageResolver.beMarkers.contains(v) { beMarkers += 1 }
+                if MeetingLanguageResolver.kkExclusive.contains(v) { kkExclusive += 1 }
+                if MeetingLanguageResolver.srExclusive.contains(v) { srExclusive += 1 }
+                if MeetingLanguageResolver.srMarkers.contains(v) { srMarkers += 1 }
+                if MeetingLanguageResolver.mkExclusive.contains(v) { mkExclusive += 1 }
+                if MeetingLanguageResolver.mkMarkers.contains(v) { mkMarkers += 1 }
+                if MeetingLanguageResolver.mnMarkers.contains(v) { mnMarkers += 1 }
+                if MeetingLanguageResolver.ruAbsentInBg.contains(v) { ruAbsentInBg += 1 }
+                if MeetingLanguageResolver.ruAbsentInUk.contains(v) { ruAbsentInUk += 1 }
+                if MeetingLanguageResolver.ruAbsentInBe.contains(v) { ruAbsentInBe += 1 }
+                if MeetingLanguageResolver.ruAbsentInSrMk.contains(v) { ruAbsentInSrMk += 1 }
+            }
+            for token in tokens {
+                if MeetingLanguageResolver.bulgarianExclusiveWords.contains(token) {
+                    bgWordHits += 1
+                }
+            }
+            bgStemHardSigns = MeetingLanguageResolver.countBulgarianStemHardSigns(in: text)
+        }
+    }
+
+    private static func cyrillicWordTokens(in text: String) -> [String] {
+        text.lowercased()
+            .split(whereSeparator: { scalarOwner in
+                !scalarOwner.unicodeScalars.contains { (0x0400...0x052F).contains($0.value) }
+            })
+            .map(String.init)
+            .filter { !$0.isEmpty }
+    }
+
+    private static func countCyrillicLetters(in text: String) -> Int {
+        text.unicodeScalars.reduce(0) { count, scalar in
+            count + ((CharacterSet.letters.contains(scalar) && (0x0400...0x052F).contains(scalar.value)) ? 1 : 0)
+        }
+    }
+
+    private static func countBulgarianStemHardSigns(in lowercased: String) -> Int {
+        let scalars = Array(lowercased.unicodeScalars)
+        guard scalars.count >= 2 else { return 0 }
+        let russianHardSignFollowers: Set<UInt32> = [0x0435, 0x0451, 0x044E, 0x044F] // е, ё, ю, я
+        var count = 0
+        for index in 0..<(scalars.count - 1) where scalars[index].value == 0x044A { // ъ
+            let next = scalars[index + 1].value
+            if (0x0400...0x052F).contains(next), !russianHardSignFollowers.contains(next) {
+                count += 1
+            }
+        }
+        return count
+    }
+
+    private static func resolveCyrillicLanguage(
+        cyrillicText: String,
+        cyrillicLetters: Int,
+        minimumConfidence: Double,
+        fallbackAppCode: String
+    ) -> String {
+        let defaultCyrillic = cyrillicLanguages.contains(fallbackAppCode) ? fallbackAppCode : "ru"
+        guard cyrillicLetters >= 12, !cyrillicText.isEmpty else {
+            return defaultCyrillic
+        }
+
+        let lowercased = cyrillicText.precomposedStringWithCanonicalMapping.lowercased()
+        let tokens = cyrillicWordTokens(in: lowercased)
+        let stats = CyrillicOrthographyStats(tokens: tokens, text: lowercased)
+
+        // Direct orthographic fast-path for unambiguous non-Russian Cyrillic scripts.
+        if stats.beExclusive >= 2 && stats.ruAbsentInBe == 0 {
+            return "be"
+        }
+        if stats.ukMarkers >= 3 && stats.ruAbsentInUk == 0 && stats.beExclusive == 0 {
+            return "uk"
+        }
+        if stats.kkExclusive >= 3 {
+            return "kk"
+        }
+        if stats.srExclusive >= 2 && stats.ruAbsentInSrMk == 0 {
+            return "sr"
+        }
+        if stats.mkExclusive >= 2 && stats.ruAbsentInSrMk == 0 {
+            return "mk"
+        }
+
+        let recognizer = NLLanguageRecognizer()
+        recognizer.languageConstraints = ["ru", "uk", "bg", "kk"].map { NLLanguage(rawValue: $0) }
+        recognizer.processString(cyrillicText)
+        let hypotheses = recognizer.languageHypotheses(withMaximum: 4)
+            .compactMap { key, score -> (String, Double)? in
+                let code = Localization.normalizedLanguageCode(key.rawValue)
+                guard cyrillicLanguages.contains(code) else { return nil }
+                return (code, score)
+            }
+            .sorted { $0.1 > $1.1 }
+
+        let requiredConfidence = max(minimumConfidence, 0.55)
+        for (code, score) in hypotheses {
+            if isOrthographicallySupported(
+                code: code,
+                stats: stats,
+                cyrillicLetters: cyrillicLetters,
+                score: score,
+                requiredConfidence: requiredConfidence,
+                fallbackAppCode: fallbackAppCode
+            ) {
+                return code
+            }
+        }
+
+        if stats.ruAbsentInBg == 0 && (stats.bgWordHits >= 2 || (stats.bgWordHits >= 1 && stats.bgStemHardSigns >= 1)) {
+            return "bg"
+        }
+        return defaultCyrillic
+    }
+
+    private static func isOrthographicallySupported(
+        code: String,
+        stats: CyrillicOrthographyStats,
+        cyrillicLetters: Int,
+        score: Double,
+        requiredConfidence: Double,
+        fallbackAppCode: String
+    ) -> Bool {
+        let defaultCyrillic = cyrillicLanguages.contains(fallbackAppCode) ? fallbackAppCode : "ru"
+        switch code {
+        case "ru":
+            let ruThreshold = defaultCyrillic == "ru" ? 0.35 : requiredConfidence
+            guard score >= ruThreshold else { return false }
+            if stats.ukMarkers >= 3 && stats.ruAbsentInUk == 0 { return false }
+            if stats.kkExclusive >= 3 { return false }
+            if stats.beExclusive >= 2 && stats.ruAbsentInBe == 0 { return false }
+            if stats.srMarkers >= 3 && stats.ruAbsentInSrMk == 0 { return false }
+            if stats.mkMarkers >= 3 && stats.ruAbsentInSrMk == 0 { return false }
+            return true
+
+        case "uk":
+            let hasMarkers = stats.ukMarkers >= 2 || (stats.ukMarkers >= 1 && cyrillicLetters < 40)
+            let noConflict = stats.ruAbsentInUk == 0 || stats.ukMarkers > stats.ruAbsentInUk * 2
+            let threshold = fallbackAppCode == "ru" ? max(requiredConfidence, 0.70) : requiredConfidence
+            return hasMarkers && noConflict && score >= threshold
+
+        case "be":
+            let hasMarkers = stats.beExclusive >= 1 || stats.beMarkers >= 2
+            let noConflict = stats.ruAbsentInBe == 0 || stats.beMarkers > stats.ruAbsentInBe * 2
+            return hasMarkers && noConflict && score >= requiredConfidence
+
+        case "kk":
+            let hasMarkers = stats.kkExclusive >= 2 || (stats.kkExclusive >= 1 && cyrillicLetters < 40)
+            return hasMarkers && score >= requiredConfidence
+
+        case "sr":
+            let hasMarkers = stats.srExclusive >= 1 || stats.srMarkers >= 2
+            let noConflict = stats.ruAbsentInSrMk == 0 || stats.srMarkers > stats.ruAbsentInSrMk * 2
+            return hasMarkers && noConflict && score >= requiredConfidence
+
+        case "mk":
+            let hasMarkers = stats.mkExclusive >= 1 || stats.mkMarkers >= 2
+            let noConflict = stats.ruAbsentInSrMk == 0 || stats.mkMarkers > stats.ruAbsentInSrMk * 2
+            return hasMarkers && noConflict && score >= requiredConfidence
+
+        case "mn":
+            return stats.mnMarkers >= 2 && score >= requiredConfidence
+
+        case "bg":
+            guard stats.ruAbsentInBg == 0 else { return false }
+            if fallbackAppCode == "bg" && score >= requiredConfidence {
+                return true
+            }
+            return cyrillicLetters >= 40
+                && score >= 0.80
+                && (stats.bgWordHits >= 2 || (stats.bgWordHits >= 1 && stats.bgStemHardSigns >= 1) || stats.bgStemHardSigns >= 2)
+
+        default:
+            return false
+        }
     }
 }

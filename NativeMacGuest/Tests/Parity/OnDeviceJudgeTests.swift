@@ -50,6 +50,31 @@ final class OnDeviceJudgeTests: XCTestCase {
         XCTAssertNil(source)
         XCTAssertEqual(asIs.window.lines.map(\.text), english.window.lines.map(\.text))
         XCTAssertEqual(asIs.language, "en")
+
+        // Short/colloquial Russian phrases and synthetic note markers must resolve to Russian, never bg/uk/kk.
+        for phrase in ["норм ок погнали", "дейли стендап команды разработки", "ретроспектива спринта"] {
+            let colloquial = request([("Анна", phrase, false)], language: "ru")
+            XCTAssertEqual(
+                AppleOnDevice.meetingLanguage(colloquial.window, appLanguage: "ru")?.languageCode?.identifier,
+                "ru",
+                "Expected ru for phrase: \(phrase)"
+            )
+        }
+        var withEnglishNote = request([("Анна", "норм ок погнали", false)], language: "ru")
+        withEnglishNote.window.lines.insert(
+            .init(id: "chapter-1", ref: "", source: .note, speaker: "", isYou: false,
+                  text: "[Scheduled meeting started: Weekly Sync]", at: nil, mentionsYou: false),
+            at: 0
+        )
+        XCTAssertEqual(
+            AppleOnDevice.meetingLanguage(withEnglishNote.window, appLanguage: "ru")?.languageCode?.identifier,
+            "ru"
+        )
+        let notesOnly = request([], language: "ru")
+        XCTAssertEqual(
+            AppleOnDevice.meetingLanguage(notesOnly.window, notes: "Обсудили перенос релиза на пятницу.", appLanguage: "ru")?.languageCode?.identifier,
+            "ru"
+        )
     }
 
     func testVerdictSchemaBuildsForWindowRefs() throws {

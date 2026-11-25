@@ -903,83 +903,135 @@ public struct PortableOutcomeService: PortableOutcomeWriting {
                 language: language,
                 customInstructions: customInstructions
             )
-            struct ProviderRefusalError: Error {}
-            let allowsDisableThinking = endpoint.host?.lowercased() != "api.openai.com"
-            var body = Self.requestBody(
-                messages: messages,
+            let initial = try await performOutcomeRequest(
+                endpoint: endpoint,
                 model: model,
-                provider: configuration.providerKind,
-                tokenLimit: 4_096
+                key: key,
+                messages: messages,
+                provider: configuration.providerKind
             )
-
-            for attempt in 0...2 {
-                var request = URLRequest(url: endpoint)
-                request.httpMethod = "POST"
-                request.timeoutInterval = 120
-                request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-                if let key, !key.isEmpty {
-                    request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+            let expectedLanguage = MeetingLanguageResolver.resolve(
+                events: events,
+                notes: notes,
+                title: title,
+                appLanguage: language
+            )
+            let allowedSources = [title, notes] + events.flatMap { [$0.speaker ?? "", $0.text] }
+            let initialTexts = [initial.summary] + initial.decisions + initial.tasks.map(\.text) + initial.openQuestions
+            if MeetingLanguageResolver.hasUnexpectedCyrillicLanguage(
+                in: initialTexts,
+                expectedLanguage: expectedLanguage,
+                allowedSourceTexts: allowedSources
+            ) {
+                var retryMessages = messages
+                if let index = retryMessages.firstIndex(where: { $0["role"] == "system" }) {
+                    retryMessages[index]["content"] = (retryMessages[index]["content"] ?? "") + "\n\n"
+                        + MeetingLanguageResolver.correctiveLanguageInstruction(for: expectedLanguage)
                 }
-                request.httpBody = try JSONSerialization.data(withJSONObject: body)
-
-                do {
-                    let (data, response) = try await MeetingAITransfer.send(request, using: session)
-                    guard let http = response as? HTTPURLResponse else {
-                        throw PortableOutcomeError.invalidResponse
+                if let retried = try? await performOutcomeRequest(
+                    endpoint: endpoint,
+                    model: model,
+                    key: key,
+                    messages: retryMessages,
+                    provider: configuration.providerKind
+                ) {
+                    let retriedTexts = [retried.summary] + retried.decisions + retried.tasks.map(\.text) + retried.openQuestions
+                    if !MeetingLanguageResolver.hasUnexpectedCyrillicLanguage(
+                        in: retriedTexts,
+                        expectedLanguage: expectedLanguage,
+                        allowedSourceTexts: allowedSources
+                    ) {
+                        return retried
                     }
-                    guard (200..<300).contains(http.statusCode) else {
-                        throw Self.httpError(status: http.statusCode, data: data)
-                    }
-                    guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                          let choices = root["choices"] as? [[String: Any]],
-                          let first = choices.first,
-                          let message = first["message"] as? [String: Any] else {
-                        throw PortableOutcomeError.invalidResponse
-                    }
-                    if let refusal = message["refusal"] as? String,
-                       !refusal.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        throw ProviderRefusalError()
-                    }
-                    let finishReason = first["finish_reason"] as? String ?? ""
-                    let extracted = OpenAIChatResponseExtractor.extractContent(
-                        from: message,
-                        finishReason: finishReason,
-                        allowTrailingReasoningJSON: attempt > 0
-                    )
-                    guard !extracted.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                        throw PortableOutcomeError.invalidResponse
-                    }
-                    return try PortableOutcomePrompt.parse(extracted.text)
-                } catch is ProviderRefusalError {
-                    throw PortableOutcomeError.invalidResponse
-                } catch PortableOutcomeError.invalidResponse {
-                    if attempt == 0 {
-                        body.removeValue(forKey: "response_format")
-                        continue
-                    }
-                    if attempt == 1 && allowsDisableThinking {
-                        body.removeValue(forKey: "response_format")
-                        body["chat_template_kwargs"] = ["enable_thinking": false]
-                        continue
-                    }
-                    throw PortableOutcomeError.invalidResponse
-                } catch let error as PortableOutcomeError {
-                    if attempt == 0,
-                       case .http(status: let status, code: let code, parameter: let param) = error,
-                       Self.shouldRetryWithoutStructuredFormat(status: status, code: code, parameter: param) {
-                        Self.adjustFallbackParameters(&body, rejectedParameter: param, tokenLimit: 4_096)
-                        continue
-                    }
-                    if attempt == 2,
-                       case .http(status: let status, code: _, parameter: _) = error,
-                       status == 400 || status == 422 {
-                        throw PortableOutcomeError.invalidResponse
-                    }
-                    throw error
                 }
             }
-            throw PortableOutcomeError.invalidResponse
+            return initial
         }
+    }
+
+    private func performOutcomeRequest(
+        endpoint: URL,
+        model: String,
+        key: String?,
+        messages: [[String: String]],
+        provider: PortableOutcomeProviderKind
+    ) async throws -> PortableOutcomeResult {
+        struct ProviderRefusalError: Error {}
+        let allowsDisableThinking = endpoint.host?.lowercased() != "api.openai.com"
+        var body = Self.requestBody(
+            messages: messages,
+            model: model,
+            provider: provider,
+            tokenLimit: 4_096
+        )
+
+        for attempt in 0...2 {
+            var request = URLRequest(url: endpoint)
+            request.httpMethod = "POST"
+            request.timeoutInterval = 120
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            if let key, !key.isEmpty {
+                request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+            }
+            request.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+            do {
+                let (data, response) = try await MeetingAITransfer.send(request, using: session)
+                guard let http = response as? HTTPURLResponse else {
+                    throw PortableOutcomeError.invalidResponse
+                }
+                guard (200..<300).contains(http.statusCode) else {
+                    throw Self.httpError(status: http.statusCode, data: data)
+                }
+                guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let choices = root["choices"] as? [[String: Any]],
+                      let first = choices.first,
+                      let message = first["message"] as? [String: Any] else {
+                    throw PortableOutcomeError.invalidResponse
+                }
+                if let refusal = message["refusal"] as? String,
+                   !refusal.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    throw ProviderRefusalError()
+                }
+                let finishReason = first["finish_reason"] as? String ?? ""
+                let extracted = OpenAIChatResponseExtractor.extractContent(
+                    from: message,
+                    finishReason: finishReason,
+                    allowTrailingReasoningJSON: attempt > 0
+                )
+                guard !extracted.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    throw PortableOutcomeError.invalidResponse
+                }
+                return try PortableOutcomePrompt.parse(extracted.text)
+            } catch is ProviderRefusalError {
+                throw PortableOutcomeError.invalidResponse
+            } catch PortableOutcomeError.invalidResponse {
+                if attempt == 0 {
+                    body.removeValue(forKey: "response_format")
+                    continue
+                }
+                if attempt == 1 && allowsDisableThinking {
+                    body.removeValue(forKey: "response_format")
+                    body["chat_template_kwargs"] = ["enable_thinking": false]
+                    continue
+                }
+                throw PortableOutcomeError.invalidResponse
+            } catch let error as PortableOutcomeError {
+                if attempt == 0,
+                   case .http(status: let status, code: let code, parameter: let param) = error,
+                   Self.shouldRetryWithoutStructuredFormat(status: status, code: code, parameter: param) {
+                    Self.adjustFallbackParameters(&body, rejectedParameter: param, tokenLimit: 4_096)
+                    continue
+                }
+                if attempt == 2,
+                   case .http(status: let status, code: _, parameter: _) = error,
+                   status == 400 || status == 422 {
+                    throw PortableOutcomeError.invalidResponse
+                }
+                throw error
+            }
+        }
+        throw PortableOutcomeError.invalidResponse
     }
 
     public static func shouldRetryWithoutStructuredFormat(

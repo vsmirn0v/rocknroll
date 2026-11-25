@@ -339,6 +339,126 @@ final class PortableOutcomeProviderTests: XCTestCase {
             "ja"
         )
     }
+
+    func testCyrillicDisambiguationAndOutputLanguageValidation() async throws {
+        let base = Date(timeIntervalSince1970: 1_795_000_000)
+        func ev(_ id: String, kind: String = "transcript", speaker: String = "Анна", text: String) -> SyncedTranscriptEvent {
+            SyncedTranscriptEvent(id: id, kind: kind, occurredAt: base, speaker: speaker, isOwn: false, text: text, deviceID: "mac-1")
+        }
+
+        // Colloquial and IT Russian phrases that raw NLLanguageRecognizer misclassifies as bg/uk/kk.
+        let russianSamples: [(title: String, lines: [String])] = [
+            ("Sync", ["норм ок погнали"]),
+            ("Standup", ["угу да", "ага ок", "ну норм", "понял ок"]),
+            ("Call", ["алло привет", "норм ок погнали"]),
+            ("Дейли стендап команды разработки", ["окей начнем"]),
+            ("Ретроспектива спринта", ["пройдемся по итогам"]),
+            ("Sync", ["лид аппрувнул дизайн ревью"]),
+            ("Sync", ["дейли стендап команды разработки"]),
+            ("Sync", ["ретроспектива спринта"])
+        ]
+        for appLang in ["ru", "en"] {
+            for sample in russianSamples {
+                let events = sample.lines.enumerated().map { ev("r-\($0.offset)", text: $0.element) }
+                XCTAssertEqual(
+                    MeetingLanguageResolver.resolve(events: events, notes: "", title: sample.title, appLanguage: appLang),
+                    "ru",
+                    "Expected ru for title='\(sample.title)' lines=\(sample.lines) appLanguage=\(appLang)"
+                )
+            }
+        }
+
+        // Genuine non-Russian Cyrillic languages must still be detected accurately even when appLanguage == "ru".
+        XCTAssertEqual(
+            MeetingLanguageResolver.resolve(
+                events: [ev("uk-1", text: "Привіт! Давайте обговоримо план релізу на наступний тиждень, які є питання?")],
+                title: "Синк",
+                appLanguage: "ru"
+            ),
+            "uk"
+        )
+        XCTAssertEqual(
+            MeetingLanguageResolver.resolve(
+                events: [ev("bg-1", text: "Здравейте, трябва да обсъдим плана за следващата седмица и кои задачи ще завършим.")],
+                title: "Среща",
+                appLanguage: "ru"
+            ),
+            "bg"
+        )
+        XCTAssertEqual(
+            MeetingLanguageResolver.resolve(
+                events: [ev("kk-1", text: "Сәлем! Келесі аптадағы релиз жоспарын талқылайық, қандай сұрақтар бар?")],
+                title: "Кездесу",
+                appLanguage: "ru"
+            ),
+            "kk"
+        )
+        XCTAssertEqual(
+            MeetingLanguageResolver.resolve(
+                events: [ev("sr-1", text: "Здраво свима, хајде да прођемо кроз план за следећу недељу и отворена питања.")],
+                title: "Састанак",
+                appLanguage: "ru"
+            ),
+            "sr"
+        )
+
+        let ruDirective = Localization.outputLanguageDirective(for: "ru")
+        XCTAssertTrue(ruDirective.contains("Russian (русский)"))
+        XCTAssertTrue(ruDirective.contains("Ukrainian, Bulgarian"))
+
+        // Output validation catches Bulgarian / Ukrainian summaries for Russian meetings.
+        XCTAssertTrue(MeetingLanguageResolver.hasUnexpectedCyrillicLanguage(
+            in: ["Обсъдихме плана за следващата седмица и кои задачи ще завършим."],
+            expectedLanguage: "ru",
+            allowedSourceTexts: ["Давайте обсудим план на следующую неделю."]
+        ))
+        XCTAssertTrue(MeetingLanguageResolver.hasUnexpectedCyrillicLanguage(
+            in: ["Обговорили план релізу на наступний тиждень та визначили відповідальних."],
+            expectedLanguage: "ru",
+            allowedSourceTexts: ["Обсудили план релиза на следующую неделю."]
+        ))
+        XCTAssertTrue(MeetingLanguageResolver.hasUnexpectedCyrillicLanguage(
+            in: ["Обсъдихме статуса на Вымпел и трябва да завършим проекта."],
+            expectedLanguage: "ru",
+            allowedSourceTexts: ["Давайте обсудим статус Вымпел и завершим проект."]
+        ))
+        // Verbatim participant names from source transcript must not trigger a false positive.
+        XCTAssertFalse(MeetingLanguageResolver.hasUnexpectedCyrillicLanguage(
+            in: ["Олексій и Қайрат подтвердили готовность релиза к пятнице."],
+            expectedLanguage: "ru",
+            allowedSourceTexts: ["Олексій", "Қайрат", "Мы подтверждаем готовность релиза к пятнице."]
+        ))
+
+        // PortableOutcomeService retries once with corrective instruction when Attempt 0 returns Bulgarian.
+        let config = PortableOutcomeConfiguration(
+            providerKind: .custom,
+            baseURL: "https://litellm.example.test/v1",
+            model: "cowork-pro"
+        )
+        let sessionConfig = URLSessionConfiguration.ephemeral
+        sessionConfig.protocolClasses = [OutcomeStubProtocol.self]
+        let session = URLSession(configuration: sessionConfig)
+        defer { session.invalidateAndCancel() }
+        var retryBodies: [[String: Any]] = []
+        OutcomeStubProtocol.handler = { request in
+            if let parsed = try JSONSerialization.jsonObject(with: OutcomeStubProtocol.body(request)) as? [String: Any] {
+                retryBodies.append(parsed)
+            }
+            if retryBodies.count == 1 {
+                return (200, Data(#"{"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"{\"summary\":\"Обсъдихме плана за следващата седмица и кои задачи ще завършим.\",\"decisions\":[],\"tasks\":[],\"open_questions\":[]}"}}]}"#.utf8))
+            }
+            return (200, Data(#"{"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"{\"summary\":\"Обсудили план на следующую неделю и распределили задачи.\",\"decisions\":[],\"tasks\":[],\"open_questions\":[]}"}}]}"#.utf8))
+        }
+        let service = PortableOutcomeService(session: session, apiKeyProvider: { _ in "test-key" })
+        let ruEvents = [ev("ru-sync", text: "Давайте обсудим план на следующую неделю и распределим задачи.")]
+        let corrected = try await service.generateOutcome(
+            title: "Синк", endedAt: base, events: ruEvents, notes: "", language: "ru", configuration: config
+        )
+        XCTAssertEqual(retryBodies.count, 2)
+        let retrySystem = ((retryBodies[1]["messages"] as? [[String: String]])?.first?["content"]) ?? ""
+        XCTAssertTrue(retrySystem.contains("CRITICAL CORRECTION"))
+        XCTAssertEqual(corrected.summary, "Обсудили план на следующую неделю и распределили задачи.")
+    }
 }
 
 private final class OutcomeStubProtocol: URLProtocol {

@@ -185,33 +185,42 @@ enum MeetingOutcomePrompt {
                       onDevice: onDevice, contextTokens: contextTokens)
     }
 
-    static func messages(_ request: MeetingOutcomeRequest) -> [[String: String]] {
-        let clock = ISO8601DateFormatter()
+    static func resolvedLanguageCode(for request: MeetingOutcomeRequest) -> String {
+        if request.lockLanguage == true {
+            return Localization.normalizedLanguageCode(request.language)
+        }
         var speechTexts: [String] = []
         var chatTexts: [String] = []
+        for line in request.window.lines where line.source != .note {
+            let isAssistant = line.id.hasPrefix("assistant:") || line.id.hasPrefix("transcript:assistant:")
+                || AssistantSpeechLedger.isAssistantSpeaker(line.speaker, role: nil)
+            guard !isAssistant else { continue }
+            if line.source == .chat { chatTexts.append(line.text) }
+            else { speechTexts.append(line.text) }
+        }
+        let cleanNotes = request.notes?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return MeetingLanguageResolver.resolve(
+            speechTexts: speechTexts,
+            chatTexts: chatTexts,
+            notes: cleanNotes,
+            title: request.meetingTitle,
+            appLanguage: request.language
+        )
+    }
+
+    static func messages(_ request: MeetingOutcomeRequest) -> [[String: String]] {
+        let clock = ISO8601DateFormatter()
         let lines = request.window.lines.map { line -> String in
             if line.source == .note { return line.text }
             let time = line.at.map(clock.string(from:)) ?? ""
             let isAssistant = line.id.hasPrefix("assistant:") || line.id.hasPrefix("transcript:assistant:")
                 || AssistantSpeechLedger.isAssistantSpeaker(line.speaker, role: nil)
-            if !isAssistant {
-                if line.source == .chat { chatTexts.append(line.text) }
-                else { speechTexts.append(line.text) }
-            }
             let roleTag = isAssistant ? " [assistant]" : (line.isYou ? " (the user)" : "")
             return "[\(line.ref)] \(time) \(line.speaker)\(roleTag)\(line.source == .chat ? " [chat]" : ""): \(line.text)"
         }.joined(separator: "\n")
 
         let cleanNotes = request.notes?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let effectiveLangCode = (request.lockLanguage == true)
-            ? Localization.normalizedLanguageCode(request.language)
-            : MeetingLanguageResolver.resolve(
-                speechTexts: speechTexts,
-                chatTexts: chatTexts,
-                notes: cleanNotes,
-                title: request.meetingTitle,
-                appLanguage: request.language
-            )
+        let effectiveLangCode = resolvedLanguageCode(for: request)
         let langLabel = Localization.languageLabel(for: effectiveLangCode)
         let langDirective = Localization.outputLanguageDirective(for: effectiveLangCode)
 

@@ -169,11 +169,30 @@ enum AppleOnDevice {
     }
 
     /// The language most of the meeting's lines are in, when one is clear.
-    static func meetingLanguage(_ window: AttentionWindow) -> Locale.Language? {
-        let recognizer = NLLanguageRecognizer()
-        recognizer.processString(window.lines.map(\.text).joined(separator: "\n"))
-        guard let dominant = recognizer.dominantLanguage, dominant != .undetermined else { return nil }
-        return Locale.Language(identifier: dominant.rawValue)
+    static func meetingLanguage(_ window: AttentionWindow, notes: String = "", appLanguage: String = "en") -> Locale.Language? {
+        let speechTexts = window.lines.compactMap { line -> String? in
+            guard line.source == .speech,
+                  !line.id.hasPrefix("assistant:"),
+                  !line.id.hasPrefix("transcript:assistant:"),
+                  !AssistantSpeechLedger.isAssistantSpeaker(line.speaker, role: nil) else { return nil }
+            return line.text
+        }
+        let chatTexts = window.lines.compactMap { line -> String? in
+            guard line.source == .chat,
+                  !line.id.hasPrefix("assistant:"),
+                  !AssistantSpeechLedger.isAssistantSpeaker(line.speaker, role: nil) else { return nil }
+            return line.text
+        }
+        let cleanNotes = notes.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !speechTexts.isEmpty || !chatTexts.isEmpty || !cleanNotes.isEmpty else { return nil }
+        let code = MeetingLanguageResolver.resolve(
+            speechTexts: speechTexts,
+            chatTexts: chatTexts,
+            notes: cleanNotes,
+            title: window.meetingTitle,
+            appLanguage: appLanguage
+        )
+        return Locale.Language(identifier: code)
     }
 
     /// The request as the model reads it: in English when the model does not know the
@@ -181,9 +200,9 @@ enum AppleOnDevice {
     /// language when it was translated. When translation fails (the system service can
     /// return internal errors), the model reads the meeting as is in its own language:
     /// weaker on Russian (25/31 vs 29/31 on the bench) but still a verdict.
-    static func englishRequest(_ request: JudgeRequest) async throws -> (JudgeRequest, Locale.Language?) {
+    static func englishRequest(_ request: JudgeRequest, notes: String = "") async throws -> (JudgeRequest, Locale.Language?) {
         var out = request
-        guard let source = meetingLanguage(request.window) else {
+        guard let source = meetingLanguage(request.window, notes: notes, appLanguage: request.language) else {
             out.language = "en"
             return (out, nil)
         }
@@ -280,8 +299,10 @@ enum AppleOnDevice {
     static func outcome(_ request: MeetingOutcomeRequest) async throws -> MeetingOutcomeContent {
         try checkModel()
         var translated = request
-        let (english, source) = try await englishRequest(JudgeRequest(window: request.window, profile: AttentionProfile(),
-            yourName: "", language: request.language))
+        let (english, source) = try await englishRequest(
+            JudgeRequest(window: request.window, profile: AttentionProfile(), yourName: "", language: request.language),
+            notes: request.notes ?? ""
+        )
         translated.window = english.window; translated.language = english.language; translated.lockLanguage = (source != nil)
         if let source, let notes = request.notes?.trimmed, !notes.isEmpty {
             translated.notes = (try? await OnDeviceTranslator.shared.translate([notes], from: source, to: Self.english, cache: false))?[notes] ?? notes
