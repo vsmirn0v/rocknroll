@@ -1,5 +1,6 @@
 import AppKit
 import ConferenceCore
+import MeetingEngine
 import SwiftUI
 
 enum NativeDesktopHomePresentation {
@@ -57,6 +58,7 @@ struct NativeDesktopHomeView: View {
     @State private var createRoomOrigin: URL?
     @State private var signInSheetOrigin: IdentifiableSiteOrigin?
     @State private var retryAfterSignIn: (url: URL, title: String?)?
+    @State private var retryInstantOriginAfterSignIn: URL?
     @FocusState private var editingName: Bool
     #if NATIVE_DIRECT_UPDATES
     @FocusState private var homeHeadingFocused: Bool
@@ -69,11 +71,7 @@ struct NativeDesktopHomeView: View {
         showingCreateRoom || signInSheetOrigin != nil
     }
     private var suggestedSiteOrigins: [URL] {
-        SiteOrigin.suggestedOrigins(
-            rooms: library.history.rooms,
-            calendarMeetings: library.calendar.meetings,
-            fallbackOrigin: library.guestWebsiteOrigin
-        )
+        workspace.suggestedSiteOrigins
     }
     /// Discoveries apply immediately; only rows under the pointer or behind an
     /// open editor are held, so a card cannot move as it is clicked.
@@ -296,25 +294,38 @@ struct NativeDesktopHomeView: View {
                 defaultDisplayName: library.displayName,
                 onJoinCreatedRoom: { created, saveFavorite in
                     showingCreateRoom = false
-                    workspace.joinCreatedRoom(created, saveFavorite: saveFavorite)
+                    workspace.joinCreatedRoom(created, saveFavorite: saveFavorite, invitationAlreadyCopied: true)
                 },
                 onSaveFavoriteOnly: { created in
                     workspace.saveCreatedRoomFavorite(created)
                 }
             )
         }
-        .sheet(item: $signInSheetOrigin, onDismiss: { retryAfterSignIn = nil }) { target in
+        .sheet(item: $signInSheetOrigin, onDismiss: {
+            retryAfterSignIn = nil
+            retryInstantOriginAfterSignIn = nil
+        }) { target in
             SiteSignInSheet(
                 initialOrigin: target.url,
                 suggestedOrigins: suggestedSiteOrigins
             ) { _ in
                 let retry = retryAfterSignIn
+                let instantOrigin = retryInstantOriginAfterSignIn
                 retryAfterSignIn = nil
+                retryInstantOriginAfterSignIn = nil
                 signInSheetOrigin = nil
                 if let retry {
                     workspace.join(retry.url, title: retry.title)
+                } else if let instantOrigin {
+                    Task { await workspace.startInstantRoom(on: instantOrigin) }
                 }
             }
+        }
+        .onChange(of: workspace.showCreateRoomSheetRequested) { requested in
+            guard requested else { return }
+            workspace.showCreateRoomSheetRequested = false
+            createRoomOrigin = workspace.preferredInstantOrigin
+            showingCreateRoom = true
         }
         .alert(alertTitle, isPresented: alertShown) {
             if workspace.error != nil, let challenge = workspace.pendingAuthChallenge {
@@ -377,8 +388,10 @@ struct NativeDesktopHomeView: View {
                 Button { workspace.toggleWindow(meeting) } label: { Label(L("Open in New Window"), systemImage: "macwindow.on.rectangle") }
                     .help(L("Open in New Window"))
             } else if workspace.selectedMeeting == nil {
-                Button { createRoomOrigin = nil; showingCreateRoom = true } label: { Label(L("New room…"), systemImage: "plus.bubble") }
-                    .help(L("Create a new meeting room"))
+                NativeDesktopInstantToolbarControl(workspace: workspace) { origin in
+                    createRoomOrigin = origin
+                    showingCreateRoom = true
+                }
                 Button { showMultiJoinSheet = true } label: { Label(L("Join with Rock…"), systemImage: "sparkles") }
                     .help(L("Join one or more meetings with an Obsidian skill"))
                 Button { addingFavorite = true } label: { Label(L("Add favorite"), systemImage: "plus") }
@@ -453,7 +466,7 @@ struct NativeDesktopHomeView: View {
                 if homeSnapshot.hasUpdates {
                     Button(L("Show updated meetings")) { homeSnapshot.acceptUpdates() }.font(.callout)
                 }
-                joinForm
+                homeCommandSurface
                 if showsFirstLibraryGuidance { firstLibraryGuidance }
                 if let warning = library.persistenceWarning {
                     HStack { Label(warning, systemImage: "exclamationmark.triangle"); Spacer(); Button(L("Retry")) { library.retryPersistence() } }.font(.callout).foregroundStyle(.orange)
@@ -514,6 +527,45 @@ struct NativeDesktopHomeView: View {
             }.font(.callout).frame(maxWidth: .infinity, alignment: .leading)
         }.padding(18).background(.quaternary.opacity(0.2), in: RoundedRectangle(cornerRadius: 16))
     }
+    private var homeCommandSurface: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(alignment: .top, spacing: 16) {
+                NativeDesktopInstantMeetingCard(
+                    workspace: workspace,
+                    onOpenOptions: { origin in
+                        createRoomOrigin = origin
+                        showingCreateRoom = true
+                    },
+                    onSignIn: { origin in
+                        retryInstantOriginAfterSignIn = origin
+                        signInSheetOrigin = IdentifiableSiteOrigin(origin)
+                    }
+                )
+                .frame(minWidth: 340, maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+
+                joinForm
+                    .frame(minWidth: 340, maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            }
+            .fixedSize(horizontal: false, vertical: true)
+
+            VStack(alignment: .leading, spacing: 16) {
+                NativeDesktopInstantMeetingCard(
+                    workspace: workspace,
+                    onOpenOptions: { origin in
+                        createRoomOrigin = origin
+                        showingCreateRoom = true
+                    },
+                    onSignIn: { origin in
+                        retryInstantOriginAfterSignIn = origin
+                        signInSheetOrigin = IdentifiableSiteOrigin(origin)
+                    }
+                )
+
+                joinForm
+            }
+        }
+    }
+
     private var joinForm: some View {
         VStack(alignment: .leading, spacing: 14) {
             Text(L("Join a meeting")).font(.headline)
@@ -538,8 +590,6 @@ struct NativeDesktopHomeView: View {
                 Image(systemName: "person.crop.circle").foregroundStyle(.secondary)
                 TextField(L("Your name"), text: $library.displayName).focused($editingName).textFieldStyle(.plain).frame(maxWidth: 280).accessibilityIdentifier("nativeGuest.displayName")
                 Spacer()
-                Button { createRoomOrigin = nil; showingCreateRoom = true } label: { Label(L("New room…"), systemImage: "plus.bubble") }
-                    .accessibilityIdentifier("nativeGuest.createRoom")
                 Button { workspace.settingsTab = 3; workspace.selection = .settings } label: { Label(L("Camera & sound"), systemImage: "slider.horizontal.3") }
             }
             if let challenge = workspace.pendingAuthChallenge {
@@ -561,7 +611,7 @@ struct NativeDesktopHomeView: View {
             if let destination = try? library.normalizedDestination(workspace.invitation) {
                 AssistantLastOutcome(assistant: workspace.attention.store.assistant, invitation: destination.invitationURL, before: Date())
             }
-        }.padding(18).background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 16))
+        }.padding(18).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading).background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 16))
     }
     private func sectionTitle(_ title: String, action: @escaping () -> Void) -> some View {
         HStack { Text(title).font(.title3.bold()); Spacer(); Button(L("See all"), action: action) }

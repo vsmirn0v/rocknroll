@@ -342,6 +342,7 @@ struct NativeDesktopMeetingView: View {
                 VStack(spacing: 0) {
                     // In the main window the toolbar holds the title, status and meeting buttons.
                     if !model.controlsHidden && !textSelection.isOpen && !embedded && chromeShown { header.padding(.horizontal, 18).padding(.top, 10) }
+                    if !textSelection.isOpen { NativeDesktopCopiedLinkToast(model: model).padding(.top, 8).padding(.trailing, reserved) }
                     if let workspace, !textSelection.isOpen { NativeDesktopListeningBanner(workspace: workspace, model: model).padding(.top, 8).padding(.trailing, reserved) }
                     if let workspace, !textSelection.isOpen { NativeDesktopSameRoomTransitionBanner(workspace: workspace, model: model).padding(.top, 8).padding(.trailing, reserved) }
                     if !textSelection.isOpen { NativeDesktopLocalFallbackBanner(model: model).padding(.top, 8).padding(.trailing, reserved) }
@@ -638,7 +639,7 @@ struct NativeDesktopMeetingView: View {
             Button(L("Play test voice reply")) { model.playTestVoiceReply() }.disabled(model.voiceReplyActive)
         }
         Button(L("Reconnect")) { model.reconnect() }
-        Button(L("Copy invitation")) { NSPasteboard.general.clearContents(); NSPasteboard.general.setString(model.invitation.absoluteString, forType: .string) }
+        Button(L("Copy invitation")) { model.copyInvitationLink() }
         Divider()
         Button(L("Hide controls")) { model.controlsHidden = true }
         if model.showsFocus { Button(model.immersive ? L("Leave immersive view") : L("Immersive view")) { model.immersive.toggle() } }
@@ -788,10 +789,15 @@ struct NativeDesktopMeetingView: View {
             }
         } else {
             VStack(spacing: 16) {
-                if let camera = model.localCamera { NativeDesktopVideoView(track: camera, mirrored: true) }
-                else { Image(systemName: "person.2").font(.system(size: 48)).foregroundStyle(.secondary) }
-                Text(model.connected ? L("You’re connected. Waiting for others.") : L("Connecting…")).font(.title3)
+                if let camera = model.localCamera {
+                    NativeDesktopVideoView(track: camera, mirrored: true)
+                    NativeDesktopWaitingInviteCard(model: model, compact: true)
+                } else {
+                    Image(systemName: "person.2").font(.system(size: 48)).foregroundStyle(.secondary)
+                    NativeDesktopWaitingInviteCard(model: model, compact: false)
+                }
             }
+            .padding(.horizontal, 24)
         }
     }
     private struct VideoTileLookupKey: Hashable {

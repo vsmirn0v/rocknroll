@@ -4251,3 +4251,10 @@
 "Choose meeting website" = "मीटिंग वेबसाइट चुनें";
 "Invitation link copied" = "निमंत्रण लिंक कॉपी हो गया";
 "Link copied · Ready to paste" = "लिंक कॉपी किया गया · पेस्ट करने के लिए तैयार";
+
+"Instant meeting · %@" = "तुरंत मीटिंग · %@";
+"Share…" = "शेयर करें…";
+"QR code" = "QR कोड";
+"Scan on iPhone to share link" = "लिंक शेयर करने के लिए iPhone पर स्कैन करें";
+"Press ⌘V to paste" = "पेस्ट करने के लिए ⌘V दबाएँ";
+"Share the invitation link so others can join this room." = "निमंत्रण लिंक शेयर करें ताकि अन्य लोग इस रूम में शामिल हो सकें।";

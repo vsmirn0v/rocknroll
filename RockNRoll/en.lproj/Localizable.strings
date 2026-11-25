@@ -4479,3 +4479,10 @@
 "Choose meeting website" = "Choose meeting website";
 "Invitation link copied" = "Invitation link copied";
 "Link copied · Ready to paste" = "Link copied · Ready to paste";
+
+"Instant meeting · %@" = "Instant meeting · %@";
+"Share…" = "Share…";
+"QR code" = "QR code";
+"Scan on iPhone to share link" = "Scan on iPhone to share link";
+"Press ⌘V to paste" = "Press ⌘V to paste";
+"Share the invitation link so others can join this room." = "Share the invitation link so others can join this room.";

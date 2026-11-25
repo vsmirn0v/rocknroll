@@ -4478,3 +4478,10 @@
 "Choose meeting website" = "Выбрать сайт для встречи";
 "Invitation link copied" = "Ссылка на встречу скопирована";
 "Link copied · Ready to paste" = "Ссылка скопирована · Можно вставлять";
+
+"Instant meeting · %@" = "Быстрая встреча · %@";
+"Share…" = "Поделиться…";
+"QR code" = "QR-код";
+"Scan on iPhone to share link" = "Отсканируйте на iPhone, чтобы поделиться ссылкой";
+"Press ⌘V to paste" = "Нажмите ⌘V, чтобы вставить";
+"Share the invitation link so others can join this room." = "Поделитесь ссылкой-приглашением, чтобы другие могли присоединиться к этой комнате.";

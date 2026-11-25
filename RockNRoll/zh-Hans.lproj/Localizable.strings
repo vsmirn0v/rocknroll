@@ -4251,3 +4251,10 @@
 "Choose meeting website" = "选择会议网站";
 "Invitation link copied" = "邀请链接已复制";
 "Link copied · Ready to paste" = "链接已复制 · 可直接粘贴";
+
+"Instant meeting · %@" = "快速会议 · %@";
+"Share…" = "共享…";
+"QR code" = "二维码";
+"Scan on iPhone to share link" = "在 iPhone 上扫描以共享链接";
+"Press ⌘V to paste" = "按 ⌘V 粘贴";
+"Share the invitation link so others can join this room." = "共享邀请链接，以便其他人加入此房间。";

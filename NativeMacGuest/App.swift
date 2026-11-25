@@ -192,6 +192,12 @@ struct NativeGuestApplication {
         let fileMenu = NSMenu(title: L("File")), fileItem = NSMenuItem()
         let show = NSMenuItem(title: L("Open Rock'N'Roll for Mac"), action: #selector(openHome), keyEquivalent: "n")
         show.target = self; fileMenu.addItem(show)
+        let instantRoom = NSMenuItem(title: L("Instant meeting"), action: #selector(startInstantMeeting), keyEquivalent: "n")
+        instantRoom.keyEquivalentModifierMask = [.command, .shift]
+        instantRoom.target = self; fileMenu.addItem(instantRoom)
+        let newRoomOptions = NSMenuItem(title: L("New room with options…"), action: #selector(openNewRoomOptions), keyEquivalent: "n")
+        newRoomOptions.keyEquivalentModifierMask = [.command, .option]
+        newRoomOptions.target = self; fileMenu.addItem(newRoomOptions)
         let joinRoom = NSMenuItem(title: L("Join Meeting…"), action: #selector(focusHomeForJoin), keyEquivalent: "j")
         joinRoom.target = self; fileMenu.addItem(joinRoom)
         fileMenu.addItem(.separator())
@@ -226,6 +232,9 @@ struct NativeGuestApplication {
         let assistantItem = NSMenuItem(title: L("Ask Assistant"), action: #selector(focusAssistantView), keyEquivalent: "a")
         assistantItem.keyEquivalentModifierMask = [.command, .shift]
         assistantItem.target = self; meetingMenu.addItem(assistantItem)
+        let copyInviteItem = NSMenuItem(title: L("Copy Invitation Link"), action: #selector(copyActiveInvitationLink), keyEquivalent: "c")
+        copyInviteItem.keyEquivalentModifierMask = [.command, .shift]
+        copyInviteItem.target = self; meetingMenu.addItem(copyInviteItem)
         meetingMenu.addItem(.separator())
         let pause = NSMenuItem(title: L("Pause All Assistant Participation"), action: #selector(pauseAllParticipation), keyEquivalent: "")
         pause.target = self; meetingMenu.addItem(pause)
@@ -456,6 +465,19 @@ struct NativeGuestApplication {
     @objc private func checkForUpdates() { updates?.check() }
     #endif
     @objc private func openHome() { showJoin() }
+    @objc private func startInstantMeeting() {
+        guard launched else { return }
+        ensureWorkspace()
+        workspace?.startInstantRoomFromMenu()
+    }
+    @objc private func openNewRoomOptions() {
+        guard launched else { return }
+        ensureWorkspace()
+        workspace?.openCreateRoomOptionsFromMenu()
+    }
+    @objc private func copyActiveInvitationLink() {
+        workspace?.copyActiveInvitationFromMenu()
+    }
     @objc private func focusHomeForJoin() {
         showJoin()
         workspace?.show(section: .home)

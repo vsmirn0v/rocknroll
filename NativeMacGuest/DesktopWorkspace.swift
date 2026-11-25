@@ -101,6 +101,7 @@ import UserNotifications
     @Published var showCreateRoomSheetRequested = false
 
     var instantRoomPreferencesDefaults: UserDefaults = .standard
+    var instantRoomAccountsProvider: @MainActor () -> [SiteAccountRecord] = { SiteAccountStore.shared.accounts }
     var createInstantRoomHandler: (@MainActor (URL, MeetingEngineKind?) async throws -> CreatedMeetingRoom)?
     var copyInvitationToClipboard: (@MainActor (String) -> Void) = { text in
         NSPasteboard.general.clearContents()
@@ -614,7 +615,8 @@ import UserNotifications
 
     func join(_ url: URL, engine known: MeetingEngineKind? = nil, title: String? = nil, eventID: String? = nil,
               quiet: Bool = false, scheduled: NativeDesktopScheduledJoin? = nil, nameOverride: String? = nil,
-              workspaceID: UUID? = nil, historyRejoinID: UUID? = nil, startNewHistory: Bool = false) {
+              workspaceID: UUID? = nil, historyRejoinID: UUID? = nil, startNewHistory: Bool = false,
+              invitationCopiedOnJoin: Bool = false) {
         guard mayAdmitMeeting() else {
             scheduled?.finish(); error = meetingAdmissionError() ?? L("An update is being installed. Please try again after Rock'N'Roll for Mac restarts."); return
         }
@@ -626,7 +628,8 @@ import UserNotifications
             // right after that step, without waiting for the other to connect.
             queuedJoin = { [weak self] in
                 self?.join(url, engine: known, title: title, eventID: eventID, quiet: quiet, nameOverride: nameOverride,
-                           workspaceID: workspaceID, historyRejoinID: historyRejoinID, startNewHistory: startNewHistory)
+                           workspaceID: workspaceID, historyRejoinID: historyRejoinID, startNewHistory: startNewHistory,
+                           invitationCopiedOnJoin: invitationCopiedOnJoin)
             }
             return
         }
@@ -727,6 +730,7 @@ import UserNotifications
                 earlierRecord = prior
                 let initialTitle = prior?.title ?? (explicitTitle?.isEmpty == false ? explicitTitle : nil) ?? calendarMeeting?.title
                 let model = makeMeeting(destination, name, initialTitle, quiet)
+                model.invitationCopiedOnJoin = invitationCopiedOnJoin
                 if startNewHistory { model.ignoreCalendarOccurrencesStartingOnOrBefore = nowAtJoin }
                 ownedModel = model; joinModels[joinID] = ObjectIdentifier(model)
                 model.resolvedEndpoint = detectedEndpoint
@@ -849,16 +853,149 @@ import UserNotifications
         )
     }
 
-    func joinCreatedRoom(_ created: CreatedMeetingRoom, saveFavorite: Bool) {
+    func joinCreatedRoom(_ created: CreatedMeetingRoom, saveFavorite: Bool, invitationAlreadyCopied: Bool = false) {
         if saveFavorite {
             saveCreatedRoomFavorite(created)
         }
         let cleanTitle = created.title.trimmingCharacters(in: .whitespacesAndNewlines)
         let roomTitle = cleanTitle.isEmpty ? nil : cleanTitle
         pendingAuthChallenge = nil
+        instantRoomError = nil
+        instantRoomAuthChallengeOrigin = nil
+        selectInstantOrigin(created.origin)
         invitation = created.invitationURL.absoluteString
         selection = .home
-        join(created.invitationURL, engine: created.engine, title: roomTitle)
+        join(created.invitationURL, engine: created.engine, title: roomTitle, invitationCopiedOnJoin: invitationAlreadyCopied)
+    }
+
+    var suggestedSiteOrigins: [URL] {
+        SiteOrigin.suggestedOrigins(
+            rooms: library.history.rooms,
+            calendarMeetings: library.calendar.meetings,
+            fallbackOrigin: library.guestWebsiteOrigin
+        )
+    }
+
+    var instantAvailableOrigins: [URL] {
+        InstantRoomPreferences.availableOrigins(
+            accounts: instantRoomAccountsProvider(),
+            suggestedOrigins: suggestedSiteOrigins,
+            lastOrigin: instantRoomPreferredOrigin ?? InstantRoomPreferences.loadLastOrigin(defaults: instantRoomPreferencesDefaults)
+        )
+    }
+
+    var preferredInstantOrigin: URL? {
+        InstantRoomPreferences.preferredOrigin(
+            accounts: instantRoomAccountsProvider(),
+            suggestedOrigins: suggestedSiteOrigins,
+            lastOrigin: instantRoomPreferredOrigin ?? InstantRoomPreferences.loadLastOrigin(defaults: instantRoomPreferencesDefaults)
+        )
+    }
+
+    func selectInstantOrigin(_ origin: URL) {
+        let canonical = SiteOrigin.canonicalOrigin(for: origin) ?? origin
+        InstantRoomPreferences.saveLastOrigin(canonical, defaults: instantRoomPreferencesDefaults)
+        instantRoomPreferredOrigin = canonical
+    }
+
+    func startInstantRoom(on origin: URL? = nil, explicitEngine: MeetingEngineKind? = nil) async {
+        guard !isCreatingInstantRoom else { return }
+        guard mayAdmitMeeting() else {
+            let message = meetingAdmissionError() ?? L("An update is being installed. Please try again after Rock'N'Roll for Mac restarts.")
+            instantRoomError = message
+            error = message
+            return
+        }
+        guard meetings.count < Self.meetingLimit else {
+            let message = L("You can be in up to %d meetings at once.", Self.meetingLimit)
+            instantRoomError = message
+            error = message
+            return
+        }
+
+        let targetOrigin = origin.flatMap { SiteOrigin.canonicalOrigin(for: $0) ?? $0 } ?? preferredInstantOrigin
+        guard let targetOrigin else {
+            show()
+            show(section: .home)
+            showCreateRoomSheetRequested = true
+            return
+        }
+
+        pendingInstantRoomOrigin = targetOrigin
+        instantRoomError = nil
+        instantRoomAuthChallengeOrigin = nil
+        isCreatingInstantRoom = true
+        defer { isCreatingInstantRoom = false }
+
+        let matchingAccount = instantRoomAccountsProvider().first { account in
+            guard let accountOrigin = account.originURL else { return false }
+            return SiteOrigin.canonicalOrigin(for: accountOrigin) == targetOrigin
+        }
+        let resolvedEngine: MeetingEngineKind? = explicitEngine
+            ?? matchingAccount?.engine
+            ?? {
+                if let host = targetOrigin.host?.lowercased(), TelemostTarget.hosts.contains(host) {
+                    return .telemost
+                }
+                return nil
+            }()
+
+        let title = InstantRoomPreferences.defaultRoomTitle(displayName: library.displayName)
+        do {
+            let created: CreatedMeetingRoom
+            if let handler = createInstantRoomHandler {
+                created = try await handler(targetOrigin, resolvedEngine)
+            } else {
+                created = try await MeetingRoomCreator(auth: .shared).createRoom(
+                    on: targetOrigin,
+                    engine: resolvedEngine,
+                    options: RoomCreationOptions(
+                        title: title,
+                        allowGuests: true,
+                        enableLobby: false
+                    )
+                )
+            }
+            selectInstantOrigin(targetOrigin)
+            copyInvitationToClipboard(created.invitationURL.absoluteString)
+            NSAccessibility.post(
+                element: NSApp as Any,
+                notification: .announcementRequested,
+                userInfo: [
+                    .announcement: L("Invitation link copied"),
+                    .priority: NSAccessibilityPriorityLevel.high.rawValue
+                ]
+            )
+            pendingInstantRoomOrigin = nil
+            joinCreatedRoom(created, saveFavorite: false, invitationAlreadyCopied: true)
+        } catch {
+            if let challenge = SiteAuthError.challengeOrigin(from: error, attemptedURL: targetOrigin, store: .shared) {
+                instantRoomAuthChallengeOrigin = challenge
+                show()
+                show(section: .home)
+            } else {
+                instantRoomError = error.localizedDescription
+                if selection != .home || selectedMeeting != nil {
+                    self.error = error.localizedDescription
+                }
+            }
+        }
+    }
+
+    @objc func startInstantRoomFromMenu() {
+        Task { @MainActor in
+            await startInstantRoom()
+        }
+    }
+
+    @objc func openCreateRoomOptionsFromMenu() {
+        show()
+        show(section: .home)
+        showCreateRoomSheetRequested = true
+    }
+
+    func copyActiveInvitationFromMenu() {
+        (selectedMeeting ?? meeting)?.copyInvitationLink()
     }
 
     private func chooseEngine(for url: URL) throws -> JoinDestination {
@@ -1626,6 +1763,9 @@ import UserNotifications
         library.objectWillChange.sink { [weak self] in
             Task { @MainActor in self?.refreshMenu() }
         }.store(in: &subscriptions)
+        SiteAccountStore.shared.$accounts.sink { [weak self] _ in
+            Task { @MainActor in self?.refreshMenu() }
+        }.store(in: &subscriptions)
     }
     private func refreshMenu() {
         guard library.calendar.keepInMenuBar || !meetings.isEmpty || preparing else {
@@ -1671,6 +1811,17 @@ import UserNotifications
                 item(L("Resume automatic joining"), #selector(resumeSchedule))
             } else { item(L("Pause automatic joining today"), #selector(pauseSchedule)) }
         }
+        let instantTitle = preferredInstantOrigin?.host.map { L("Instant meeting · %@", $0) } ?? L("Instant meeting")
+        let instantItem = NSMenuItem(
+            title: isCreatingInstantRoom ? L("Creating room…") : instantTitle,
+            action: #selector(startInstantRoomFromMenu),
+            keyEquivalent: ""
+        )
+        instantItem.target = self
+        instantItem.image = NSImage(systemSymbolName: "bolt.fill", accessibilityDescription: nil)
+        instantItem.isEnabled = !isCreatingInstantRoom
+        menu.addItem(.separator())
+        menu.addItem(instantItem)
         menu.addItem(.separator()); item(L("Open Rock'N'Roll for Mac"), #selector(openHome))
         item(L("Settings…"), #selector(openSettings)); menu.addItem(.separator())
         let quit = NSMenuItem(title: L("Quit Rock'N'Roll for Mac"), action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
@@ -1737,6 +1888,13 @@ import UserNotifications
             _ = add(L("Leave “%@”", talk.title), #selector(leaveItem(_:)), talk)
             menu.addItem(.separator())
         }
+        if !meetings.isEmpty && talkMeeting == nil {
+            menu.addItem(.separator())
+        }
+        let instantDockTitle = preferredInstantOrigin?.host.map { L("Instant meeting · %@", $0) } ?? L("Instant meeting")
+        let instantDock = add(isCreatingInstantRoom ? L("Creating room…") : instantDockTitle, #selector(startInstantRoomFromMenu))
+        instantDock.image = NSImage(systemSymbolName: "bolt.fill", accessibilityDescription: nil)
+        instantDock.isEnabled = !isCreatingInstantRoom
         _ = add(L("Home"), #selector(showHomeItem))
         return menu
     }

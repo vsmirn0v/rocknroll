@@ -4251,3 +4251,10 @@
 "Choose meeting website" = "Pilih situs web rapat";
 "Invitation link copied" = "Tautan undangan disalin";
 "Link copied · Ready to paste" = "Tautan disalin · Siap ditempel";
+
+"Instant meeting · %@" = "Rapat instan · %@";
+"Share…" = "Bagikan…";
+"QR code" = "Kode QR";
+"Scan on iPhone to share link" = "Pindai di iPhone untuk membagikan tautan";
+"Press ⌘V to paste" = "Tekan ⌘V untuk menempel";
+"Share the invitation link so others can join this room." = "Bagikan tautan undangan agar orang lain dapat bergabung ke ruang ini.";
