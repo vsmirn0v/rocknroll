@@ -1538,6 +1538,7 @@ import UserNotifications
     /// Selects an embedded meeting in the main window, or fronts a detached one.
     func showMeeting(_ model: NativeDesktopMeetingModel) {
         guard let host = meetingWindows[model.sessionID] else { return }
+        installKeyboard()
         host.show()
         refreshMenu()
     }
@@ -1592,6 +1593,7 @@ import UserNotifications
         if host.detached { host.moveToMainWindow() } else { host.detach() }
     }
     func showMini(_ model: NativeDesktopMeetingModel) {
+        installKeyboard()
         meetingWindows[model.sessionID]?.showMini()
         // A new floating panel may take the last streaming slot or free one.
         synchronizeMeetingPresentation()
@@ -1734,26 +1736,59 @@ import UserNotifications
             }
         }; return true
     }
+    static func blocksSpaceShortcut(responder: NSResponder?) -> Bool {
+        guard let responder else { return false }
+        if let text = responder as? NSText { return text.isEditable }
+        if let field = responder as? NSTextField { return field.isEditable }
+        if responder is NSTableView || responder is NSImageView || responder is NSScroller { return false }
+        if let control = responder as? NSControl { return control.isEnabled }
+        return false
+    }
+
+    private func activeKeyMeeting(keyWindow: NSWindow?) -> NativeDesktopMeetingModel? {
+        if let direct = meetings.first(where: { meetingWindows[$0.sessionID]?.ownsKeyEvent(for: keyWindow) == true }) {
+            return direct
+        }
+        if let window, window.isVisible, window.attachedSheet == nil,
+           keyWindow === window || (keyWindow == nil && window.isKeyWindow) {
+            return selectedMeeting.flatMap { isDetached($0) ? nil : $0 }
+        }
+        if keyWindow == nil {
+            if let talk = talkMeeting, meetingWindows[talk.sessionID]?.isMiniVisible == true {
+                return talk
+            }
+            return meetings.first { meetingWindows[$0.sessionID]?.isMiniVisible == true }
+        }
+        return nil
+    }
+
+    func handleKeyDown(_ event: NSEvent, keyWindowOverride: NSWindow?? = nil) -> NSEvent? {
+        guard NSApp.modalWindow == nil, let fallback = meeting else { return event }
+        let modifiers = event.modifierFlags.intersection([.command, .shift, .option, .control])
+        let key = event.charactersIgnoringModifiers?.lowercased()
+        let keyWindow = keyWindowOverride ?? (event.window ?? NSApp.keyWindow)
+        // Shortcuts act on the meeting whose window is key; unmuting there moves the mic.
+        let keyMeeting = activeKeyMeeting(keyWindow: keyWindow)
+        if event.keyCode == 49 && modifiers.isEmpty && !Self.blocksSpaceShortcut(responder: keyWindow?.firstResponder),
+           let keyMeeting {
+            if !event.isARepeat { keyMeeting.toggleMicrophone() }
+            return nil
+        }
+        guard !event.isARepeat else { return event }
+        if event.keyCode == 53 && modifiers.isEmpty, let keyMeeting, keyMeeting.immersive { keyMeeting.immersive = false; return nil }
+        if key == "m" && modifiers == [.command, .shift] { (keyMeeting ?? fallback).toggleMicrophone(); return nil }
+        if key == "s" && modifiers == [.command, .shift], let keyMeeting { keyMeeting.togglePlayout(); return nil }
+        if modifiers == [.command] || modifiers == [.command, .control], let digit = key.flatMap(Int.init) {
+            if digit == 0 && modifiers == [.command] { show(section: .home); return nil }
+            if digit >= 1 && digit <= meetings.count { showMeeting(meetings[digit - 1]); return nil }
+        }
+        return event
+    }
+
     private func installKeyboard() {
         guard keyMonitor == nil else { return }
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            guard let self, let fallback = meeting, event.isARepeat == false else { return event }
-            let modifiers = event.modifierFlags.intersection([.command, .shift, .option, .control])
-            let key = event.charactersIgnoringModifiers?.lowercased()
-            // Shortcuts act on the meeting whose window is key; unmuting there moves the mic.
-            let keyMeeting = meetings.first { self.meetingWindows[$0.sessionID]?.isKeyWindow == true }
-                ?? (self.window?.isKeyWindow == true ? self.selectedMeeting.flatMap { self.isDetached($0) ? nil : $0 } : nil)
-            let responder = NSApp.keyWindow?.firstResponder
-            let typing = responder is NSText || responder is NSControl
-            if event.keyCode == 53 && modifiers.isEmpty, let keyMeeting, keyMeeting.immersive { keyMeeting.immersive = false; return nil }
-            if key == "m" && modifiers == [.command, .shift] { (keyMeeting ?? fallback).toggleMicrophone(); return nil }
-            if key == "s" && modifiers == [.command, .shift], let keyMeeting { keyMeeting.togglePlayout(); return nil }
-            if modifiers == [.command] || modifiers == [.command, .control], let digit = key.flatMap(Int.init) {
-                if digit == 0 && modifiers == [.command] { show(section: .home); return nil }
-                if digit >= 1 && digit <= meetings.count { showMeeting(meetings[digit - 1]); return nil }
-            }
-            if event.keyCode == 49 && modifiers.isEmpty && !typing, let keyMeeting { keyMeeting.toggleMicrophone(); return nil }
-            return event
+            self?.handleKeyDown(event) ?? event
         }
     }
     private func installMenuBar() {

@@ -2160,4 +2160,187 @@ private final class DesktopActivitySpy: NSUserActivity {
 
         _ = await workspace.leave()
     }
+
+    private func spaceKeyEvent(windowNumber: Int, modifiers: NSEvent.ModifierFlags = [], isARepeat: Bool = false) throws -> NSEvent {
+        try XCTUnwrap(NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: modifiers,
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: windowNumber,
+            context: nil,
+            characters: " ",
+            charactersIgnoringModifiers: " ",
+            isARepeat: isARepeat,
+            keyCode: 49
+        ))
+    }
+
+    private func findSubview<T: NSView>(_ type: T.Type, in view: NSView?) -> T? {
+        guard let view else { return nil }
+        if let match = view as? T { return match }
+        for subview in view.subviews {
+            if let found = findSubview(type, in: subview) { return found }
+        }
+        return nil
+    }
+
+    func testSpaceShortcutResponderBlockingPolicy() {
+        XCTAssertFalse(NativeDesktopWorkspace.blocksSpaceShortcut(responder: nil))
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 200, height: 120),
+                              styleMask: [.titled], backing: .buffered, defer: false)
+        XCTAssertFalse(NativeDesktopWorkspace.blocksSpaceShortcut(responder: window))
+        XCTAssertFalse(NativeDesktopWorkspace.blocksSpaceShortcut(responder: NSOutlineView()))
+        XCTAssertFalse(NativeDesktopWorkspace.blocksSpaceShortcut(responder: NSTableView()))
+        XCTAssertFalse(NativeDesktopWorkspace.blocksSpaceShortcut(responder: NSImageView()))
+        XCTAssertFalse(NativeDesktopWorkspace.blocksSpaceShortcut(responder: NSScroller()))
+        XCTAssertFalse(NativeDesktopWorkspace.blocksSpaceShortcut(responder: NSTextField(labelWithString: "Label")))
+
+        let nonEditableText = NSTextView()
+        nonEditableText.isEditable = false
+        XCTAssertFalse(NativeDesktopWorkspace.blocksSpaceShortcut(responder: nonEditableText))
+
+        let disabledButton = NSButton(title: "Mic", target: nil, action: nil)
+        disabledButton.isEnabled = false
+        XCTAssertFalse(NativeDesktopWorkspace.blocksSpaceShortcut(responder: disabledButton))
+
+        let editableText = NSTextView()
+        editableText.isEditable = true
+        XCTAssertTrue(NativeDesktopWorkspace.blocksSpaceShortcut(responder: editableText))
+
+        let editableField = NSTextField()
+        editableField.isEditable = true
+        XCTAssertTrue(NativeDesktopWorkspace.blocksSpaceShortcut(responder: editableField))
+        XCTAssertTrue(NativeDesktopWorkspace.blocksSpaceShortcut(responder: NSSearchField()))
+        XCTAssertTrue(NativeDesktopWorkspace.blocksSpaceShortcut(responder: NSButton(title: "Mic", target: nil, action: nil)))
+        XCTAssertTrue(NativeDesktopWorkspace.blocksSpaceShortcut(responder: NSSwitch()))
+        XCTAssertTrue(NativeDesktopWorkspace.blocksSpaceShortcut(responder: NSPopUpButton()))
+    }
+
+    func testSpaceTogglesMicrophoneInEmbeddedMeetingEvenWhenSidebarOutlineIsFirstResponder() async throws {
+        let preferences = UserDefaults(suiteName: "native-space-embedded-\(UUID())")!
+        let history = RoomHistoryStore(storage: DesktopMemoryStorage())
+        let library = NativeDesktopLibrary(preferences: preferences, history: history, syncStorage: DesktopMemoryStorage())
+        library.displayName = "Host"
+        let engine = DesktopTestEngine()
+        let workspace = NativeDesktopWorkspace(library: library, detect: { _ in .verified(.guest(endpoint: self.url)) },
+            makeMeeting: { destination, name, title, quiet in
+                NativeDesktopMeetingModel(destination: destination, name: name, title: title, quiet: quiet,
+                    engine: engine, joinReadiness: .init(microphone: .off, camera: .off), power: joinTestPower())
+            }, attention: desktopTestAttention())
+        workspace.join(url)
+        try await spin { workspace.meeting?.connected == true }
+        let model = try XCTUnwrap(workspace.meeting)
+        let mainWindow = try XCTUnwrap(NSApp.windows.first { $0.delegate === workspace })
+        addTeardownBlock { mainWindow.close() }
+        mainWindow.makeKeyAndOrderFront(nil)
+        try await Task.sleep(for: .milliseconds(100))
+
+        let outline = try XCTUnwrap(findSubview(NSOutlineView.self, in: mainWindow.contentView))
+        _ = mainWindow.makeFirstResponder(outline)
+        XCTAssertTrue(mainWindow.firstResponder is NSOutlineView)
+
+        XCTAssertNil(workspace.handleKeyDown(try spaceKeyEvent(windowNumber: mainWindow.windowNumber)))
+        await model.waitForMediaActionsForTesting()
+        XCTAssertEqual(engine.microphoneCommands, [true])
+        XCTAssertTrue(model.snapshot.microphoneOn)
+
+        // Key-repeat events are consumed without toggling again.
+        XCTAssertNil(workspace.handleKeyDown(try spaceKeyEvent(windowNumber: mainWindow.windowNumber, isARepeat: true)))
+        await model.waitForMediaActionsForTesting()
+        XCTAssertEqual(engine.microphoneCommands, [true])
+
+        XCTAssertNil(workspace.handleKeyDown(try spaceKeyEvent(windowNumber: mainWindow.windowNumber)))
+        await model.waitForMediaActionsForTesting()
+        XCTAssertEqual(engine.microphoneCommands, [true, false])
+        XCTAssertFalse(model.snapshot.microphoneOn)
+
+        // Modified Space (e.g. Option-Space push-to-talk) must pass through.
+        XCTAssertNotNil(workspace.handleKeyDown(try spaceKeyEvent(windowNumber: mainWindow.windowNumber, modifiers: [.option])))
+        await model.waitForMediaActionsForTesting()
+        XCTAssertEqual(engine.microphoneCommands, [true, false])
+
+        // Editable text input must keep Spacebar.
+        let editor = NSTextView(frame: NSRect(x: 0, y: 0, width: 120, height: 40))
+        editor.isEditable = true
+        mainWindow.contentView?.addSubview(editor)
+        XCTAssertTrue(mainWindow.makeFirstResponder(editor))
+        XCTAssertNotNil(workspace.handleKeyDown(try spaceKeyEvent(windowNumber: mainWindow.windowNumber)))
+        await model.waitForMediaActionsForTesting()
+        XCTAssertEqual(engine.microphoneCommands, [true, false])
+        editor.removeFromSuperview()
+
+        // Navigating away from the embedded meeting stops Spacebar from toggling mic.
+        workspace.selection = .settings
+        _ = mainWindow.makeFirstResponder(outline)
+        XCTAssertNotNil(workspace.handleKeyDown(try spaceKeyEvent(windowNumber: mainWindow.windowNumber)))
+        await model.waitForMediaActionsForTesting()
+        XCTAssertEqual(engine.microphoneCommands, [true, false])
+
+        _ = await workspace.leave()
+    }
+
+    func testSpaceTogglesMicrophoneInDetachedAndMiniMeetings() async throws {
+        let preferences = UserDefaults(suiteName: "native-space-detached-mini-\(UUID())")!
+        let history = RoomHistoryStore(storage: DesktopMemoryStorage())
+        let library = NativeDesktopLibrary(preferences: preferences, history: history, syncStorage: DesktopMemoryStorage())
+        library.displayName = "Host"
+        let engine = DesktopTestEngine()
+        let meetingTitle = "Space Detached \(UUID().uuidString)"
+        let workspace = NativeDesktopWorkspace(library: library, detect: { _ in .verified(.guest(endpoint: self.url)) },
+            makeMeeting: { destination, name, title, quiet in
+                NativeDesktopMeetingModel(destination: destination, name: name, title: title, quiet: quiet,
+                    engine: engine, joinReadiness: .init(microphone: .off, camera: .off), power: joinTestPower())
+            }, attention: desktopTestAttention())
+        workspace.join(url, title: meetingTitle)
+        try await spin { workspace.meeting?.connected == true }
+        let model = try XCTUnwrap(workspace.meeting)
+        let mainWindow = NSApp.windows.first { $0.delegate === workspace }
+        addTeardownBlock { mainWindow?.close() }
+
+        workspace.toggleWindow(model)
+        let detachedWindow = try XCTUnwrap(NSApp.windows.first {
+            $0.delegate is NativeDesktopMeetingWindow && !($0 is NSPanel) && $0.isVisible && $0.title == meetingTitle
+        })
+        addTeardownBlock { detachedWindow.close() }
+        detachedWindow.makeKeyAndOrderFront(nil)
+        try await spin { detachedWindow.isVisible }
+
+        XCTAssertNil(workspace.handleKeyDown(try spaceKeyEvent(windowNumber: detachedWindow.windowNumber)))
+        await model.waitForMediaActionsForTesting()
+        XCTAssertEqual(engine.microphoneCommands, [true])
+        XCTAssertTrue(model.snapshot.microphoneOn)
+
+        workspace.showMini(model)
+        let miniPanel = try XCTUnwrap(NSApp.windows.compactMap { $0 as? NSPanel }.first {
+            $0.delegate is NativeDesktopMeetingWindow && $0.isVisible && $0.title == meetingTitle
+        })
+        addTeardownBlock { miniPanel.close() }
+        try await spin { !detachedWindow.isVisible && miniPanel.isVisible }
+
+        XCTAssertNil(workspace.handleKeyDown(try spaceKeyEvent(windowNumber: miniPanel.windowNumber)))
+        await model.waitForMediaActionsForTesting()
+        XCTAssertEqual(engine.microphoneCommands, [true, false])
+        XCTAssertFalse(model.snapshot.microphoneOn)
+
+        // When no window is key (e.g. nonactivating Mini panel only), Space still toggles the visible mini meeting.
+        mainWindow?.orderOut(nil)
+        detachedWindow.orderOut(nil)
+        XCTAssertNil(workspace.handleKeyDown(try spaceKeyEvent(windowNumber: 0), keyWindowOverride: .some(nil)))
+        await model.waitForMediaActionsForTesting()
+        XCTAssertEqual(engine.microphoneCommands, [true, false, true])
+
+        // An unrelated window does not toggle the meeting microphone.
+        let unrelated = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 240, height: 160),
+                                 styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        unrelated.isReleasedWhenClosed = false
+        addTeardownBlock { unrelated.close() }
+        unrelated.makeKeyAndOrderFront(nil)
+        let commandsBeforeUnrelated = engine.microphoneCommands
+        XCTAssertNotNil(workspace.handleKeyDown(try spaceKeyEvent(windowNumber: unrelated.windowNumber)))
+        await model.waitForMediaActionsForTesting()
+        XCTAssertEqual(engine.microphoneCommands, commandsBeforeUnrelated)
+
+        _ = await workspace.leave()
+    }
 }

@@ -75,7 +75,18 @@ import SwiftUI
     /// A visible, non-occluded mini panel — the single predicate for "this Mini
     /// meeting occupies a video streaming slot" (synchronization and the cap).
     var isStreamingMini: Bool { mini.map { $0.isVisible && $0.occlusionState.contains(.visible) } ?? false }
-    var isKeyWindow: Bool { (!isEmbedded && window.isKeyWindow) || mini?.isKeyWindow == true }
+    var isKeyWindow: Bool {
+        (!isEmbedded && window.isKeyWindow && window.attachedSheet == nil) ||
+        (mini?.isKeyWindow == true && mini?.attachedSheet == nil)
+    }
+    func ownsKeyEvent(for target: NSWindow?) -> Bool {
+        if let target {
+            if !isEmbedded && target === window && window.isVisible && window.attachedSheet == nil { return true }
+            if let mini, target === mini && mini.isVisible && mini.attachedSheet == nil { return true }
+            return false
+        }
+        return isKeyWindow
+    }
     private func positionNewWindow(_ target: NSWindow) {
         target.center()
         guard let screen = target.screen else { return }
