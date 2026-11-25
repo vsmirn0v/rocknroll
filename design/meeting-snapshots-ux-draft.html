@@ -1,0 +1,325 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Snap to Summary · Rock’n’Roll iOS &amp; Mac Design Draft</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #0f1117;
+      --panel: #171a23;
+      --panel-2: #1f2431;
+      --border: rgba(255, 255, 255, 0.12);
+      --text: #f3f5f8;
+      --muted: #9aa3b2;
+      --accent: #ff9954;
+      --accent-soft: rgba(255, 153, 84, 0.16);
+      --sky: #5cc8ff;
+      --green: #3cd070;
+      --red: #ff6361;
+    }
+    @media (prefers-color-scheme: light) {
+      :root {
+        --bg: #f5f6f8;
+        --panel: #ffffff;
+        --panel-2: #f0f2f6;
+        --border: rgba(17, 24, 39, 0.12);
+        --text: #111827;
+        --muted: #525d6f;
+        --accent: #e26415;
+        --accent-soft: rgba(226, 100, 21, 0.12);
+        --sky: #0284c7;
+        --green: #16a34a;
+        --red: #dc2626;
+      }
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      padding: 20px;
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      font-size: 13px;
+      line-height: 1.5;
+    }
+    .wrap { max-width: 1200px; margin: 0 auto; display: grid; gap: 16px; }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 16px;
+    }
+    .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; justify-content: space-between; }
+    .tabs { display: flex; flex-wrap: wrap; gap: 8px; }
+    button {
+      font: inherit;
+      cursor: pointer;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: var(--panel-2);
+      color: var(--text);
+      padding: 7px 12px;
+      font-weight: 600;
+    }
+    button.primary { background: var(--accent); color: #111; border-color: transparent; }
+    button.active { background: var(--accent); color: #111; border-color: transparent; }
+    .grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; }
+    .stage {
+      background: #0b0d13;
+      color: #f3f5f8;
+      border-radius: 14px;
+      border: 1px solid rgba(255,255,255,0.14);
+      padding: 14px;
+      display: grid;
+      gap: 12px;
+    }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 10px;
+      border-radius: 999px;
+      font-size: 12px;
+      background: rgba(255,255,255,0.08);
+      border: 1px solid rgba(255,255,255,0.14);
+    }
+    .toast {
+      background: rgba(24, 28, 38, 0.92);
+      color: #f3f5f8;
+      border: 1px solid rgba(255, 153, 84, 0.45);
+      border-radius: 12px;
+      padding: 10px 12px;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+    .filmstrip { display: flex; gap: 10px; overflow-x: auto; padding-bottom: 4px; }
+    .thumb {
+      min-width: 190px;
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 10px;
+      text-align: left;
+    }
+    .thumb.selected { border-color: var(--accent); background: var(--accent-soft); }
+    .mono { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; }
+    .muted { color: var(--muted); }
+    .hidden { display: none !important; }
+    select {
+      font: inherit;
+      background: #1f2431;
+      color: #f3f5f8;
+      border: 1px solid rgba(255,255,255,0.2);
+      border-radius: 8px;
+      padding: 4px 8px;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card row">
+      <div>
+        <div class="pill" style="background: var(--accent-soft); color: var(--accent); border-color: transparent;">
+          Offline Design Draft · Rock’n’Roll iOS &amp; NativeMacGuest
+        </div>
+        <h1 style="margin: 8px 0 4px; font-size: 20px;">Snap to Summary — Interactive Design Review</h1>
+        <div class="muted">Zero-modal raw-stream capture (Screen Share, Camera, Full Stage) with 6s retroactive source switching and Summary/Obsidian anchoring.</div>
+      </div>
+      <div class="tabs">
+        <button id="t-live" class="active" onclick="showView('live')">1. Live Capture (Mac &amp; iOS)</button>
+        <button id="t-summary" onclick="showView('summary')">2. Summary, OCR &amp; Obsidian</button>
+      </div>
+    </div>
+
+    <div id="v-live" class="grid-2">
+      <!-- macOS Stage -->
+      <div class="card" style="display:grid; gap:12px;">
+        <div class="row">
+          <strong>macOS · NativeMacGuest (`CompanionVideoSink.snapshotImage`)</strong>
+          <span class="mono muted">⌘⇧S Smart · ⌘⇧E Stage</span>
+        </div>
+        <div class="stage">
+          <div class="row">
+            <span class="pill">Alex Kim is speaking</span>
+            <button onclick="addSnap('share-alex', 'mac')">📷 Snap Share</button>
+          </div>
+          <div style="background:#131722; border:1px solid rgba(92,200,255,0.3); border-radius:10px; padding:12px;">
+            <div class="mono" style="color:#5cc8ff;">Edge Gateway (TTL = 30s) ──▶ LiveKit p99 &lt; 42ms</div>
+          </div>
+          <div class="row">
+            <button onclick="addSnap('cam-maya', 'mac')">📷 Snap Maya’s Camera (Whiteboard)</button>
+            <button onclick="addSnap('full-stage', 'mac')">⊞ Snap Full Stage</button>
+          </div>
+          <div id="mac-toast" class="toast hidden">
+            <div>
+              <strong style="color:#3cd070;">✓ Attached to Summary</strong>
+              <span id="mac-toast-meta" class="muted"> · 14:25</span>
+            </div>
+            <div style="display:flex; gap:8px; align-items:center;">
+              <select id="mac-flip" onchange="flipLatest(this.value, 'mac')">
+                <option value="share-alex">Screen · Alex</option>
+                <option value="cam-maya">Cam · Maya</option>
+                <option value="full-stage">Full Stage</option>
+              </select>
+              <button onclick="undoLatest('mac')">Undo</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- iOS Stage -->
+      <div class="card" style="display:grid; gap:12px;">
+        <div class="row">
+          <strong>iOS 26 · Rock’n’Roll (`CallVideoView.snapshotFrame`)</strong>
+          <span class="mono muted">Tap / Hold 0.45s / Side+VolUp</span>
+        </div>
+        <div class="stage">
+          <div id="ios-hw-banner" class="toast hidden" style="border-color: rgba(92,200,255,0.5);">
+            <span>System screenshot detected — attach clean HD frame?</span>
+            <div style="display:flex; gap:6px;">
+              <button class="primary" onclick="addSnap('share-alex', 'ios'); hideHw();">Shared Screen</button>
+              <button onclick="addSnap('full-stage', 'ios'); hideHw();">Full Stage</button>
+            </div>
+          </div>
+          <div class="row">
+            <span class="pill">MeetingChromeSurface · Liquid Glass</span>
+            <label style="display:flex; align-items:center; gap:6px; font-size:12px;">
+              <input id="hw-bridge-toggle" type="checkbox" checked onchange="setHwBridge(this.checked)" />
+              <span>Bridge ON by default</span>
+            </label>
+            <button onclick="showHw()">Simulate Side + Vol Up</button>
+          </div>
+          <div id="ios-hw-off" class="muted hidden" style="font-size:12px;">Hardware screenshot bridge is toggled OFF in Settings.</div>
+          <div class="row">
+            <button class="primary" onclick="addSnap('share-alex', 'ios')">📷 1-Tap Smart Snap</button>
+            <button onclick="addSnap('cam-maya', 'ios')">2-Finger Tile Tap (Maya Cam)</button>
+          </div>
+          <div id="ios-toast" class="toast hidden">
+            <div>
+              <strong style="color:#3cd070;">✓ Saved to Summary</strong>
+              <span id="ios-toast-meta" class="muted"> · 14:25</span>
+            </div>
+            <div style="display:flex; gap:8px; align-items:center;">
+              <select id="ios-flip" onchange="flipLatest(this.value, 'ios')">
+                <option value="share-alex">Screen · Alex</option>
+                <option value="cam-maya">Cam · Maya</option>
+                <option value="full-stage">Full Stage</option>
+              </select>
+              <button onclick="undoLatest('ios')">Undo</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div id="v-summary" class="card hidden" style="display:grid; gap:14px;">
+      <div class="row">
+        <div>
+          <strong style="font-size:16px;">Q4 Architecture Sync — Summary &amp; Visual Highlights</strong>
+          <div class="muted">Anchored in Outcome, Decisions, Transcript, and Obsidian Export · Zero-idle multi-meeting buffer (&lt;150ms, 6s auto-purge)</div>
+        </div>
+        <div style="display:flex; gap:8px; align-items:center;">
+          <select id="format-select" onchange="setFormat(this.value)">
+            <option value="jpeg">Format: JPEG (Default)</option>
+            <option value="png">Format: PNG</option>
+            <option value="mixed">Format: Mixed (PNG + HEIC)</option>
+          </select>
+          <span class="pill" style="color: var(--green);">Saved locally · Obsidian Up to date</span>
+        </div>
+      </div>
+      <div id="filmstrip" class="filmstrip"></div>
+      <div class="grid-2">
+        <div class="card" style="background:var(--panel-2);">
+          <strong>Decisions with Visual Evidence</strong>
+          <p>✓ Cap Edge Gateway auth cache TTL at 30s. <span class="pill" id="chip-0">🖼 14:22 · Screen · Alex</span></p>
+          <p>✓ Use Region-B warm standby path from whiteboard. <span class="pill">🖼 14:24 · Cam · Maya</span></p>
+        </div>
+        <div class="card" style="background:var(--panel-2);">
+          <strong>Obsidian Markdown Preview</strong>
+          <pre id="md-preview" class="mono" style="white-space:pre-wrap; margin:8px 0 0;"></pre>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const SRC = {
+      'share-alex': { label: 'Screen · Alex', ocr: 'Edge Gateway TTL = 30s' },
+      'cam-maya': { label: 'Cam · Maya', ocr: '[Region A] -> [Region B Standby]' },
+      'full-stage': { label: 'Full Stage', ocr: 'Stage Composite (4 tiles + share)' }
+    };
+    let snaps = [
+      { key: 'share-alex', time: '14:22' },
+      { key: 'cam-maya', time: '14:24' }
+    ];
+    let snapFormat = 'jpeg';
+    let hwBridgeOn = true;
+    function extFor(key) {
+      if (snapFormat === 'png') return 'png';
+      if (snapFormat === 'mixed') return key.startsWith('share-') ? 'png' : 'heic';
+      return 'jpg';
+    }
+    function setFormat(f) { snapFormat = f; render(); }
+    function setHwBridge(on) {
+      hwBridgeOn = on;
+      document.getElementById('ios-hw-off').classList.toggle('hidden', on);
+      if (!on) hideHw();
+    }
+    function showView(v) {
+      document.getElementById('v-live').classList.toggle('hidden', v !== 'live');
+      document.getElementById('v-summary').classList.toggle('hidden', v !== 'summary');
+      document.getElementById('t-live').classList.toggle('active', v === 'live');
+      document.getElementById('t-summary').classList.toggle('active', v === 'summary');
+      render();
+    }
+    function addSnap(key, plat) {
+      const time = '14:' + String(25 + snaps.length).padStart(2, '0');
+      snaps.unshift({ key, time });
+      const toast = document.getElementById(plat + '-toast');
+      toast.classList.remove('hidden');
+      document.getElementById(plat + '-toast-meta').textContent = ' · ' + time;
+      document.getElementById(plat + '-flip').value = key;
+      render();
+    }
+    function flipLatest(key, plat) {
+      if (!snaps.length) return;
+      snaps[0].key = key;
+      render();
+    }
+    function undoLatest(plat) {
+      if (!snaps.length) return;
+      snaps.shift();
+      document.getElementById(plat + '-toast').classList.add('hidden');
+      render();
+    }
+    function showHw() {
+      if (!hwBridgeOn) { document.getElementById('ios-hw-off').classList.remove('hidden'); return; }
+      document.getElementById('ios-hw-banner').classList.remove('hidden');
+    }
+    function hideHw() { document.getElementById('ios-hw-banner').classList.add('hidden'); }
+    function render() {
+      const strip = document.getElementById('filmstrip');
+      strip.innerHTML = '';
+      snaps.forEach((s, i) => {
+        const meta = SRC[s.key];
+        const el = document.createElement('div');
+        el.className = 'thumb' + (i === 0 ? ' selected' : '');
+        el.innerHTML = `<div class="row"><strong>${meta.label}</strong><span class="muted mono">${s.time}</span></div><div class="mono" style="margin-top:6px; color:var(--sky);">${meta.ocr}</div>`;
+        strip.appendChild(el);
+      });
+      if (snaps[0]) {
+        document.getElementById('chip-0').textContent = `🖼 ${snaps[0].time} · ${SRC[snaps[0].key].label}`;
+      }
+      document.getElementById('md-preview').textContent =
+        '### Visual Snapshots\n' +
+        snaps.map(s => `- **${s.time} · ${SRC[s.key].label}**\n  ![[${s.time.replace(':','')}-${s.key}.${extFor(s.key)}]]`).join('\n');
+    }
+    render();
+  </script>
+</body>
+</html>

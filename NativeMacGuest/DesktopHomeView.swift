@@ -681,6 +681,7 @@ struct NativeDesktopSettingsView: View {
     var onCreateRoom: (@MainActor (URL) -> Void)? = nil
     @State private var editingName = false
     @AppStorage(UniversalMeetingEngine.forceTCPRelayKey) private var forceTCPRelay = false
+    @AppStorage(MeetingSnapshotPreferences.imageFormatKey) private var snapshotImageFormatRaw = MeetingSnapshotImageFormat.jpeg.rawValue
     @State private var settingsQuery = ""
     @State private var previousQuery = ""
     @State private var revealID: String?
@@ -894,6 +895,24 @@ struct NativeDesktopSettingsView: View {
                 Section(L("Guest meeting connection")) {
                     NativeSettingsSwitch(title: L("Use TCP/TLS relay only"), isOn: $forceTCPRelay, id: "settings.relay")
                     Text(L("Applies when you join your next guest meeting. Automatic mode can switch to a TCP/TLS relay if UDP fails."))
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Section(L("Meeting snapshots")) {
+                    let selectedFormat = MeetingSnapshotImageFormat(rawValue: snapshotImageFormatRaw) ?? .jpeg
+                    NativeSettingsPopup(
+                        title: L("Image format"),
+                        selection: Binding(
+                            get: { selectedFormat },
+                            set: {
+                                snapshotImageFormatRaw = $0.rawValue
+                                MeetingSnapshotPreferences.setImageFormat($0)
+                            }
+                        ),
+                        choices: MeetingSnapshotImageFormat.allCases,
+                        titleForChoice: \.title,
+                        id: "settings.snapshot-format"
+                    )
+                    Text(selectedFormat.detail)
                         .font(.caption).foregroundStyle(.secondary)
                 }
 

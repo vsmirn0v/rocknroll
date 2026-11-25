@@ -10,8 +10,9 @@ struct MeetingMarkdownSections: OptionSet, Codable, Sendable {
     static let tasks = Self(rawValue: 1 << 3)
     static let questions = Self(rawValue: 1 << 4)
     static let transcript = Self(rawValue: 1 << 5)
+    static let snapshots = Self(rawValue: 1 << 6)
     // Transcripts are opt-in for both new and existing destinations.
-    static let all: Self = [.notes, .summary, .decisions, .tasks, .questions]
+    static let all: Self = [.notes, .summary, .decisions, .tasks, .questions, .snapshots]
 
     func applying(_ overrides: MeetingAutoExportOverrides) -> Self {
         var result = self
@@ -74,9 +75,19 @@ enum MeetingMarkdownTemplate {
     static func managedContent(session: MeetingSessionRecord, note: MeetingNoteRecord?,
                                outcome: MeetingOutcome?, outcomeState: MeetingOutcomePersistenceState,
                                sections: MeetingMarkdownSections = .all, headingLevel: Int = 1,
-                               boldTitle: Bool = false) -> String {
+                               boldTitle: Bool = false,
+                               snapshots: [MeetingSnapshotRecord] = [],
+                               useWikiLinksForSnapshots: Bool = true) -> String {
         let heading = String(repeating: "#", count: headingLevel)
         var parts = [boldTitle ? "**" + session.title + "**" : heading + " " + session.title]
+        if sections.contains(.snapshots), !snapshots.isEmpty {
+            parts += ["", MeetingSnapshotMarkdown.obsidianSection(
+                snapshots: snapshots,
+                attachmentsFolder: "Attachments",
+                headingLevel: headingLevel + 1,
+                useWikiLinks: useWikiLinksForSnapshots
+            )]
+        }
         if sections.contains(.notes) {
             parts += ["", heading + "# Notes"]
             if let note, !note.markdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {

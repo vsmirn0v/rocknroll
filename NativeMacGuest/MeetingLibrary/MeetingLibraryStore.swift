@@ -2301,6 +2301,24 @@ extension MeetingLibraryStore {
         }
     }
 
+    func markSnapshotExportDirty(sessionID: UUID, now: Date = Date()) throws {
+        let db = try db()
+        var queued = 0
+        try db.transaction {
+            guard let row = try db.one("SELECT export_revision FROM meeting_sessions WHERE session_id=?", bind: {
+                try Self.bindText($0, sessionID.uuidString, at: 1)
+            }) else { return }
+            let exportRevision = Int((row.integer(0) ?? 0) + 1)
+            try db.run("UPDATE meeting_sessions SET export_revision=?,updated_at=? WHERE session_id=?") {
+                try Self.bindInt($0, Int64(exportRevision), at: 1)
+                try Self.bindInt($0, now.ms, at: 2)
+                try Self.bindText($0, sessionID.uuidString, at: 3)
+            }
+            queued = try Self.queueOutbox(db: db, sessionID: sessionID, desiredRevision: exportRevision)
+        }
+        if queued > 0 { connectionBox.notifyOutboxQueued() }
+    }
+
     func binding(destinationID: UUID, sessionID: UUID, component: ObsidianExportComponent) async throws -> ObsidianExportBindingRecord? {
         let db = try db()
         guard let row = try db.one("SELECT * FROM export_bindings WHERE destination_id=? AND session_id=? AND component=?", bind: {

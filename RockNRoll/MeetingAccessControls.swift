@@ -81,7 +81,21 @@ final class MeetingAccessControls: UIView {
             setNeedsLayout()
         }
     }
+    var snapButton: UIButton? {
+        didSet {
+            guard oldValue !== snapButton else { return }
+            oldValue?.removeFromSuperview()
+            if let snapButton {
+                snapButton.configuration?.imagePadding = 6
+                snapButton.configuration?.contentInsets = NSDirectionalEdgeInsets(top: 4, leading: 6, bottom: 4, trailing: 6)
+                snapButton.configuration?.titleTextAttributesTransformer = scaleButton.configuration?.titleTextAttributesTransformer
+                controls.addSubview(snapButton)
+            }
+            setNeedsLayout()
+        }
+    }
     var capturedTextMode = false
+    private var snapWidth: CGFloat { snapButton?.isHidden == false ? 44 : 0 }
     private var textWidth: CGFloat { textButton?.isHidden == false ? 44 : 0 }
     private var scaleWidth: CGFloat { scaleButton.isHidden ? 0 : 44 }
     private let viewSizingButton = UIButton(type: .system)
@@ -122,7 +136,7 @@ final class MeetingAccessControls: UIView {
     }
     func fittingSize(availableWidth: CGFloat) -> CGSize {
         if capturedTextMode { return CGSize(width: 264, height: 48) }
-        let extras = textWidth + scaleWidth
+        let extras = snapWidth + textWidth + scaleWidth
         return CGSize(width: min(max(88 + extras, availableWidth), viewWidth + 44 + extras), height: 48)
     }
     override init(frame: CGRect) {
@@ -211,21 +225,24 @@ final class MeetingAccessControls: UIView {
             layoutShareTools()
             return
         }
+        if snapButton?.configuration?.title != nil { snapButton?.configuration?.title = nil }
         if textButton?.configuration?.title != nil { textButton?.configuration?.title = nil }
         if scaleButton.configuration?.title != nil { scaleButton.configuration?.title = nil }
         let rtl = effectiveUserInterfaceLayoutDirection == .rightToLeft
-        let leading = textWidth + scaleWidth
+        let leading = snapWidth + textWidth + scaleWidth
         let viewW = max(44, bounds.width - 44 - leading)
         if rtl {
             moreButton.frame = CGRect(x: 0, y: 0, width: 44, height: bounds.height)
             viewButton.frame = CGRect(x: 44, y: 0, width: viewW, height: bounds.height)
             scaleButton.frame = CGRect(x: viewButton.frame.maxX, y: 0, width: scaleWidth, height: bounds.height)
             textButton?.frame = CGRect(x: scaleButton.frame.maxX, y: 0, width: textWidth, height: bounds.height)
+            snapButton?.frame = CGRect(x: scaleButton.frame.maxX + textWidth, y: 0, width: snapWidth, height: bounds.height)
             divider.frame = CGRect(x: 44, y: 10, width: 1, height: max(0, bounds.height - 20))
             reminderIndicator.frame = CGRect(x: 7, y: 10, width: 6, height: 6)
         } else {
-            textButton?.frame = CGRect(x: 0, y: 0, width: textWidth, height: bounds.height)
-            scaleButton.frame = CGRect(x: textWidth, y: 0, width: scaleWidth, height: bounds.height)
+            snapButton?.frame = CGRect(x: 0, y: 0, width: snapWidth, height: bounds.height)
+            textButton?.frame = CGRect(x: snapWidth, y: 0, width: textWidth, height: bounds.height)
+            scaleButton.frame = CGRect(x: snapWidth + textWidth, y: 0, width: scaleWidth, height: bounds.height)
             viewButton.frame = CGRect(x: leading, y: 0, width: viewW, height: bounds.height)
             moreButton.frame = CGRect(x: viewButton.frame.maxX, y: 0, width: 44, height: bounds.height)
             divider.frame = CGRect(x: viewButton.frame.maxX, y: 10, width: 1, height: max(0, bounds.height - 20))
@@ -236,7 +253,7 @@ final class MeetingAccessControls: UIView {
     }
 
     private func layoutShareTools() {
-        let buttons = [textButton, scaleButton, pinButton, viewButton, moreButton].compactMap { $0 }.filter { !$0.isHidden }
+        let buttons = [snapButton, textButton, scaleButton, pinButton, viewButton, moreButton].compactMap { $0 }.filter { !$0.isHidden }
         let inset: CGFloat = 4
         var widths = Dictionary(uniqueKeysWithValues: buttons.map { (ObjectIdentifier($0), CGFloat(44)) })
         var spare = max(0, bounds.width - 2 * inset - CGFloat(buttons.count) * 44)

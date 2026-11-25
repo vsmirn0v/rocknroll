@@ -678,6 +678,11 @@ final class AttentionMemoryPressure: @unchecked Sendable {
                    !storedNote.isEmpty {
                     resolvedInput.request.notes = storedNote
                 }
+                let visualRecords = await MeetingSnapshotStore.shared.snapshots(for: segment.sessionID)
+                if let visualContext = MeetingSnapshotMarkdown.summaryPromptContext(snapshots: visualRecords) {
+                    let existingNotes = resolvedInput.request.notes ?? ""
+                    resolvedInput.request.notes = existingNotes.isEmpty ? visualContext : existingNotes + "\n\n" + visualContext
+                }
                 let persisted = try await library.startOutcome(draft, input: resolvedInput, owner: owner)
                 return (persisted, resolvedInput)
             }
@@ -831,6 +836,16 @@ final class AttentionMemoryPressure: @unchecked Sendable {
                     )
                 }
 
+                let visualRecords = await MeetingSnapshotStore.shared.snapshots(for: sessionIDs)
+                let visualContext = MeetingSnapshotMarkdown.summaryPromptContext(snapshots: visualRecords)
+                let combinedNotes: String? = {
+                    switch (noteMarkdown.isEmpty ? nil : noteMarkdown, visualContext) {
+                    case (let n?, let v?): return n + "\n\n" + v
+                    case (let n?, nil): return n
+                    case (nil, let v?): return v
+                    case (nil, nil): return nil
+                    }
+                }()
                 let writer = makeOutcomeWriter(provider, store.apiKey(for: provider))
                 let request = MeetingOutcomeRequest(
                     meetingTitle: card.title,
@@ -838,7 +853,7 @@ final class AttentionMemoryPressure: @unchecked Sendable {
                     window: window,
                     language: language,
                     customInstructions: summaryPrompt,
-                    notes: noteMarkdown.isEmpty ? nil : noteMarkdown
+                    notes: combinedNotes
                 )
                 let content = try await writer.outcome(request)
                 try Task.checkCancellation()

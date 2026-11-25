@@ -21,6 +21,8 @@ struct IOSAssistantSettingsView: View {
     @State private var pickingExportBundleFolder = false
     @State private var pickingImportBundleFolder = false
     @State private var archiveFeedback: String?
+    @AppStorage(MeetingSnapshotPreferences.imageFormatKey) private var snapshotImageFormatRaw = MeetingSnapshotImageFormat.jpeg.rawValue
+    @AppStorage(MeetingSnapshotPreferences.iosHardwareBridgeKey) private var snapshotBridgeEnabled = true
 
     var body: some View {
         Form {
@@ -286,6 +288,41 @@ struct IOSAssistantSettingsView: View {
                         .font(.caption)
                         .foregroundStyle(.red)
                 }
+            }
+
+            Section {
+                let selectedFormat = MeetingSnapshotImageFormat(rawValue: snapshotImageFormatRaw) ?? .jpeg
+                IOSFullRowMenuPicker(
+                    L("Image format"),
+                    selection: Binding(
+                        get: { selectedFormat },
+                        set: {
+                            snapshotImageFormatRaw = $0.rawValue
+                            MeetingSnapshotPreferences.setImageFormat($0)
+                        }
+                    ),
+                    options: MeetingSnapshotImageFormat.allCases,
+                    optionTitle: \.title,
+                    selectedTitle: selectedFormat.title
+                )
+                .accessibilityIdentifier("snapshots.settings.imageFormat")
+
+                Toggle(
+                    L("Offer clean frame on system screenshot"),
+                    isOn: Binding(
+                        get: { snapshotBridgeEnabled },
+                        set: {
+                            snapshotBridgeEnabled = $0
+                            MeetingSnapshotPreferences.setIOSHardwareScreenshotBridgeEnabled($0)
+                        }
+                    )
+                )
+                .accessibilityIdentifier("snapshots.settings.hardwareBridge")
+            } header: {
+                Text(L("Meeting Snapshots"))
+            } footer: {
+                let selectedFormat = MeetingSnapshotImageFormat(rawValue: snapshotImageFormatRaw) ?? .jpeg
+                Text(selectedFormat.detail)
             }
         }
         .scrollDismissesKeyboard(.interactively)

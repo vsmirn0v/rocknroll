@@ -194,6 +194,22 @@ final class RockCallViewController: UIViewController, UIScrollViewDelegate, UICo
     private var actionsMenu: UIMenu?
     private let shareOffer = UIButton(type: .system)
     private var textCapture: SharedTextOverlay?
+    var workspaceSessionIDProvider: (() -> UUID)?
+    private let snapshotController = IOSMeetingSnapshotController()
+    private var snapshotPillHost: UIHostingController<IOSSnapshotPillView>?
+    private var snapshotBannerHost: UIHostingController<IOSSnapshotHardwareBannerView>?
+    private var snapshotStateObserver: AnyCancellable?
+    private lazy var snapButton: UIButton = {
+        let button = UIButton(type: .system)
+        button.configuration = .plain(); button.configuration?.baseForegroundColor = .label
+        button.accessibilityLabel = L("Snap to summary")
+        button.accessibilityHint = L("Tap to snap; touch and hold to choose stream.")
+        button.configuration?.image = UIImage(systemName: "camera.viewfinder")
+        button.accessibilityIdentifier = "call.snap"
+        button.addAction(UIAction { [weak self] _ in self?.snapshotController.captureSmart() }, for: .touchUpInside)
+        MeetingActionsShortcut.install(on: button) { [weak self] in self?.presentSnapshotScopeSheet() }
+        return button
+    }()
     private lazy var selectTextButton: UIButton = {
         let button = UIButton(type: .system)
         button.configuration = .plain(); button.configuration?.baseForegroundColor = .label
@@ -351,7 +367,10 @@ final class RockCallViewController: UIViewController, UIScrollViewDelegate, UICo
     }
 
     required init?(coder: NSCoder) { nil }
-    deinit { stageVisibilityObservers.forEach(NotificationCenter.default.removeObserver) }
+    deinit {
+        snapshotStateObserver?.cancel()
+        stageVisibilityObservers.forEach(NotificationCenter.default.removeObserver)
+    }
 
     override func loadView() {
         view = FoldAwareMeetingView()
@@ -359,9 +378,22 @@ final class RockCallViewController: UIViewController, UIScrollViewDelegate, UICo
 
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
+        snapshotController.setCallVisible(true)
         reminderHost.changed()
         floatingVideo?.refreshPreference()
         focus.interaction()
+    }
+
+    override func viewDidDisappear(_ animated: Bool) {
+        super.viewDidDisappear(animated)
+        snapshotController.setCallVisible(false)
+        if isBeingDismissed || movingFromParentOrWindow {
+            snapshotController.teardown()
+        }
+    }
+
+    private var movingFromParentOrWindow: Bool {
+        isMovingFromParent || view.window == nil
     }
 
     override func viewDidLayoutSubviews() {
@@ -397,6 +429,7 @@ final class RockCallViewController: UIViewController, UIScrollViewDelegate, UICo
         shareSpeakerCue.layer.cornerCurve = .continuous
         view.addSubview(shareSpeakerCue)
         view.addSubview(reactionOverlay)
+        installSnapshotUI()
         sourceSelector.onMenuVisibilityChanged = { [weak self] in self?.focus.menuVisible = $0 }
         layoutControls.onMenuVisibilityChanged = { [weak self] in self?.focus.menuVisible = $0 }
         compactHeader.onMenuVisibilityChanged = { [weak self] in self?.focus.menuVisible = $0 }
@@ -550,6 +583,8 @@ final class RockCallViewController: UIViewController, UIScrollViewDelegate, UICo
         let sharedKey = currentPrimaryKey.flatMap { streamPinTargets[$0]?.isScreenShare == true ? $0 : nil }
         let sharing = effectiveLayoutMode == .speaker && currentPrimaryTarget?.isScreenShare == true
         selectTextButton.isHidden = sharedKey == nil || effectiveLayoutMode != .speaker || focus.hidden || textCapture != nil
+        snapButton.isHidden = focus.hidden || textCapture != nil || snapshotController.availableTargets().isEmpty
+        accessControls.snapButton = snapButton
         accessControls.scaleButton.isHidden = selectTextButton.isHidden || primaryZoom == nil
         accessControls.textButton = selectTextButton
         accessControls.capturedTextMode = textCapture != nil
@@ -762,6 +797,7 @@ final class RockCallViewController: UIViewController, UIScrollViewDelegate, UICo
         shareReconnectNotice.isHidden = !sharing || !reconnectingShares.contains(currentPrimaryTarget?.participantID ?? "")
         shareReconnectNotice.frame = CGRect(x: stage.midX - min(150, stage.width / 2), y: stage.minY + 8,
             width: min(300, stage.width), height: 44)
+        layoutSnapshotOverlays(stage: stage, headerBottom: geometry.header.maxY, access: access)
         updateShareSpeakerCue()
         for entry in videoTiles.values {
             entry.zoom.isAccessibilityElement = true
@@ -926,6 +962,134 @@ final class RockCallViewController: UIViewController, UIScrollViewDelegate, UICo
     @objc private func doubleTappedStage(_ gesture: UITapGestureRecognizer) {
         guard let zoom = gesture.view as? UIScrollView, zoom.maximumZoomScale > 1 else { return }
         zoom.setZoomScale(zoom.zoomScale > 1.01 ? 1 : 2, animated: true)
+    }
+
+    @objc private func twoFingerDoubleTappedTile(_ gesture: UITapGestureRecognizer) {
+        guard let key = gesture.view?.accessibilityIdentifier, videoTiles[key] != nil else { return }
+        snapshotController.capture(targetID: key)
+    }
+
+    private func installSnapshotUI() {
+        snapshotController.sessionIDProvider = { [weak self] in
+            self?.workspaceSessionIDProvider?() ?? UUID()
+        }
+        snapshotController.primaryKeyProvider = { [weak self] in
+            self?.currentPrimaryKey
+        }
+        snapshotController.liveSourcesProvider = { [weak self] in
+            guard let self else { return [] }
+            return self.videoTiles.compactMap { key, entry in
+                guard entry.tile.superview != nil, let target = self.streamPinTargets[key] else { return nil }
+                let name = entry.tile.accessibilityLabel ?? L("Musician")
+                return IOSMeetingSnapshotController.LiveTileSource(
+                    key: key,
+                    scope: target.isScreenShare ? .screenShare : .participantCamera,
+                    sourceName: name,
+                    captureFrame: { [weak video = entry.video] in video?.snapshotFrame() },
+                    isMirrored: entry.video.isMirrored
+                )
+            }
+        }
+        snapshotController.onFlashTile = { [weak self] targetID in
+            guard let self, !UIAccessibility.isReduceMotionEnabled else { return }
+            let targets = targetID == "full-stage"
+                ? Array(self.videoTiles.values.map(\.tile))
+                : [self.videoTiles[targetID]?.tile].compactMap { $0 }
+            for tile in targets {
+                let flashLayer = CALayer()
+                flashLayer.frame = tile.bounds
+                flashLayer.cornerRadius = tile.layer.cornerRadius
+                flashLayer.borderWidth = 3
+                flashLayer.borderColor = UIColor.systemOrange.cgColor
+                tile.layer.addSublayer(flashLayer)
+                Task { @MainActor [weak flashLayer] in
+                    try? await Task.sleep(for: .milliseconds(220))
+                    flashLayer?.removeFromSuperlayer()
+                }
+            }
+        }
+        snapshotController.onOpenCaptionEditor = { [weak self] record in
+            guard let self, self.presentedViewController == nil else { return }
+            let alert = UIAlertController(title: L("Snapshot caption"), message: nil, preferredStyle: .alert)
+            alert.addTextField { field in
+                field.placeholder = L("Add a note for this snapshot…")
+                field.text = record.caption
+            }
+            alert.addAction(UIAlertAction(title: L("Cancel"), style: .cancel) { [weak self] _ in
+                self?.snapshotController.isEditingCaption = false
+                self?.snapshotController.scheduleDismiss()
+            })
+            alert.addAction(UIAlertAction(title: L("Save"), style: .default) { [weak self, weak alert] _ in
+                let text = alert?.textFields?.first?.text ?? ""
+                self?.snapshotController.saveCaption(text, for: record)
+            })
+            self.present(alert, animated: true)
+        }
+
+        let pill = UIHostingController(rootView: IOSSnapshotPillView(controller: snapshotController))
+        pill.view.backgroundColor = .clear
+        pill.view.isHidden = true
+        view.addSubview(pill.view)
+        snapshotPillHost = pill
+
+        let banner = UIHostingController(rootView: IOSSnapshotHardwareBannerView(controller: snapshotController))
+        banner.view.backgroundColor = .clear
+        banner.view.isHidden = true
+        view.addSubview(banner.view)
+        snapshotBannerHost = banner
+
+        snapshotStateObserver = Publishers.Merge(
+            snapshotController.$activePill.map { _ in () },
+            snapshotController.$hardwareOfferVisible.map { _ in () }
+        )
+        .receive(on: DispatchQueue.main)
+        .sink { [weak self] _ in
+            self?.view.setNeedsLayout()
+        }
+    }
+
+    private func presentSnapshotScopeSheet() {
+        guard presentedViewController == nil else { return }
+        let sheet = UIHostingController(rootView: IOSSnapshotScopeSheet(controller: snapshotController))
+        sheet.modalPresentationStyle = .pageSheet
+        sheet.sheetPresentationController?.detents = [.medium()]
+        sheet.sheetPresentationController?.prefersGrabberVisible = true
+        present(sheet, animated: true)
+    }
+
+    private func layoutSnapshotOverlays(stage: CGRect, headerBottom: CGFloat, access: MeetingAccessGeometry) {
+        if let pillView = snapshotPillHost?.view {
+            let showPill = snapshotController.activePill != nil && textCapture == nil
+            pillView.isHidden = !showPill
+            if showPill {
+                let maxWidth = min(380, max(220, view.bounds.width - 24))
+                let size = pillView.sizeThatFits(CGSize(width: maxWidth, height: 80))
+                let anchorY = min(access.toolbar.minY, access.access.minY)
+                let y = max(headerBottom + 8, anchorY - max(52, ceil(size.height)) - 10)
+                pillView.frame = CGRect(
+                    x: floor(view.bounds.midX - min(maxWidth, ceil(size.width)) / 2),
+                    y: y,
+                    width: min(maxWidth, ceil(size.width)),
+                    height: max(52, ceil(size.height))
+                )
+                view.bringSubviewToFront(pillView)
+            }
+        }
+        if let bannerView = snapshotBannerHost?.view {
+            let showBanner = snapshotController.hardwareOfferVisible && textCapture == nil
+            bannerView.isHidden = !showBanner
+            if showBanner {
+                let maxWidth = min(360, max(220, stage.width - 16))
+                let size = bannerView.sizeThatFits(CGSize(width: maxWidth, height: 120))
+                bannerView.frame = CGRect(
+                    x: floor(stage.midX - min(maxWidth, ceil(size.width)) / 2),
+                    y: max(headerBottom + 8, stage.minY + 8),
+                    width: min(maxWidth, ceil(size.width)),
+                    height: max(68, ceil(size.height))
+                )
+                view.bringSubviewToFront(bannerView)
+            }
+        }
     }
     func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
         if gestureRecognizer is UISwipeGestureRecognizer { return effectiveLayoutMode != .grid && (primaryZoom?.zoomScale ?? 1) <= 1.01 }
@@ -1499,6 +1663,14 @@ final class RockCallViewController: UIViewController, UIScrollViewDelegate, UICo
                     self?.setPin(selected ? nil : target)
                 }]
             if target.isScreenShare { actions.append(UIAction(title: L("Select text"), image: UIImage(systemName: "text.viewfinder")) { _ in self?.openSharedText(key: key) }) }
+            if self?.videoTiles[key] != nil {
+                actions.append(UIAction(title: target.isScreenShare ? L("Snap screen share") : L("Snap camera"), image: UIImage(systemName: "camera.viewfinder")) { _ in
+                    self?.snapshotController.capture(targetID: key)
+                })
+                actions.append(UIAction(title: L("Snap full meeting stage"), image: UIImage(systemName: "rectangle.grid.2x2")) { _ in
+                    self?.snapshotController.captureFullStage()
+                })
+            }
             return UIMenu(children: actions)
         }
     }
@@ -1840,6 +2012,10 @@ final class RockCallViewController: UIViewController, UIScrollViewDelegate, UICo
         tile.accessibilityIdentifier = key
         tile.accessibilityLabel = "\(participant.name ?? L("Musician")) \(isShare ? L("screen share") : L("video"))"
         tile.addInteraction(UIContextMenuInteraction(delegate: self))
+        let snapTap = UITapGestureRecognizer(target: self, action: #selector(twoFingerDoubleTappedTile(_:)))
+        snapTap.numberOfTouchesRequired = 2
+        snapTap.numberOfTapsRequired = 2
+        tile.addGestureRecognizer(snapTap)
         let zoom = UIScrollView()
         zoom.contentInsetAdjustmentBehavior = .never
         zoom.minimumZoomScale = 1

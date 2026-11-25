@@ -36,6 +36,8 @@ import UniformTypeIdentifiers
     let chat = ChatStore()
     let participation = ParticipationCoordinator()
     let catchUp = CatchUpStore()
+    let snapshotRegistry = NativeDesktopSnapshotRegistry()
+    lazy var snapshotController = NativeDesktopSnapshotController(model: self)
     let sessionID = UUID()
     private let fallbackRoomTitle: String
     private(set) var scheduledTitle: String?
@@ -2581,6 +2583,8 @@ import UniformTypeIdentifiers
         if let leaveTask { return leaveTask }
         let leftAt = Date()
         cancelWorkspaceApprovedOutputs()
+        snapshotController.teardown()
+        snapshotRegistry.removeAll()
         participation.stop(.meetingEnded)
         captureCoordinator.beginLeave(sessionID: sessionID); power.stop()
         closed = true; generation = UUID(); snapshot.phase = .leaving; headset.end()

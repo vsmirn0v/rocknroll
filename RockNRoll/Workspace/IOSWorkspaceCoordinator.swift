@@ -701,11 +701,22 @@ final class IOSWorkspaceCoordinator: ObservableObject {
         do {
             // Reading the transcript can suspend while the user changes providers or revokes consent.
             _ = try permittedAIConfiguration()
+            let visualRecords = await MeetingSnapshotStore.shared.snapshots(for: sid)
+            let visualContext = MeetingSnapshotMarkdown.summaryPromptContext(snapshots: visualRecords)
+            let trimmedNotes = noteText.trimmingCharacters(in: .whitespacesAndNewlines)
+            let combinedNotes: String = {
+                switch (trimmedNotes.isEmpty ? nil : noteText, visualContext) {
+                case (let n?, let v?): return n + "\n\n" + v
+                case (let n?, nil): return n
+                case (nil, let v?): return v
+                case (nil, nil): return noteText
+                }
+            }()
             let result = try await outcomeWriter.generateOutcome(
                 title: title,
                 endedAt: endedAt,
                 events: events,
-                notes: noteText,
+                notes: combinedNotes,
                 language: language,
                 configuration: configuration,
                 customInstructions: summaryPromptProvider?()

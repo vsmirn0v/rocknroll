@@ -1,3 +1,4 @@
+import ConferenceCore
 import Foundation
 
 /// Actor-owned export loop. One pass drains the due outbox rows; each session's file
@@ -327,9 +328,15 @@ actor ObsidianExportWorker {
                 binding.lastMetadataSHA256 = approved
             }
         }
+        let visualSnapshots = destination.layout.sections.contains(.snapshots) && component != .index && component != .transcript
+            ? await MeetingSnapshotStore.shared.snapshots(for: session.id) : []
+        if !visualSnapshots.isEmpty {
+            try await copySnapshotAttachments(visualSnapshots, destination: destination, relativeMarkdownPath: relativePath, in: vault)
+        }
         let result = try ObsidianComponentRenderer.patch(existing: existingText, binding: binding,
             destination: destination, snapshot: snapshot, meetingRelativePath: meetingRelativePath,
-            transcriptBody: transcriptBody, transcriptRelativePath: transcriptRelativePath, fileExists: expected != nil)
+            transcriptBody: transcriptBody, transcriptRelativePath: transcriptRelativePath,
+            fileExists: expected != nil, visualSnapshots: visualSnapshots)
         if let reviewed = approval?.proposedBlockHash, reviewed != result.blockSHA256 {
             throw ObsidianExportError.managedBlockConflict
         }
@@ -347,6 +354,29 @@ actor ObsidianExportWorker {
         receipt.lastFileSHA256 = outcome.identity.sha256
         try await store.commitExportWrite(receipt)
         return receipt
+    }
+
+    private func copySnapshotAttachments(
+        _ snapshots: [MeetingSnapshotRecord],
+        destination: ObsidianDestinationRecord,
+        relativeMarkdownPath: String,
+        in vault: URL
+    ) async throws {
+        let parentDir = (relativeMarkdownPath as NSString).deletingLastPathComponent
+        let attachmentsDir = parentDir.isEmpty ? "Attachments" : parentDir + "/Attachments"
+        for snap in snapshots {
+            let relativeTarget = attachmentsDir + "/" + snap.exportFileName
+            guard case .success(let targetURL) = ObsidianVaultAccess.validate(relativePath: relativeTarget, in: vault),
+                  case .success(let fileURL) = ObsidianVaultAccess.validateFileTarget(targetURL) else {
+                continue
+            }
+            if FileManager.default.fileExists(atPath: fileURL.path) { continue }
+            let sourceURL = await MeetingSnapshotStore.shared.imageURL(for: snap)
+            guard FileManager.default.fileExists(atPath: sourceURL.path) else { continue }
+            try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            let data = try Data(contentsOf: sourceURL)
+            try data.write(to: fileURL, options: .atomic)
+        }
     }
 
     private func metadataMatches(_ binding: ObsidianExportBindingRecord, in text: String) throws -> Bool {
@@ -394,8 +424,11 @@ actor ObsidianExportWorker {
         let overrides = (try? await store.autoExportOverrides(for: snapshot.session)) ?? .init()
         let destination = rawDestination.effective(for: overrides)
         let transcript = destination.layout.sections.contains(.transcript) ? await transcriptProvider(snapshot.session) : nil
+        let visualSnapshots = destination.layout.sections.contains(.snapshots)
+            ? await MeetingSnapshotStore.shared.snapshots(for: snapshot.session.id) : []
         let copy = MeetingMarkdownTemplate.managedContent(session: snapshot.session, note: snapshot.note,
-            outcome: snapshot.outcome, outcomeState: snapshot.outcomeState, sections: destination.layout.sections)
+            outcome: snapshot.outcome, outcomeState: snapshot.outcomeState, sections: destination.layout.sections,
+            snapshots: visualSnapshots, useWikiLinksForSnapshots: true)
             + ObsidianComponentRenderer.transcriptSection(component: .meeting, layout: destination.layout,
                 path: binding.relativePath, body: transcript, transcriptPath: nil)
         guard let vault = await resolveVault(destination) else {
@@ -421,7 +454,8 @@ actor ObsidianExportWorker {
         if let currentMetadata { reviewed.lastMetadataSHA256 = MarkdownFilePatcher.sha256(currentMetadata) }
         let candidate = try? ObsidianComponentRenderer.patch(existing: text, binding: reviewed,
             destination: destination, snapshot: snapshot, meetingRelativePath: meetingPath,
-            transcriptBody: transcript, transcriptRelativePath: transcriptPath, fileExists: true)
+            transcriptBody: transcript, transcriptRelativePath: transcriptPath, fileExists: true,
+            visualSnapshots: visualSnapshots)
         let local = candidate.flatMap {
             MarkdownFilePatcher.managedBlockContent(in: $0.text, sessionID: row.sessionID,
                 nonce: nonce, component: binding.component)

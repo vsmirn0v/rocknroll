@@ -983,6 +983,13 @@ struct MeetingHistoryView: View {
         ScrollViewReader { scroll in
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
+                    MacMeetingSnapshotsStripView(
+                        sessionIDs: Array(Set([card.sessionID] + sources.map(\.sessionID))),
+                        onSnapshotUpdated: { updatedSessionID in
+                            Task { try? await library.store.markSnapshotExportDirty(sessionID: updatedSessionID) }
+                        }
+                    )
+                    .padding([.top, .horizontal], 20)
                     VStack(alignment: .leading, spacing: 10) {
                         if sources.count > 1 {
                             Picker(L("Notes"), selection: Binding(get: {

@@ -1,3 +1,4 @@
+import ConferenceCore
 import Darwin
 import Foundation
 
@@ -9,6 +10,8 @@ struct MeetingManualExportItem: Identifiable, Sendable {
     var outcomeState: MeetingOutcomePersistenceState
     var isUnsavedDraft: Bool
     var transcriptBody: String? = nil
+    var visualSnapshots: [MeetingSnapshotRecord] = []
+    var snapshotSourceURLs: [UUID: URL] = [:]
 
     var effectiveDate: Date? {
         session.effectiveDate?.date
@@ -89,9 +92,16 @@ enum MeetingManualExport {
         if options.format != .worklog {
             for item in items {
                 let name = MeetingMarkdownTemplate.meetingFileName(title: item.session.title, sessionID: item.id)
+                if options.sections.contains(.snapshots) {
+                    copySnapshots(for: item, toDirectory: directory)
+                }
                 let result = save(render(item: item, sections: options.sections), name: name, directory: directory)
                 results.append(result)
                 written[item.id] = result.url
+            }
+        } else if options.sections.contains(.snapshots) {
+            for item in items {
+                copySnapshots(for: item, toDirectory: directory)
             }
         }
         if options.format != .files {
@@ -165,7 +175,8 @@ enum MeetingManualExport {
 
     private static func renderBody(_ item: MeetingManualExportItem, sections: MeetingMarkdownSections, heading: Int) -> String {
         var body = MeetingMarkdownTemplate.managedContent(session: item.session, note: item.note, outcome: item.outcome,
-            outcomeState: item.outcomeState, sections: sections, headingLevel: heading)
+            outcomeState: item.outcomeState, sections: sections, headingLevel: heading,
+            snapshots: item.visualSnapshots, useWikiLinksForSnapshots: false)
         if item.isUnsavedDraft, sections.contains(.notes) {
             body += "\n\n> " + L("Unsaved draft: the local note had not finished saving when this file was written.")
         }
@@ -196,6 +207,21 @@ enum MeetingManualExport {
         guard index > 1 else { return directory.appendingPathComponent(fileName) }
         let base = (fileName as NSString).deletingPathExtension
         return directory.appendingPathComponent("\(base) \(index).md")
+    }
+
+    private static func copySnapshots(for item: MeetingManualExportItem, toDirectory directory: URL) {
+        guard !item.visualSnapshots.isEmpty else { return }
+        let attachmentsDir = directory.appendingPathComponent("Attachments", isDirectory: true)
+        try? FileManager.default.createDirectory(at: attachmentsDir, withIntermediateDirectories: true)
+        for snap in item.visualSnapshots {
+            guard let srcURL = item.snapshotSourceURLs[snap.id],
+                  FileManager.default.fileExists(atPath: srcURL.path) else { continue }
+            let destURL = attachmentsDir.appendingPathComponent(snap.exportFileName)
+            if !FileManager.default.fileExists(atPath: destURL.path),
+               let data = try? Data(contentsOf: srcURL) {
+                try? data.write(to: destURL, options: .atomic)
+            }
+        }
     }
 
     private static func save(_ text: String, name: String, directory: URL) -> MeetingManualExportFileResult {

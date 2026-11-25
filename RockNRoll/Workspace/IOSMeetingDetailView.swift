@@ -363,6 +363,10 @@ struct IOSMeetingDetailView: View {
                 }
             }
 
+            IOSMeetingSnapshotsSection(
+                sessionIDs: [resolvedSessionID] + workspace.linkedHistorySources(for: sessionID).map(\.id)
+            )
+
             if let outcome {
                 Section {
                     if editingOutcome {

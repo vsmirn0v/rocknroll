@@ -1,6 +1,7 @@
 import AppKit
 import AVFoundation
 import Combine
+import ConferenceCore
 import LiveKitWebRTC
 import SwiftUI
 
@@ -467,17 +468,36 @@ struct NativeDesktopVideoView: NSViewRepresentable {
     var pan: CGSize = .zero
     var textFrame: NativeDesktopTextFrame? = nil
     var textSourceID: String? = nil
+    var snapshotRegistry: NativeDesktopSnapshotRegistry? = nil
+    var snapshotSourceID: String? = nil
+    var snapshotParticipantID: String? = nil
+    var snapshotSourceName: String? = nil
+    var snapshotScope: MeetingSnapshotScope = .participantCamera
     func makeCoordinator() -> Coordinator { Coordinator() }
     func makeNSView(context: Context) -> NSView {
         let host = NativeDesktopVideoHost(); host.wantsLayer = true; host.layer?.backgroundColor = NSColor.black.cgColor
         host.onVisibilityChanged = { [weak coordinator = context.coordinator, weak host] in
             guard let host else { return }; coordinator?.refreshVisibility(host: host)
         }
+        context.coordinator.bindSnapshot(
+            registry: snapshotRegistry,
+            sourceID: snapshotSourceID,
+            participantID: snapshotParticipantID,
+            sourceName: snapshotSourceName,
+            scope: snapshotScope
+        )
         context.coordinator.bind(track: track, mirrored: mirrored, crop: crop, zoom: zoom, pan: pan, host: host)
         bindTextCapture(context.coordinator)
         return host
     }
     func updateNSView(_ view: NSView, context: Context) {
+        context.coordinator.bindSnapshot(
+            registry: snapshotRegistry,
+            sourceID: snapshotSourceID,
+            participantID: snapshotParticipantID,
+            sourceName: snapshotSourceName,
+            scope: snapshotScope
+        )
         context.coordinator.bind(track: track, mirrored: mirrored, crop: crop, zoom: zoom, pan: pan, host: view)
         bindTextCapture(context.coordinator)
     }
@@ -498,6 +518,29 @@ struct NativeDesktopVideoView: NSViewRepresentable {
         private var crop: CGRect?
         private var zoom: CGFloat = 1
         private var pan = CGSize.zero
+        private weak var snapshotRegistry: NativeDesktopSnapshotRegistry?
+        private var snapshotSourceID: String?
+        private var snapshotParticipantID: String?
+        private var snapshotSourceName: String?
+        private var snapshotScope: MeetingSnapshotScope = .participantCamera
+        private var registeredSnapshotID: String?
+        func bindSnapshot(
+            registry: NativeDesktopSnapshotRegistry?,
+            sourceID: String?,
+            participantID: String?,
+            sourceName: String?,
+            scope: MeetingSnapshotScope
+        ) {
+            if let old = registeredSnapshotID, (registry !== snapshotRegistry || sourceID != old) {
+                snapshotRegistry?.unregister(id: old)
+                registeredSnapshotID = nil
+            }
+            snapshotRegistry = registry
+            snapshotSourceID = sourceID
+            snapshotParticipantID = participantID
+            snapshotSourceName = sourceName
+            snapshotScope = scope
+        }
         func snapshotImage(expectedTrack: LKRTCVideoTrack, expectedCrop: CGRect?, expectedMirrored: Bool) async -> CGImage? {
             guard track === expectedTrack, crop == expectedCrop, mirrored == expectedMirrored else { return nil }
             return await sink?.snapshotImage(expectedCrop: expectedCrop)
@@ -525,8 +568,27 @@ struct NativeDesktopVideoView: NSViewRepresentable {
                 track.add(sink)
             }
             sink?.setPresentation(crop: crop, zoom: zoom, pan: pan)
+            if let registry = snapshotRegistry, let sourceID = snapshotSourceID, let participantID = snapshotParticipantID {
+                let expectedTrack = track
+                let expectedCrop = crop
+                let expectedMirrored = mirrored
+                registry.register(
+                    id: sourceID,
+                    participantID: participantID,
+                    participantName: snapshotSourceName ?? "",
+                    scope: snapshotScope
+                ) { [weak self, weak expectedTrack] in
+                    guard let self, let expectedTrack else { return nil }
+                    return await self.snapshotImage(expectedTrack: expectedTrack, expectedCrop: expectedCrop, expectedMirrored: expectedMirrored)
+                }
+                registeredSnapshotID = sourceID
+            }
         }
         private func retireRenderer() {
+            if let old = registeredSnapshotID {
+                snapshotRegistry?.unregister(id: old)
+                registeredSnapshotID = nil
+            }
             sink?.stop()
             if let sink { track?.remove(sink); sink.view.removeFromSuperview() }
             sink = nil

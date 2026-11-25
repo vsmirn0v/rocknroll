@@ -24,7 +24,8 @@ enum ObsidianComponentRenderer {
     static func patch(existing: String, binding: ObsidianExportBindingRecord, destination: ObsidianDestinationRecord,
                       snapshot: ObsidianExportSnapshot, meetingRelativePath: String?,
                       transcriptBody: String? = nil, transcriptRelativePath: String? = nil,
-                      fileExists: Bool = false) throws -> MarkdownFilePatcher.PatchResult {
+                      fileExists: Bool = false,
+                      visualSnapshots: [MeetingSnapshotRecord] = []) throws -> MarkdownFilePatcher.PatchResult {
         guard let nonce = binding.markerID else { throw ObsidianExportError.markerDamage("The export binding has no marker identity.") }
         let layout = destination.layout
         let session = snapshot.session
@@ -35,7 +36,8 @@ enum ObsidianComponentRenderer {
             let heading = shared ? (layout.groupByDay ? 4 : 3) : 1
             content = MeetingMarkdownTemplate.managedContent(session: session, note: snapshot.note, outcome: snapshot.outcome,
                 outcomeState: snapshot.outcomeState, sections: layout.sections, headingLevel: heading,
-                boldTitle: shared && layout.runtimeStyle) + transcriptSection(component: binding.component, layout: layout,
+                boldTitle: shared && layout.runtimeStyle, snapshots: visualSnapshots,
+                useWikiLinksForSnapshots: true) + transcriptSection(component: binding.component, layout: layout,
                     path: binding.relativePath, body: transcriptBody, transcriptPath: transcriptRelativePath)
         case .transcript:
             content = "# " + MeetingMarkdownTemplate.transcriptText(session.title) + transcriptSection(component: .transcript, layout: layout,

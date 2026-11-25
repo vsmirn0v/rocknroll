@@ -1,4 +1,5 @@
 import AppKit
+import ConferenceCore
 import Foundation
 
 @MainActor final class MeetingManualExportController: ObservableObject {
@@ -64,9 +65,12 @@ import Foundation
                         endedAt: card.endedAt, state: card.state, startProvenance: card.startProvenance,
                         outcomeEndFallback: card.outcomeEndFallback)
                     let transcriptBody = await transcriptLoader(card, session)
+                    let snaps = await MeetingSnapshotStore.shared.snapshots(for: card.sessionID)
+                    var urls: [UUID: URL] = [:]
+                    for snap in snaps { urls[snap.id] = await MeetingSnapshotStore.shared.imageURL(for: snap) }
                     items.append(.init(session: session, note: Self.draftNote(draft.text, session: session),
                                        outcome: nil, outcomeState: card.outcomeState, isUnsavedDraft: true,
-                                       transcriptBody: transcriptBody))
+                                       transcriptBody: transcriptBody, visualSnapshots: snaps, snapshotSourceURLs: urls))
                 } else {
                     let name = MeetingMarkdownTemplate.meetingFileName(title: card.title, sessionID: card.sessionID)
                     failures.append(.init(name: name, url: nil, error: snapshotError ?? L("The meeting is unavailable.")))
@@ -81,9 +85,12 @@ import Foundation
                 if !unsaved, let revision = draft.revision { note?.revision = revision }
             }
             let transcriptBody = await transcriptLoader(card, snapshot.session)
+            let snaps = await MeetingSnapshotStore.shared.snapshots(for: card.sessionID)
+            var urls: [UUID: URL] = [:]
+            for snap in snaps { urls[snap.id] = await MeetingSnapshotStore.shared.imageURL(for: snap) }
             items.append(.init(session: snapshot.session, note: note, outcome: snapshot.outcome,
                                outcomeState: snapshot.outcomeState, isUnsavedDraft: unsaved,
-                               transcriptBody: transcriptBody))
+                               transcriptBody: transcriptBody, visualSnapshots: snaps, snapshotSourceURLs: urls))
         }
         return (items, failures)
     }

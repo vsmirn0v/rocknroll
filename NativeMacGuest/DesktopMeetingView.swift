@@ -348,6 +348,12 @@ struct NativeDesktopMeetingView: View {
                     if model.isSharingLive && !textSelection.isOpen { shareBanner.padding(.top, 8).padding(.trailing, reserved) }
                     if !textSelection.isOpen { HStack { reactionOverlay; Spacer() }.padding(.leading, 22).padding(.top, 12) }
                     Spacer(minLength: 0)
+                    if !textSelection.isOpen {
+                        NativeDesktopSnapshotPill(controller: model.snapshotController)
+                            .padding(.horizontal, 16)
+                            .padding(.bottom, 8)
+                            .padding(.trailing, reserved)
+                    }
                     if model.immersive && immersiveHint {
                         Text(L("Move the pointer to show controls · Esc to leave immersive view")).font(.callout)
                             .padding(.horizontal, 14).padding(.vertical, 8).background(.black.opacity(0.7), in: Capsule()).padding(.bottom, 22)
@@ -509,6 +515,11 @@ struct NativeDesktopMeetingView: View {
                 controlButton("face.smiling", L("Reactions"), width: 36, selected: reactionsOpen) { reactionsOpen.toggle() }
                     .help(L("Reactions")).disabled(!model.canReact)
                     .popover(isPresented: $reactionsOpen, arrowEdge: .top) { reactionPicker }
+                controlButton("camera.viewfinder", L("Snap"), width: 36) { model.snapshotController.captureSmart() }
+                    .help(L("Snap to summary (⇧⌘S)"))
+                    .keyboardShortcut("s", modifiers: [.command, .shift])
+                    .disabled(model.visibleVideos.isEmpty && model.localCamera == nil)
+                    .accessibilityIdentifier("meeting.footer.snap")
                 if let workspace {
                     AttentionControlButtonGate(attention: workspace.attention, model: model)
                 }
@@ -611,6 +622,12 @@ struct NativeDesktopMeetingView: View {
         Button(L("Conversation")) { togglePanel(.conversation) }
         Button(L("Notes")) { togglePanel(.notes) }
         Button(L("Mini meeting"), action: onMini)
+        Divider()
+        Button(L("Snap to summary")) { model.snapshotController.captureSmart() }
+            .disabled(model.visibleVideos.isEmpty && model.localCamera == nil)
+        Button(L("Snap full meeting stage")) { model.snapshotController.captureFullStage() }
+            .keyboardShortcut("e", modifiers: [.command, .shift])
+            .disabled(model.visibleVideos.isEmpty && model.localCamera == nil)
         Divider()
         Button(L("Camera & sound")) { togglePanel(.studio) }
         Button(L("Presenter studio")) { togglePanel(.presenter) }
@@ -737,6 +754,7 @@ struct NativeDesktopMeetingView: View {
                 if let focused = model.focusedVideo {
                     NativeDesktopZoomVideo(video: focused, name: name(focusedID), viewport: focusedViewport,
                         textFrame: textFrame, selectText: focused.source == .screen ? selectSharedText : nil,
+                        snapshotRegistry: model.snapshotRegistry, snapshotController: model.snapshotController,
                         immersive: model.immersive, onImmersive: { model.immersive.toggle() },
                         bottomOverlayInset: model.immersive && showsFooter ? Self.footerHeight : 0)
                         .overlay(alignment: .topLeading) {
@@ -775,19 +793,71 @@ struct NativeDesktopMeetingView: View {
     }
     private func participantTile(_ person: NativeDesktopParticipant, compact: Bool, presenter: Bool = false) -> some View {
         let source: NativeDesktopVideoSource = !presenter && model.display == .screenShares ? .screen : .camera
+        let tileScope: MeetingSnapshotScope = source == .screen ? .screenShare : .participantCamera
+        let tileSourceID: String = {
+            if person.isLocal { return source == .screen ? "local-screen" : "local-camera" }
+            if let video = model.visibleVideos.first(where: {
+                $0.participantID == person.id && $0.source == source && (!presenter || person.cameraOn != false)
+            }) {
+                return video.id
+            }
+            return "\(person.id)-\(source.rawValue)"
+        }()
+        let hasLiveTileVideo: Bool = {
+            if person.isLocal, (!presenter || (model.receivesCameras && person.cameraOn != false)), model.localCamera != nil { return true }
+            return model.visibleVideos.contains(where: {
+                $0.participantID == person.id && $0.source == source && (!presenter || person.cameraOn != false)
+            })
+        }()
         return ZStack(alignment: .bottomLeading) {
             Color(white: 0.11)
             if person.isLocal, (!presenter || (model.receivesCameras && person.cameraOn != false)), let track = model.localCamera {
-                NativeDesktopVideoView(track: track, mirrored: true)
+                NativeDesktopVideoView(
+                    track: track,
+                    mirrored: true,
+                    snapshotRegistry: model.snapshotRegistry,
+                    snapshotSourceID: tileSourceID,
+                    snapshotParticipantID: person.id,
+                    snapshotSourceName: person.name,
+                    snapshotScope: tileScope
+                )
             } else if let video = model.visibleVideos.first(where: {
                 $0.participantID == person.id && $0.source == source && (!presenter || person.cameraOn != false)
             }) {
-                NativeDesktopVideoView(track: video.track, crop: video.crop)
+                NativeDesktopVideoView(
+                    track: video.track,
+                    crop: video.crop,
+                    snapshotRegistry: model.snapshotRegistry,
+                    snapshotSourceID: video.id,
+                    snapshotParticipantID: person.id,
+                    snapshotSourceName: person.name,
+                    snapshotScope: tileScope
+                )
             } else {
                 VStack(spacing: 12) {
                     Text(initials(person.name)).font(compact ? .body : .title).padding(compact ? 8 : 15).background(.white.opacity(0.08), in: Circle())
                     if !compact { Text(person.name).font(.headline).lineLimit(2).multilineTextAlignment(.center) }
                 }.frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+            if hasLiveTileVideo {
+                VStack {
+                    HStack {
+                        Spacer()
+                        Button {
+                            model.snapshotController.capture(targetID: tileSourceID)
+                        } label: {
+                            Image(systemName: "camera.viewfinder")
+                                .font(.caption.weight(.semibold))
+                                .padding(6)
+                                .background(.black.opacity(0.62), in: Circle())
+                        }
+                        .buttonStyle(.plain)
+                        .help(L("Snap %@ to summary", person.name))
+                        .accessibilityLabel(L("Snap %@ to summary", person.name))
+                    }
+                    Spacer()
+                }
+                .padding(8)
             }
             HStack(spacing: 7) {
                 VStack(alignment: .leading, spacing: 1) {
@@ -800,8 +870,22 @@ struct NativeDesktopMeetingView: View {
                 else if person.speaking == true { NativeDesktopLevelMeter(level: person.isLocal ? model.snapshot.microphoneLevel ?? 0 : 0.7) }
             }.font(.caption).padding(10).background(.black.opacity(0.45))
         }.foregroundStyle(.white).clipShape(RoundedRectangle(cornerRadius: 14))
-        .overlay(RoundedRectangle(cornerRadius: 14).stroke(person.speaking == true ? Color.green : Color.white.opacity(0.12), lineWidth: person.speaking == true ? 2 : 1))
+        .overlay(
+            RoundedRectangle(cornerRadius: 14)
+                .stroke(person.speaking == true ? Color.green : Color.white.opacity(0.12),
+                        lineWidth: person.speaking == true ? 2 : 1)
+        )
+        .overlay(NativeDesktopSnapshotFlashOverlay(controller: model.snapshotController, targetID: tileSourceID, cornerRadius: 14))
         .contextMenu {
+            if hasLiveTileVideo {
+                Button(source == .screen ? L("Snap screen share") : L("Snap camera")) {
+                    model.snapshotController.capture(targetID: tileSourceID)
+                }
+                Button(L("Snap full meeting stage")) {
+                    model.snapshotController.captureFullStage()
+                }
+                Divider()
+            }
             Button(L("Focus camera")) { model.focus(participantID: person.id, source: .camera) }
             if person.sharing == true { Button(L("Focus screen")) { model.focus(participantID: person.id, source: .screen) } }
             if !person.isLocal && model.supportsParticipantVolume { participantVolumeMenu(person) }
@@ -921,6 +1005,8 @@ struct NativeDesktopZoomVideo: View {
     @ObservedObject var viewport: NativeDesktopVideoViewport
     var textFrame: NativeDesktopTextFrame? = nil
     var selectText: (() -> Void)? = nil
+    var snapshotRegistry: NativeDesktopSnapshotRegistry? = nil
+    var snapshotController: NativeDesktopSnapshotController? = nil
     var immersive = false
     var onImmersive: (() -> Void)? = nil
     var bottomOverlayInset: CGFloat = 0
@@ -934,7 +1020,19 @@ struct NativeDesktopZoomVideo: View {
     private var savedPan: CGSize { get { viewport.savedPan } nonmutating set { viewport.savedPan = newValue } }
     var body: some View {
         GeometryReader { geometry in
-            NativeDesktopVideoView(track: video.track, crop: video.crop, zoom: zoom, pan: pan, textFrame: textFrame, textSourceID: video.id)
+            NativeDesktopVideoView(
+                track: video.track,
+                crop: video.crop,
+                zoom: zoom,
+                pan: pan,
+                textFrame: textFrame,
+                textSourceID: video.id,
+                snapshotRegistry: snapshotRegistry,
+                snapshotSourceID: video.id,
+                snapshotParticipantID: video.participantID,
+                snapshotSourceName: name,
+                snapshotScope: video.source == .screen ? .screenShare : .participantCamera
+            )
                 .contentShape(Rectangle())
                 .onAppear { viewport.size = geometry.size }
                 .onChange(of: geometry.size) { viewport.size = $0 }
@@ -956,6 +1054,29 @@ struct NativeDesktopZoomVideo: View {
                         VStack(alignment: .trailing, spacing: 6) {
                             if zoom > 1 { NativeDesktopZoomIndicator(zoom: zoom, pan: pan, aspect: geometry.size) }
                             HStack(spacing: 4) {
+                                if let snapshotController {
+                                    HStack(spacing: 0) {
+                                        Button { snapshotController.capture(targetID: video.id) } label: {
+                                            Image(systemName: "camera.viewfinder").frame(width: 30, height: 28).contentShape(Rectangle())
+                                        }
+                                        .help(L("Snap to summary (⇧⌘S)")).accessibilityLabel(L("Snap to summary"))
+                                        Menu {
+                                            ForEach(snapshotController.availableTargets()) { target in
+                                                Button {
+                                                    snapshotController.capture(targetID: target.id)
+                                                } label: {
+                                                    Label(target.title, systemImage: target.symbol)
+                                                }
+                                            }
+                                        } label: {
+                                            Image(systemName: "chevron.down").font(.system(size: 9, weight: .semibold)).frame(width: 16, height: 28)
+                                        }
+                                        .menuStyle(.borderlessButton)
+                                        .fixedSize()
+                                        .help(L("Choose snapshot target"))
+                                    }
+                                    Divider().frame(height: 16)
+                                }
                                 if video.source == .screen, let selectText {
                                     Button(action: selectText) {
                                         Image(systemName: "text.viewfinder").frame(width: 32, height: 28).contentShape(Rectangle())
@@ -983,7 +1104,26 @@ struct NativeDesktopZoomVideo: View {
                     .padding(.bottom, bottomOverlayInset)
                 }
         }.clipShape(RoundedRectangle(cornerRadius: immersive ? 0 : 14))
-            .contextMenu { if video.source == .screen, let selectText { Button(L("Select text"), action: selectText) } }
+            .overlay {
+                if let snapshotController {
+                    NativeDesktopSnapshotFlashOverlay(
+                        controller: snapshotController,
+                        targetID: video.id,
+                        cornerRadius: immersive ? 0 : 14
+                    )
+                }
+            }
+            .contextMenu {
+                if let snapshotController {
+                    Button(video.source == .screen ? L("Snap screen share") : L("Snap camera")) {
+                        snapshotController.capture(targetID: video.id)
+                    }
+                    Button(L("Snap full meeting stage")) {
+                        snapshotController.captureFullStage()
+                    }
+                }
+                if video.source == .screen, let selectText { Button(L("Select text"), action: selectText) }
+            }
             .onAppear { viewport.select(participant: video.participantID, source: video.source) }
             .onChange(of: video.participantID) { _ in viewport.select(participant: video.participantID, source: video.source) }
             .onChange(of: video.source.rawValue) { _ in viewport.select(participant: video.participantID, source: video.source) }
@@ -1227,8 +1367,28 @@ struct NativeDesktopMiniMeeting: View {
                         NativeDesktopLevelMeter(level: model.snapshot.microphoneLevel ?? 0).foregroundStyle(.secondary)
                     }.padding()
                 }
-                else if model.mediaPresentation == .floating, model.display != .audioOnly, let video = model.floatingVideo { NativeDesktopVideoView(track: video.track, crop: video.crop) }
-                else if model.mediaPresentation == .floating, model.display == .all, let camera = model.localCamera { NativeDesktopVideoView(track: camera, mirrored: true) }
+                else if model.mediaPresentation == .floating, model.display != .audioOnly, let video = model.floatingVideo {
+                    NativeDesktopVideoView(
+                        track: video.track,
+                        crop: video.crop,
+                        snapshotRegistry: model.snapshotRegistry,
+                        snapshotSourceID: video.id,
+                        snapshotParticipantID: video.participantID,
+                        snapshotSourceName: model.participants.first(where: { $0.id == video.participantID })?.name ?? "",
+                        snapshotScope: video.source == .screen ? .screenShare : .participantCamera
+                    )
+                }
+                else if model.mediaPresentation == .floating, model.display == .all, let camera = model.localCamera {
+                    NativeDesktopVideoView(
+                        track: camera,
+                        mirrored: true,
+                        snapshotRegistry: model.snapshotRegistry,
+                        snapshotSourceID: "local-camera",
+                        snapshotParticipantID: model.participants.first(where: { $0.isLocal })?.id ?? "local",
+                        snapshotSourceName: L("You"),
+                        snapshotScope: .participantCamera
+                    )
+                }
                 else { Text(model.title).foregroundStyle(.white).padding() }
                 VStack {
                     header.padding(8)
@@ -1277,6 +1437,10 @@ struct NativeDesktopMiniMeeting: View {
                 .accessibilityLabel(L("Mute or unmute"))
             NativeDesktopLevelMeter(level: model.snapshot.microphoneLevel ?? 0)
             NativeDesktopMeetingVolume(model: model, compact: true).frame(minWidth: 70, maxWidth: 150)
+            Button { model.snapshotController.captureSmart() } label: { Image(systemName: "camera.viewfinder") }
+                .help(L("Snap to summary"))
+                .accessibilityLabel(L("Snap to summary"))
+                .disabled(model.visibleVideos.isEmpty && model.localCamera == nil)
             Spacer(minLength: 4); Button(L("Show meeting"), action: onRestore)
             Button { Task { await model.onLeave?() } } label: { Image(systemName: "phone.down.fill").foregroundStyle(.red) }
                 .help(L("Leave"))

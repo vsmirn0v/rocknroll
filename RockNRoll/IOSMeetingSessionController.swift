@@ -384,6 +384,7 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
         view.usesNativeShareControl = IOSNativeScreenCaptureAvailability.isAvailable
         view.sharingAvailable = false
         view.studio = studio
+        view.workspaceSessionIDProvider = { [weak self] in self?.workspaceSessionID ?? self?.id ?? UUID() }
         view.onMinimize = { [weak self] in self?.onMinimize?() }
         view.onSelectMeeting = { [weak self] id in self?.onSelectMeeting?(id) }
         view.onTalkHere = { [weak self] id in self?.onTalkHere?(id) }
