@@ -124,6 +124,8 @@ final class RockCallViewController: UIViewController, UIScrollViewDelegate, UICo
         let browsedStream: PinnedStream?
         let cameraFocusShare: PinnedStream?
         let preservingPinDuringReconnect: Bool
+        let stagePhase: NativeDesktopMeetingPhase
+        let stageLobbyMessage: String?
         let isHeld: Bool
         let canFlipCamera: Bool
         let captureDeviceID: String?
@@ -297,6 +299,8 @@ final class RockCallViewController: UIViewController, UIScrollViewDelegate, UICo
     private var pinnedStreamKey: String?
     private var pinnedStream: PinnedStream?
     private var preservingPinDuringReconnect = false
+    private var stagePhase: NativeDesktopMeetingPhase = .connected
+    private var stageLobbyMessage: String?
     private var streamPinTargets: [String: PinnedStream] = [:]
     private var offeredShare: PinnedStream?
     private var participantBadges: [String: [ParticipantMediaBadge]] = [:]
@@ -1658,8 +1662,21 @@ final class RockCallViewController: UIViewController, UIScrollViewDelegate, UICo
     }
 
     func setConnectionRecovering(_ recovering: Bool) {
+        let changed = preservingPinDuringReconnect != recovering
         preservingPinDuringReconnect = recovering
         updateSpeakerAvailability()
+        if changed, let snapshot = displayedSnapshot {
+            render(snapshot: snapshot)
+        }
+    }
+
+    func setStagePhase(_ phase: NativeDesktopMeetingPhase, lobbyMessage: String? = nil) {
+        let changed = stagePhase != phase || stageLobbyMessage != lobbyMessage
+        stagePhase = phase
+        stageLobbyMessage = lobbyMessage
+        if changed, let snapshot = displayedSnapshot {
+            render(snapshot: snapshot)
+        }
     }
 
     func contextMenuInteraction(_ interaction: UIContextMenuInteraction,
@@ -1772,6 +1789,8 @@ final class RockCallViewController: UIViewController, UIScrollViewDelegate, UICo
             browsedStream: browsedStream,
             cameraFocusShare: cameraFocusShare,
             preservingPinDuringReconnect: preservingPinDuringReconnect,
+            stagePhase: stagePhase,
+            stageLobbyMessage: stageLobbyMessage,
             isHeld: isHeld,
             canFlipCamera: studio?.canFlipCamera == true,
             captureDeviceID: studio?.liveCaptureDevice?()?.uniqueID,
@@ -1804,8 +1823,14 @@ final class RockCallViewController: UIViewController, UIScrollViewDelegate, UICo
             if !pin.isScreenShare { layoutMode = .grid }
         }
         let identifier = workspace.roomIdentifier.map { " · \($0)" } ?? ""
-        if preservingPinDuringReconnect && snapshot.remoteParticipants.isEmpty {
-            countLabel.text = L("Reconnecting…")
+        if preservingPinDuringReconnect {
+            countLabel.text = snapshot.remoteParticipants.isEmpty
+                ? L("Reconnecting…")
+                : L("Reconnecting…") + " · " + L("%ld musicians", participants.count) + identifier
+        } else if stagePhase == .connecting && snapshot.remoteParticipants.isEmpty {
+            countLabel.text = L("Connecting…")
+        } else if stagePhase == .lobby && snapshot.remoteParticipants.isEmpty {
+            countLabel.text = L("Waiting for host…")
         } else {
             countLabel.text = snapshot.remoteParticipants.isEmpty ? L("Only you here%@", identifier) : L("%ld musicians", participants.count) + identifier
         }
@@ -1934,6 +1959,17 @@ final class RockCallViewController: UIViewController, UIScrollViewDelegate, UICo
             if tiles.arrangedSubviews.isEmpty {
                 let status = UILabel()
                 status.text = L("Restoring meeting media…")
+                status.textColor = .lightGray
+                status.textAlignment = .center
+                status.numberOfLines = 0
+                tiles.addArrangedSubview(status)
+            }
+        } else if stagePhase == .connecting || stagePhase == .lobby {
+            if tiles.arrangedSubviews.isEmpty {
+                let status = UILabel()
+                status.text = stagePhase == .lobby
+                    ? (stageLobbyMessage ?? L("Waiting for the host to admit you…"))
+                    : L("Connecting…")
                 status.textColor = .lightGray
                 status.textAlignment = .center
                 status.numberOfLines = 0

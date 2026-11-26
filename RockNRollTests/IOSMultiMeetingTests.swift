@@ -196,6 +196,13 @@ final class IOSMultiMeetingTests: XCTestCase {
         func setTranscriptionRequested(_ requested: Bool) {}
         func setMicrophoneGate(open: Bool) async -> Bool { true }
         func playVoiceReply(_ buffer: AVAudioPCMBuffer) async -> Bool { false }
+        func prepareLocalMuteIntent(audioMuted: Bool?, videoMuted: Bool?) {
+            if let audioMuted {
+                snapshot.microphoneOn = !audioMuted
+                sessionSnapshot.intent.microphoneOn = !audioMuted
+                sessionSnapshot.effective.microphoneOn = false
+            }
+        }
     }
 
     private func makeModel(lobbyForGuest: Bool = false, preferences: UserDefaults = UserDefaults(suiteName: UUID().uuidString)!) -> (
@@ -1237,6 +1244,244 @@ final class IOSMultiMeetingTests: XCTestCase {
         XCTAssertEqual(h.model.sessions.count, 3)
         XCTAssertEqual(h.model.sessions.first?.phase, .lobby)
         XCTAssertEqual(h.model.sessions.filter { $0.phase == .connected }.count, 2)
+    }
+
+    func testGuestReconnectOnIOSPreservesRosterSuppressesInviteCardAllowsMuteAndRetainsSharedAudioEngine() async throws {
+        // 1. iOS AppDiagnostics captures allowlisted guest-transport-failure without URLs or secrets.
+        AppDiagnostics.start()
+        let secretURL = URL(string: "wss://secret.example.test/ws?token=supersecret")!
+        let transport = GuestTransport(url: secretURL, roomID: "ios-diag")
+        await transport.openWithoutSocketForTesting()
+        await transport.simulateUnexpectedSocketEndForTesting(closeCode: 1006, reasonBytes: 12, error: nil)
+        NativeDiagnosticsLog.shared.flush()
+        let logContents = try NativeDiagnosticsLog.shared.files.map { try String(contentsOf: $0, encoding: .utf8) }.joined(separator: "\n")
+        XCTAssertTrue(logContents.contains("\"event\":\"guest-transport-failure\""))
+        XCTAssertTrue(logContents.contains("\"closeCode\":1006"))
+        XCTAssertFalse(logContents.contains("secret.example.test"))
+        XCTAssertFalse(logContents.contains("supersecret"))
+
+        // 2. End-to-end iOS IOSMeetingSessionController + GuestAdapter + GuestSession + RockCallViewController.
+        let invitation = URL(string: "https://salutejazz.ru/calls/ios-daily")!
+        let destination = try JoinDestination.verified(invitation, engine: .guest)
+        let adapter = GuestAdapter(microphoneAuthorized: { false })
+        var attemptCount = 0
+        var engines: [NativeGuestEngine] = []
+        var releaseSecondAttempt: CheckedContinuation<Void, Never>?
+        let session = GuestSession(makeEngine: {
+            attemptCount += 1
+            let engine = NativeGuestEngine(label: "iOS Guest", verifyReceivedPixels: false)
+            if attemptCount == 1 {
+                engine.joinForTesting = { _, _ in }
+            } else {
+                engine.joinForTesting = { _, _ in
+                    await withCheckedContinuation { releaseSecondAttempt = $0 }
+                    throw GuestTransportError.networkFailure
+                }
+            }
+            engines.append(engine)
+            return engine
+        })
+        adapter.attachSessionForTesting(session)
+
+        let queue = DispatchQueue(label: "test.ios-guest-reconnect.\(UUID().uuidString)")
+        let worker = AudioSessionWorker(queue: queue, activate: {}, deactivate: {})
+        let systemCall = SystemCallCoordinator(
+            transactionRequester: { _, done in done(nil) },
+            callUpdateReporter: { _, _ in },
+            callSnapshot: { [] },
+            systemCallRegistration: false,
+            activateAudioSession: {},
+            sessionWorker: worker
+        )
+        let workspaceAudio = IOSWorkspaceAudioCoordinator(
+            systemCall: systemCall,
+            audio: AudioCoordinator(worker: worker, prepareSession: {}),
+            captureGate: .live,
+            sharedAudio: nil,
+            configureLiveKit: false
+        )
+        let controller = IOSMeetingSessionController(
+            destination: destination,
+            session: MeetingSession(kind: .guest, adapter: adapter),
+            chat: ChatStore(),
+            catchUp: CatchUpStore(storageURL: FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)),
+            workspaceAudio: workspaceAudio,
+            initialTitle: nil,
+            preferences: UserDefaults(suiteName: UUID().uuidString)!,
+            invitationCopiedOnJoin: true
+        )
+        var endedEvent: CallEvent?
+        controller.onEvent = { event in
+            if event == .left || event == .canceled || event == .failed {
+                endedEvent = event
+            }
+        }
+        let callView = controller.prepareCallView()
+        callView.view.frame = CGRect(x: 0, y: 0, width: 390, height: 844)
+
+        let parsed = try GuestInvitation.parse(invitation)
+        try await session.connect(parsed, publish: false, codec: "h264", camera: false,
+                                  initialAudioMuted: true, initialVideoMuted: true)
+        let firstEngine = try XCTUnwrap(engines.first)
+        try await firstEngine.processEventForTesting([
+            "event": "joined",
+            "payload": [
+                "roomId": "ios-daily",
+                "participant": [
+                    "participantId": "local-1",
+                    "name": "Vitalii",
+                    "role": "PARTICIPANT",
+                    "permissions": ["canViewParticipants": true, "canViewChat": false, "canViewTranscription": false]
+                ],
+                "participantGroup": [
+                    "groupId": "group-ios-daily",
+                    "name": "Daily Standup",
+                    "participants": [
+                        ["participantId": "local-1", "name": "Vitalii", "role": "PARTICIPANT"],
+                        ["participantId": "remote-1", "name": "Alex", "role": "MODERATOR"]
+                    ]
+                ]
+            ]
+        ])
+        XCTAssertEqual(controller.phase, .connected)
+        XCTAssertEqual(controller.title, "Daily Standup")
+        callView.view.layoutIfNeeded()
+        let tiles = try XCTUnwrap(Self.findTileContainer(in: callView.view))
+        XCTAssertEqual(tiles.arrangedSubviews.map(\.accessibilityIdentifier), ["camera-off.local-1", "camera-off.remote-1"])
+
+        firstEngine.simulateFailureForTesting(GuestTransportError.networkFailure)
+        try await waitUntil { controller.phase == .reconnecting && attemptCount >= 2 }
+        callView.view.layoutIfNeeded()
+        XCTAssertEqual(controller.phase, .reconnecting)
+        XCTAssertEqual(adapter.snapshot.participants.count, 2)
+        XCTAssertEqual(tiles.arrangedSubviews.map(\.accessibilityIdentifier), ["camera-off.local-1", "camera-off.remote-1"])
+        let reconnectLabels = Self.collectLabels(in: callView.view)
+        XCTAssertTrue(reconnectLabels.contains { $0.hasPrefix(L("Reconnecting…")) && $0.contains(L("%ld musicians", 2)) })
+        XCTAssertFalse(reconnectLabels.contains(L("You're connected. Waiting for others.")))
+
+        releaseSecondAttempt?.resume()
+        releaseSecondAttempt = nil
+        controller.leave()
+        try await waitUntil { endedEvent != nil }
+
+        // 3. Muting during .reconnecting and external forced mute at .connected both sync workspaceAudio + CaptureGate.
+        let h = makeModel()
+        defer {
+            h.model.workspaceAudio.systemCall.markEnded(reason: .remoteEnded)
+            withExtendedLifetime(h.container) {}
+        }
+        h.model.receive(url: invitation)
+        h.model.join()
+        try await waitUntil { h.model.isInConference && !h.model.sessions.isEmpty }
+        let liveController = try XCTUnwrap(h.model.sessions.first)
+        let mockAdapter = try XCTUnwrap(h.adapters().first)
+
+        liveController.toggleMicrophone()
+        try await waitUntil { liveController.isMicrophoneOn && !h.model.workspaceAudio.isMuted && LKRTCApplicationCaptureMuted() == 0 }
+        XCTAssertTrue(liveController.isMicrophoneOn)
+        XCTAssertFalse(h.model.workspaceAudio.isMuted)
+        XCTAssertEqual(LKRTCApplicationCaptureMuted(), 0)
+
+        mockAdapter.snapshot.phase = .reconnecting
+        mockAdapter.snapshot.microphoneOn = false
+        mockAdapter.sessionSnapshot.phase = .reconnecting
+        mockAdapter.sessionSnapshot.effective.microphoneOn = false
+        mockAdapter.onSessionSnapshot?(mockAdapter.sessionSnapshot)
+        try await waitUntil { liveController.phase == .reconnecting }
+        XCTAssertTrue(mockAdapter.sessionSnapshot.intent.microphoneOn)
+        XCTAssertFalse(liveController.isMicrophoneOn)
+
+        liveController.toggleMicrophone()
+        try await waitUntil { h.model.workspaceAudio.isMuted && !mockAdapter.sessionSnapshot.intent.microphoneOn }
+        XCTAssertTrue(h.model.workspaceAudio.isMuted)
+        XCTAssertNotEqual(LKRTCApplicationCaptureMuted(), 0)
+        XCTAssertFalse(mockAdapter.sessionSnapshot.intent.microphoneOn)
+
+        mockAdapter.snapshot.phase = .connected
+        mockAdapter.sessionSnapshot.phase = .connected
+        mockAdapter.onSessionSnapshot?(mockAdapter.sessionSnapshot)
+        try await waitUntil { liveController.phase == .connected }
+
+        liveController.toggleMicrophone()
+        try await waitUntil { liveController.isMicrophoneOn && !h.model.workspaceAudio.isMuted && LKRTCApplicationCaptureMuted() == 0 }
+
+        mockAdapter.snapshot.microphoneOn = false
+        mockAdapter.sessionSnapshot.intent.microphoneOn = false
+        mockAdapter.sessionSnapshot.effective.microphoneOn = false
+        mockAdapter.onSessionSnapshot?(mockAdapter.sessionSnapshot)
+        try await waitUntil { h.model.workspaceAudio.isMuted && !liveController.isMicrophoneOn }
+        XCTAssertTrue(h.model.workspaceAudio.isMuted)
+        XCTAssertNotEqual(LKRTCApplicationCaptureMuted(), 0)
+        h.model.leave()
+        try await waitUntil { h.model.sessions.isEmpty }
+
+        // 4. iOS SharedAudioEngine + SharedGuestMeetingAudio retains warm AVAudioEngine across attempt handoff.
+        GuestSystemAudio.microphoneAuthorizationOverrideForTesting = true
+        defer { GuestSystemAudio.microphoneAuthorizationOverrideForTesting = nil }
+
+        let shared = SharedAudioEngine.live(manualRenderingForTesting: true)
+        let audio = try await SharedGuestMeetingAudio.attach(to: shared)
+        let owner = try XCTUnwrap(shared.guestOwner)
+        do {
+            let permitted = await audio.setInputPermitted(true)
+            XCTAssertTrue(permitted)
+            let began = await audio.beginAttempt(sound: true)
+            XCTAssertTrue(began)
+            let activated = await audio.activateMicrophone()
+            XCTAssertTrue(activated)
+            XCTAssertTrue(audio.canUnmuteMicrophone)
+
+            let subscriber = try await GuestPeer(target: .subscriber, factory: audio.factory, physicalAudio: true)
+            let publisher = try await GuestPeer(target: .publisher, factory: audio.factory, physicalAudio: true)
+            let micTrack = try await publisher.prepareAudio(cid: "ios-handoff-mic")
+            try await publisher.attach(micTrack, codec: "opus")
+            _ = try await publisher.makeOffer()
+
+            XCTAssertEqual(owner.snapshot["enginesCreated"] as? Int, 1)
+            XCTAssertEqual(owner.snapshot["enginesReleased"] as? Int ?? 0, 0)
+
+            let prepared = await audio.prepareAttemptHandoff()
+            XCTAssertTrue(prepared)
+            await subscriber.closeAndDrain(timeout: 1)
+            await publisher.closeAndDrain(timeout: 1)
+            let completed = await audio.completeAttemptHandoff()
+            XCTAssertTrue(completed)
+            let reactivated = await audio.activateMicrophone()
+            XCTAssertTrue(reactivated)
+
+            XCTAssertEqual(owner.snapshot["enginesCreated"] as? Int, 1, "Attempt handoff must retain the existing AVAudioEngine on iOS")
+            XCTAssertEqual(owner.snapshot["enginesReleased"] as? Int ?? 0, 0, "Attempt handoff must not release AVAudioEngine across peer teardown on iOS")
+            XCTAssertEqual(owner.snapshot["recordingAlwaysPrepared"] as? Bool, false)
+            XCTAssertTrue(audio.isMicrophoneMuted)
+        } catch {
+            _ = await audio.shutdown()
+            throw error
+        }
+        let shutDown = await audio.shutdown()
+        XCTAssertTrue(shutDown)
+    }
+
+    private static func findTileContainer(in root: UIView) -> CallTileContainer? {
+        if let container = root as? CallTileContainer {
+            return container
+        }
+        for subview in root.subviews {
+            if let match = findTileContainer(in: subview) {
+                return match
+            }
+        }
+        return nil
+    }
+
+    private static func collectLabels(in root: UIView) -> [String] {
+        var result: [String] = []
+        if let label = root as? UILabel, let text = label.text {
+            result.append(text)
+        }
+        for subview in root.subviews {
+            result.append(contentsOf: collectLabels(in: subview))
+        }
+        return result
     }
 
     private static func findScrollView(id: String, in root: UIView) -> UIScrollView? {

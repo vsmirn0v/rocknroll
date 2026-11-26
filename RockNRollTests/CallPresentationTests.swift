@@ -2,6 +2,7 @@ import AVFoundation
 import ConferenceCore
 import LiveKit
 import LiveKitWebRTC
+import MeetingEngine
 import SwiftUI
 import UIKit
 import XCTest
@@ -222,6 +223,53 @@ final class CallPresentationTests: XCTestCase {
         labels = descendants(call.view).compactMap { ($0 as? UILabel)?.text }
         XCTAssertFalse(labels.contains(recoveryMessage))
         XCTAssertTrue(labels.contains(waitingMessage))
+    }
+
+    func testReconnectingWithPreservedParticipantsKeepsTilesShowsReconnectingCountAndHidesWaitingCard() throws {
+        let invitation = URL(string: "https://salutejazz.ru/calls/daily-ios?psw=secret")!
+        let call = RockCallViewController(
+            title: "Daily",
+            catchUp: CatchUpStore(),
+            chat: ChatStore(),
+            invitationURL: invitation,
+            roomIdentifier: "daily-ios",
+            invitationCopiedOnJoin: true
+        )
+        call.loadViewIfNeeded()
+        call.view.frame = CGRect(x: 0, y: 0, width: 390, height: 844)
+
+        let emptySnapshot = CallMediaSnapshot(participants: [])
+        call.setStagePhase(.connecting)
+        call.render(snapshot: emptySnapshot)
+        call.view.layoutIfNeeded()
+        var labels = descendants(call.view).compactMap { ($0 as? UILabel)?.text }
+        var buttonTitles = descendants(call.view).compactMap { $0 as? UIButton }.compactMap { $0.configuration?.title ?? $0.currentTitle }
+        XCTAssertTrue(labels.contains(L("Connecting…")))
+        XCTAssertFalse(labels.contains(L("You're connected. Waiting for others.")))
+        XCTAssertFalse(buttonTitles.contains(L("Invite musicians")))
+
+        call.setStagePhase(.lobby, lobbyMessage: L("Waiting for the host to admit you…"))
+        call.view.layoutIfNeeded()
+        labels = descendants(call.view).compactMap { ($0 as? UILabel)?.text }
+        XCTAssertTrue(labels.contains(L("Waiting for the host to admit you…")))
+        XCTAssertFalse(labels.contains(L("You're connected. Waiting for others.")))
+
+        call.setStagePhase(.connected)
+        let populated = CallMediaSnapshot(participants: [
+            .init(id: "local", name: "Vitalii", isLocal: true, microphoneOn: false, cameraOn: false, screenShareOn: false, isSpeaking: false, videoTracks: []),
+            .init(id: "alex", name: "Alex", isLocal: false, microphoneOn: true, cameraOn: false, screenShareOn: false, isSpeaking: true, videoTracks: [])
+        ])
+        call.render(snapshot: populated)
+        call.setConnectionRecovering(true)
+        call.view.layoutIfNeeded()
+
+        let tiles = try XCTUnwrap(descendants(call.view).compactMap { $0 as? CallTileContainer }.first)
+        XCTAssertEqual(tiles.arrangedSubviews.map(\.accessibilityIdentifier), ["camera-off.local", "camera-off.alex"])
+        labels = descendants(call.view).compactMap { ($0 as? UILabel)?.text }
+        buttonTitles = descendants(call.view).compactMap { $0 as? UIButton }.compactMap { $0.configuration?.title ?? $0.currentTitle }
+        XCTAssertTrue(labels.contains { $0.hasPrefix(L("Reconnecting…")) && $0.contains(L("%ld musicians", 2)) })
+        XCTAssertFalse(labels.contains(L("You're connected. Waiting for others.")))
+        XCTAssertFalse(buttonTitles.contains(L("Invite musicians")))
     }
 
     func testScreenSharesOnlyKeepsRosterThroughShareStartAndStop() throws {

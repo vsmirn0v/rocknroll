@@ -447,6 +447,8 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
             self?.videoDemand.setFloatingRecovery(needed)
         }
         view.loadViewIfNeeded()
+        view.setStagePhase(phase, lobbyMessage: phase == .lobby ? session.sessionSnapshot.lastError : nil)
+        view.setConnectionRecovering(isRecoveringConnection)
         view.setMeetingSound(enabled: isMeetingSoundEnabled, available: canSetMeetingSound)
         view.updateAssistantBadge(
             mode: lastAssistantBadge.mode,
@@ -721,14 +723,40 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
         callView?.setMeetingSound(enabled: isMeetingSoundEnabled, available: canSetMeetingSound)
     }
 
+    private var hasPendingUnmutedReconnectIntent: Bool {
+        isTalkRoom && isRecoveringConnection && session.sessionSnapshot.intent.microphoneOn && !(workspaceAudio?.isMuted ?? true) && !isHeld && !quiet
+    }
+
     func toggleMicrophone() {
-        setMicrophone(!(requestedMicrophone ?? isMicrophoneOn))
+        let activeOrPending = requestedMicrophone ?? (isMicrophoneOn || hasPendingUnmutedReconnectIntent)
+        setMicrophone(!activeOrPending)
     }
 
     func setMicrophone(_ enabled: Bool) {
-        guard !leaving, phase == .connected else {
+        guard !leaving else {
             requestedMicrophone = nil
             callView?.setMicrophone(false)
+            return
+        }
+        guard phase == .connected else {
+            requestedMicrophone = nil
+            if !enabled {
+                workspaceAudio?.suppressMicrophoneImmediately(for: id)
+                updateMicrophoneIndicator()
+                renderSnapshot()
+                if microphoneTask == nil {
+                    microphoneTask = Task { @MainActor [weak self] in
+                        guard let self else { return }
+                        defer { self.microphoneTask = nil }
+                        guard !self.leaving else { return }
+                        try? await self.workspaceAudio?.setTalkMicrophone(false, for: self.id)
+                        self.updateMicrophoneIndicator()
+                        self.renderSnapshot()
+                    }
+                }
+            } else {
+                callView?.setMicrophone(false)
+            }
             return
         }
         requestedMicrophone = enabled
@@ -1142,6 +1170,15 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
         callView?.supportsChat = snapshot.capabilities.supportsChatRead || snapshot.capabilities.supportsChatSend
         isCameraOn = snapshot.effective.cameraOn
         callView?.setCamera(snapshot.effective.cameraOn)
+        if snapshot.phase == .connected,
+           isTalkRoom,
+           !(workspaceAudio?.isMuted ?? true),
+           requestedMicrophone == nil,
+           microphoneTask == nil,
+           !snapshot.intent.microphoneOn,
+           !snapshot.effective.microphoneOn {
+            workspaceAudio?.suppressMicrophoneImmediately(for: id)
+        }
         updateMicrophoneIndicator(snapshot: snapshot)
 
         let remoteSpeaking = snapshot.participants.contains { !$0.isLocal && $0.speaking == true }
@@ -1175,6 +1212,7 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
             ])
         }
         if previous != phase { updateBackgroundRecoveryTask() }
+        callView?.setStagePhase(phase, lobbyMessage: phase == .lobby ? snapshot.lastError : nil)
         callView?.setConnectionRecovering(isRecoveringConnection)
 
         if let error = snapshot.lastError {

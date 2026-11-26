@@ -78,7 +78,7 @@ import LiveKitWebRTC
     var playoutEpoch: UUID? { nil }
     var startupAudioObservation: GuestStartupAudioObservation { owner.startupAudioObservation }
     var canUnmuteMicrophone: Bool {
-        attachment.isTalk && !attachment.privateCheckActive && AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
+        attachment.isTalk && !attachment.privateCheckActive && GuestSystemAudio.microphoneAuthorized
     }
     var privateInputLevel: Float? { owner.privateInputLevel }
     var privateInputMeterEvidence: [String: Any] { owner.privateInputMeterEvidence }
