@@ -138,7 +138,12 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
         conference?.meetingActivityForegrounded()
         conference?.calendarForegrounded()
         conference?.sync.foregrounded()
-        conference?.workspace.scheduleSync(delayMilliseconds: 250)
+        if let conference,
+           !conference.isInConference,
+           !conference.isJoining,
+           (conference.workspace.lastSyncedAt.map { Date().timeIntervalSince($0) >= 60 } ?? true) {
+            conference.workspace.scheduleSync(delayMilliseconds: 250)
+        }
         conference?.continuation.setForeground(true)
         conference?.updateContinuationActivity()
         conference?.restoreFromFloatingVideo()

@@ -123,7 +123,7 @@ final class MeetingContinuationCloud: MeetingContinuationTransport {
         }
     }
     private func fetchJams() async throws -> [ActiveJam] {
-        if lastValidatedAt == nil || Date().timeIntervalSince(lastValidatedAt!) >= 60 {
+        if lastValidatedAt == nil || Date().timeIntervalSince(lastValidatedAt!) >= 600 {
             _ = try await validate()
             lastValidatedAt = Date()
         }

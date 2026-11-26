@@ -93,7 +93,9 @@ final class MacSyncStatusTests: XCTestCase {
         handoffEnabled: Bool = true,
         transcriptRetention: TranscriptSyncRetention = .days30,
         workspaceIsSyncing: Bool = false,
-        workspaceSyncError: String? = nil
+        workspaceSyncError: String? = nil,
+        isManualSyncing: Bool = false,
+        prolongedSyncFailure: Bool = false
     ) -> MacSyncStatusPresentation.Snapshot {
         .init(
             enabled: enabled,
@@ -110,6 +112,8 @@ final class MacSyncStatusTests: XCTestCase {
             transcriptRetention: transcriptRetention,
             workspaceIsSyncing: workspaceIsSyncing,
             workspaceSyncError: workspaceSyncError,
+            isManualSyncing: isManualSyncing,
+            prolongedSyncFailure: prolongedSyncFailure,
             lastLibrarySyncAt: nil,
             nextRetryAt: nil
         )
@@ -152,40 +156,72 @@ final class MacSyncStatusTests: XCTestCase {
         ])
     }
 
-    func testSyncingStateShowsSpinnerForRoomAndWorkspaceSync() {
-        let roomBusy = MacSyncStatusPresentation(snapshot(
+    func testSyncingStateShowsSpinnerOnlyForManualOrInitialConnectingSync() {
+        let backgroundRoomSync = MacSyncStatusPresentation(snapshot(
             enabled: true,
             busy: true,
             syncState: .syncing,
             status: L("Connecting to iCloud…")
         ))
-        XCTAssertTrue(roomBusy.showsSpinner)
-        XCTAssertEqual(roomBusy.tone, .active)
-        XCTAssertEqual(roomBusy.cardSubtitle, L("Syncing with iCloud…"))
-        XCTAssertEqual(roomBusy.popoverBadge, L("Syncing…"))
+        XCTAssertFalse(backgroundRoomSync.showsSpinner)
+        XCTAssertEqual(backgroundRoomSync.tone, .ok)
+        XCTAssertEqual(backgroundRoomSync.cardSubtitle, L("Synced with iCloud"))
 
-        let workspaceBusy = MacSyncStatusPresentation(snapshot(
+        let backgroundWorkspaceSync = MacSyncStatusPresentation(snapshot(
             enabled: true,
             syncState: .upToDate,
             status: L("Up to date"),
             workspaceIsSyncing: true
         ))
-        XCTAssertTrue(workspaceBusy.showsSpinner)
-        XCTAssertEqual(workspaceBusy.tone, .active)
+        XCTAssertFalse(backgroundWorkspaceSync.showsSpinner)
+        XCTAssertEqual(backgroundWorkspaceSync.tone, .ok)
+
+        let manualBusy = MacSyncStatusPresentation(snapshot(
+            enabled: true,
+            syncState: .upToDate,
+            status: L("Up to date"),
+            workspaceIsSyncing: true,
+            isManualSyncing: true
+        ))
+        XCTAssertTrue(manualBusy.showsSpinner)
+        XCTAssertEqual(manualBusy.tone, .active)
+        XCTAssertEqual(manualBusy.cardSubtitle, L("Syncing with iCloud…"))
+        XCTAssertEqual(manualBusy.popoverBadge, L("Syncing…"))
+
+        let initialConnecting = MacSyncStatusPresentation(snapshot(
+            enabled: true,
+            busy: true,
+            syncState: .connecting,
+            status: L("Connecting to iCloud…")
+        ))
+        XCTAssertTrue(initialConnecting.showsSpinner)
+        XCTAssertEqual(initialConnecting.tone, .active)
     }
 
     func testPendingErrorConflictAndAccountChangedStates() {
         let pending = MacSyncStatusPresentation(snapshot(enabled: true, syncState: .pending, status: L("Changes pending")))
-        XCTAssertEqual(pending.iconName, "icloud.and.arrow.up")
-        XCTAssertEqual(pending.tone, .warning)
-        XCTAssertEqual(pending.cardSubtitle, L("Changes pending"))
+        XCTAssertEqual(pending.iconName, "checkmark.icloud")
+        XCTAssertEqual(pending.tone, .ok)
+        XCTAssertEqual(pending.cardSubtitle, L("Synced with iCloud"))
 
         let unavailable = MacSyncStatusPresentation(snapshot(enabled: true, syncState: .unavailable, status: L("iCloud unavailable. Your changes stay on this device.")))
         XCTAssertEqual(unavailable.iconName, "exclamationmark.icloud")
         XCTAssertEqual(unavailable.tone, .warning)
         XCTAssertEqual(unavailable.cardSubtitle, L("iCloud unavailable"))
 
-        let workspaceError = MacSyncStatusPresentation(snapshot(enabled: true, syncState: .upToDate, status: L("Up to date"), workspaceSyncError: "Workspace error"))
+        let transientWorkspaceError = MacSyncStatusPresentation(snapshot(enabled: true, syncState: .upToDate, status: L("Up to date"), workspaceSyncError: "Workspace error"))
+        XCTAssertEqual(transientWorkspaceError.iconName, "checkmark.icloud")
+        XCTAssertEqual(transientWorkspaceError.tone, .ok)
+        XCTAssertEqual(transientWorkspaceError.cardSubtitle, L("Synced with iCloud"))
+        XCTAssertFalse(transientWorkspaceError.showsSpinner)
+
+        let workspaceError = MacSyncStatusPresentation(snapshot(
+            enabled: true,
+            syncState: .upToDate,
+            status: L("Up to date"),
+            workspaceSyncError: "Workspace error",
+            prolongedSyncFailure: true
+        ))
         XCTAssertEqual(workspaceError.iconName, "exclamationmark.icloud")
         XCTAssertEqual(workspaceError.tone, .warning)
         XCTAssertEqual(workspaceError.cardSubtitle, L("Sync issue · Retry"))

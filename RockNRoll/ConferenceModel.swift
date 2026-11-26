@@ -126,9 +126,15 @@ final class ConferenceModel: ObservableObject {
     let continuationBanner = ContinuationBanner()
     var currentContinuationActivity: NSUserActivity?
     lazy var continuation: MeetingContinuationCoordinator = makeContinuationCoordinator()
+    let cloudBackoffGate = CloudKitBackoffGate()
     private var applyingSyncedName = false
     lazy var sync: RoomSyncCoordinator = {
         let coordinator = RoomSyncCoordinator(history: history, name: displayName, preferences: preferences)
+        coordinator.backoffGate = cloudBackoffGate
+        coordinator.hasActiveMeeting = { [weak self] in
+            guard let self else { return false }
+            return !self.sessions.isEmpty
+        }
         coordinator.onRemoteName = { [weak self] name in
             self?.applySyncedName(name)
         }
@@ -145,6 +151,11 @@ final class ConferenceModel: ObservableObject {
             syncPreferences: sync,
             preferences: preferences
         )
+        coordinator.backoffGate = cloudBackoffGate
+        coordinator.hasActiveMeeting = { [weak self] in
+            guard let self else { return false }
+            return !self.sessions.isEmpty
+        }
         coordinator.summaryPromptProvider = { [weak self] in
             self?.assistantSkills.promptText(for: .meetingSummary)
         }
@@ -1918,6 +1929,8 @@ final class ConferenceModel: ObservableObject {
             sessionRecords.removeValue(forKey: id)
             leavingSessionIDs.remove(id)
             sessions.removeAll { $0.id == id }
+            sync.noteActiveMeetingsChanged()
+            workspace.noteActiveMeetingsChanged()
             resumeDepartureWaiters(forSessionID: id)
 
             let replacingSession = replacementAfterLeave != nil && (event == .left || event == .canceled)

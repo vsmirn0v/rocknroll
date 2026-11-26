@@ -168,9 +168,9 @@ struct RoomSyncSettingsView: View {
 
     @ViewBuilder private var syncNowButton: some View {
         #if os(macOS)
-        NativeSettingsButton(title: L("Sync now"), id: "settings.sync-now") { sync.requestSync(immediate: true) }
+        NativeSettingsButton(title: L("Sync now"), id: "settings.sync-now") { sync.requestManualSync() }
         #else
-        Button(L("Sync now")) { sync.requestSync(immediate: true) }
+        Button(L("Sync now")) { sync.requestManualSync() }
         #endif
     }
 }

@@ -1583,4 +1583,33 @@ final class IOSWorkspaceSyncTests: XCTestCase {
             initialCursorsInode
         )
     }
+
+    func testIOSBackgroundSyncDefersDuringActiveMeetingAndFlushesAfterLeave() async throws {
+        let f = try await makeCoordinator()
+        await f.workspace.synchronizeNow()
+        let baselineConnects = f.libraryCloud.connectCalls
+
+        var inMeeting = true
+        f.workspace.hasActiveMeeting = { inMeeting }
+        f.workspace.scheduleSync(zones: [.library], delayMilliseconds: 10)
+        try await Task.sleep(for: .milliseconds(150))
+
+        XCTAssertEqual(
+            f.libraryCloud.connectCalls,
+            baselineConnects,
+            "Background workspace sync must defer while in an active iOS meeting"
+        )
+
+        inMeeting = false
+        f.workspace.noteActiveMeetingsChanged()
+        let deadline = ContinuousClock.now + .seconds(3)
+        while f.libraryCloud.connectCalls == baselineConnects && ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        XCTAssertGreaterThan(
+            f.libraryCloud.connectCalls,
+            baselineConnects,
+            "Deferred iOS workspace sync should flush after leaving the meeting"
+        )
+    }
 }

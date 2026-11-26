@@ -955,8 +955,8 @@ struct MeetingHistoryView: View {
                         Text(L("No saved transcript or assistant reply text is available for this meeting."))
                             .multilineTextAlignment(.center).foregroundStyle(.secondary)
                         if let workspace {
-                            Button(L("Sync now")) { workspace.workspaceSync.scheduleSync(delayMilliseconds: 0) }
-                                .disabled(!workspace.library.sync.enabled || !workspace.library.sync.syncWorkspace)
+                            Button(L("Sync now")) { workspace.workspaceSync.requestManualSync() }
+                                .disabled(!workspace.library.sync.enabled || !workspace.library.sync.syncWorkspace || workspace.workspaceSync.isManualSyncing)
                             Button(L("Settings")) { workspace.settingsTab = 0; workspace.show(section: .settings) }
                         }
                     }.padding().frame(maxWidth: .infinity, maxHeight: .infinity)

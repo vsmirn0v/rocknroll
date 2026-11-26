@@ -6,6 +6,7 @@ extension ConferenceModel {
     func makeContinuationCoordinator(preferences: UserDefaults = .standard) -> MeetingContinuationCoordinator {
         let device = UIDevice.current.userInterfaceIdiom == .pad ? "iPad" : "iPhone"
         let coordinator = MeetingContinuationCoordinator(deviceID: sync.deviceID, deviceLabel: device, preferences: preferences)
+        coordinator.backoffGate = cloudBackoffGate
         coordinator.onPrepareSource = { [weak self] id in
             guard let self else { throw ContinuationError.expired }
             try await self.holdForContinuation(id, held: true, restoreSending: true)

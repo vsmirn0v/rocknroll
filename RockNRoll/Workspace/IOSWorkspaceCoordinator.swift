@@ -36,6 +36,12 @@ enum IOSSameRoomTransitionMode: String, CaseIterable, Codable, Sendable {
 
 @MainActor
 final class IOSWorkspaceCoordinator: ObservableObject {
+    enum SyncZoneKind: Hashable, CaseIterable, Sendable {
+        case library
+        case transcripts
+        case schedule
+    }
+
     static weak var active: IOSWorkspaceCoordinator?
     private static let remoteAIConsentKey = "workspace.remoteAIConsent.v1"
     static let outcomeConfigDefaultsKey = "workspace.portableOutcomeConfig"
@@ -83,6 +89,12 @@ final class IOSWorkspaceCoordinator: ObservableObject {
     @Published private(set) var lastSyncedAt: Date?
     @Published private(set) var syncError: String?
     @Published private(set) var isSyncing = false
+    @Published private(set) var isManualSyncing = false
+    @Published private(set) var hasProlongedSyncFailure = false
+    private(set) var lastCloudSaveCompletedAt: Date?
+
+    var backoffGate: CloudKitBackoffGate?
+    var hasActiveMeeting: () -> Bool = { false }
 
     let deviceID: String
     let store: IOSWorkspaceStore
@@ -134,6 +146,11 @@ final class IOSWorkspaceCoordinator: ObservableObject {
     private var pendingLocalAssistantExportCount = 0
     private var cloudBackoffUntil: Date = .distantPast
     private var consecutiveCloudBackoffs = 0
+    private var pendingZones: Set<SyncZoneKind> = Set(SyncZoneKind.allCases)
+    private var deferredForActiveMeeting = false
+    private var deferredZones: Set<SyncZoneKind> = []
+    private var consecutiveUnresolvedFailures = 0
+    private var firstUnresolvedFailureAt: Date?
     internal var cloudBackoffUntilForTesting: Date { cloudBackoffUntil }
 
     private struct ReplicaDiskState: Sendable {
@@ -331,14 +348,14 @@ final class IOSWorkspaceCoordinator: ObservableObject {
                 guard let self else { return }
                 self.lastLocalSchedule = (meetings, bindings, suppressed)
                 if self.syncPreferences.enabled && self.syncPreferences.shareCalendar {
-                    self.scheduleSync(delayMilliseconds: 400)
+                    self.scheduleSync(zones: [.schedule], delayMilliseconds: 400)
                 }
             }
             calendar.onLocalOccurrenceStateChanged = { [weak self] occurrenceKey in
                 guard let self else { return }
                 self.updateSingleLocalOccurrenceState(occurrenceKey: occurrenceKey)
                 if self.syncPreferences.enabled && self.syncPreferences.shareCalendar {
-                    self.scheduleSync(delayMilliseconds: 300)
+                    self.scheduleSync(zones: [.schedule], delayMilliseconds: 300)
                 }
             }
         }
@@ -393,7 +410,7 @@ final class IOSWorkspaceCoordinator: ObservableObject {
             await self.ingestLocalAssistantStateIntoDocument()
             self.persistReplica()
             if self.syncPreferences.enabled && self.syncPreferences.syncWorkspace {
-                self.scheduleSync(delayMilliseconds: 250)
+                self.scheduleSync(zones: [.library], delayMilliseconds: 250)
             }
         }
     }
@@ -2097,25 +2114,74 @@ final class IOSWorkspaceCoordinator: ObservableObject {
 
     // MARK: - Sync Engine
 
-    func scheduleSync(delayMilliseconds: Int = 500) {
+    func scheduleSync(
+        zones: Set<SyncZoneKind> = Set(SyncZoneKind.allCases),
+        delayMilliseconds: Int = 500,
+        userInitiated: Bool = false
+    ) {
         // Local edits must survive relaunch even when iCloud is disabled or offline.
         persistReplica()
         guard syncPreferences.enabled else { return }
-        let remainingMs = max(0, Int(ceil(cloudBackoffUntil.timeIntervalSinceNow * 1000)))
-        let effectiveDelay = max(delayMilliseconds, remainingMs)
+        if userInitiated {
+            isManualSyncing = true
+            deferredForActiveMeeting = false
+            deferredZones.removeAll()
+        } else if hasActiveMeeting() {
+            deferredForActiveMeeting = true
+            deferredZones.formUnion(zones)
+            return
+        }
+        pendingZones.formUnion(zones)
+        let gateUntil = userInitiated ? .distantPast : (backoffGate?.backoffUntil() ?? .distantPast)
+        let earliestAllowed = max(cloudBackoffUntil, gateUntil)
+        let remainingMs = userInitiated ? 0 : max(0, Int(ceil(earliestAllowed.timeIntervalSinceNow * 1000)))
+        let effectiveDelay = userInitiated ? 0 : max(delayMilliseconds, remainingMs)
         pendingSyncTask?.cancel()
         pendingSyncTask = Task { @MainActor [weak self] in
             if effectiveDelay > 0 {
                 try? await Task.sleep(for: .milliseconds(effectiveDelay))
             }
-            guard !Task.isCancelled else { return }
-            await self?.synchronizeNow()
+            guard !Task.isCancelled, let self else { return }
+            if !userInitiated && self.hasActiveMeeting() {
+                self.deferredForActiveMeeting = true
+                self.deferredZones.formUnion(self.pendingZones)
+                self.pendingZones.removeAll()
+                return
+            }
+            await self.synchronizeNow(zones: zones, userInitiated: userInitiated)
         }
     }
 
-    func synchronizeNow() async {
+    func requestManualSync() {
+        cloudBackoffUntil = .distantPast
+        backoffGate?.recordSuccess()
+        deferredForActiveMeeting = false
+        deferredZones.removeAll()
+        Task { @MainActor [weak self] in
+            await self?.synchronizeNow(zones: Set(SyncZoneKind.allCases), userInitiated: true)
+        }
+    }
+
+    func noteActiveMeetingsChanged() {
+        guard deferredForActiveMeeting, !hasActiveMeeting() else { return }
+        let zones = deferredZones.isEmpty ? Set(SyncZoneKind.allCases) : deferredZones
+        deferredForActiveMeeting = false
+        deferredZones.removeAll()
+        scheduleSync(zones: zones, delayMilliseconds: 400)
+    }
+
+    func synchronizeNow(
+        zones: Set<SyncZoneKind> = Set(SyncZoneKind.allCases),
+        userInitiated: Bool = false
+    ) async {
         pendingSyncTask?.cancel()
         pendingSyncTask = nil
+        pendingZones.formUnion(zones)
+        if userInitiated {
+            isManualSyncing = true
+            deferredForActiveMeeting = false
+            deferredZones.removeAll()
+        }
         if let active = activeSyncTask {
             needsAnotherPass = true
             await active.value
@@ -2161,70 +2227,118 @@ final class IOSWorkspaceCoordinator: ObservableObject {
         persistReplica()
     }
 
+    private func handleSyncPassError(
+        _ error: Error,
+        pass: String,
+        unresolvedPassError: inout String?
+    ) -> Bool {
+        syncError = error.localizedDescription
+        let ns = error as NSError
+        var fields: [String: Any] = ["pass": pass, "domain": ns.domain, "code": ns.code]
+        if let retryAfter = CloudKitRateLimit.retryAfter(for: error, consecutiveFailures: consecutiveCloudBackoffs + 1) {
+            consecutiveCloudBackoffs += 1
+            let gateDelay = backoffGate?.recordRateLimit(for: error) ?? 0
+            let effectiveDelay = max(retryAfter, gateDelay)
+            let until = Date().addingTimeInterval(effectiveDelay)
+            cloudBackoffUntil = max(cloudBackoffUntil, until)
+            fields["retryAfter"] = Int(effectiveDelay.rounded())
+            AppDiagnostics.log("workspace-sync-error", fields)
+            return true
+        }
+        if !CloudKitRateLimit.isTransientSyncError(error) {
+            unresolvedPassError = unresolvedPassError ?? error.localizedDescription
+        }
+        AppDiagnostics.log("workspace-sync-error", fields)
+        return false
+    }
+
     private func runSyncLoop() async {
         isSyncing = true
-        defer { isSyncing = false }
+        defer {
+            isSyncing = false
+            isManualSyncing = false
+        }
 
         repeat {
             needsAnotherPass = false
+            let runZones = pendingZones.isEmpty ? Set(SyncZoneKind.allCases) : pendingZones
+            pendingZones.removeAll()
             guard syncPreferences.enabled else {
                 calendar?.applyRemoteSchedule([], localDeviceID: deviceID)
+                consecutiveUnresolvedFailures = 0
+                firstUnresolvedFailureAt = nil
+                hasProlongedSyncFailure = false
                 break
             }
-            if Date() < cloudBackoffUntil {
-                scheduleSync(delayMilliseconds: 0)
+            let effectiveBackoff = max(cloudBackoffUntil, backoffGate?.backoffUntil() ?? .distantPast)
+            if !isManualSyncing && Date() < effectiveBackoff {
+                pendingZones.formUnion(runZones)
+                scheduleSync(zones: runZones, delayMilliseconds: 0)
                 break
+            }
+            if isManualSyncing {
+                cloudBackoffUntil = .distantPast
+                backoffGate?.recordSuccess()
             }
             syncError = nil
             await flushNotesNow()
 
             var hitRateLimit = false
             var anyPassSucceeded = false
+            var unresolvedPassError: String?
 
-            if syncPreferences.syncWorkspace {
+            if syncPreferences.syncWorkspace && (runZones.contains(.library) || runZones.contains(.transcripts)) {
                 do {
-                    try await syncLibraryPass()
-                    try await syncTranscriptsPass()
+                    if runZones.contains(.library) {
+                        try await syncLibraryPass()
+                    }
+                    if runZones.contains(.transcripts) {
+                        try await syncTranscriptsPass()
+                    }
                     anyPassSucceeded = true
                 } catch {
-                    syncError = error.localizedDescription
-                    let ns = error as NSError
-                    var fields: [String: Any] = ["pass": "library", "domain": ns.domain, "code": ns.code]
-                    if let retryAfter = CloudKitRateLimit.retryAfter(for: error, consecutiveFailures: consecutiveCloudBackoffs + 1) {
-                        consecutiveCloudBackoffs += 1
-                        cloudBackoffUntil = Date().addingTimeInterval(retryAfter)
-                        hitRateLimit = true
-                        fields["retryAfter"] = Int(retryAfter.rounded())
-                    }
-                    AppDiagnostics.log("workspace-sync-error", fields)
+                    hitRateLimit = handleSyncPassError(error, pass: "library", unresolvedPassError: &unresolvedPassError)
                 }
             }
 
-            if syncPreferences.shareCalendar {
+            if syncPreferences.shareCalendar && runZones.contains(.schedule) {
                 if !hitRateLimit {
                     do {
                         try await syncSchedulePass()
                         anyPassSucceeded = true
                     } catch {
-                        syncError = error.localizedDescription
-                        let ns = error as NSError
-                        var fields: [String: Any] = ["pass": "schedule", "domain": ns.domain, "code": ns.code]
-                        if let retryAfter = CloudKitRateLimit.retryAfter(for: error, consecutiveFailures: consecutiveCloudBackoffs + 1) {
-                            consecutiveCloudBackoffs += 1
-                            cloudBackoffUntil = Date().addingTimeInterval(retryAfter)
+                        if handleSyncPassError(error, pass: "schedule", unresolvedPassError: &unresolvedPassError) {
                             hitRateLimit = true
-                            fields["retryAfter"] = Int(retryAfter.rounded())
                         }
-                        AppDiagnostics.log("workspace-sync-error", fields)
                     }
+                } else {
+                    pendingZones.insert(.schedule)
                 }
-            } else {
+            } else if !syncPreferences.shareCalendar {
                 calendar?.applyRemoteSchedule([], localDeviceID: deviceID)
+            }
+
+            if unresolvedPassError != nil || hitRateLimit {
+                if unresolvedPassError != nil {
+                    consecutiveUnresolvedFailures += 1
+                }
+                if firstUnresolvedFailureAt == nil {
+                    firstUnresolvedFailureAt = Date()
+                }
+                let elapsed = firstUnresolvedFailureAt.map { Date().timeIntervalSince($0) } ?? 0
+                let totalFailures = max(consecutiveUnresolvedFailures, consecutiveCloudBackoffs)
+                hasProlongedSyncFailure = totalFailures >= 5 || elapsed >= 900
             }
 
             if anyPassSucceeded && !hitRateLimit {
                 consecutiveCloudBackoffs = 0
                 cloudBackoffUntil = .distantPast
+                backoffGate?.recordSuccess()
+                if unresolvedPassError == nil {
+                    consecutiveUnresolvedFailures = 0
+                    firstUnresolvedFailureAt = nil
+                    hasProlongedSyncFailure = false
+                }
                 lastSyncedAt = Date()
                 persistReplica()
             } else if anyPassSucceeded {
@@ -2232,7 +2346,7 @@ final class IOSWorkspaceCoordinator: ObservableObject {
                 persistReplica()
             }
             if hitRateLimit {
-                scheduleSync(delayMilliseconds: 0)
+                scheduleSync(zones: runZones, delayMilliseconds: 0)
                 break
             }
         } while needsAnotherPass && !Task.isCancelled
@@ -2337,6 +2451,7 @@ final class IOSWorkspaceCoordinator: ObservableObject {
         let pending = replica.workspaceDoc.pendingLibraryRecords(acknowledgedDigests: replica.acknowledgedLibraryDigests)
         if !pending.isEmpty {
             let saved = try await libraryTransport.save(pending, session: session)
+            if !saved.isEmpty { lastCloudSaveCompletedAt = Date() }
             for record in saved {
                 replica.acknowledgedLibraryDigests[record.syncRecordID] = SyncRecordDigest.sha256(record)
                 if case .note(let note) = record {
@@ -2376,6 +2491,7 @@ final class IOSWorkspaceCoordinator: ObservableObject {
         }
         if !pending.isEmpty {
             let saved = try await transcriptTransport.save(pending, session: session)
+            if !saved.isEmpty { lastCloudSaveCompletedAt = Date() }
             for record in saved {
                 replica.acknowledgedTranscriptDigests[record.syncRecordID] = SyncRecordDigest.sha256(record)
                 if case .chunk(let chunk) = record {
@@ -2418,6 +2534,7 @@ final class IOSWorkspaceCoordinator: ObservableObject {
         }
         if !pending.isEmpty {
             let saved = try await scheduleTransport.save(pending, session: session)
+            if !saved.isEmpty { lastCloudSaveCompletedAt = Date() }
             for record in saved {
                 replica.acknowledgedScheduleDigests[record.syncRecordID] = SyncRecordDigest.sha256(record)
             }

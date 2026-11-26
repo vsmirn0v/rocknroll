@@ -120,30 +120,31 @@ struct NativeDesktopHomeView: View {
             .accessibilityIdentifier("sidebar.section.\(item.id)")
     }
     private var sidebar: some View {
-        List(selection: Binding(get: { workspace.sidebarSelection }, set: { workspace.sidebarSelection = $0 })) {
-            if !workspace.meetings.isEmpty {
-                Section(workspace.meetings.count == 1 ? L("In meeting") : L("Meetings")) {
-                    ForEach(workspace.meetings, id: \.sessionID) { model in
-                        NativeDesktopLiveMeetingControls(workspace: workspace, model: model, inSidebar: true)
-                            .tag(NativeDesktopSidebarItem.meeting(model.sessionID))
+        VStack(spacing: 0) {
+            List(selection: Binding(get: { workspace.sidebarSelection }, set: { workspace.sidebarSelection = $0 })) {
+                if !workspace.meetings.isEmpty {
+                    Section(workspace.meetings.count == 1 ? L("In meeting") : L("Meetings")) {
+                        ForEach(workspace.meetings, id: \.sessionID) { model in
+                            NativeDesktopLiveMeetingControls(workspace: workspace, model: model, inSidebar: true)
+                                .tag(NativeDesktopSidebarItem.meeting(model.sessionID))
+                        }
+                    }
+                }
+                Section {
+                    ForEach(NativeDesktopWorkspace.Section.allCases) { item in
+                        sectionRow(item)
+                    }
+                }
+                if !library.favorites.isEmpty {
+                    Section(L("Favorites")) {
+                        ForEach(library.favorites) { room in
+                            favoriteSidebarRow(room)
+                        }.onMove { library.moveFavorites(from: $0, to: $1) }
                     }
                 }
             }
-            Section {
-                ForEach(NativeDesktopWorkspace.Section.allCases) { item in
-                    sectionRow(item)
-                }
-            }
-            if !library.favorites.isEmpty {
-                Section(L("Favorites")) {
-                    ForEach(library.favorites) { room in
-                        favoriteSidebarRow(room)
-                    }.onMove { library.moveFavorites(from: $0, to: $1) }
-                }
-            }
-        }
-        .listStyle(.sidebar).navigationSplitViewColumnWidth(min: 190, ideal: 230, max: 320)
-        .safeAreaInset(edge: .bottom) {
+            .listStyle(.sidebar)
+            Divider().opacity(0.35)
             VStack(alignment: .leading, spacing: 8) {
                 LocalModelStatusIndicator(
                     models: workspace.attention.localModels,
@@ -160,6 +161,7 @@ struct NativeDesktopHomeView: View {
             }
             .padding(10)
         }
+        .navigationSplitViewColumnWidth(min: 190, ideal: 230, max: 320)
     }
     var body: some View {
         navigation
@@ -185,7 +187,10 @@ struct NativeDesktopHomeView: View {
                                 case .calendar: NativeDesktopCalendarView(workspace: workspace, library: library, cache: calendarCache)
                                 case .workspace: NativeDesktopMeetingWorkspaceView(workspace: workspace)
                                 case .history: MeetingHistoryView(attention: workspace.attention, workspace: workspace)
-                                    .onAppear { workspace.workspaceSync.scheduleSync(delayMilliseconds: 100, localChanges: false) }
+                                    .onAppear {
+                                        let stale = workspace.workspaceSync.lastLibrarySyncAt.map { Date().timeIntervalSince($0) >= 60 } ?? true
+                                        if stale { workspace.workspaceSync.scheduleSync(delayMilliseconds: 100, localChanges: false) }
+                                    }
                                 case .assistant: AttentionMomentsView(attention: workspace.attention, store: workspace.attention.store)
                                 case .tasks:
                                     PersonalTasksView(attention: workspace.attention) { sessionID, taskID in

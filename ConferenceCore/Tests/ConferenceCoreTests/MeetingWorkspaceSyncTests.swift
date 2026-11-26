@@ -745,6 +745,33 @@ final class MeetingWorkspaceSyncTests: XCTestCase {
         XCTAssertNil(CloudKitRateLimit.retryAfter(for: CloudZoneError.noAccount))
     }
 
+    func testCloudKitBackoffGateAndTransientErrorClassification() {
+        let serviceUnavailable = NSError(domain: CKError.errorDomain, code: CKError.Code.serviceUnavailable.rawValue)
+        let networkFailure = NSError(domain: CKError.errorDomain, code: CKError.Code.networkFailure.rawValue)
+        let unknownItem = NSError(domain: CKError.errorDomain, code: CKError.Code.unknownItem.rawValue)
+        XCTAssertTrue(CloudKitRateLimit.isTransientSyncError(serviceUnavailable))
+        XCTAssertTrue(CloudKitRateLimit.isTransientSyncError(networkFailure))
+        XCTAssertTrue(CloudKitRateLimit.isTransientSyncError(URLError(.timedOut)))
+        XCTAssertFalse(CloudKitRateLimit.isTransientSyncError(unknownItem))
+        XCTAssertFalse(CloudKitRateLimit.isTransientSyncError(CloudZoneError.noAccount))
+
+        let t0 = Date(timeIntervalSince1970: 1_795_200_000)
+        let gate = CloudKitBackoffGate()
+        XCTAssertNil(gate.backoffUntil(now: t0))
+        XCTAssertNil(gate.recordRateLimit(for: unknownItem, now: t0))
+
+        let firstDelay = gate.recordRateLimit(for: serviceUnavailable, now: t0)
+        XCTAssertEqual(firstDelay, 15.0)
+        XCTAssertEqual(gate.backoffUntil(now: t0.addingTimeInterval(5)), t0.addingTimeInterval(15))
+
+        let secondDelay = gate.recordRateLimit(for: serviceUnavailable, now: t0.addingTimeInterval(16))
+        XCTAssertEqual(secondDelay, 30.0)
+
+        gate.recordSuccess()
+        XCTAssertNil(gate.backoffUntil(now: t0))
+        XCTAssertEqual(gate.recordRateLimit(for: serviceUnavailable, now: t0), 15.0)
+    }
+
     func testCalendarScheduleDeduplicatesCrossPlatformExternalIDsAndAvoidsNoOpRewrites() {
         let now = Date(timeIntervalSince1970: 1_795_070_000)
         let start = now.addingTimeInterval(1800)

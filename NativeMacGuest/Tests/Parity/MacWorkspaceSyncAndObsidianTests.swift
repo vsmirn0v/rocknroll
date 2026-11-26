@@ -1249,4 +1249,33 @@ final class MacWorkspaceSyncAndObsidianTests: XCTestCase {
             "Subsequent transcript updates must leave workspace-sync-replica.json untouched"
         )
     }
+
+    func testBackgroundSyncDefersDuringActiveMeetingAndFlushesWhenMeetingEnds() async throws {
+        let f = try await makeFixture()
+        await f.sync.synchronizeNow()
+        let baselineFetches = f.libraryCloud.fetchedTokens.count
+
+        var inMeeting = true
+        f.sync.hasActiveMeeting = { inMeeting }
+        f.sync.scheduleSync(delayMilliseconds: 10, zones: [.library])
+        try await Task.sleep(for: .milliseconds(150))
+
+        XCTAssertEqual(
+            f.libraryCloud.fetchedTokens.count,
+            baselineFetches,
+            "Background sync must defer while a meeting is active"
+        )
+
+        inMeeting = false
+        f.sync.noteActiveMeetingsChanged()
+        let deadline = ContinuousClock.now + .seconds(3)
+        while f.libraryCloud.fetchedTokens.count == baselineFetches && ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        XCTAssertGreaterThan(
+            f.libraryCloud.fetchedTokens.count,
+            baselineFetches,
+            "Deferred sync should flush once the meeting ends"
+        )
+    }
 }

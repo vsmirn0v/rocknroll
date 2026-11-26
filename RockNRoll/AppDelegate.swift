@@ -41,7 +41,17 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
             if subscription == "MeetingLibraryChanges" ||
                 subscription == "MeetingTranscriptsChanges" ||
                 subscription == "MeetingScheduleChanges" {
-                await IOSWorkspaceCoordinator.active?.synchronizeNow()
+                let zones: Set<IOSWorkspaceCoordinator.SyncZoneKind> = switch subscription {
+                case "MeetingLibraryChanges": [.library]
+                case "MeetingTranscriptsChanges": [.transcripts]
+                default: [.schedule]
+                }
+                if let workspace = IOSWorkspaceCoordinator.active {
+                    if let savedAt = workspace.lastCloudSaveCompletedAt, Date().timeIntervalSince(savedAt) < 5 {
+                        completionHandler(.noData); return
+                    }
+                    workspace.scheduleSync(zones: zones, delayMilliseconds: 250)
+                }
                 completionHandler(.newData); return
             }
             guard let sync = RoomSyncCoordinator.active, sync.enabled else { completionHandler(.noData); return }

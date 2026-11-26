@@ -78,6 +78,7 @@ final class MeetingContinuationCoordinator: ObservableObject {
     private var refreshFailed = false
     private var consecutiveRefreshFailures = 0
     private var cloudBackoffUntil: Date = .distantPast
+    var backoffGate: CloudKitBackoffGate?
     internal var scheduledBackoffUntilForTesting: Date { cloudBackoffUntil }
 
     init(deviceID: String, deviceLabel: String, preferences: UserDefaults = .standard,
@@ -255,7 +256,9 @@ final class MeetingContinuationCoordinator: ObservableObject {
     func refresh() async {
         guard enabled, let account else { return }
         checkExpiredHold()
-        if prepared == nil, receiver == nil, refreshWaiters.isEmpty, now() < cloudBackoffUntil {
+        let effectiveBackoff = max(cloudBackoffUntil, backoffGate?.backoffUntil(now: now()) ?? .distantPast)
+        if prepared == nil, receiver == nil, refreshWaiters.isEmpty, now() < effectiveBackoff {
+            cloudBackoffUntil = effectiveBackoff
             scheduleTick()
             return
         }
@@ -265,7 +268,7 @@ final class MeetingContinuationCoordinator: ObservableObject {
         let expected = revision, pass = refreshPass
         defer {
             busy = false
-            if pendingRefresh && (now() >= cloudBackoffUntil || !refreshWaiters.isEmpty) {
+            if pendingRefresh && (now() >= max(cloudBackoffUntil, backoffGate?.backoffUntil(now: now()) ?? .distantPast) || !refreshWaiters.isEmpty) {
                 Task { await refresh() }
             }
             scheduleTick()
@@ -322,6 +325,7 @@ final class MeetingContinuationCoordinator: ObservableObject {
             ]
             if let retryAfter = CloudKitRateLimit.retryAfter(for: error, consecutiveFailures: consecutiveRefreshFailures) {
                 cloudBackoffUntil = max(cloudBackoffUntil, now().addingTimeInterval(retryAfter))
+                backoffGate?.recordRateLimit(for: error, now: now())
                 fields["retryAfter"] = Int(retryAfter.rounded())
             }
             #if os(iOS)
@@ -344,13 +348,17 @@ final class MeetingContinuationCoordinator: ObservableObject {
         guard automatic, enabled, account != nil, foreground || current != nil else { return }
         tick?.cancel()
         let currentNow = now()
+        let effectiveBackoff = max(cloudBackoffUntil, backoffGate?.backoffUntil(now: currentNow) ?? .distantPast)
         let delay: TimeInterval
         if prepared != nil {
             delay = 0.35
-        } else if currentNow < cloudBackoffUntil {
-            delay = max(1, ceil(cloudBackoffUntil.timeIntervalSince(currentNow)))
+        } else if receiver != nil {
+            delay = 2
+        } else if currentNow < effectiveBackoff {
+            delay = max(1, ceil(effectiveBackoff.timeIntervalSince(currentNow)))
         } else if current != nil {
-            delay = 5
+            // Zone push handles immediate updates; keep background heartbeat coarse so media stays uninterrupted.
+            delay = 60
         } else if refreshFailed {
             delay = 10
         } else {

@@ -56,12 +56,17 @@ final class RoomSyncCoordinator: ObservableObject {
     @Published private(set) var storageWarning: String?
     @Published private(set) var offerSync = false
     @Published private(set) var activeCloudSession: RoomCloudSession?
+    @Published private(set) var isManualSyncing = false
+    @Published private(set) var hasProlongedFailure = false
+    private(set) var lastSyncedAt: Date?
+    private(set) var lastCloudSaveCompletedAt: Date?
     private var state: State
     private let history: RoomHistoryStore
     private let storage: any RoomHistoryStorage
     private let transport: any RoomCloudTransport
     private let preferences: UserDefaults
     private var task: Task<Void, Never>?
+    private var retryTask: Task<Void, Never>?
     private var revision = 0
     private var anotherPass = false
     private var nameDraft: String
@@ -69,6 +74,13 @@ final class RoomSyncCoordinator: ObservableObject {
     private var observers: [NSObjectProtocol] = []
     private var networkMonitor: NWPathMonitor?
     private var networkWasAvailable = false
+    private var lastPersistedData: Data?
+    private var firstUnresolvedFailureAt: Date?
+    private var consecutiveFailures = 0
+    private var cloudBackoffUntil: Date = .distantPast
+    private var deferredForActiveMeeting = false
+    var backoffGate: CloudKitBackoffGate?
+    var hasActiveMeeting: (() -> Bool)?
     var onRemoteName: ((String) -> Void)?
     var onCommittedName: ((String) -> Void)?
     var onCloudAccessChanged: ((String?) -> Void)?
@@ -84,14 +96,23 @@ final class RoomSyncCoordinator: ObservableObject {
          transport: (any RoomCloudTransport)? = nil) {
         self.history = history; self.storage = storage; self.transport = transport ?? CloudRoomTransport()
         self.preferences = preferences; nameDraft = name
+        let loadedFromStorage: Bool
         if let data = storage.read(), let restored = try? JSONDecoder().decode(State.self, from: data) {
             state = restored
+            loadedFromStorage = true
         } else {
             state = State()
             for room in history.rooms { state.document.upsert(room, visited: true) }
             if !name.isEmpty { state.document.setName(name) }
+            loadedFromStorage = false
         }
+        let preMigrateData = loadedFromStorage ? (try? Self.canonicalEncoder().encode(state)) : nil
         state.document.migrateFavoriteOrderIfNeeded()
+        if loadedFromStorage, let preMigrateData,
+           let postMigrateData = try? Self.canonicalEncoder().encode(state),
+           preMigrateData == postMigrateData {
+            lastPersistedData = postMigrateData
+        }
         enabled = state.enabled; includeRecent = state.includeRecent
         syncWorkspace = preferences.object(forKey: "iCloudSync.workspace") as? Bool ?? true
         shareCalendar = preferences.object(forKey: "iCloudSync.shareCalendar") as? Bool ?? true
@@ -118,6 +139,7 @@ final class RoomSyncCoordinator: ObservableObject {
 
     deinit {
         task?.cancel()
+        retryTask?.cancel()
         networkMonitor?.cancel()
         for observer in observers { NotificationCenter.default.removeObserver(observer) }
     }
@@ -159,7 +181,8 @@ final class RoomSyncCoordinator: ObservableObject {
 
     func setEnabled(_ value: Bool) {
         guard value != enabled else { return }
-        revision += 1; task?.cancel(); task = nil
+        revision += 1; task?.cancel(); task = nil; retryTask?.cancel(); retryTask = nil
+        firstUnresolvedFailureAt = nil; consecutiveFailures = 0; hasProlongedFailure = false; cloudBackoffUntil = .distantPast
         enabled = value; state.enabled = value
         if !value { activeCloudSession = nil; onCloudAccessChanged?(nil) }
         if value {
@@ -175,7 +198,10 @@ final class RoomSyncCoordinator: ObservableObject {
             keepLocalNameWhenPausing()
         }
         _ = persist()
-        if value { requestSync(immediate: true) }
+        if value {
+            onSyncNow?()
+            requestSync(immediate: true)
+        }
     }
 
     func setIncludeRecent(_ value: Bool) {
@@ -233,7 +259,33 @@ final class RoomSyncCoordinator: ObservableObject {
         preferences.set(true, forKey: "iCloudSyncOfferSeen")
     }
 
-    func foregrounded() { requestSync(immediate: true) }
+    func foregrounded() {
+        guard enabled, !needsFreshAccount else { return }
+        if hasActiveMeeting?() == true {
+            deferredForActiveMeeting = true
+            return
+        }
+        if syncState == .upToDate, pendingRecords.isEmpty,
+           let lastSyncedAt, Date().timeIntervalSince(lastSyncedAt) < 60 {
+            return
+        }
+        requestSync(immediate: true)
+    }
+
+    func noteActiveMeetingsChanged() {
+        guard deferredForActiveMeeting, hasActiveMeeting?() != true else { return }
+        deferredForActiveMeeting = false
+        requestSync(immediate: false)
+    }
+
+    func requestManualSync() {
+        guard enabled, !needsFreshAccount else { return }
+        isManualSyncing = true
+        cloudBackoffUntil = .distantPast
+        retryTask?.cancel(); retryTask = nil
+        onSyncNow?()
+        requestSync(immediate: true, userInitiated: true)
+    }
 
     private func registerForCloudNotifications() {
         #if canImport(UIKit)
@@ -264,17 +316,25 @@ final class RoomSyncCoordinator: ObservableObject {
         await task?.value
     }
 
-    func requestSync(immediate: Bool = false) {
+    func requestSync(immediate: Bool = false, userInitiated: Bool = false) {
         guard enabled, !needsFreshAccount else { return }
-        if immediate { onSyncNow?() }
+        if userInitiated { isManualSyncing = true }
+        if !userInitiated && hasActiveMeeting?() == true {
+            deferredForActiveMeeting = true
+            return
+        }
         if busy { anotherPass = true; return }
         task?.cancel()
+        retryTask?.cancel(); retryTask = nil
+        let effectiveBackoff = max(cloudBackoffUntil, backoffGate?.backoffUntil() ?? .distantPast)
+        let backoffSeconds = userInitiated ? 0 : max(0, effectiveBackoff.timeIntervalSinceNow)
+        let delaySeconds = max(immediate ? 0 : 1, backoffSeconds)
         let expected = revision
         task = Task { [weak self] in
-            if !immediate {
-                do { try await Task.sleep(for: .seconds(1)) } catch { return }
+            if delaySeconds > 0 {
+                try? await Task.sleep(for: .seconds(delaySeconds))
             }
-            guard let self, expected == self.revision, self.enabled else { return }
+            guard !Task.isCancelled, let self, expected == self.revision, self.enabled else { return }
             await self.synchronize(revision: expected)
         }
     }
@@ -303,11 +363,25 @@ final class RoomSyncCoordinator: ObservableObject {
         if persist() { requestSync(immediate: true) }
     }
 
+    private static func canonicalEncoder() -> JSONEncoder {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return encoder
+    }
+
     @discardableResult private func persist() -> Bool {
         do {
-            try storage.write(JSONEncoder().encode(state))
-            storageWarning = nil; return true
+            let encoded = try Self.canonicalEncoder().encode(state)
+            if encoded == lastPersistedData {
+                storageWarning = nil
+                return true
+            }
+            try storage.write(encoded)
+            lastPersistedData = encoded
+            storageWarning = nil
+            return true
         } catch {
+            lastPersistedData = nil
             storageWarning = L("Sync changes are not saved on this device yet. Retry before closing the app.")
             return false
         }
@@ -316,16 +390,32 @@ final class RoomSyncCoordinator: ObservableObject {
     private func valid(_ expected: Int) -> Bool { expected == revision && enabled && !Task.isCancelled }
 
     private func synchronize(revision expected: Int) async {
-        guard persist() else { return }
+        guard persist() else {
+            isManualSyncing = false
+            return
+        }
+        let effectiveBackoff = max(cloudBackoffUntil, backoffGate?.backoffUntil() ?? .distantPast)
+        if !isManualSyncing && Date() < effectiveBackoff {
+            if expected == revision { task = nil }
+            requestSync(immediate: false)
+            return
+        }
         busy = true; anotherPass = false
         syncState = state.owner == nil ? .connecting : .syncing
         defer {
             busy = false
             if expected == revision {
                 task = nil
-                if anotherPass { requestSync() }
-            } else if enabled {
-                requestSync(immediate: true)
+                if anotherPass {
+                    let wasManual = isManualSyncing
+                    isManualSyncing = false
+                    requestSync(userInitiated: wasManual)
+                } else {
+                    isManualSyncing = false
+                }
+            } else {
+                isManualSyncing = false
+                if enabled { requestSync(immediate: true) }
             }
         }
         do {
@@ -345,7 +435,6 @@ final class RoomSyncCoordinator: ObservableObject {
             state.owner = session.account; state.generation = session.generation
             activeCloudSession = session
             onCloudAccessChanged?(session.account)
-            onSyncNow?()
             for attempt in 0..<3 {
                 let changes = try await transport.fetch(session: session, after: state.token)
                 guard valid(expected) else { return }
@@ -378,11 +467,18 @@ final class RoomSyncCoordinator: ObservableObject {
                 guard !outgoing.isEmpty else {
                     status = nameChoice == nil ? L("Up to date") : L("Choose the name to use across devices")
                     syncState = nameChoice == nil ? .upToDate : .nameConflict
+                    lastSyncedAt = Date()
+                    firstUnresolvedFailureAt = nil
+                    consecutiveFailures = 0
+                    hasProlongedFailure = false
+                    cloudBackoffUntil = .distantPast
+                    backoffGate?.recordSuccess()
                     return
                 }
                 do {
                     let saved = try await transport.save(outgoing, session: session)
                     guard valid(expected) else { return }
+                    lastCloudSaveCompletedAt = Date()
                     state.document.merge(saved)
                     for record in saved { state.acknowledged[record.id] = record }
                     guard persist() else { return }
@@ -390,6 +486,12 @@ final class RoomSyncCoordinator: ObservableObject {
                     if pendingRecords.isEmpty {
                         status = nameChoice == nil ? L("Up to date") : L("Choose the name to use across devices")
                         syncState = nameChoice == nil ? .upToDate : .nameConflict
+                        lastSyncedAt = Date()
+                        firstUnresolvedFailureAt = nil
+                        consecutiveFailures = 0
+                        hasProlongedFailure = false
+                        cloudBackoffUntil = .distantPast
+                        backoffGate?.recordSuccess()
                         return
                     }
                 } catch RoomCloudError.conflict where attempt < 2 {
@@ -414,6 +516,20 @@ final class RoomSyncCoordinator: ObservableObject {
                 status = L("Update the app on all devices before syncing.")
                 syncState = .incompatible
             default:
+                consecutiveFailures += 1
+                let now = Date()
+                if firstUnresolvedFailureAt == nil { firstUnresolvedFailureAt = now }
+                hasProlongedFailure = consecutiveFailures >= 5 || now.timeIntervalSince(firstUnresolvedFailureAt!) >= 900
+                if let retryAfter = backoffGate?.recordRateLimit(for: error, now: now)
+                    ?? CloudKitRateLimit.retryAfter(for: error, consecutiveFailures: consecutiveFailures) {
+                    cloudBackoffUntil = now.addingTimeInterval(retryAfter)
+                    retryTask?.cancel()
+                    retryTask = Task { [weak self] in
+                        try? await Task.sleep(for: .seconds(retryAfter))
+                        guard !Task.isCancelled, let self, self.revision == expected, self.enabled else { return }
+                        self.requestSync(immediate: false)
+                    }
+                }
                 status = L("Changes pending. iCloud will retry when the app opens or you tap Sync now.")
                 syncState = .failed
             }

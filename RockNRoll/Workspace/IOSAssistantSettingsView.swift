@@ -265,15 +265,15 @@ struct IOSAssistantSettingsView: View {
 
             Section {
                 Button {
-                    Task { await workspace.synchronizeNow() }
+                    workspace.requestManualSync()
                 } label: {
                     HStack {
                         Text(L("Sync Workspace Now"))
                         Spacer()
-                        if workspace.isSyncing { ProgressView() }
+                        if workspace.isManualSyncing { ProgressView() }
                     }
                 }
-                .disabled(!sync.enabled || workspace.isSyncing)
+                .disabled(!sync.enabled || workspace.isManualSyncing)
 
                 if let synced = workspace.lastSyncedAt {
                     HStack {

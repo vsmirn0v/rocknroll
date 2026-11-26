@@ -372,16 +372,16 @@ struct IOSWorkspaceHubView: View {
             }
 
             Button {
-                Task { await workspace.synchronizeNow() }
+                workspace.requestManualSync()
             } label: {
-                if workspace.isSyncing {
+                if workspace.isManualSyncing {
                     ProgressView()
                 } else {
                     Image(systemName: "arrow.triangle.2.circlepath")
                 }
             }
             .accessibilityLabel(L("Sync Now"))
-            .disabled(!sync.enabled || workspace.isSyncing)
+            .disabled(!sync.enabled || workspace.isManualSyncing)
 
             Button {
                 showingSettings = true

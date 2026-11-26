@@ -282,7 +282,7 @@ struct MeetingHistoryContext: View {
             } else if receipt.pending {
                 Text(L("Waiting for transcript from another device")).foregroundStyle(.secondary)
             }
-            Button(L("Sync now")) { sync.scheduleSync(delayMilliseconds: 0) }.disabled(sync.isSyncing)
+            Button(L("Sync now")) { sync.requestManualSync() }.disabled(sync.isManualSyncing)
         }
     }
 }

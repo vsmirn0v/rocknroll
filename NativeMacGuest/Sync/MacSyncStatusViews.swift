@@ -34,6 +34,8 @@ struct MacSyncStatusPresentation: Equatable {
         var transcriptRetention: TranscriptSyncRetention
         var workspaceIsSyncing: Bool
         var workspaceSyncError: String?
+        var isManualSyncing: Bool = false
+        var prolongedSyncFailure: Bool = false
         var lastLibrarySyncAt: Date?
         var nextRetryAt: Date?
     }
@@ -53,17 +55,17 @@ struct MacSyncStatusPresentation: Equatable {
         cardTitle = L("Meetings sync")
         popoverTitle = L("iCloud Sync for Meetings")
 
-        let hasBlockingIssue = snapshot.needsFreshAccount
+        let hasImmediateActionIssue = snapshot.needsFreshAccount
             || snapshot.storageWarning != nil
             || snapshot.hasNameChoice
-            || snapshot.workspaceSyncError != nil
-            || [.unavailable, .restricted, .incompatible, .failed].contains(snapshot.syncState)
+            || [.unavailable, .restricted, .incompatible, .accountChanged, .nameConflict].contains(snapshot.syncState)
+        let hasProlongedIssue = snapshot.prolongedSyncFailure
+            && (snapshot.workspaceSyncError != nil || snapshot.syncState == .failed)
+        let hasDisplayedIssue = hasImmediateActionIssue || hasProlongedIssue
 
-        let spinning = snapshot.enabled && !hasBlockingIssue && (
-            snapshot.busy
-                || snapshot.workspaceIsSyncing
-                || snapshot.syncState == .connecting
-                || snapshot.syncState == .syncing
+        let spinning = snapshot.enabled && !hasDisplayedIssue && (
+            snapshot.isManualSyncing
+                || (snapshot.syncState == .connecting && snapshot.lastLibrarySyncAt == nil && snapshot.busy)
         )
         showsSpinner = spinning
 
@@ -102,7 +104,7 @@ struct MacSyncStatusPresentation: Equatable {
             tone = .warning
             cardSubtitle = L("Update app to sync")
             popoverBadge = L("Update needed")
-        } else if snapshot.workspaceSyncError != nil || snapshot.syncState == .failed {
+        } else if hasProlongedIssue {
             iconName = "exclamationmark.icloud"
             tone = .warning
             cardSubtitle = L("Sync issue · Retry")
@@ -112,12 +114,8 @@ struct MacSyncStatusPresentation: Equatable {
             tone = .active
             cardSubtitle = L("Syncing with iCloud…")
             popoverBadge = L("Syncing…")
-        } else if snapshot.syncState == .pending {
-            iconName = "icloud.and.arrow.up"
-            tone = .warning
-            cardSubtitle = L("Changes pending")
-            popoverBadge = L("Pending")
         } else {
+            // Keep background retries, transient throttles, and routine change batching calm when healthy.
             iconName = "checkmark.icloud"
             tone = .ok
             cardSubtitle = L("Synced with iCloud")
@@ -132,7 +130,13 @@ struct MacSyncStatusPresentation: Equatable {
             }
             syncedItems = []
         } else {
-            statusDetail = snapshot.workspaceSyncError ?? snapshot.status
+            if hasProlongedIssue {
+                statusDetail = snapshot.workspaceSyncError ?? snapshot.status
+            } else if snapshot.syncState == .pending || snapshot.syncState == .syncing || snapshot.syncState == .failed {
+                statusDetail = L("Up to date")
+            } else {
+                statusDetail = snapshot.status
+            }
             var items = [L("Saved rooms & favorites")]
             if snapshot.includeRecent {
                 items.append(L("Recent jams"))
@@ -176,6 +180,8 @@ struct MacSyncStatusPresentation: Equatable {
             transcriptRetention: sync.transcriptRetention,
             workspaceIsSyncing: workspaceSync.isSyncing,
             workspaceSyncError: workspaceSync.syncError,
+            isManualSyncing: sync.isManualSyncing || workspaceSync.isManualSyncing,
+            prolongedSyncFailure: sync.hasProlongedFailure || workspaceSync.hasProlongedSyncFailure,
             lastLibrarySyncAt: workspaceSync.lastLibrarySyncAt,
             nextRetryAt: workspaceSync.nextRetryAt
         ))
@@ -414,11 +420,11 @@ struct MacSyncStatusPopover: View {
 
         HStack {
             Button(L("Sync now")) {
-                sync.requestSync(immediate: true)
-                workspaceSync.scheduleSync(delayMilliseconds: 0)
+                sync.requestManualSync()
+                workspaceSync.requestManualSync()
             }
             .buttonStyle(.bordered)
-            .disabled(sync.busy || workspaceSync.isSyncing)
+            .disabled(sync.isManualSyncing || workspaceSync.isManualSyncing)
             .accessibilityIdentifier("sync-popover.sync-now")
             Spacer()
             settingsButton(prominent: false)

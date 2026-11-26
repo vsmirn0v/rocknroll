@@ -1,4 +1,5 @@
 import AppKit
+import CloudKit
 import Combine
 import ConferenceCore
 import MeetingEngine
@@ -53,6 +54,7 @@ import UserNotifications
         return coord
     }()
     private lazy var transcriptArchive = TranscriptArchiveStore()
+    private let cloudBackoffGate = CloudKitBackoffGate()
     /// CloudKit workspace, transcript, task, context-settings and calendar schedule sync coordinator.
     lazy var workspaceSync = MacWorkspaceSyncCoordinator(
         storageRoot: attention.store.root,
@@ -64,7 +66,8 @@ import UserNotifications
         obsidianExportNow: { [weak self] in await self?.obsidian.exportPendingNow() },
         calendar: library.calendar,
         syncPreferences: library.sync,
-        archiveStore: transcriptArchive
+        archiveStore: transcriptArchive,
+        backoffGate: cloudBackoffGate
     )
     /// A library section is shown unless a meeting is selected in the sidebar.
     @Published var selection: Section = .home {
@@ -386,6 +389,17 @@ import UserNotifications
                 model.noteUserRenamedSession(title)
             }
         }
+        library.sync.backoffGate = cloudBackoffGate
+        library.continuation.backoffGate = cloudBackoffGate
+        let hasLiveMeetingCheck: () -> Bool = { [weak self] in
+            guard let self else { return false }
+            return self.meetings.contains { model in
+                !self.meetingLeaves.keys.contains(model.sessionID) &&
+                    [.connecting, .connected, .reconnecting].contains(model.snapshot.phase)
+            }
+        }
+        library.sync.hasActiveMeeting = hasLiveMeetingCheck
+        workspaceSync.hasActiveMeeting = hasLiveMeetingCheck
         library.sync.onSyncNow = { [weak self] in
             self?.workspaceSync.scheduleSync(delayMilliseconds: 150, localChanges: false)
         }
@@ -1534,6 +1548,8 @@ import UserNotifications
                 self.synchronizeScheduledTransitions()
                 self.attention.forgetLeave(id)
                 self.attention.speech.refreshState()
+                self.library.sync.noteActiveMeetingsChanged()
+                self.workspaceSync.noteActiveMeetingsChanged()
             } else {
                 self.shutdownBlocked = true; self.error = NativeDesktopError.cleanupFailed.localizedDescription
             }
@@ -1683,10 +1699,34 @@ import UserNotifications
     }
     func activate() { library.foregrounded(); if meeting != nil { showMeeting() } else { show() } }
     func backgrounded() { library.backgrounded() }
-    func cloudNotification() async {
-        await library.sync.synchronizeForNotification()
-        await workspaceSync.synchronizeNow(localChanges: false)
-        await library.continuation.refresh()
+    func cloudNotification(_ userInfo: [AnyHashable: Any] = [:]) async {
+        let subscription = CKNotification(fromRemoteNotificationDictionary: userInfo)?.subscriptionID
+        let nowDate = Date()
+        if subscription == "ActiveJamsChanges" || subscription == nil {
+            await library.continuation.refresh()
+            if subscription == "ActiveJamsChanges" { return }
+        }
+        if subscription == "SavedJamsChanges" || subscription == nil {
+            let recentSave = library.sync.lastCloudSaveCompletedAt.map { nowDate.timeIntervalSince($0) < 5 } ?? false
+            if !recentSave {
+                if library.sync.hasActiveMeeting?() == true {
+                    library.sync.foregrounded()
+                } else {
+                    await library.sync.synchronizeForNotification()
+                }
+            }
+            if subscription == "SavedJamsChanges" { return }
+        }
+        let recentWorkspaceSave = workspaceSync.lastCloudSaveCompletedAt.map { nowDate.timeIntervalSince($0) < 5 } ?? false
+        guard !recentWorkspaceSave else { return }
+        let zones: Set<MacWorkspaceSyncCoordinator.SyncZoneKind>
+        switch subscription {
+        case "MeetingLibraryChanges": zones = [.library]
+        case "MeetingTranscriptsChanges": zones = [.transcripts]
+        case "MeetingScheduleChanges": zones = [.schedule]
+        default: zones = Set(MacWorkspaceSyncCoordinator.SyncZoneKind.allCases)
+        }
+        workspaceSync.scheduleSync(delayMilliseconds: 300, localChanges: false, zones: zones)
     }
     func handleURL(_ url: URL) { show(); invitation = url.absoluteString; joinInput() }
 
@@ -1734,6 +1774,9 @@ import UserNotifications
                 sessionID: meeting.workspaceSessionID,
                 active: meeting.snapshot.microphoneOn && meeting.ownsMicrophone
             )
+        } else {
+            library.sync.noteActiveMeetingsChanged()
+            workspaceSync.noteActiveMeetingsChanged()
         }
     }
     private func updateContinuation() {

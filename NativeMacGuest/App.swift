@@ -449,7 +449,7 @@ struct NativeGuestApplication {
         showJoin(); if let url = urls.first { workspace?.handleURL(url) }
     }
     func application(_ application: NSApplication, didReceiveRemoteNotification userInfo: [String: Any]) {
-        Task { await workspace?.cloudNotification() }
+        Task { await workspace?.cloudNotification(userInfo) }
     }
     func application(_ application: NSApplication, continue userActivity: NSUserActivity,
                      restorationHandler: @escaping ([any NSUserActivityRestoring]) -> Void) -> Bool {
