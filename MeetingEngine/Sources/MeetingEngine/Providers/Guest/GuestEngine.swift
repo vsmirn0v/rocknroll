@@ -247,6 +247,7 @@ public final class NativeGuestEngine {
     var muteNotifyFinishedForTesting: (() -> Void)?
     var featureRequestForTesting: ((String, [String: Any], String?) async throws -> [String: Any])?
     var featureNotifyForTesting: ((String, [String: Any]) async throws -> Void)?
+    var joinForTesting: ((GuestInvitation, String?) async throws -> Void)?
 #endif
 
     init(label: String, systemAudio: (any GuestMeetingAudio)? = nil, icePolicy: GuestICEPolicy = .automatic, verifyReceivedPixels: Bool = true) {
@@ -263,6 +264,12 @@ public final class NativeGuestEngine {
     }
 
     func join(_ invitation: GuestInvitation, sessionID: String? = nil) async throws {
+#if DEBUG
+        if let joinForTesting {
+            try await joinForTesting(invitation, sessionID)
+            return
+        }
+#endif
         LKRTCInitializeSSL()
         let tlsDelegate = SiteTLSDelegate(preferredOrigin: invitation.origin, lookup: SiteClientIdentityRegistry.shared)
         let httpSession = SiteTLSDelegate.makeEphemeralSession(preferredOrigin: invitation.origin, lookup: SiteClientIdentityRegistry.shared)
@@ -1897,9 +1904,14 @@ public final class NativeGuestEngine {
         remoteParticipantIdentities.removeAll(); connectedRemoteParticipants.removeAll(); remoteTrackIDs.removeAll()
         // Drain subscriber teardown while publisher's send stream still holds input
         // running, so StopPlayout does not trigger a throwaway playout-only engine rebuild.
+        // For non-terminal recovery on the shared owner, keep the muted input graph warm
+        // across peer teardown so Bluetooth HFP does not tear down and rebuild.
+        let handoffAudio = !sendLeave && releaseSystemAudio != nil && cameraStopped && screenStopped
+        if handoffAudio, let systemAudio { _ = await systemAudio.prepareAttemptHandoff() }
         await subscriber?.closeAndDrain(timeout: 1)
         await publisher?.closeAndDrain(timeout: 1)
         subscriber = nil; publisher = nil
+        if handoffAudio, let systemAudio { _ = await systemAudio.completeAttemptHandoff() }
         await transport?.close(graceTimeout: sendLeave ? 2 : 0.15); transport = nil
         reader?.cancel(); reader = nil
         let audioStopped: Bool
@@ -2307,6 +2319,9 @@ extension NativeGuestEngine {
     func startTransportObservationForTesting() {
         peerTransportObservers.forEach { $0.cancel() }
         peerTransportObservers = [subscriber, publisher].compactMap { $0 }.map { observeTransport($0) }
+    }
+    func simulateFailureForTesting(_ error: Error) {
+        recordFailure(error)
     }
 }
 #endif

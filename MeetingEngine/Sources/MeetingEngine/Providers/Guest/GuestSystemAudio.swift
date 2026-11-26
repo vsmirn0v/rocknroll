@@ -668,6 +668,7 @@ public final class GuestSystemAudio: NSObject, LKRTCAudioDeviceModuleDelegate, @
     private var outputSilenced = false
     // Confined to audioQueue: output runs while sound is off for local transcription.
     private var transcriptionOutput = false
+    private var handoffPreparedRecording = false
 
     /// App-only meeting level (0...1). macOS output volume is never changed;
     /// mute and sound-on intent remain separate.
@@ -1288,6 +1289,7 @@ public final class GuestSystemAudio: NSObject, LKRTCAudioDeviceModuleDelegate, @
         setWatchdogInputUnmuted(false)
         return await perform("idle-input-release", timeout: timeout) {
             guard !self.closed, let module = self.currentModule else { return true }
+            self.locked { self.handoffPreparedRecording = false }
             self.startedRecordingForPrivateCheck = false
             self.deferredActivation = false
             self.inputPermitted = false
@@ -1298,11 +1300,13 @@ public final class GuestSystemAudio: NSObject, LKRTCAudioDeviceModuleDelegate, @
                          "transcriptionOutput": false,
                          "inputPermitted": false, "inputKeptWarm": false,
                          "deferredActivation": false, "microphoneOptIn": false])
+            let clearedPrepared = !module.isRecordingAlwaysPreparedMode ||
+                self.nativeCall("set-recording-prepared", { module.setRecordingAlwaysPreparedMode(false) }) == 0
             let muted = self.nativeCall("set-microphone-muted", { module.setMicrophoneMuted(true) }) == 0
             let available = self.applyAvailability(module)
             let stoppedRecording = !module.isRecording || self.nativeCall("stop-recording", { module.stopRecording() }) == 0
             self.readSnapshot(module)
-            return muted && module.isMicrophoneMuted && available && stoppedRecording
+            return clearedPrepared && muted && module.isMicrophoneMuted && available && stoppedRecording
         }
     }
 
@@ -1314,7 +1318,10 @@ public final class GuestSystemAudio: NSObject, LKRTCAudioDeviceModuleDelegate, @
             guard !self.closed, let module = self.currentModule,
                   self.inputPermitted, self.microphoneOptIn,
                   GuestSystemAudio.microphoneAuthorized else { return false }
+            self.locked { self.handoffPreparedRecording = false }
             self.update(["microphoneMutedRequested": true])
+            let clearedPrepared = !module.isRecordingAlwaysPreparedMode ||
+                self.nativeCall("set-recording-prepared", { module.setRecordingAlwaysPreparedMode(false) }) == 0
             let muted = self.nativeCall("set-microphone-muted", { module.setMicrophoneMuted(true) }) == 0
             var unavailable = LKRTCAudioEngineAvailability()
             unavailable.isInputAvailable = false; unavailable.isOutputAvailable = false
@@ -1326,7 +1333,7 @@ public final class GuestSystemAudio: NSObject, LKRTCAudioDeviceModuleDelegate, @
                 startRecording: { module.isRecording || self.nativeCall("start-recording", { module.initAndStartRecording(audioProcessingOptions: nil) }) == 0 },
                 isMuted: { module.isMicrophoneMuted })
             self.readSnapshot(module)
-            return muted && gated && stoppedRecording && restarted
+            return clearedPrepared && muted && gated && stoppedRecording && restarted
         }
     }
 
@@ -1366,6 +1373,7 @@ public final class GuestSystemAudio: NSObject, LKRTCAudioDeviceModuleDelegate, @
         if sharedNativeOwner, !(await sharedPlayoutGate.reset(sound: playout)) { _ = await shutdown(); return false }
         return await perform("room-audio-reset", timeout: 8) {
             guard !self.closed, let module = self.currentModule else { return false }
+            self.locked { self.handoffPreparedRecording = false }
             self.startedRecordingForPrivateCheck = false
             // A new room or recovery attempt starts permitted; the meeting reapplies
             // its own withdrawal before any session can activate input.
@@ -1374,12 +1382,63 @@ public final class GuestSystemAudio: NSObject, LKRTCAudioDeviceModuleDelegate, @
             self.inputActivation = .init(persistent: input); self.microphoneOptIn = input
             self.deferredActivation = false; self.update(["deferredActivation": false, "inputPermitted": true])
             self.playoutEnabled = playout
+            let clearedPrepared = !module.isRecordingAlwaysPreparedMode ||
+                self.nativeCall("set-recording-prepared", { module.setRecordingAlwaysPreparedMode(false) }) == 0
             let muted = self.nativeCall("set-microphone-muted", { module.setMicrophoneMuted(true) }) == 0
             let available = self.applyAvailability(module)
             let recording = input || self.nativeCall("stop-recording", { module.stopRecording() }) == 0
             let restored = self.nativeCall("restore-microphone-muted", { module.setMicrophoneMuted(true) }) == 0
             self.readSnapshot(module)
-            return muted && restored && module.isMicrophoneMuted && available && recording
+            return clearedPrepared && muted && restored && module.isMicrophoneMuted && available && recording
+        }
+    }
+
+    /// Holds the underlying audio engine across peer teardown during non-terminal
+    /// recovery so Bluetooth HFP does not tear down and rebuild before reconnect.
+    public func prepareAttemptHandoff(timeout: TimeInterval = 2) async -> Bool {
+        setWatchdogInputUnmuted(false)
+        return await perform("attempt-handoff-prepare", timeout: timeout) {
+            guard !self.closed, let module = self.currentModule else { return true }
+            self.update(["microphoneMutedRequested": true])
+            let muted = self.nativeCall("set-microphone-muted", { module.setMicrophoneMuted(true) }) == 0 && module.isMicrophoneMuted
+            if self.inputPermitted, self.microphoneOptIn, GuestSystemAudio.microphoneAuthorized,
+               module.isRecording || module.isEngineRunning {
+                let prepared = self.nativeCall("set-recording-prepared", { module.setRecordingAlwaysPreparedMode(true) }) == 0
+                self.locked { self.handoffPreparedRecording = prepared }
+            } else {
+                self.locked { self.handoffPreparedRecording = false }
+            }
+            self.readSnapshot(module)
+            return muted
+        }
+    }
+
+    /// Re-establishes muted recording on the retained engine after peer teardown
+    /// and clears persistent recording-prepared mode.
+    public func completeAttemptHandoff(timeout: TimeInterval = 8) async -> Bool {
+        setWatchdogInputUnmuted(false)
+        return await perform("attempt-handoff-complete", timeout: timeout) {
+            let wasPrepared = self.locked {
+                let value = self.handoffPreparedRecording
+                self.handoffPreparedRecording = false
+                return value
+            }
+            guard !self.closed, let module = self.currentModule else { return true }
+            guard wasPrepared else { return true }
+            if self.inputPermitted, self.microphoneOptIn, GuestSystemAudio.microphoneAuthorized,
+               self.mediaContext != nil || self.manualRenderingMode {
+                let started = GuestMutedInputPreparation.start(
+                    mute: { self.nativeCall("set-microphone-muted", { module.setMicrophoneMuted(true) }) == 0 },
+                    makeAvailable: { self.applyAvailability(module) },
+                    startRecording: { module.isRecording || self.nativeCall("start-recording", { module.initAndStartRecording(audioProcessingOptions: nil) }) == 0 },
+                    isMuted: { module.isMicrophoneMuted })
+                let cleared = self.nativeCall("set-recording-prepared", { module.setRecordingAlwaysPreparedMode(false) }) == 0
+                self.readSnapshot(module)
+                return started && cleared
+            }
+            let cleared = self.nativeCall("set-recording-prepared", { module.setRecordingAlwaysPreparedMode(false) }) == 0
+            self.readSnapshot(module)
+            return cleared
         }
     }
 
@@ -1520,9 +1579,12 @@ public final class GuestSystemAudio: NSObject, LKRTCAudioDeviceModuleDelegate, @
                 self.readSnapshot(module)
                 return muted && module.isMicrophoneMuted
             }
+            self.locked { self.handoffPreparedRecording = false }
             self.deferredActivation = self.deferredActivation || self.microphoneOptIn
             self.inputPermitted = false
             self.update(["microphoneMutedRequested": true])
+            let clearedPrepared = !module.isRecordingAlwaysPreparedMode ||
+                self.nativeCall("set-recording-prepared", { module.setRecordingAlwaysPreparedMode(false) }) == 0
             let muted = self.nativeCall("set-microphone-muted", { module.setMicrophoneMuted(true) }) == 0
             self.inputActivation = .init(persistent: false); self.microphoneOptIn = false
             // Unavailable input releases the device, as a finished private check does.
@@ -1530,7 +1592,7 @@ public final class GuestSystemAudio: NSObject, LKRTCAudioDeviceModuleDelegate, @
             let available = self.applyAvailability(module)
             self.update(["inputPermitted": false, "deferredActivation": self.deferredActivation, "microphoneOptIn": false])
             self.readSnapshot(module)
-            return muted && module.isMicrophoneMuted && available
+            return clearedPrepared && muted && module.isMicrophoneMuted && available
         }
     }
 
@@ -1607,6 +1669,7 @@ public final class GuestSystemAudio: NSObject, LKRTCAudioDeviceModuleDelegate, @
         setWatchdogInputUnmuted(false)
         if sharedNativeOwner { _ = await sharedPlayoutGate.close(retire: true) }
         let success = await perform("shutdown", timeout: timeout) {
+            self.locked { self.handoffPreparedRecording = false }
             if self.closed { return self.snapshot["cleanupSucceeded"] as? Bool == true }
             self.closed = true
             guard let module = self.currentModule else { self.update(["cleanupSucceeded": true]); return true }
@@ -1832,7 +1895,9 @@ public final class GuestSystemAudio: NSObject, LKRTCAudioDeviceModuleDelegate, @
             isPlayoutEnabled: isPlayoutEnabled, isRecordingEnabled: isRecordingEnabled) ?? 0
         locked { cached["engineStops"] = (cached["engineStops"] as? Int ?? 0) + 1 }
         logLifecycle("engine-stop", ["playout": isPlayoutEnabled, "recording": isRecordingEnabled])
-        reportSpontaneous(.stopped)
+        if !locked({ handoffPreparedRecording && isRecordingEnabled }) {
+            reportSpontaneous(.stopped)
+        }
 #if os(iOS)
         if isPlayoutEnabled { restoreMeetingPlayoutIfNeeded() }
 #endif

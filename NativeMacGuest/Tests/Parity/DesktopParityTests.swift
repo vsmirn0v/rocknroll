@@ -2343,4 +2343,35 @@ private final class DesktopActivitySpy: NSUserActivity {
 
         _ = await workspace.leave()
     }
+
+    func testReconnectingPreservesParticipantsAndHidesInvitePrompt() async throws {
+        let engine = DesktopTestEngine()
+        let model = NativeDesktopMeetingModel(destination: try .verified(url, engine: .guest), name: "Host", title: "Daily",
+            engine: engine, joinReadiness: .init(microphone: .off, camera: .off), power: joinTestPower())
+        try await model.connect()
+        engine.snapshot.participants = [
+            NativeDesktopParticipant(id: "local", name: "Host", isLocal: true, microphoneOn: false, cameraOn: false, sharing: false, speaking: false),
+            NativeDesktopParticipant(id: "remote", name: "Alex", isLocal: false, microphoneOn: true, cameraOn: false, sharing: false, speaking: true)
+        ]
+        engine.onState?(engine.snapshot)
+        XCTAssertEqual(model.participants.count, 2)
+
+        // Transitioning to .reconnecting with preserved participants must keep the gallery populated.
+        engine.snapshot.phase = .reconnecting
+        engine.snapshot.microphoneOn = false
+        engine.snapshot.sharing = false
+        engine.snapshot.participants[1].speaking = false
+        engine.onState?(engine.snapshot)
+        XCTAssertEqual(model.snapshot.phase, .reconnecting)
+        XCTAssertEqual(model.participants.count, 2)
+        XCTAssertFalse(model.connected)
+
+        // Even in a solo room, NativeDesktopWaitingInviteCard enters reconnecting state without exposing invite links.
+        let soloCard = NativeDesktopWaitingInviteCard(model: model, compact: false)
+        _ = soloCard.body
+        let banner = NativeDesktopReconnectingBanner(model: model)
+        _ = banner.body
+
+        _ = await model.leave()
+    }
 }

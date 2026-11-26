@@ -1,4 +1,5 @@
 import Foundation
+import LiveKitWebRTC
 import XCTest
 @testable import MeetingEngine
 
@@ -168,5 +169,193 @@ final class GuestPermissionsAndSignalingTests: XCTestCase {
         XCTAssertEqual(reported2.count, 1)
         adapter2.unbindHistoryForTesting()
         _ = await engine2.leave(sendLeave: false)
+    }
+
+    func testTransportSocketFailureLogsAllowlistedDiagnosticsAndGracefulCloseDoesNot() async throws {
+        var events: [[String: Any]] = []
+        setProbeLogSink { line in
+            if let data = line.data(using: .utf8),
+               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                events.append(obj)
+            }
+        }
+        defer { setProbeLogSink(nil) }
+
+        let url = URL(string: "wss://secret.example.test/ws?token=supersecret")!
+
+        // 1. Unexpected WebSocket close logs allowlisted diagnostics without URLs or raw reason text.
+        let unexpected = GuestTransport(url: url, roomID: "room-1")
+        await unexpected.openWithoutSocketForTesting()
+        await unexpected.simulateUnexpectedSocketEndForTesting(closeCode: 1006, reasonBytes: 24, error: nil)
+        let failureEvents = events.filter { $0["event"] as? String == "guest-transport-failure" }
+        XCTAssertEqual(failureEvents.count, 1)
+        let first = try XCTUnwrap(failureEvents.first)
+        XCTAssertEqual(first["source"] as? String, "ws-close")
+        XCTAssertEqual(first["kind"] as? String, "networkFailure")
+        XCTAssertEqual(first["closeCode"] as? Int, 1006)
+        XCTAssertEqual(first["reasonBytes"] as? Int, 24)
+        let serialized = try String(data: JSONSerialization.data(withJSONObject: first), encoding: .utf8) ?? ""
+        XCTAssertFalse(serialized.contains("secret.example.test"))
+        XCTAssertFalse(serialized.contains("supersecret"))
+
+        // 2. Task error with underlying error logs sanitized domain/code.
+        events.removeAll()
+        let taskFailed = GuestTransport(url: url, roomID: "room-2")
+        await taskFailed.openWithoutSocketForTesting()
+        let inner = NSError(domain: NSPOSIXErrorDomain, code: Int(ECONNRESET))
+        let outer = NSError(domain: NSURLErrorDomain, code: NSURLErrorNetworkConnectionLost, userInfo: [
+            NSUnderlyingErrorKey: inner,
+            NSURLErrorFailingURLStringErrorKey: "https://secret.example.test/leak"
+        ])
+        await taskFailed.simulateUnexpectedSocketEndForTesting(closeCode: nil, reasonBytes: nil, error: outer)
+        let taskEvents = events.filter { $0["event"] as? String == "guest-transport-failure" }
+        XCTAssertEqual(taskEvents.count, 1)
+        let second = try XCTUnwrap(taskEvents.first)
+        XCTAssertEqual(second["source"] as? String, "task-complete")
+        XCTAssertEqual(second["errorDomain"] as? String, NSURLErrorDomain)
+        XCTAssertEqual(second["errorCode"] as? Int, NSURLErrorNetworkConnectionLost)
+        XCTAssertEqual(second["underlyingDomain"] as? String, NSPOSIXErrorDomain)
+        XCTAssertEqual(second["underlyingCode"] as? Int, Int(ECONNRESET))
+        let taskSerialized = try String(data: JSONSerialization.data(withJSONObject: second), encoding: .utf8) ?? ""
+        XCTAssertFalse(taskSerialized.contains("secret.example.test"))
+
+        // 3. Graceful close emits no failure event.
+        events.removeAll()
+        let graceful = GuestTransport(url: url, roomID: "room-3")
+        await graceful.openWithoutSocketForTesting()
+        let closing = Task { await graceful.close(graceTimeout: 1) }
+        while await !graceful.isClosingForTesting { await Task.yield() }
+        await graceful.finishCloseForTesting()
+        await closing.value
+        XCTAssertTrue(events.filter { $0["event"] as? String == "guest-transport-failure" }.isEmpty)
+    }
+
+    func testGuestAdapterPreservesParticipantsAcrossRecoveringAndClearsOnTerminalState() async throws {
+        let invitation = try GuestInvitation.parse(URL(string: "https://guest.example.test/call/daily-room")!)
+        let adapter = GuestAdapter(microphoneAuthorized: { false })
+        var attemptCount = 0
+        var engines: [NativeGuestEngine] = []
+        var releaseSecondAttempt: CheckedContinuation<Void, Never>?
+
+        let session = GuestSession(makeEngine: {
+            attemptCount += 1
+            let engine = NativeGuestEngine(label: "Guest", verifyReceivedPixels: false)
+            if attemptCount == 1 {
+                engine.joinForTesting = { _, _ in }
+            } else {
+                engine.joinForTesting = { _, _ in
+                    await withCheckedContinuation { releaseSecondAttempt = $0 }
+                    throw GuestTransportError.networkFailure
+                }
+            }
+            engines.append(engine)
+            return engine
+        })
+        adapter.attachSessionForTesting(session)
+
+        try await session.connect(invitation, publish: false, codec: "h264", camera: false,
+                                  initialAudioMuted: true, initialVideoMuted: true)
+        XCTAssertEqual(session.state, .connected)
+        let firstEngine = try XCTUnwrap(engines.first)
+        try await firstEngine.processEventForTesting([
+            "event": "joined",
+            "payload": [
+                "roomId": "room-daily",
+                "participant": [
+                    "participantId": "local-1",
+                    "name": "Vitalii",
+                    "role": "PARTICIPANT",
+                    "permissions": ["canViewParticipants": true, "canViewChat": false, "canViewTranscription": false]
+                ],
+                "participantGroup": [
+                    "groupId": "group-daily",
+                    "name": "Daily Standup",
+                    "participants": [
+                        ["participantId": "local-1", "name": "Vitalii", "role": "PARTICIPANT"],
+                        ["participantId": "remote-1", "name": "Alex", "role": "MODERATOR"]
+                    ]
+                ]
+            ]
+        ])
+        XCTAssertEqual(adapter.snapshot.phase, .connected)
+        XCTAssertEqual(adapter.snapshot.participants.count, 2)
+        XCTAssertEqual(adapter.guestSnapshot.title, "Daily Standup")
+
+        // Trigger a recoverable network failure; the old engine retires while recovery holds.
+        firstEngine.simulateFailureForTesting(GuestTransportError.networkFailure)
+        for _ in 0..<100 {
+            if session.state == .recovering && attemptCount >= 2 { break }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertEqual(session.state, .recovering)
+        XCTAssertEqual(adapter.snapshot.phase, .reconnecting)
+        XCTAssertEqual(adapter.snapshot.participants.count, 2, "Participants must remain visible during recovery")
+        XCTAssertTrue(adapter.snapshot.participants.allSatisfy { $0.speaking != true && $0.sharing != true })
+        XCTAssertEqual(adapter.guestSnapshot.title, "Daily Standup")
+        XCTAssertFalse(adapter.guestSnapshot.connected)
+
+        // Even if the replacement engine emits an unjoined empty snapshot before failing, preserve the roster.
+        releaseSecondAttempt?.resume()
+        releaseSecondAttempt = nil
+        try await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertEqual(adapter.snapshot.phase, .reconnecting)
+        XCTAssertEqual(adapter.snapshot.participants.count, 2)
+
+        // Terminal leave clears the preserved roster cleanly.
+        let left = await adapter.leave()
+        XCTAssertTrue(left)
+        XCTAssertEqual(adapter.snapshot.phase, .left)
+        XCTAssertTrue(adapter.snapshot.participants.isEmpty)
+        XCTAssertEqual(adapter.guestSnapshot, GuestMeetingSnapshot())
+    }
+
+    func testAttemptHandoffRetainsAudioEngineWithoutReleaseAcrossPeerTeardown() async throws {
+        GuestSystemAudio.microphoneAuthorizationOverrideForTesting = true
+        defer { GuestSystemAudio.microphoneAuthorizationOverrideForTesting = nil }
+
+        let audio = try await GuestSystemAudio.create(
+            microphoneEnabled: false,
+            playoutEnabled: true,
+            concurrent: true,
+            manualRendering: true,
+            keepOutputAvailableWithInput: true
+        )
+        do {
+            let activated = await audio.activateMicrophone()
+            XCTAssertTrue(activated)
+            let subscriber = try await GuestPeer(target: .subscriber, factory: audio.factory, physicalAudio: true)
+            let publisher = try await GuestPeer(target: .publisher, factory: audio.factory, physicalAudio: true)
+            let micTrack = try await publisher.prepareAudio(cid: "handoff-mic")
+            try await publisher.attach(micTrack, codec: "opus")
+            _ = try await publisher.makeOffer()
+
+            let beforeSnapshot = audio.snapshot
+            let createdBefore = beforeSnapshot["enginesCreated"] as? Int ?? 0
+            let releasedBefore = beforeSnapshot["enginesReleased"] as? Int ?? 0
+            XCTAssertEqual(createdBefore, 1)
+            XCTAssertEqual(releasedBefore, 0)
+            XCTAssertEqual(beforeSnapshot["recording"] as? Bool, true)
+
+            let handoffPrepared = await audio.prepareAttemptHandoff()
+            XCTAssertTrue(handoffPrepared)
+            await subscriber.closeAndDrain(timeout: 1)
+            await publisher.closeAndDrain(timeout: 1)
+            let handoffCompleted = await audio.completeAttemptHandoff()
+            XCTAssertTrue(handoffCompleted)
+            let reactivated = await audio.activateMicrophone()
+            XCTAssertTrue(reactivated)
+
+            let afterSnapshot = audio.snapshot
+            XCTAssertEqual(afterSnapshot["enginesCreated"] as? Int, 1, "Attempt handoff must retain the existing AVAudioEngine")
+            XCTAssertEqual(afterSnapshot["enginesReleased"] as? Int ?? 0, 0, "Attempt handoff must not release the AVAudioEngine across peer teardown")
+            XCTAssertEqual(afterSnapshot["recording"] as? Bool, true)
+            XCTAssertEqual(afterSnapshot["microphoneMuted"] as? Bool, true)
+            XCTAssertEqual(afterSnapshot["recordingAlwaysPrepared"] as? Bool, false)
+        } catch {
+            _ = await audio.shutdown()
+            throw error
+        }
+        let stopped = await audio.shutdown()
+        XCTAssertTrue(stopped)
     }
 }

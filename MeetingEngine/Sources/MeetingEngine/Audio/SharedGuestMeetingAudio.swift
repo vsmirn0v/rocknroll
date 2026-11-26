@@ -49,6 +49,16 @@ import LiveKitWebRTC
         let muted = await attachment.setMuted(true)
         return clean && muted
     }
+    func prepareAttemptHandoff(timeout: TimeInterval) async -> Bool {
+        attachment.removeAllSenders()
+        let muted = await attachment.setMuted(true)
+        guard attachment.isTalk else { return muted }
+        return await owner.prepareAttemptHandoff(timeout: timeout) && muted
+    }
+    func completeAttemptHandoff(timeout: TimeInterval) async -> Bool {
+        guard attachment.isTalk else { return true }
+        return await owner.completeAttemptHandoff(timeout: timeout)
+    }
 
     // MARK: GuestMeetingAudio
 

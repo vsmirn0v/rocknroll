@@ -33,6 +33,8 @@ import LiveKitWebRTC
     func prewarmInput(timeout: TimeInterval) async -> Bool
     func setPlayoutEnabled(_ enabled: Bool, timeout: TimeInterval, expectedEpoch: UUID?) async -> Bool
     func setTranscriptionOutput(_ keep: Bool, timeout: TimeInterval) async -> Bool
+    func prepareAttemptHandoff(timeout: TimeInterval) async -> Bool
+    func completeAttemptHandoff(timeout: TimeInterval) async -> Bool
     func openSharedPlayout(expected: UUID?) -> Bool
     func setSharedSoundIntent(_ sound: Bool, expected: UUID?) -> Bool
     func closeSharedPlayout(expected: UUID?) -> Bool
@@ -113,6 +115,10 @@ public extension GuestMeetingAudio {
         await setPlayoutEnabled(enabled, timeout: 2, expectedEpoch: expectedEpoch)
     }
     func setTranscriptionOutput(_ keep: Bool) async -> Bool { await setTranscriptionOutput(keep, timeout: 2) }
+    func prepareAttemptHandoff(timeout: TimeInterval) async -> Bool { true }
+    func completeAttemptHandoff(timeout: TimeInterval) async -> Bool { true }
+    func prepareAttemptHandoff() async -> Bool { await prepareAttemptHandoff(timeout: 2) }
+    func completeAttemptHandoff() async -> Bool { await completeAttemptHandoff(timeout: 8) }
     @discardableResult func refreshSnapshot() async -> Bool { await refreshSnapshot(timeout: 2) }
     func beginPrivateInputCheck() async -> Bool { await beginPrivateInputCheck(timeout: nil) }
     func endPrivateInputCheck() async -> Bool { await endPrivateInputCheck(timeout: 2) }

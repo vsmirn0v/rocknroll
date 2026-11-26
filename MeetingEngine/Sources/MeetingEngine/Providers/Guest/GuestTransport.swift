@@ -115,17 +115,21 @@ public enum GuestTransportError: Error, LocalizedError {
 
 private final class GuestSocketDelegate: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDelegate, @unchecked Sendable {
     let opened: () -> Void
-    let ended: () -> Void
+    let ended: (Int?, Int?, Error?) -> Void
     let tlsDelegate: (any URLSessionDelegate)?
-    init(opened: @escaping () -> Void, ended: @escaping () -> Void, tlsDelegate: (any URLSessionDelegate)?) {
+    init(opened: @escaping () -> Void, ended: @escaping (Int?, Int?, Error?) -> Void, tlsDelegate: (any URLSessionDelegate)?) {
         self.opened = opened; self.ended = ended; self.tlsDelegate = tlsDelegate
     }
     func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask,
                     didOpenWithProtocol protocol: String?) { opened() }
     func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask,
-                    didCloseWith closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) { ended() }
+                    didCloseWith closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {
+        ended(closeCode.rawValue, reason?.count ?? 0, nil)
+    }
     func urlSession(_ session: URLSession, task: URLSessionTask,
-                    didCompleteWithError error: Error?) { ended() }
+                    didCompleteWithError error: Error?) {
+        ended(nil, nil, error)
+    }
     func urlSession(_ session: URLSession,
                     didReceive challenge: URLAuthenticationChallenge,
                     completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
@@ -218,8 +222,8 @@ public actor GuestTransport {
         let resolvedTLS = tlsDelegate ?? SiteTLSDelegate(preferredOrigin: origin, lookup: SiteClientIdentityRegistry.shared)
         let delegate = GuestSocketDelegate(opened: { [weak self] in
             Task { await self?.didOpen() }
-        }, ended: { [weak self] in
-            Task { await self?.socketEnded() }
+        }, ended: { [weak self] closeCode, reasonBytes, error in
+            Task { await self?.socketEnded(closeCode: closeCode, reasonBytes: reasonBytes, error: error) }
         }, tlsDelegate: resolvedTLS)
         let configuration = URLSessionConfiguration.ephemeral
         configuration.httpShouldSetCookies = false
@@ -242,7 +246,7 @@ public actor GuestTransport {
                 connectTimeout = Task { [weak self] in
                     do { try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000)) }
                     catch { return }
-                    await self?.fail(.timedOut)
+                    await self?.fail(.timedOut, source: "connect-timeout")
                 }
                 task.resume()
             }
@@ -354,7 +358,10 @@ public actor GuestTransport {
     var isClosingForTesting: Bool { state == .closing }
     func finishCloseForTesting() {
         precondition(state == .closing && socket == nil && session == nil)
-        socketEnded()
+        socketEnded(closeCode: nil, reasonBytes: nil, error: nil)
+    }
+    func simulateUnexpectedSocketEndForTesting(closeCode: Int? = nil, reasonBytes: Int? = nil, error: Error? = nil) {
+        socketEnded(closeCode: closeCode, reasonBytes: reasonBytes, error: error)
     }
 #endif
 
@@ -426,7 +433,7 @@ public actor GuestTransport {
                     try await socket.send(.string(frame.text))
                 }
             }
-            catch { fail(.networkFailure); return }
+            catch { fail(.networkFailure, source: "write", underlyingError: error); return }
             sendTimeout?.cancel(); sendTimeout = nil; activeFrameID = nil
             if let notification = notifications.removeValue(forKey: frame.id) {
                 notification.timeout.cancel()
@@ -452,8 +459,8 @@ public actor GuestTransport {
                     throw GuestTransportError.invalidEnvelope
                 }
                 accept(object)
-            } catch let error as GuestTransportError { fail(error); return }
-            catch { fail(.networkFailure); return }
+            } catch let error as GuestTransportError { fail(error, source: "read"); return }
+            catch { fail(.networkFailure, source: "read", underlyingError: error); return }
         }
     }
 
@@ -472,10 +479,10 @@ public actor GuestTransport {
             } else { request.continuation.resume(returning: envelope) }
         }
         switch eventContinuation.yield(envelope) {
-        case .dropped: fail(.queueOverflow)
+        case .dropped: fail(.queueOverflow, source: "queue-overflow")
         case .terminated: Task { await self.close() }
         case .enqueued: break
-        @unknown default: fail(.queueOverflow)
+        @unknown default: fail(.queueOverflow, source: "queue-overflow")
         }
     }
 
@@ -499,22 +506,59 @@ public actor GuestTransport {
     }
 
     private func sendExpired(_ id: String) {
-        if activeFrameID == id { fail(.timedOut) }
+        if activeFrameID == id { fail(.timedOut, source: "send-timeout") }
     }
 
     private func notificationExpired(_ id: String) {
-        if notifications[id] != nil { fail(.timedOut) }
+        if notifications[id] != nil { fail(.timedOut, source: "notify-timeout") }
     }
 
-    private func socketEnded() {
+    private func socketEnded(closeCode: Int?, reasonBytes: Int?, error: Error?) {
         if state == .closing { finish(error: nil) }
-        else { fail(.networkFailure) }
+        else {
+            fail(.networkFailure, source: closeCode != nil ? "ws-close" : "task-complete",
+                 closeCode: closeCode, reasonBytes: reasonBytes, underlyingError: error)
+        }
     }
 
-    private func fail(_ error: GuestTransportError) {
+    private func fail(_ error: GuestTransportError, source: String, closeCode: Int? = nil,
+                      reasonBytes: Int? = nil, underlyingError: Error? = nil) {
         // Canceled receives/sends are expected while the close handshake runs.
-        guard state != .closing else { return }
+        guard state != .closing, state != .closed else { return }
+        var fields: [String: Any] = ["source": source, "kind": Self.failureKind(error)]
+        if let closeCode { fields["closeCode"] = closeCode }
+        if let reasonBytes { fields["reasonBytes"] = reasonBytes }
+        if let underlyingError {
+            let ns = underlyingError as NSError
+            fields["errorDomain"] = Self.safeDomain(ns.domain)
+            fields["errorCode"] = ns.code
+            if let inner = ns.userInfo[NSUnderlyingErrorKey] as? NSError {
+                fields["underlyingDomain"] = Self.safeDomain(inner.domain)
+                fields["underlyingCode"] = inner.code
+            }
+        }
+        probeLog("guest-transport-failure", fields)
         finish(error: error)
+    }
+
+    private nonisolated static func failureKind(_ error: GuestTransportError) -> String {
+        switch error {
+        case .invalidURL: return "invalidURL"
+        case .notConnected: return "notConnected"
+        case .alreadyConnecting: return "alreadyConnecting"
+        case .closed: return "closed"
+        case .timedOut: return "timedOut"
+        case .invalidEnvelope: return "invalidEnvelope"
+        case .queueOverflow: return "queueOverflow"
+        case .frameTooLarge: return "frameTooLarge"
+        case .networkFailure: return "networkFailure"
+        case .server: return "server"
+        }
+    }
+
+    private nonisolated static func safeDomain(_ raw: String) -> String {
+        let cleaned = String(raw.prefix(64)).filter { $0.isASCII && ($0.isLetter || $0.isNumber || [".", "_", "-"].contains($0)) }
+        return cleaned.isEmpty ? "unknown" : cleaned
     }
 
     private func finish(error: GuestTransportError?) {

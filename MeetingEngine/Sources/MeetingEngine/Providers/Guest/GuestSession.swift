@@ -503,11 +503,13 @@ public final class GuestSession {
                     "causeCode": (cause as NSError).code])
                 let failedAt = now()
                 let delay = policy.nextDelay(after: cause, at: failedAt, pendingRelayTrial: hasPendingRelayTrial())
+                if delay != nil {
+                    recoveryAttempts = policy.retries; state = .recovering
+                }
                 let stopped = await retireCurrent(sendLeave: delay == nil)
                 guard generation == expected, !Task.isCancelled else { return }
                 guard stopped else { finish(GuestSessionError.cleanupFailed); return }
                 guard let delay else { finish(cause); return }
-                recoveryAttempts = policy.retries; state = .recovering
                 let rawElapsed = now() - failedAt
                 let elapsed = rawElapsed.isFinite && rawElapsed > 0 ? rawElapsed : 0
                 let delaySeconds = Double(delay) / 1_000_000_000

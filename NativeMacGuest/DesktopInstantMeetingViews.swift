@@ -386,77 +386,80 @@ struct NativeDesktopWaitingInviteCard: View {
     @State private var showingQR = false
 
     var body: some View {
+        let isReconnecting = model.snapshot.phase == .reconnecting
         VStack(alignment: .leading, spacing: compact ? 10 : 14) {
             HStack(spacing: 8) {
                 Circle()
                     .fill(model.connected ? Color.green : Color.orange)
                     .frame(width: 8, height: 8)
-                Text(model.connected ? L("You’re connected. Waiting for others.") : L("Connecting…"))
+                Text(model.connected ? L("You’re connected. Waiting for others.") : (isReconnecting ? L("Reconnecting…") : L("Connecting…")))
                     .font(compact ? .subheadline.weight(.semibold) : .headline)
                 Spacer(minLength: 8)
-                if model.invitationCopiedOnJoin || model.copiedToastRevision > 0 {
+                if !isReconnecting && (model.invitationCopiedOnJoin || model.copiedToastRevision > 0) {
                     Label(L("Invitation link copied"), systemImage: "checkmark.circle.fill")
                         .font(.caption.weight(.medium))
                         .foregroundStyle(.green)
                 }
             }
 
-            if !compact {
-                Text(L("Share the invitation link so others can join this room."))
-                    .font(.subheadline)
+            if !isReconnecting {
+                if !compact {
+                    Text(L("Share the invitation link so others can join this room."))
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+
+                Text(model.invitation.absoluteString)
+                    .font(.caption.monospaced())
                     .foregroundStyle(.secondary)
-            }
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .textSelection(.enabled)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
 
-            Text(model.invitation.absoluteString)
-                .font(.caption.monospaced())
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-                .truncationMode(.middle)
-                .textSelection(.enabled)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 6)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-
-            HStack(spacing: 8) {
-                NativeDesktopSharingPickerButton(item: model.invitation) {
-                    Label(L("Share…"), systemImage: "square.and.arrow.up")
-                }
-                .buttonStyle(.borderedProminent)
-                .accessibilityIdentifier("meeting.waitingInvite.share")
-
-                Button {
-                    model.copyInvitationLink()
-                } label: {
-                    Label(L("Copy Link"), systemImage: "doc.on.doc")
-                }
-                .buttonStyle(.bordered)
-                .help("\(L("Copy Invitation Link")) (⇧⌘C)")
-                .accessibilityIdentifier("meeting.waitingInvite.copy")
-
-                Button {
-                    showingQR.toggle()
-                } label: {
-                    Label(L("QR code"), systemImage: "qrcode")
-                }
-                .buttonStyle(.bordered)
-                .accessibilityIdentifier("meeting.waitingInvite.qr")
-                .popover(isPresented: $showingQR, arrowEdge: .bottom) {
-                    VStack(spacing: 10) {
-                        if let qr = NativeDesktopInvitationQR.image(for: model.invitation.absoluteString) {
-                            Image(nsImage: qr)
-                                .interpolation(.none)
-                                .resizable()
-                                .scaledToFit()
-                                .frame(width: 172, height: 172)
-                                .padding(10)
-                                .background(Color.white, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-                        }
-                        Text(L("Scan on iPhone to share link"))
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                HStack(spacing: 8) {
+                    NativeDesktopSharingPickerButton(item: model.invitation) {
+                        Label(L("Share…"), systemImage: "square.and.arrow.up")
                     }
-                    .padding(16)
+                    .buttonStyle(.borderedProminent)
+                    .accessibilityIdentifier("meeting.waitingInvite.share")
+
+                    Button {
+                        model.copyInvitationLink()
+                    } label: {
+                        Label(L("Copy Link"), systemImage: "doc.on.doc")
+                    }
+                    .buttonStyle(.bordered)
+                    .help("\(L("Copy Invitation Link")) (⇧⌘C)")
+                    .accessibilityIdentifier("meeting.waitingInvite.copy")
+
+                    Button {
+                        showingQR.toggle()
+                    } label: {
+                        Label(L("QR code"), systemImage: "qrcode")
+                    }
+                    .buttonStyle(.bordered)
+                    .accessibilityIdentifier("meeting.waitingInvite.qr")
+                    .popover(isPresented: $showingQR, arrowEdge: .bottom) {
+                        VStack(spacing: 10) {
+                            if let qr = NativeDesktopInvitationQR.image(for: model.invitation.absoluteString) {
+                                Image(nsImage: qr)
+                                    .interpolation(.none)
+                                    .resizable()
+                                    .scaledToFit()
+                                    .frame(width: 172, height: 172)
+                                    .padding(10)
+                                    .background(Color.white, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                            }
+                            Text(L("Scan on iPhone to share link"))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        .padding(16)
+                    }
                 }
             }
         }

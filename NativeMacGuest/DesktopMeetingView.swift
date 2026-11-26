@@ -356,6 +356,7 @@ struct NativeDesktopMeetingView: View {
                     if !textSelection.isOpen { NativeDesktopCopiedLinkToast(model: model).padding(.top, 8).padding(.trailing, reserved) }
                     if let workspace, !textSelection.isOpen { NativeDesktopListeningBanner(workspace: workspace, model: model).padding(.top, 8).padding(.trailing, reserved) }
                     if let workspace, !textSelection.isOpen { NativeDesktopSameRoomTransitionBanner(workspace: workspace, model: model).padding(.top, 8).padding(.trailing, reserved) }
+                    if !textSelection.isOpen { NativeDesktopReconnectingBanner(model: model).padding(.top, 8).padding(.trailing, reserved) }
                     if !textSelection.isOpen { NativeDesktopLocalFallbackBanner(model: model).padding(.top, 8).padding(.trailing, reserved) }
                     if !textSelection.isOpen { NativeDesktopCatchUpCard(model: model).padding(.top, 8).padding(.trailing, reserved) }
                     if model.isSharingLive && !textSelection.isOpen { shareBanner.padding(.top, 8).padding(.trailing, reserved) }
@@ -1944,6 +1945,21 @@ private struct NativeDesktopTranscriptionDetails: View {
 }
 
 /// Asks before downloading a speech model when the service transcript cannot be read.
+struct NativeDesktopReconnectingBanner: View {
+    @ObservedObject var model: NativeDesktopMeetingModel
+    var body: some View {
+        if model.snapshot.phase == .reconnecting {
+            HStack(spacing: 8) {
+                ProgressView().controlSize(.small)
+                Text(L("Connection interrupted. Reconnecting…")).font(.callout.weight(.medium))
+            }
+            .padding(.horizontal, 14).padding(.vertical, 8).nativeMeetingChrome()
+            .accessibilityElement(children: .combine)
+            .accessibilityIdentifier("meeting.reconnectingBanner")
+        }
+    }
+}
+
 struct NativeDesktopLocalFallbackBanner: View {
     @ObservedObject var model: NativeDesktopMeetingModel
     var body: some View {

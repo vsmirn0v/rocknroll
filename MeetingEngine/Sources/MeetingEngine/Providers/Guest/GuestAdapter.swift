@@ -825,6 +825,20 @@ public enum NativeDesktopGuestError: LocalizedError {
     func bindHistoryForTesting(_ engine: NativeGuestEngine) { bind(engine, token: revision) }
     func unbindHistoryForTesting() { cancelHistory(); detachEngine() }
     var transcriptHistoryIdleForTesting: Bool { transcriptHistoryTask == nil }
+    func attachSessionForTesting(_ session: GuestSession) {
+        let token = revision
+        self.session = session
+        session.onEngineChange = { [weak self, weak session] engine in
+            guard let self, self.revision == token, self.session === session else { return }
+            bind(engine, token: token)
+        }
+        session.onStateChange = { [weak self, weak session] state in
+            guard let self, self.revision == token, self.session === session else { return }
+            refresh(state)
+        }
+        bind(session.engine, token: token)
+        refresh(session.snapshot)
+    }
     #endif
 
     // MARK: Internals
@@ -876,12 +890,28 @@ public enum NativeDesktopGuestError: LocalizedError {
         incomingVideo = []; onVideo?([]); onLocalCamera?(nil)
     }
 
+    private func preserveFeaturesForRecovery() {
+        guestSnapshot.connected = false
+        guestSnapshot.screenSharing = false
+        for index in guestSnapshot.participants.indices {
+            guestSnapshot.participants[index].isSpeaking = false
+            guestSnapshot.participants[index].audioLevel = 0
+            guestSnapshot.participants[index].sharingScreen = false
+        }
+    }
+
     private func bind(_ engine: NativeGuestEngine?, token: UUID) {
         cancelHistory(); detachEngine()
         currentNativeEngine = engine
         connectionAttemptToken = engine == nil ? nil : UUID()
         guard let engine else {
-            systemAudio = nil; guestSnapshot = .init(); onFeatures?(guestSnapshot)
+            systemAudio = nil
+            if !leaving, let session, session.state == .recovering {
+                preserveFeaturesForRecovery()
+            } else {
+                guestSnapshot = .init()
+            }
+            onFeatures?(guestSnapshot)
             if let session { refresh(session.snapshot) } else { emit() }
             return
         }
@@ -895,6 +925,15 @@ public enum NativeDesktopGuestError: LocalizedError {
         }
         engine.onMeetingChange = { [weak self, weak engine] features in
             guard let self, let engine, revision == token, currentNativeEngine === engine else { return }
+            if !leaving, session?.state == .recovering,
+               !features.connected, !engine.lobbyState.inLobby,
+               features.participants.isEmpty, features.title.isEmpty,
+               (!guestSnapshot.participants.isEmpty || !guestSnapshot.title.isEmpty) {
+                preserveFeaturesForRecovery()
+                onFeatures?(guestSnapshot)
+                if let session { refresh(session.snapshot) } else { emit() }
+                return
+            }
             let titleChanged = guestSnapshot.title != features.title
             if guestSnapshot.connected && !features.connected { cancelHistory() }
             if guestSnapshot.permissions.canViewChat && !features.permissions.canViewChat {
@@ -947,6 +986,9 @@ public enum NativeDesktopGuestError: LocalizedError {
         case .failed: snapshot.phase = .failed
         case .left: snapshot.phase = leaving ? .leaving : .left
         }
+        if currentNativeEngine == nil, leaving || [.idle, .left, .failed].contains(state.state), guestSnapshot != .init() {
+            guestSnapshot = .init(); onFeatures?(guestSnapshot)
+        }
         snapshot.lobbyModeratorPresent = state.state == .lobby ? state.lobbyModeratorPresent : nil
         let connected = state.state == .connected && !leaving
         snapshot.microphoneOn = connected && state.appliedIntent?.audioMuted == false && state.desiredIntent?.audioMuted == false &&
@@ -963,8 +1005,8 @@ public enum NativeDesktopGuestError: LocalizedError {
             NativeDesktopParticipant(id: participant.id, name: participant.name, isLocal: participant.isLocal,
                 microphoneOn: participant.isLocal ? snapshot.microphoneOn : !participant.microphoneMuted,
                 cameraOn: participant.isLocal ? snapshot.cameraOn : !participant.cameraMuted,
-                sharing: participant.isLocal ? snapshot.sharing : participant.sharingScreen,
-                speaking: participant.isSpeaking && (!participant.isLocal || snapshot.microphoneOn))
+                sharing: connected && (participant.isLocal ? snapshot.sharing : participant.sharingScreen),
+                speaking: connected && participant.isSpeaking && (!participant.isLocal || snapshot.microphoneOn))
         }
         emit()
     }
