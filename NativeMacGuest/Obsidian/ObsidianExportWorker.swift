@@ -16,8 +16,17 @@ actor ObsidianExportWorker {
     private var processing = false
     private var pendingWake = false
     private var loopTask: Task<Void, Never>?
+    private struct VaultAccessBackoff {
+        let destinationID: UUID
+        let configRevision: Int
+        let reason: String
+        let message: String?
+        var failures: Int
+        var retryAt: Date
+    }
     private var sleepWaiter: (id: UUID, continuation: CheckedContinuation<Void, Never>, timer: Task<Void, Never>)?
     private var vaultCache: (destinationID: UUID, configRevision: Int, url: URL, started: Bool)?
+    private var vaultBackoff: VaultAccessBackoff?
 
     var onLog: (String, [String: Any]) -> Void = { _, _ in }
 
@@ -54,7 +63,13 @@ actor ObsidianExportWorker {
             row.destinationID == destination.id
         }
         guard !due.isEmpty else { return }
-        guard let vault = await resolveVault(destination) else { return }
+        if let backoff = vaultBackoff,
+           backoff.destinationID == destination.id,
+           backoff.configRevision == destination.configRevision,
+           now < backoff.retryAt {
+            return
+        }
+        guard let vault = await resolveVault(destination, now: now) else { return }
         for row in due {
             let overrides: MeetingAutoExportOverrides
             if let snap = row.snapshot {
@@ -109,10 +124,16 @@ actor ObsidianExportWorker {
         waiter.continuation.resume()
     }
 
-    private func nextSleepDelay(now: Date = Date()) async -> TimeInterval {
+    func nextSleepDelay(now: Date = Date()) async -> TimeInterval {
         guard let destination = try? await store.destination(),
               destination.vaultBookmark != nil else {
             return 30.0
+        }
+        if let backoff = vaultBackoff,
+           backoff.destinationID == destination.id,
+           backoff.configRevision == destination.configRevision,
+           backoff.retryAt > now {
+            return min(60.0, max(1.0, backoff.retryAt.timeIntervalSince(now)))
         }
         if let nextAttempt = try? await store.earliestActiveOutboxAttempt(destinationID: destination.id) {
             return min(15.0, max(0.25, nextAttempt.timeIntervalSince(now)))
@@ -167,25 +188,49 @@ actor ObsidianExportWorker {
             var isDirectory: ObjCBool = false
             return FileManager.default.fileExists(atPath: cache.url.path, isDirectory: &isDirectory) && isDirectory.boolValue
         }
-        return await resolveVault(destination) != nil
+        return await resolveVault(destination, interactiveProbe: true) != nil
     }
 
-    private func resolveVault(_ destination: ObsidianDestinationRecord) async -> URL? {
+    private func resolveVault(_ destination: ObsidianDestinationRecord, now: Date = Date(), interactiveProbe: Bool = false) async -> URL? {
         if let cache = vaultCache, cache.destinationID == destination.id,
            cache.configRevision == destination.configRevision, cache.started {
             var isDirectory: ObjCBool = false
             if FileManager.default.fileExists(atPath: cache.url.path, isDirectory: &isDirectory), isDirectory.boolValue {
+                vaultBackoff = nil
                 return cache.url
             }
         }
         stopVaultAccess()
+        func recordFailure(_ event: String, reason: String, message: String? = nil, fields: [String: Any] = [:]) {
+            guard !interactiveProbe else { return }
+            let sameFailure = vaultBackoff?.destinationID == destination.id &&
+                vaultBackoff?.configRevision == destination.configRevision &&
+                vaultBackoff?.reason == reason &&
+                vaultBackoff?.message == message
+            if !sameFailure {
+                onLog(event, fields)
+            }
+            let priorFailures = (vaultBackoff?.destinationID == destination.id &&
+                vaultBackoff?.configRevision == destination.configRevision) ? (vaultBackoff?.failures ?? 0) : 0
+            let failures = priorFailures + 1
+            let delay = min(300.0, 15.0 * pow(2.0, Double(min(failures - 1, 5))))
+            vaultBackoff = VaultAccessBackoff(
+                destinationID: destination.id,
+                configRevision: destination.configRevision,
+                reason: reason,
+                message: message,
+                failures: failures,
+                retryAt: now.addingTimeInterval(delay)
+            )
+        }
         guard let bookmark = destination.vaultBookmark else {
-            onLog("obsidian-export-no-bookmark", [:])
+            recordFailure("obsidian-export-no-bookmark", reason: "no-bookmark")
             return nil
         }
         let resolved = vaultResolver(bookmark)
         switch resolved.resolution {
         case .granted(let url):
+            vaultBackoff = nil
             if let refreshed = resolved.refreshedBookmark {
                 try? await store.refreshDestinationVaultBookmark(
                     id: destination.id,
@@ -197,13 +242,13 @@ actor ObsidianExportWorker {
             vaultCache = (destination.id, destination.configRevision, url, true)
             return url
         case .stale:
-            onLog("obsidian-export-stale-bookmark", ["destination": destination.id.uuidString])
+            recordFailure("obsidian-export-stale-bookmark", reason: "stale", fields: ["destination": destination.id.uuidString])
             return nil
         case .missing:
-            onLog("obsidian-export-vault-missing", [:])
+            recordFailure("obsidian-export-vault-missing", reason: "missing")
             return nil
         case .denied(let message):
-            onLog("obsidian-export-vault-denied", ["error": message])
+            recordFailure("obsidian-export-vault-denied", reason: "denied", message: message, fields: ["error": message])
             return nil
         }
     }

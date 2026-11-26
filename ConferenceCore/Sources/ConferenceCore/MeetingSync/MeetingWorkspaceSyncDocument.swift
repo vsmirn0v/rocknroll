@@ -631,6 +631,25 @@ public struct MeetingWorkspaceSyncDocument: Codable, Equatable, Sendable {
         return copy
     }
 
+    /// Returns a copy with both inline transcript chunks and the cloud upload index cleared
+    /// for metadata persistence alongside cursor and chunk sidecars.
+    public func withoutSyncSidecars() -> MeetingWorkspaceSyncDocument {
+        var copy = self
+        copy.transcriptChunks = [:]
+        copy.cloudTranscriptIndex = [:]
+        return copy
+    }
+
+    /// Merges cloud transcript upload timestamps loaded from cursor sidecar storage.
+    public mutating func restoreCloudTranscriptIndex(_ index: [String: Date]) {
+        for (recordID, startedAt) in index {
+            if let existing = cloudTranscriptIndex[recordID], existing >= startedAt {
+                continue
+            }
+            cloudTranscriptIndex[recordID] = startedAt
+        }
+    }
+
     /// Merges transcript chunks loaded from sidecar storage into this document.
     public mutating func restoreTranscriptChunks(_ chunks: [String: SyncedTranscriptChunk]) {
         for (id, chunk) in chunks {

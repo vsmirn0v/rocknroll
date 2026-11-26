@@ -80,6 +80,8 @@ import FoundationModels
     var customRealtimeTransportFactory: (@Sendable () -> any RealtimeVoiceTransport)?
 
     private var auditionTask: Task<Void, Never>?
+    private var captureTask: Task<Void, Never>?
+    private var captureGeneration = UUID()
     private var holdLimitTask: Task<Void, Never>?
     private struct WarmRealtimeConfigKey: Equatable {
         let provider: RealtimeProviderKind
@@ -115,6 +117,7 @@ import FoundationModels
 
     deinit {
         auditionTask?.cancel()
+        captureTask?.cancel()
         holdLimitTask?.cancel()
         warmRealtimeIdleTask?.cancel()
         if let router = warmRealtimeRouter {
@@ -269,11 +272,20 @@ import FoundationModels
     }
 
     func startPushToTalk() {
-        guard !listening, !working, let speech else { return }
+        guard !listening, captureTask == nil, !working, let speech else { return }
         audioError = nil
-        Task { @MainActor [weak self] in
+        let generation = UUID()
+        captureGeneration = generation
+        captureTask = Task { @MainActor [weak self] in
             guard let self else { return }
             let started = await speech.beginPushToTalkCapture()
+            if self.captureGeneration == generation {
+                self.captureTask = nil
+            }
+            guard !Task.isCancelled, self.captureGeneration == generation else {
+                if started { _ = speech.finishPushToTalkCapture() }
+                return
+            }
             guard started else {
                 switch speech.lastStartFailure {
                 case .audioBusy:
@@ -300,6 +312,9 @@ import FoundationModels
     func stopPushToTalk() {
         holdLimitTask?.cancel()
         holdLimitTask = nil
+        captureGeneration = UUID()
+        captureTask?.cancel()
+        captureTask = nil
         guard listening, let speech else { return }
         listening = false
         let samples = speech.finishPushToTalkCapture()

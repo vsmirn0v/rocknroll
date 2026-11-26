@@ -138,7 +138,12 @@ final class IOSWorkspaceCoordinator: ObservableObject {
 
     private struct ReplicaDiskState: Sendable {
         var metaDigest: String?
+        var cursorsDigest: String?
         var chunkDigests: [String: String] = [:]
+    }
+
+    private var cursorsURL: URL {
+        replicaURL.deletingLastPathComponent().appendingPathComponent("ios-workspace-sync-cursors.json")
     }
 
     private let replicaDiskState = OSAllocatedUnfairLock(initialState: ReplicaDiskState())
@@ -2322,8 +2327,7 @@ final class IOSWorkspaceCoordinator: ObservableObject {
         }
 
         if !report.changedSessions.isEmpty || !report.changedTaskIDs.isEmpty ||
-            !report.changedProfileIDs.isEmpty || !report.changedSettingsKeys.isEmpty ||
-            !changes.records.isEmpty {
+            !report.changedProfileIDs.isEmpty || !report.changedSettingsKeys.isEmpty {
             replica.pendingCloudSessions = report.changedSessions
             replica.pendingCloudSettings = report.changedSettingsKeys
             try await persistReplicaCheckpoint()
@@ -2748,21 +2752,34 @@ final class IOSWorkspaceCoordinator: ObservableObject {
         guard !replicaLoaded else { return }
         replicaLoaded = true
         let url = replicaURL
+        let cursorsURL = self.cursorsURL
         let sidecarURL = transcriptSidecarURL
-        let result = await Task.detached(priority: .userInitiated) { () -> (loaded: ReplicaState?, sidecarChunks: [String: SyncedTranscriptChunk], sidecarDigests: [String: String]) in
+        let result = await Task.detached(priority: .userInitiated) { () -> (loaded: ReplicaState?, cursorState: WorkspaceSyncCursorState?, cursorDigest: String?, sidecarChunks: [String: SyncedTranscriptChunk], sidecarDigests: [String: String]) in
             let loaded: ReplicaState? = (try? Data(contentsOf: url)).flatMap { try? JSONDecoder().decode(ReplicaState.self, from: $0) }
+            let cursors = WorkspaceSyncCursorSidecar.loadWithDigest(from: cursorsURL)
             let sidecar = WorkspaceTranscriptChunkSidecar.loadChunksWithDigests(from: sidecarURL)
-            return (loaded, sidecar.chunks, sidecar.digests)
+            return (loaded, cursors.state, cursors.digest, sidecar.chunks, sidecar.digests)
         }.value
 
+        let hasInlineCursors = result.loaded.map {
+            $0.libraryToken != nil ||
+                $0.transcriptToken != nil ||
+                $0.scheduleToken != nil ||
+                !$0.zoneGenerations.isEmpty ||
+                !$0.acknowledgedLibraryDigests.isEmpty ||
+                !$0.acknowledgedTranscriptDigests.isEmpty ||
+                !$0.acknowledgedScheduleDigests.isEmpty ||
+                !$0.workspaceDoc.cloudTranscriptIndex.isEmpty
+        } ?? false
         let initialMetaDigest: String?
-        if let loaded = result.loaded, !loaded.migratedFromLegacyFormat, loaded.workspaceDoc.transcriptChunks.isEmpty {
+        if let loaded = result.loaded, !loaded.migratedFromLegacyFormat, loaded.workspaceDoc.transcriptChunks.isEmpty, !hasInlineCursors {
             initialMetaDigest = SyncRecordDigest.sha256(loaded)
         } else {
             initialMetaDigest = nil
         }
         replicaDiskState.withLock { state in
             if state.metaDigest == nil { state.metaDigest = initialMetaDigest }
+            if state.cursorsDigest == nil { state.cursorsDigest = result.cursorDigest }
             for (id, digest) in result.sidecarDigests where state.chunkDigests[id] == nil {
                 state.chunkDigests[id] = digest
             }
@@ -2806,6 +2823,28 @@ final class IOSWorkspaceCoordinator: ObservableObject {
                 replica.lastExportedAssistantBaseline = loaded.lastExportedAssistantBaseline
             }
         }
+        if let cs = result.cursorState {
+            if result.loaded?.migratedFromLegacyFormat == true {
+                for (k, v) in cs.acknowledgedLibraryDigests where replica.acknowledgedLibraryDigests[k] == nil {
+                    replica.acknowledgedLibraryDigests[k] = v
+                }
+                for (k, v) in cs.acknowledgedTranscriptDigests where replica.acknowledgedTranscriptDigests[k] == nil {
+                    replica.acknowledgedTranscriptDigests[k] = v
+                }
+                for (k, v) in cs.acknowledgedScheduleDigests where replica.acknowledgedScheduleDigests[k] == nil {
+                    replica.acknowledgedScheduleDigests[k] = v
+                }
+            } else {
+                for (k, v) in cs.acknowledgedLibraryDigests { replica.acknowledgedLibraryDigests[k] = v }
+                for (k, v) in cs.acknowledgedTranscriptDigests { replica.acknowledgedTranscriptDigests[k] = v }
+                for (k, v) in cs.acknowledgedScheduleDigests { replica.acknowledgedScheduleDigests[k] = v }
+            }
+            if let token = cs.libraryToken { replica.libraryToken = token }
+            if let token = cs.transcriptToken { replica.transcriptToken = token }
+            if let token = cs.scheduleToken { replica.scheduleToken = token }
+            for (k, v) in cs.zoneGenerations { replica.zoneGenerations[k] = v }
+            replica.workspaceDoc.restoreCloudTranscriptIndex(cs.cloudTranscriptIndex)
+        }
         if !result.sidecarChunks.isEmpty {
             replica.workspaceDoc.restoreTranscriptChunks(result.sidecarChunks)
         }
@@ -2814,11 +2853,29 @@ final class IOSWorkspaceCoordinator: ObservableObject {
     private static func writeReplicaToDisk(
         _ snapshot: ReplicaState,
         replicaURL: URL,
+        cursorsURL: URL,
         sidecarURL: URL,
         diskState: OSAllocatedUnfairLock<ReplicaDiskState>
     ) throws {
+        let cursors = WorkspaceSyncCursorState(
+            libraryToken: snapshot.libraryToken,
+            transcriptToken: snapshot.transcriptToken,
+            scheduleToken: snapshot.scheduleToken,
+            zoneGenerations: snapshot.zoneGenerations,
+            acknowledgedLibraryDigests: snapshot.acknowledgedLibraryDigests,
+            acknowledgedTranscriptDigests: snapshot.acknowledgedTranscriptDigests,
+            acknowledgedScheduleDigests: snapshot.acknowledgedScheduleDigests,
+            cloudTranscriptIndex: snapshot.workspaceDoc.cloudTranscriptIndex
+        )
         var metadata = snapshot
-        metadata.workspaceDoc = metadata.workspaceDoc.withoutTranscriptChunks()
+        metadata.workspaceDoc = metadata.workspaceDoc.withoutSyncSidecars()
+        metadata.libraryToken = nil
+        metadata.transcriptToken = nil
+        metadata.scheduleToken = nil
+        metadata.zoneGenerations = [:]
+        metadata.acknowledgedLibraryDigests = [:]
+        metadata.acknowledgedTranscriptDigests = [:]
+        metadata.acknowledgedScheduleDigests = [:]
         let metadataData = try SyncRecordDigest.makeCanonicalEncoder().encode(metadata)
         let metaDigest = SyncRecordDigest.sha256(metadataData)
         var state = diskState.withLock { $0 }
@@ -2827,6 +2884,11 @@ final class IOSWorkspaceCoordinator: ObservableObject {
             try metadataData.write(to: replicaURL, options: .atomic)
             state.metaDigest = metaDigest
         }
+        try WorkspaceSyncCursorSidecar.sync(
+            cursors,
+            persistedDigest: &state.cursorsDigest,
+            to: cursorsURL
+        )
         try WorkspaceTranscriptChunkSidecar.sync(
             chunks: snapshot.workspaceDoc.transcriptChunks,
             persistedDigests: &state.chunkDigests,
@@ -2842,12 +2904,13 @@ final class IOSWorkspaceCoordinator: ObservableObject {
         let snapshot = replica
         let revision = replicaRevision
         let url = replicaURL
+        let cursorsURL = self.cursorsURL
         let sidecarURL = transcriptSidecarURL
         let diskState = replicaDiskState
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             replicaIOQueue.async {
                 do {
-                    try Self.writeReplicaToDisk(snapshot, replicaURL: url, sidecarURL: sidecarURL, diskState: diskState)
+                    try Self.writeReplicaToDisk(snapshot, replicaURL: url, cursorsURL: cursorsURL, sidecarURL: sidecarURL, diskState: diskState)
                     continuation.resume()
                 } catch { continuation.resume(throwing: error) }
             }
@@ -2865,11 +2928,12 @@ final class IOSWorkspaceCoordinator: ObservableObject {
             if let lastPersistedRevision, lastPersistedRevision == revision { return }
             let snapshot = self.replica
             let url = self.replicaURL
+            let cursorsURL = self.cursorsURL
             let sidecarURL = self.transcriptSidecarURL
             let diskState = self.replicaDiskState
             self.replicaIOQueue.async {
                 do {
-                    try Self.writeReplicaToDisk(snapshot, replicaURL: url, sidecarURL: sidecarURL, diskState: diskState)
+                    try Self.writeReplicaToDisk(snapshot, replicaURL: url, cursorsURL: cursorsURL, sidecarURL: sidecarURL, diskState: diskState)
                 } catch {
                     let ns = error as NSError
                     AppDiagnostics.log("workspace-replica-write-failed", ["domain": ns.domain, "code": ns.code])

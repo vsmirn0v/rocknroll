@@ -750,4 +750,26 @@ import XCTest
         XCTAssertEqual(decoded.occurrences.count, 1)
         XCTAssertEqual(decoded.occurrences.first?.eligible, true)
     }
+
+    func testUnchangedSaveSkipsRedundantDiskWrites() async throws {
+        final class CountingStorage: ReminderStorage {
+            var data: Data?
+            var writes = 0
+            func read() throws -> Data? { data }
+            func write(_ data: Data) throws { writes += 1; self.data = data }
+        }
+        let storage = CountingStorage()
+        let coordinator = CalendarReminderCoordinator(preferences: preferences(), storage: storage, notifications: Notifications(), clock: { self.now })
+        await coordinator.setEnabled(true)
+        coordinator.update(meetings: [meeting()], available: true)
+        await coordinator.waitForReconciliation()
+        let baselineWrites = storage.writes
+
+        // Repeating identical updates with unchanged meetings must not rewrite disk.
+        coordinator.update(meetings: [meeting()], available: true)
+        await coordinator.waitForReconciliation()
+        coordinator.update(meetings: [meeting()], available: true)
+        await coordinator.waitForReconciliation()
+        XCTAssertEqual(storage.writes, baselineWrites, "Unchanged repository state must not cause redundant ReminderStorage writes")
+    }
 }

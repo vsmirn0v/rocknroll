@@ -58,6 +58,7 @@ final class CalendarReminderCoordinator: ObservableObject {
     private(set) var hasOpenIntent = false
     var presenting = false { didSet { refreshPresentation() } }
     private var enableRevision = 0
+    private var lastSavedData: Data?
 
     init(preferences: UserDefaults = .standard, storage: any ReminderStorage = ReminderFileStorage(),
          notifications: (any ReminderNotifying)? = nil, clock: @escaping () -> Date = Date.init) {
@@ -98,24 +99,47 @@ final class CalendarReminderCoordinator: ObservableObject {
         if let suppress = preferences.object(forKey: Self.suppressOtherDevicesKey) as? Bool { self.suppressOtherDevices = suppress }
         var repaired = false
         do {
+            var hadStoredData = false
             if let data = try storage.read() {
                 let saved = try JSONDecoder().decode(CalendarReminderRepository.self, from: data)
                 guard (1...2).contains(saved.schema), (1...2).contains(saved.profile.schema) else { throw CocoaError(.coderReadCorrupt) }
                 repository = saved
                 repository.schema = 2; repository.profile.schema = 2
                 repaired = repository.normalizeOccurrences()
+                hadStoredData = !repaired
+            } else {
+                repaired = false
             }
             enabled = preferences.object(forKey: "calendarReminders.enabled") as? Bool ?? repository.enabled
             repository.enabled = enabled
             suppressOtherDevices = (preferences.object(forKey: Self.suppressOtherDevicesKey) as? Bool) ?? repository.suppressOtherDevices ?? true
             repository.suppressOtherDevices = suppressOtherDevices
             profile = repository.profile.value; loaded = true; error = nil
-            if repaired { _ = save() }
+            if repaired {
+                _ = save()
+            } else if hadStoredData {
+                lastSavedData = try? Self.canonicalEncoder().encode(repository)
+            }
         } catch { self.error = L("Reminders could not be saved. Try again."); loaded = false }
+    }
+    private static func canonicalEncoder() -> JSONEncoder {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return encoder
     }
     @discardableResult private func save() -> Bool {
         guard loaded else { return false }
-        do { try storage.write(JSONEncoder().encode(repository)); error = nil; return true }
+        do {
+            let encoded = try Self.canonicalEncoder().encode(repository)
+            if encoded == lastSavedData {
+                error = nil
+                return true
+            }
+            try storage.write(encoded)
+            lastSavedData = encoded
+            error = nil
+            return true
+        }
         catch { self.error = L("Reminders could not be saved. Try again."); return false }
     }
     func foregrounded() {

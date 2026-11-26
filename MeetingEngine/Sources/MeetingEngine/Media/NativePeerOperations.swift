@@ -4,18 +4,38 @@ import Foundation
 import LiveKitWebRTC
 
 enum NativeAdapterRecoveryPolicy {
+    static func isTransientPOSIXNetworkError(_ error: Error) -> Bool {
+        func matchesPOSIXCode(_ code: Int) -> Bool {
+            guard let raw = Int32(exactly: code), let posix = POSIXErrorCode(rawValue: raw) else { return false }
+            switch posix {
+            case .ENOTCONN, .ECONNRESET, .ECONNABORTED, .EPIPE, .ETIMEDOUT,
+                 .ENETDOWN, .ENETRESET, .ENETUNREACH, .EHOSTUNREACH, .ECONNREFUSED,
+                 .ENOMEM, .ENOBUFS:
+                return true
+            default:
+                return false
+            }
+        }
+        let ns = error as NSError
+        if ns.domain == NSPOSIXErrorDomain, matchesPOSIXCode(ns.code) {
+            return true
+        }
+        if ns.domain == NSURLErrorDomain, ns.code > 0, matchesPOSIXCode(ns.code) {
+            return true
+        }
+        if let underlying = ns.userInfo[NSUnderlyingErrorKey] as? NSError,
+           underlying.domain == NSPOSIXErrorDomain, matchesPOSIXCode(underlying.code) {
+            return true
+        }
+        return false
+    }
+
     static func isRetryableTransportFailure(_ error: Error) -> Bool {
         if let error = error as? TelemostError { return error.isRetryable }
         if let error = error as? TrueConfError { return error.isRetryable }
         if error as? NativeDesktopRTCError == .cleanupFailed { return false }
         if error is URLError || error is NativeDesktopRTCError || error is GuestTransportError { return true }
-        let system = error as NSError
-        guard system.domain == NSPOSIXErrorDomain, let code = Int32(exactly: system.code) else { return false }
-        switch POSIXErrorCode(rawValue: code) {
-        case .ENOTCONN, .ECONNRESET, .ECONNABORTED, .EPIPE, .ETIMEDOUT,
-             .ENETDOWN, .ENETRESET, .ENETUNREACH, .EHOSTUNREACH, .ECONNREFUSED: return true
-        default: return false
-        }
+        return isTransientPOSIXNetworkError(error)
     }
 }
 

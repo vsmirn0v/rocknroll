@@ -74,18 +74,24 @@ struct LocalSpeechRecognizerRuntimeSnapshot: Equatable, Sendable {
 /// queue; when more than `maxPendingSeconds` of speech waits, new speech is
 /// dropped and counted instead of falling ever further behind.
 final class LocalSpeechRecognizer: @unchecked Sendable {
-    static let shared = LocalSpeechRecognizer()
+    static let shared = LocalSpeechRecognizer(idleUnloadDelay: 30)
     static let maxPendingSeconds = 90.0
     enum DropReason: String, Sendable {
         case audioBacklog, recognitionBacklog, modelUnavailable, decodeFailure
     }
     let runtime = CurrentValueSubject<LocalSpeechRecognizerRuntimeSnapshot, Never>(.init())
+    private let idleUnloadDelay: TimeInterval
     private let queue = DispatchQueue(label: "attention.listen.recognizer", qos: .utility, autoreleaseFrequency: .workItem)
     private let lock = NSLock()
     private var pending = 0.0
     private var recognizer: (([Float]) throws -> String)?
     private var loaded: ListenRecognizerModel?
     private var runtimeState = LocalSpeechRecognizerRuntimeSnapshot()
+    private var pendingUnloadWork: DispatchWorkItem?
+
+    init(idleUnloadDelay: TimeInterval = 0) {
+        self.idleUnloadDelay = max(0, idleUnloadDelay)
+    }
 
     /// Reports why audio could not be recognized, including bounded-queue overload.
     func transcribe(_ samples: [Float], model: ListenRecognizerModel, completion: @escaping (String?, TimeInterval, DropReason?) -> Void) {
@@ -147,16 +153,50 @@ final class LocalSpeechRecognizer: @unchecked Sendable {
 
     /// A meeting starts transcribing: the model loads ahead of its first utterance.
     func acquire(_ model: ListenRecognizerModel) {
-        lock.lock(); users += 1; runtimeState.users = users; lock.unlock()
+        lock.lock()
+        pendingUnloadWork?.cancel()
+        pendingUnloadWork = nil
+        users += 1
+        runtimeState.users = users
+        lock.unlock()
         publishRuntime()
         prepare(model)
     }
-    /// A meeting stopped. When none transcribes, the model's memory is freed (the Core ML
-    /// encoder otherwise stays resident for the app's life, beside the judge's models).
+    /// A meeting stopped. When none transcribes, the model's memory is freed after the idle
+    /// grace delay (so brief reconnects or short holds avoid CoreML reload churn).
     func release() {
-        lock.lock(); users = max(0, users - 1); runtimeState.users = users; let idle = users == 0; lock.unlock()
+        lock.lock()
+        users = max(0, users - 1)
+        runtimeState.users = users
+        let idle = users == 0
+        pendingUnloadWork?.cancel()
+        pendingUnloadWork = nil
+        let delay = idleUnloadDelay
+        var scheduledWork: DispatchWorkItem?
+        if idle, delay > 0 {
+            let work = DispatchWorkItem { [weak self] in
+                guard let self else { return }
+                self.lock.lock()
+                let stillIdle = self.users == 0
+                if stillIdle {
+                    self.pendingUnloadWork = nil
+                }
+                self.lock.unlock()
+                guard stillIdle else { return }
+                self.unloadIfIdle()
+            }
+            pendingUnloadWork = work
+            scheduledWork = work
+        }
+        lock.unlock()
         publishRuntime()
-        if idle { unload() }
+        if idle {
+            if let scheduledWork {
+                queue.asyncAfter(deadline: .now() + delay, execute: scheduledWork)
+            } else {
+                unload()
+            }
+        }
     }
     var userCount: Int { lock.lock(); defer { lock.unlock() }; return users }
 

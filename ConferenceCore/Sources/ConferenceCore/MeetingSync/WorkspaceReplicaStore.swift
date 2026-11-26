@@ -103,3 +103,60 @@ public enum WorkspaceTranscriptChunkSidecar {
         }
     }
 }
+
+/// High-churn CloudKit sync cursors and acknowledgement digests persisted separately from
+/// full workspace metadata so 2-second sync polls never rewrite the full replica JSON.
+public struct WorkspaceSyncCursorState: Codable, Equatable, Sendable {
+    public var libraryToken: Data?
+    public var transcriptToken: Data?
+    public var scheduleToken: Data?
+    public var zoneGenerations: [String: String]
+    public var acknowledgedLibraryDigests: [String: String]
+    public var acknowledgedTranscriptDigests: [String: String]
+    public var acknowledgedScheduleDigests: [String: String]
+    public var cloudTranscriptIndex: [String: Date]
+
+    public init(
+        libraryToken: Data? = nil,
+        transcriptToken: Data? = nil,
+        scheduleToken: Data? = nil,
+        zoneGenerations: [String: String] = [:],
+        acknowledgedLibraryDigests: [String: String] = [:],
+        acknowledgedTranscriptDigests: [String: String] = [:],
+        acknowledgedScheduleDigests: [String: String] = [:],
+        cloudTranscriptIndex: [String: Date] = [:]
+    ) {
+        self.libraryToken = libraryToken
+        self.transcriptToken = transcriptToken
+        self.scheduleToken = scheduleToken
+        self.zoneGenerations = zoneGenerations
+        self.acknowledgedLibraryDigests = acknowledgedLibraryDigests
+        self.acknowledgedTranscriptDigests = acknowledgedTranscriptDigests
+        self.acknowledgedScheduleDigests = acknowledgedScheduleDigests
+        self.cloudTranscriptIndex = cloudTranscriptIndex
+    }
+}
+
+/// Incremental persistence for `WorkspaceSyncCursorState`; performs zero disk I/O when unchanged.
+public enum WorkspaceSyncCursorSidecar {
+    public static func loadWithDigest(from url: URL) -> (state: WorkspaceSyncCursorState?, digest: String?) {
+        guard let data = try? Data(contentsOf: url),
+              let state = try? JSONDecoder().decode(WorkspaceSyncCursorState.self, from: data) else {
+            return (nil, nil)
+        }
+        return (state, SyncRecordDigest.sha256(state))
+    }
+
+    public static func sync(
+        _ cursors: WorkspaceSyncCursorState,
+        persistedDigest: inout String?,
+        to url: URL
+    ) throws {
+        let data = try SyncRecordDigest.makeCanonicalEncoder().encode(cursors)
+        let digest = SyncRecordDigest.sha256(data)
+        guard persistedDigest != digest else { return }
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try data.write(to: url, options: .atomic)
+        persistedDigest = digest
+    }
+}

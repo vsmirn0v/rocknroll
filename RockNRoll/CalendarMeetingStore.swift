@@ -353,7 +353,13 @@ final class CalendarMeetingStore: ObservableObject {
             }
         }
     }
+    private var hasAppliedRemoteSchedule = false
+
     func applyRemoteSchedule(_ occurrences: [SyncedCalendarOccurrence], localDeviceID: String) {
+        if hasAppliedRemoteSchedule, lastLocalDeviceID == localDeviceID, remoteOccurrences == occurrences {
+            return
+        }
+        hasAppliedRemoteSchedule = true
         lastLocalDeviceID = localDeviceID
         remoteOccurrences = occurrences
         rebuildMeetings()

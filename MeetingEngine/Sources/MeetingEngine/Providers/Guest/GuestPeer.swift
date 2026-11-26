@@ -107,6 +107,8 @@ public final class GuestPeer: NSObject, LKRTCPeerConnectionDelegate {
     private var bufferedRemoteICECandidates = 0
     private var addedRemoteICECandidates = 0
     private var iceGatheringErrors = 0
+    private var loggedICEGatherErrorCodes: Set<Int> = []
+    private var iceGatherErrorCountsByCode: [String: Int] = [:]
     private var lastGatheringState = LKRTCIceGatheringState.new
     private let maximumLoggedICEGatheringErrors = 32
     /// Candidate kinds in the last remote description ("host/udp": 2, ...), no addresses.
@@ -832,8 +834,11 @@ public final class GuestPeer: NSObject, LKRTCPeerConnectionDelegate {
 #endif
             guard !closed else { return }
             if iceGatheringErrors < Int.max { iceGatheringErrors += 1 }
-            if iceGatheringErrors <= maximumLoggedICEGatheringErrors {
-                logICEDiagnostic("ice-gather-error", ["errorCode": errorCode])
+            let code = Int(errorCode)
+            iceGatherErrorCountsByCode[String(code), default: 0] += 1
+            if loggedICEGatherErrorCodes.insert(code).inserted,
+               loggedICEGatherErrorCodes.count <= maximumLoggedICEGatheringErrors {
+                logICEDiagnostic("ice-gather-error", ["errorCode": code])
             }
         }
     }
@@ -858,7 +863,8 @@ public final class GuestPeer: NSObject, LKRTCPeerConnectionDelegate {
             "addedRemoteCandidates": addedRemoteICECandidates,
             "pendingLocalCandidates": localICE.count, "pendingRemoteCandidates": remoteICE.count,
             "gatheringState": lastGatheringState.rawValue, "gatheringErrors": iceGatheringErrors,
-            "gatheringErrorsLogged": min(iceGatheringErrors, maximumLoggedICEGatheringErrors),
+            "gatheringErrorCounts": iceGatherErrorCountsByCode,
+            "gatheringErrorsLogged": min(loggedICEGatherErrorCodes.count, maximumLoggedICEGatheringErrors),
             "policy": icePolicy.forTarget(target).rawValue, "relayOnly": relayOnlyConfigured,
             "remoteDescriptionCandidates": remoteDescriptionCandidates])
         // Request bounded, allowlisted native evidence without delaying recovery.
@@ -1145,7 +1151,12 @@ public final class GuestPeer: NSObject, LKRTCPeerConnectionDelegate {
         Task { @MainActor [weak self] in
             guard let self, !closed, newState != lastGatheringState else { return }
             lastGatheringState = newState
-            logICEDiagnostic("ice-gathering-state", ["state": newState.rawValue])
+            var fields: [String: Any] = ["state": newState.rawValue]
+            if newState == .complete, iceGatheringErrors > 0 {
+                fields["gatheringErrors"] = iceGatheringErrors
+                fields["errorCounts"] = iceGatherErrorCountsByCode
+            }
+            logICEDiagnostic("ice-gathering-state", fields)
         }
     }
     nonisolated public func peerConnection(_ pc: LKRTCPeerConnection, didRemove candidates: [LKRTCIceCandidate]) {}

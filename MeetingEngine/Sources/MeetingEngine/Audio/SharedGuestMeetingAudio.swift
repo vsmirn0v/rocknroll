@@ -86,7 +86,17 @@ import LiveKitWebRTC
 
     func registerMicrophoneTrack(_ track: LKRTCAudioTrack) { attachment.addSender(track) }
     func activateMicrophone(timeout: TimeInterval?) async -> Bool { await engine.activateInput(for: attachment) }
-    func setMicrophoneMuted(_ muted: Bool, timeout: TimeInterval) async -> Bool { await attachment.setMuted(muted) }
+    func setMicrophoneMuted(_ muted: Bool, timeout: TimeInterval) async -> Bool {
+        if await attachment.setMuted(muted) { return true }
+        guard !muted, attachment.isTalk, !attachment.privateCheckActive, GuestSystemAudio.microphoneAuthorized else {
+            return false
+        }
+        try? await Task.sleep(for: .milliseconds(200))
+        guard !Task.isCancelled, attachment.isTalk, !attachment.privateCheckActive, GuestSystemAudio.microphoneAuthorized else {
+            return false
+        }
+        return await attachment.setMuted(false)
+    }
     func suppressMicrophone() { attachment.suppress() }
     func setInputPermitted(_ permitted: Bool, keepWarm: Bool, timeout: TimeInterval) async -> Bool {
         if permitted { return await attachment.assumeTalk() }

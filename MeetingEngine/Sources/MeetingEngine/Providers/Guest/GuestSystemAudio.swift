@@ -1750,7 +1750,7 @@ public final class GuestSystemAudio: NSObject, LKRTCAudioDeviceModuleDelegate, @
     }
 
 #if os(iOS)
-    private var wantsMeetingPlayout: Bool { mediaContext != nil && (playoutEnabled || transcriptionOutput) }
+    private var wantsMeetingPlayout: Bool { !manualRenderingMode && mediaContext != nil && (playoutEnabled || transcriptionOutput) }
 
     private func ensureMeetingPlayout(_ module: LKRTCAudioDeviceModule) -> Bool {
         guard module.isPlayoutInitialized || nativeCall("init-meeting-playout", { module.initPlayout() }) == 0 else { return false }

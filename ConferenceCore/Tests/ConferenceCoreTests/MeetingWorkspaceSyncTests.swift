@@ -1156,5 +1156,35 @@ final class MeetingWorkspaceSyncTests: XCTestCase {
             updatedAt: now
         ))
         XCTAssertTrue(doc.pendingLibraryRecords(acknowledgedDigests: [record.syncRecordID: SyncRecordDigest.sha256(record)]).isEmpty)
+
+        // Cloud transcript upload index lives in the cursor sidecar, leaving metadata replica invariant.
+        doc.markTranscriptUploaded(recordID: "transcript:\(sid1.uuidString):mac:0", sessionStartedAt: now)
+        let stripped = doc.withoutSyncSidecars()
+        XCTAssertTrue(stripped.transcriptChunks.isEmpty)
+        XCTAssertTrue(stripped.cloudTranscriptIndex.isEmpty)
+
+        let cursorsURL = dir.deletingLastPathComponent().appendingPathComponent("cursors.json")
+        var cursorsDigest: String?
+        let initialCursors = WorkspaceSyncCursorState(
+            libraryToken: Data([1, 2, 3]),
+            transcriptToken: Data([4, 5]),
+            scheduleToken: Data([6]),
+            zoneGenerations: ["library": "gen-1"],
+            acknowledgedLibraryDigests: [record.syncRecordID: SyncRecordDigest.sha256(record)],
+            acknowledgedTranscriptDigests: ["transcript:t1": "d1"],
+            acknowledgedScheduleDigests: ["sched:s1": "d2"],
+            cloudTranscriptIndex: doc.cloudTranscriptIndex
+        )
+        try WorkspaceSyncCursorSidecar.sync(initialCursors, persistedDigest: &cursorsDigest, to: cursorsURL)
+        let cursorInode = try FileManager.default.attributesOfItem(atPath: cursorsURL.path)[.systemFileNumber] as? NSNumber
+
+        try WorkspaceSyncCursorSidecar.sync(initialCursors, persistedDigest: &cursorsDigest, to: cursorsURL)
+        XCTAssertEqual(try FileManager.default.attributesOfItem(atPath: cursorsURL.path)[.systemFileNumber] as? NSNumber, cursorInode)
+
+        let loadedCursors = WorkspaceSyncCursorSidecar.loadWithDigest(from: cursorsURL)
+        XCTAssertEqual(loadedCursors.state, initialCursors)
+        var restored = MeetingWorkspaceSyncDocument(device: "mac")
+        restored.restoreCloudTranscriptIndex(loadedCursors.state?.cloudTranscriptIndex ?? [:])
+        XCTAssertEqual(restored.cloudTranscriptIndex, doc.cloudTranscriptIndex)
     }
 }

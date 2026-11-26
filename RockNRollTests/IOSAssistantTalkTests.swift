@@ -2386,4 +2386,18 @@ final class IOSAssistantTalkTests: XCTestCase {
 
         await store.close()
     }
+
+    func testPushToTalkStopBeforeStartTaskCompletesCancelsPendingCapture() async throws {
+        let suite = SuiteBox()
+        let speech = IOSAssistantSpeechCoordinator()
+        speech.isTestingEnvironment = true
+        let talk = IOSAssistantTalkController(speech: speech, voiceStore: IOSVoiceStore(preferences: suite.defaults))
+
+        talk.startPushToTalk()
+        talk.stopPushToTalk()
+        for _ in 0..<20 { await Task.yield() }
+
+        XCTAssertFalse(talk.listening, "Cancelling before async capture startup finishes must not leave listening stuck true")
+        XCTAssertEqual(speech.mode, .idle)
+    }
 }

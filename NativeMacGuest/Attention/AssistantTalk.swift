@@ -53,9 +53,13 @@ import SwiftUI
 
     weak var attention: AttentionCoordinator?
     private var captureTask: Task<Void, Never>?
+    private var modelAcquireTask: Task<Void, Never>?
     private var captureMeeting: NativeDesktopMeetingModel?
     private var captureRecognizerAcquired = false
     private var captureGeneration = UUID()
+    /// Hold threshold before global `⌥Space` opens the microphone and CoreML pipeline.
+    var hotKeyHoldThreshold: Duration = .milliseconds(150)
+    private var hotKeyDebounceTask: Task<Void, Never>?
     /// Wall-clock limit for one hold. Cancelled on release, disable, and unregister.
     private var holdLimit: Task<Void, Never>?
     private var monitors: [Any] = []
@@ -91,6 +95,8 @@ import SwiftUI
 
     deinit {
         holdLimit?.cancel()
+        hotKeyDebounceTask?.cancel()
+        modelAcquireTask?.cancel()
         auditionTask?.cancel()
         warmRealtimeIdleTask?.cancel()
         if let router = warmRealtimeRouter {
@@ -732,6 +738,8 @@ import SwiftUI
     }
 
     private func unregisterCarbonHotKey() {
+        hotKeyDebounceTask?.cancel()
+        hotKeyDebounceTask = nil
         if let carbonHotKey { UnregisterEventHotKey(carbonHotKey) }
         carbonHotKey = nil
         if let carbonHandler { RemoveEventHandler(carbonHandler) }
@@ -741,11 +749,30 @@ import SwiftUI
     }
 
     private func carbonPressed(_ down: Bool) {
-        guard attention?.store.pushToTalk == true else { stopPushToTalk(); return }
+        guard attention?.store.pushToTalk == true else {
+            hotKeyDebounceTask?.cancel()
+            hotKeyDebounceTask = nil
+            stopPushToTalk()
+            return
+        }
         if down {
             guard !textFieldFocused else { return }
-            startPushToTalk()
+            guard hotKeyDebounceTask == nil, !listening, captureTask == nil, !working else { return }
+            let threshold = hotKeyHoldThreshold
+            if threshold <= .zero {
+                startPushToTalk()
+                return
+            }
+            hotKeyDebounceTask = Task { @MainActor [weak self] in
+                do { try await Task.sleep(for: threshold) } catch { return }
+                guard let self, !Task.isCancelled else { return }
+                self.hotKeyDebounceTask = nil
+                guard self.attention?.store.pushToTalk == true, !self.textFieldFocused else { return }
+                self.startPushToTalk()
+            }
         } else {
+            hotKeyDebounceTask?.cancel()
+            hotKeyDebounceTask = nil
             stopPushToTalk()
         }
     }
@@ -787,8 +814,14 @@ import SwiftUI
                 }
                 listening = true
                 if let localModel {
-                    LocalSpeechRecognizer.shared.acquire(localModel)
-                    captureRecognizerAcquired = true
+                    modelAcquireTask?.cancel()
+                    modelAcquireTask = Task { @MainActor [weak self] in
+                        do { try await Task.sleep(for: .milliseconds(180)) } catch { return }
+                        guard let self, !Task.isCancelled, self.captureGeneration == generation, self.listening else { return }
+                        LocalSpeechRecognizer.shared.acquire(localModel)
+                        self.captureRecognizerAcquired = true
+                        self.modelAcquireTask = nil
+                    }
                 }
                 probeLog("assistant-capture-start", ["meeting": meeting?.sessionID.uuidString ?? "local"])
             } catch {
@@ -799,6 +832,8 @@ import SwiftUI
 
     func stopPushToTalk() {
         cancelHoldLimit()
+        hotKeyDebounceTask?.cancel(); hotKeyDebounceTask = nil
+        modelAcquireTask?.cancel(); modelAcquireTask = nil
         captureGeneration = UUID()
         guard listening || captureMeeting != nil || captureTask != nil else { return }
         captureTask?.cancel(); captureTask = nil

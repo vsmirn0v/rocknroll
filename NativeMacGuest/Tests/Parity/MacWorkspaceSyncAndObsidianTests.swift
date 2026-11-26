@@ -1205,4 +1205,48 @@ final class MacWorkspaceSyncAndObsidianTests: XCTestCase {
         XCTAssertEqual(try FileManager.default.attributesOfItem(atPath: url.path)[.systemFileNumber] as? NSNumber, replicaInode)
         XCTAssertEqual(try FileManager.default.attributesOfItem(atPath: chunkURL.path)[.systemFileNumber] as? NSNumber, chunkInode)
     }
+
+    func testTokenAndTranscriptUpdatesDoNotRewriteFullReplicaFileOnMacOS() async throws {
+        var f = try await makeFixture()
+        let now = Date(timeIntervalSince1970: 1_795_100_000)
+        let session = MeetingSessionRecord(title: "Live Sync", startedAt: now - 60, state: .active)
+        try await f.library.store.upsertSession(session)
+        await f.library.refresh()
+        await f.sync.synchronizeNow()
+        try await f.sync.persistReplicaCheckpoint()
+
+        let url = temp.appendingPathComponent("AppSupport/workspace-sync-replica.json")
+        let cursorsURL = temp.appendingPathComponent("AppSupport/workspace-sync-cursors.json")
+        let initialReplicaInode = try FileManager.default.attributesOfItem(atPath: url.path)[.systemFileNumber] as? NSNumber
+        let initialCursorInode = try FileManager.default.attributesOfItem(atPath: cursorsURL.path)[.systemFileNumber] as? NSNumber
+
+        // Simulate CloudKit returning a new transcript line from another device + advancing tokens.
+        f.library.workspaceJournal.begin(sessionID: session.id, title: session.title, calendarSeriesID: nil, roomIdentity: nil, at: session.startedAt)
+        f.library.workspaceJournal.observe(sessionID: session.id, events: [
+            MeetingWorkspaceEvent(id: "ev-1", kind: .transcript, occurredAt: now - 10, source: "local", text: "Line one")
+        ])
+        await f.sync.synchronizeNow()
+        try await f.sync.persistReplicaCheckpoint()
+
+        let replicaInodeAfterLine1 = try FileManager.default.attributesOfItem(atPath: url.path)[.systemFileNumber] as? NSNumber
+        XCTAssertEqual(replicaInodeAfterLine1, initialReplicaInode, "Uploading transcript chunks must not rewrite full workspace metadata replica")
+        XCTAssertNotEqual(
+            try FileManager.default.attributesOfItem(atPath: cursorsURL.path)[.systemFileNumber] as? NSNumber,
+            initialCursorInode,
+            "Cursor sidecar should advance with transcript upload state"
+        )
+
+        f.library.workspaceJournal.observe(sessionID: session.id, events: [
+            MeetingWorkspaceEvent(id: "ev-1", kind: .transcript, occurredAt: now - 10, source: "local", text: "Line one"),
+            MeetingWorkspaceEvent(id: "ev-2", kind: .transcript, occurredAt: now - 5, source: "local", text: "Line two")
+        ])
+        await f.sync.synchronizeNow()
+        try await f.sync.persistReplicaCheckpoint()
+
+        XCTAssertEqual(
+            try FileManager.default.attributesOfItem(atPath: url.path)[.systemFileNumber] as? NSNumber,
+            replicaInodeAfterLine1,
+            "Subsequent transcript updates must leave workspace-sync-replica.json untouched"
+        )
+    }
 }

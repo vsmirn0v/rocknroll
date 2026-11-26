@@ -614,4 +614,57 @@ final class ObsidianExportTests: XCTestCase {
         XCTAssertTrue(effective.contains(.tasks), "Untouched nil inherits global default")
         XCTAssertTrue(effective.contains(.decisions), "Untouched nil inherits global default")
     }
+
+    func testWorkerBacksOffAndDeduplicatesLogsOnVaultDenialUntilConfigChanges() async throws {
+        let (store, initial) = try await makeStoreWithDestination()
+        let session = MeetingSessionRecord(title: "Denied Vault", startedAt: Date())
+        try await store.upsertSession(session)
+        _ = try await store.saveNote(sessionID: session.id, markdown: "pending export")
+        try await store.endSession(session.id, at: Date(), awaitingOutcome: false)
+
+        var grantAccess = false
+        var resolverCalls = 0
+        var loggedEvents: [(String, String?)] = []
+        let worker = ObsidianExportWorker(
+            store: store,
+            backupRoot: backups,
+            vaultResolver: { _ in
+                resolverCalls += 1
+                return grantAccess ? .granted(self.vault) : .denied("macOS не предоставила доступ к хранилищу.")
+            },
+            onLog: { event, fields in
+                loggedEvents.append((event, fields["error"] as? String))
+            }
+        )
+
+        let t0 = Date(timeIntervalSince1970: 1_795_200_000)
+        await worker.runOnce(now: t0)
+        XCTAssertEqual(resolverCalls, 1)
+        XCTAssertEqual(loggedEvents.filter { $0.0 == "obsidian-export-vault-denied" }.count, 1)
+        let sleepDuringBackoff = await worker.nextSleepDelay(now: t0.addingTimeInterval(1))
+        XCTAssertGreaterThanOrEqual(sleepDuringBackoff, 13.0)
+
+        // Calling runOnce again before backoff expires must neither resolve again nor re-log denial.
+        await worker.runOnce(now: t0.addingTimeInterval(2))
+        await worker.runOnce(now: t0.addingTimeInterval(5))
+        XCTAssertEqual(resolverCalls, 1)
+        XCTAssertEqual(loggedEvents.filter { $0.0 == "obsidian-export-vault-denied" }.count, 1)
+
+        // After the 15s backoff elapses, a second failure doubles backoff and still does not spam the same denial log.
+        await worker.runOnce(now: t0.addingTimeInterval(16))
+        XCTAssertEqual(resolverCalls, 2)
+        XCTAssertEqual(loggedEvents.filter { $0.0 == "obsidian-export-vault-denied" }.count, 1)
+        let secondBackoff = await worker.nextSleepDelay(now: t0.addingTimeInterval(17))
+        XCTAssertGreaterThanOrEqual(secondBackoff, 28.0)
+
+        // Changing configRevision (re-authorizing vault in Settings) clears backoff immediately.
+        grantAccess = true
+        var updated = initial
+        updated.configRevision += 1
+        try await store.saveDestination(updated)
+        await worker.runOnce(now: t0.addingTimeInterval(18))
+        XCTAssertEqual(resolverCalls, 3)
+        let remaining = try await store.outboxCount()
+        XCTAssertEqual(remaining, 0)
+    }
 }

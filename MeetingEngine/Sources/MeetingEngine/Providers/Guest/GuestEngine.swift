@@ -57,6 +57,9 @@ private struct GuestRemoteTrackState {
 public final class NativeGuestEngine {
     /// Official next-room feature key registered by the transcription plugin.
     static let supportedFeatures: [String: Any] = ["transcription": true]
+    private static let suppressedMediaProbeMethods: Set<String> = [
+        "rtc:ice", "rtc:pong", "rtc:ping", "rtc:speakers:changed", "rtc:quality"
+    ]
     let label: String
     /// Display names stay out of release diagnostics; test harnesses tell clients apart by name.
     nonisolated var probeClient: String {
@@ -557,7 +560,11 @@ public final class NativeGuestEngine {
     private func receiveMedia(_ payload: [String: Any]) async throws {
         lastMediaEvent = ProcessInfo.processInfo.systemUptime
         guard let method = payload["method"] as? String else { throw GuestEngineError.malformed }
-        if method != "rtc:ice" && method != "rtc:pong" { probeLog("media-event", ["client": probeClient, "method": method]) }
+        if method != "rtc:ice" && method != "rtc:pong" {
+            if !Self.suppressedMediaProbeMethods.contains(method) {
+                probeLog("media-event", ["client": probeClient, "method": method])
+            }
+        }
         switch method {
         case "rtc:config":
             guard let config = payload["configuration"] as? [String: Any] else { throw GuestEngineError.malformed }
@@ -1755,7 +1762,17 @@ public final class NativeGuestEngine {
             guard localMuteIntent[video] == false, !outputSuppressed else { return }
             try requirePermission(video: video)
             if !video, let systemAudio {
-                guard await systemAudio.setMicrophoneMuted(false) else { throw GuestEngineError.disconnected }
+                guard await systemAudio.setMicrophoneMuted(false) else {
+                    publisher.suppress(video: false)
+                    systemAudio.suppressMicrophone()
+                    if serverMute[sid] == false {
+                        try? await signalParticipationMute(true, sid: sid)
+                    }
+                    probeLog("local-unmute-audio-rejected", ["client": probeClient, "physicalAudio": systemAudio.snapshot])
+                    throw GuestSystemAudioError.microphoneActivationFailure(
+                        authorization: AVCaptureDevice.authorizationStatus(for: .audio)
+                    )
+                }
                 try checkActive()
                 guard localMuteIntent[video] == false, !outputSuppressed else {
                     _ = await systemAudio.setMicrophoneMuted(true); return

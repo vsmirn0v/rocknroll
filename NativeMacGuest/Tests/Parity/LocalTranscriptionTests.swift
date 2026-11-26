@@ -48,7 +48,7 @@ import XCTest
     /// bytes, the same schema and runtime, a higher revision and pinned files.
     /// Review finding 2: the speech model stayed loaded for the app's life. It is freed
     /// once the last transcribing meeting stops, and not while another still runs.
-    func testRecognizerUnloadsOnlyWhenTheLastMeetingStops() {
+    func testRecognizerUnloadsOnlyWhenTheLastMeetingStops() async throws {
         let recognizer = LocalSpeechRecognizer()
         let missing = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("no-model-\(UUID().uuidString)")
         // Missing files: loading fails in Swift (no native runtime is touched).
@@ -67,6 +67,19 @@ import XCTest
         recognizer.warmUp(model)
         XCTAssertFalse(recognizer.isLoaded, "a warm-up with no meeting keeps nothing loaded")
         XCTAssertEqual(recognizer.userCount, 0)
+
+        let delayed = LocalSpeechRecognizer(idleUnloadDelay: 0.25)
+        delayed.acquire(model)
+        delayed.release()
+        XCTAssertEqual(delayed.unloads, 0, "idle unload grace window avoids immediate CoreML teardown")
+        try await Task.sleep(for: .milliseconds(80))
+        delayed.acquire(model)
+        XCTAssertEqual(delayed.unloads, 0, "re-acquiring inside grace window cancels pending unload")
+        delayed.release()
+        for _ in 0..<40 where delayed.unloads == 0 {
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        XCTAssertEqual(delayed.unloads, 1, "model unloads after grace window expires with zero users")
     }
 
     func testSignedCatalogVerification() throws {

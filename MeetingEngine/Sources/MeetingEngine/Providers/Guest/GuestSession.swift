@@ -76,10 +76,13 @@ struct GuestRecoveryPolicy {
             switch error.code {
             case .timedOut, .cannotFindHost, .cannotConnectToHost, .dnsLookupFailed,
                  .networkConnectionLost, .notConnectedToInternet: return true
-            default: return false
+            default:
+                return NativeAdapterRecoveryPolicy.isTransientPOSIXNetworkError(error)
             }
         }
         if case GuestPeerError.iceFailed = error { return true }
+        if case GuestEngineError.disconnected = error { return true }
+        if NativeAdapterRecoveryPolicy.isTransientPOSIXNetworkError(error) { return true }
         return error is GuestRecoverableError
     }
 
@@ -195,6 +198,7 @@ public final class GuestSession {
     private var control: Task<Void, Never>?
     private var shutdown: Task<Bool, Never>?
     private var pendingFailure: Error?
+    private var lastCommandFailure: Error?
     private var cleanupSucceeded = true
     private var policy = GuestRecoveryPolicy()
     private let makeAttempt: @MainActor () async throws -> any GuestSessionEngine
@@ -244,7 +248,7 @@ public final class GuestSession {
         guard generation == expected else { throw CancellationError() }
         if Task.isCancelled { _ = await leave(); throw CancellationError() }
         guard drained else { state = .failed; failure = GuestSessionError.cleanupFailed; throw GuestSessionError.cleanupFailed }
-        shutdown = nil; failure = nil; pendingFailure = nil; sessionID = nil
+        shutdown = nil; failure = nil; pendingFailure = nil; lastCommandFailure = nil; sessionID = nil
         cleanupSucceeded = true; policy = GuestRecoveryPolicy(); recoveryAttempts = 0
         microphoneActivationRequested = false; microphonePreparationRequested = initialMicrophonePreparation
         attemptMicrophonePreparation = false; appliedMicrophoneActivation = false
@@ -323,11 +327,16 @@ public final class GuestSession {
 
     private func reconcileControl() async throws {
         let expected = generation
+        lastCommandFailure = nil
         startControl()
         await control?.value
         try Task.checkCancellation()
         guard generation == expected else { throw CancellationError() }
         if let failure { throw failure }
+        if let commandError = lastCommandFailure {
+            lastCommandFailure = nil
+            throw commandError
+        }
         guard state == .connected else { throw GuestTransportError.notConnected }
     }
 
@@ -441,14 +450,15 @@ public final class GuestSession {
                     next.onLobbyChange = { [weak self] lobby in
                         self?.lobbyChanged(lobby, generation: expected, attempt: attempt)
                     }
-                    // Speculative activation has one prejoin decision per attempt.
-                    // A later policy opt-in cannot activate input after playout starts.
-                    attemptMicrophonePreparation = microphonePreparationRequested
-                    try await reconcileDeviceIntent(next, generation: expected, attempt: attempt)
                     try await next.join(invitation, sessionID: sessionID)
                     relayTrialAwaitingJoin = false
                     try check(expected, attempt: attempt)
                     sessionID = next.sessionID ?? sessionID
+                    // Speculative activation runs once per joined attempt while playout is still closed,
+                    // avoiding lobby/failed-join mic activation and multi-second peerless Bluetooth HFP churn.
+                    attemptMicrophonePreparation = microphonePreparationRequested
+                    try await reconcileDeviceIntent(next, generation: expected, attempt: attempt)
+                    try check(expected, attempt: attempt)
                     guard let intent = desiredIntent else { throw CancellationError() }
                     if intent.publish {
                         try await next.publishPattern(codec: intent.codec, camera: intent.camera,
@@ -496,8 +506,31 @@ public final class GuestSession {
                     _ = await retireCurrent(sendLeave: true)
                     return
                 }
-                let cause = pendingFailure ?? error
+                let rawFailure = pendingFailure
+                let cause = rawFailure ?? error
                 pendingFailure = nil
+                if let current, let attempt = attemptID, connectedAttemptID == attempt,
+                   rawFailure == nil, (cause is GuestSystemAudioError || cause is GuestCameraError) {
+                    if desiredIntent?.audioMuted == false && appliedIntent?.audioMuted != false {
+                        desiredIntent?.audioMuted = true
+                        current.setLocalMuteIntent(true, video: false)
+                    }
+                    if desiredIntent?.videoMuted == false && appliedIntent?.videoMuted != false {
+                        desiredIntent?.videoMuted = true
+                        current.setLocalMuteIntent(true, video: true)
+                    }
+                    if microphoneActivationRequested && !appliedMicrophoneActivation {
+                        microphoneActivationRequested = false
+                    }
+                    if desiredPlayoutEnabled != appliedPlayoutEnabled {
+                        desiredPlayoutEnabled = appliedPlayoutEnabled
+                    }
+                    lastCommandFailure = cause
+                    state = .connected
+                    control = nil
+                    notifyStateChange()
+                    return
+                }
                 if relayTrialAwaitingJoin, GuestRecoveryPolicy.isRecoverable(cause) { restoreUnstartedRelayTrial() }
                 probeLog("session-control-failure", ["causeType": String(describing: type(of: cause)),
                     "causeCode": (cause as NSError).code])

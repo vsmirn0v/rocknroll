@@ -1537,4 +1537,50 @@ final class IOSWorkspaceSyncTests: XCTestCase {
         XCTAssertEqual(try FileManager.default.attributesOfItem(atPath: chunkURL.path)[.systemFileNumber] as? NSNumber, chunkInode)
         XCTAssertEqual(f.workspace.sessions.first?.id, sid)
     }
+
+    func testIOSTokenAndTranscriptUpdatesDoNotRewriteFullReplicaFile() async throws {
+        let f = try await makeCoordinator()
+        let cid = UUID()
+        let url = try XCTUnwrap(URL(string: "https://meet.example.com/live"))
+        _ = f.workspace.beginSession(
+            controllerID: cid,
+            requestedWorkspaceID: nil,
+            title: "iOS Live Sync",
+            invitation: url,
+            roomIdentity: url.absoluteString,
+            calendarMeeting: nil
+        )
+        await f.workspace.synchronizeNow()
+        try await f.workspace.persistReplicaCheckpoint()
+
+        let replicaURL = temp.appendingPathComponent("DB/ios-workspace-sync-replica.json")
+        let cursorsURL = temp.appendingPathComponent("DB/ios-workspace-sync-cursors.json")
+        let initialReplicaInode = try FileManager.default.attributesOfItem(atPath: replicaURL.path)[.systemFileNumber] as? NSNumber
+        let initialCursorsInode = try FileManager.default.attributesOfItem(atPath: cursorsURL.path)[.systemFileNumber] as? NSNumber
+
+        f.workspace.recordLiveEvents(
+            controllerID: cid,
+            events: [
+                SyncedTranscriptEvent(
+                    id: "ios-live-1",
+                    kind: "transcript",
+                    occurredAt: Date(),
+                    speaker: "Vlad",
+                    isOwn: true,
+                    text: "Live line one",
+                    deviceID: f.roomSync.deviceID
+                )
+            ],
+            micIntervals: []
+        )
+        await f.workspace.synchronizeNow()
+        try await f.workspace.persistReplicaCheckpoint()
+
+        let replicaInodeAfterLine1 = try FileManager.default.attributesOfItem(atPath: replicaURL.path)[.systemFileNumber] as? NSNumber
+        XCTAssertEqual(replicaInodeAfterLine1, initialReplicaInode, "Live transcript chunk uploads must not rewrite ios-workspace-sync-replica.json")
+        XCTAssertNotEqual(
+            try FileManager.default.attributesOfItem(atPath: cursorsURL.path)[.systemFileNumber] as? NSNumber,
+            initialCursorsInode
+        )
+    }
 }

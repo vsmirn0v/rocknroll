@@ -358,4 +358,106 @@ final class GuestPermissionsAndSignalingTests: XCTestCase {
         let stopped = await audio.shutdown()
         XCTAssertTrue(stopped)
     }
+
+    func testPostSleepPOSIXENOMEMIsRecoverableAcrossGuestAndExternalPolicies() {
+        let bridgedENOMEM = NSError(domain: NSURLErrorDomain, code: Int(POSIXErrorCode.ENOMEM.rawValue))
+        XCTAssertTrue(GuestRecoveryPolicy.isRecoverable(bridgedENOMEM))
+        XCTAssertTrue(NativeAdapterRecoveryPolicy.isRetryableTransportFailure(bridgedENOMEM))
+
+        let directENOMEM = NSError(domain: NSPOSIXErrorDomain, code: Int(POSIXErrorCode.ENOMEM.rawValue))
+        XCTAssertTrue(GuestRecoveryPolicy.isRecoverable(directENOMEM))
+        XCTAssertTrue(NativeAdapterRecoveryPolicy.isRetryableTransportFailure(directENOMEM))
+
+        let einval = NSError(domain: NSPOSIXErrorDomain, code: Int(POSIXErrorCode.EINVAL.rawValue))
+        XCTAssertFalse(GuestRecoveryPolicy.isRecoverable(einval))
+        XCTAssertFalse(NativeAdapterRecoveryPolicy.isRetryableTransportFailure(einval))
+    }
+
+    func testConnectedSessionStaysUpWhenLocalUnmuteAudioFails() async throws {
+        @MainActor final class MockAudioRejectionEngine: GuestSessionEngine {
+            var sessionID: String? = "sess-1"
+            var onFailure: ((Error) -> Void)?
+            var onForcedMute: ((Bool) -> Void)?
+            var mediaPermissions = GuestMediaPermissions(canShareMicrophone: true, canShareCamera: true)
+            var onPermissionsChange: ((GuestMediaPermissions) -> Void)?
+            var lobbyState = GuestLobbyState()
+            var onLobbyChange: ((GuestLobbyState) -> Void)?
+            var leaves = 0
+            var activateBeforeJoin = false
+            var joined = false
+
+            func activateMicrophone() async throws {
+                if !joined { activateBeforeJoin = true }
+            }
+            func setPlayoutEnabled(_ enabled: Bool) async throws {}
+            func waitForStartupAudio() async throws {}
+            func waitForTransportRecovery() async throws {}
+            func releaseStartupAudio() -> Bool { true }
+            func join(_ invitation: GuestInvitation, sessionID: String?) async throws { joined = true }
+            func publishPattern(codec: String, camera: Bool, audioMuted: Bool, videoMuted: Bool) async throws {}
+            func mute(_ muted: Bool, video: Bool) async throws {
+                if !video && !muted {
+                    throw GuestSystemAudioError.microphoneActivationFailure(authorization: .authorized)
+                }
+            }
+            func setLocalMuteIntent(_ muted: Bool, video: Bool) {}
+            func suppressOutgoingMedia() {}
+            func leave(sendLeave: Bool) async -> Bool { leaves += 1; return true }
+            func interruptTransportForTesting() async {}
+        }
+
+        let invitation = try GuestInvitation.parse(URL(string: "https://guest.example.test/call/unmute-fail")!)
+        var created: [MockAudioRejectionEngine] = []
+        let session = GuestSession(makeAttempt: {
+            let e = MockAudioRejectionEngine()
+            created.append(e)
+            return e
+        })
+
+        try await session.connect(invitation, publish: true, codec: "h264", camera: false,
+                                  initialAudioMuted: true, initialVideoMuted: true,
+                                  initialMicrophonePreparation: true)
+        XCTAssertEqual(session.state, .connected)
+        let first = try XCTUnwrap(created.first)
+        XCTAssertFalse(first.activateBeforeJoin, "Microphone preparation must run after join completes")
+
+        do {
+            try await session.mute(false, video: false)
+            XCTFail("Unmute audio failure must throw to caller")
+        } catch let error as GuestSystemAudioError {
+            if case .setupFailedOrTimedOut = error {} else { XCTFail("Unexpected error: \(error)") }
+        }
+
+        XCTAssertEqual(session.state, .connected, "Local unmute rejection must keep the live session connected")
+        XCTAssertEqual(session.snapshot.desiredIntent?.audioMuted, true, "Failed unmute must revert desired audioMuted back to muted")
+        XCTAssertEqual(first.leaves, 0)
+        XCTAssertEqual(created.count, 1)
+        _ = await session.leave()
+    }
+
+    func testMediaEventDiagnosticsSuppressSpeakersChangedAndQuality() async throws {
+        var events: [[String: Any]] = []
+        setProbeLogSink { line in
+            if let data = line.data(using: .utf8),
+               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                events.append(obj)
+            }
+        }
+        defer { setProbeLogSink(nil) }
+
+        let engine = NativeGuestEngine(label: "LogFilter", verifyReceivedPixels: false)
+        _ = try await engine.prepareJoinForTesting()
+        try await engine.processEventForTesting([
+            "event": "media-out",
+            "payload": ["method": "rtc:speakers:changed", "speakersChanged": ["speakers": []]]
+        ])
+        try await engine.processEventForTesting([
+            "event": "media-out",
+            "payload": ["method": "rtc:quality", "updates": []]
+        ])
+
+        let mediaEvents = events.filter { $0["event"] as? String == "media-event" }
+        XCTAssertTrue(mediaEvents.isEmpty, "High-frequency rtc:speakers:changed and rtc:quality should not flood event logs")
+        _ = await engine.leave(sendLeave: false)
+    }
 }

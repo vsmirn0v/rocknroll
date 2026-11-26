@@ -23,6 +23,7 @@ public final class CatchUpStore: ObservableObject {
     private var sessionID: String?
     private var markerWarning: String?
     private let revision = WriteRevision()
+    private let persistedState = PersistedStateBox()
     private var writeVersion: UInt64 = 0
     private var lastEnqueuedWriteAt: TimeInterval = 0
 
@@ -84,8 +85,10 @@ public final class CatchUpStore: ObservableObject {
         revision.set(writeVersion)
         let url = storage
         let writer = writer
+        let persistedState = persistedState
         let completion = AsyncStream<Void> { continuation in
             writer.async {
+                persistedState.set(nil)
                 try? FileManager.default.removeItem(at: url)
                 continuation.yield(())
                 continuation.finish()
@@ -168,6 +171,10 @@ public final class CatchUpStore: ObservableObject {
         let version = writeVersion
         revision.set(version)
         let revision = revision
+        let persistedState = persistedState
+        let payload = PersistPayload(path: storage.path, sessionID: sessionID, roomKey: roomKey,
+                                     timeline: timeline, canViewTranscript: canViewTranscript,
+                                     transcriptionEnabled: transcriptionEnabled)
         let saved = SavedTimeline(sessionID: sessionID, roomKey: roomKey, savedAt: Date(), timeline: timeline,
                                   canViewTranscript: canViewTranscript,
                                   transcriptionEnabled: transcriptionEnabled)
@@ -175,22 +182,29 @@ public final class CatchUpStore: ObservableObject {
         writer.async { [weak self] in
             guard revision.matches(version) else { return }
             let warning: String?
-            do {
-                let data = try JSONEncoder().encode(saved)
-                let directory = url.deletingLastPathComponent()
-                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-                try data.write(to: url,
-                               options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
-                var values = URLResourceValues()
-                values.isExcludedFromBackup = true
-                var savedURL = url
-                try savedURL.setResourceValues(values)
+            let digest = SyncRecordDigest.sha256(payload)
+            if !digest.isEmpty, persistedState.matches(digest) {
                 warning = nil
-            } catch {
-                warning = L("Catch-up history is available only until this app closes.")
-                #if DEBUG
-                print("Could not save local catch-up history: \(error.localizedDescription)")
-                #endif
+            } else {
+                do {
+                    let data = try JSONEncoder().encode(saved)
+                    let directory = url.deletingLastPathComponent()
+                    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                    try data.write(to: url,
+                                   options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+                    var values = URLResourceValues()
+                    values.isExcludedFromBackup = true
+                    var savedURL = url
+                    try savedURL.setResourceValues(values)
+                    persistedState.set(digest.isEmpty ? nil : digest)
+                    warning = nil
+                } catch {
+                    persistedState.set(nil)
+                    warning = L("Catch-up history is available only until this app closes.")
+                    #if DEBUG
+                    print("Could not save local catch-up history: \(error.localizedDescription)")
+                    #endif
+                }
             }
             DispatchQueue.main.async { [weak self] in
                 guard let self, self.writeVersion == version else { return }
@@ -239,4 +253,20 @@ private final class WriteRevision: @unchecked Sendable {
     private var value: UInt64 = 0
     func set(_ value: UInt64) { lock.lock(); self.value = value; lock.unlock() }
     func matches(_ value: UInt64) -> Bool { lock.lock(); defer { lock.unlock() }; return self.value == value }
+}
+
+private struct PersistPayload: Encodable {
+    let path: String
+    let sessionID: String?
+    let roomKey: String
+    let timeline: CatchUpTimeline
+    let canViewTranscript: Bool?
+    let transcriptionEnabled: Bool
+}
+
+private final class PersistedStateBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: String?
+    func set(_ value: String?) { lock.lock(); self.value = value; lock.unlock() }
+    func matches(_ value: String) -> Bool { lock.lock(); defer { lock.unlock() }; return self.value == value }
 }

@@ -76,6 +76,7 @@ final class MacWorkspaceSyncCoordinator: ObservableObject {
 
     private struct ReplicaDiskState: Sendable {
         var metaDigest: String?
+        var cursorsDigest: String?
         var chunkDigests: [String: String]
     }
 
@@ -288,15 +289,55 @@ final class MacWorkspaceSyncCoordinator: ObservableObject {
             CloudEnvelopeTransport<MeetingScheduleSyncRecord>(zoneName: "MeetingSchedule", subscriptionID: "MeetingScheduleChanges")
         )
         let replicaURL = storageRoot.appendingPathComponent("workspace-sync-replica.json")
+        let cursorsURL = storageRoot.appendingPathComponent("workspace-sync-cursors.json")
         let transcriptSidecarURL = storageRoot.appendingPathComponent("workspace-sync-transcripts")
         let stored = (try? Data(contentsOf: replicaURL)).flatMap { try? JSONDecoder().decode(ReplicaState.self, from: $0) }
+        let cursorSidecar = WorkspaceSyncCursorSidecar.loadWithDigest(from: cursorsURL)
         let sidecar = WorkspaceTranscriptChunkSidecar.loadChunksWithDigests(from: transcriptSidecarURL)
         var initialState = stored ?? ReplicaState(
             workspaceDoc: MeetingWorkspaceSyncDocument(device: syncPreferences.deviceID),
             scheduleDoc: CalendarScheduleSyncDocument(device: syncPreferences.deviceID)
         )
+        let hasInlineCursors = stored.map {
+            $0.libraryToken != nil ||
+                $0.transcriptToken != nil ||
+                $0.scheduleToken != nil ||
+                !$0.zoneGenerations.isEmpty ||
+                !$0.acknowledgedLibraryDigests.isEmpty ||
+                !$0.acknowledgedTranscriptDigests.isEmpty ||
+                !$0.acknowledgedScheduleDigests.isEmpty ||
+                !$0.workspaceDoc.cloudTranscriptIndex.isEmpty
+        } ?? false
+        if let cs = cursorSidecar.state {
+            if stored?.migratedFromLegacyFormat == true {
+                for (k, v) in cs.acknowledgedLibraryDigests where initialState.acknowledgedLibraryDigests[k] == nil {
+                    initialState.acknowledgedLibraryDigests[k] = v
+                }
+                for (k, v) in cs.acknowledgedTranscriptDigests where initialState.acknowledgedTranscriptDigests[k] == nil {
+                    initialState.acknowledgedTranscriptDigests[k] = v
+                }
+                for (k, v) in cs.acknowledgedScheduleDigests where initialState.acknowledgedScheduleDigests[k] == nil {
+                    initialState.acknowledgedScheduleDigests[k] = v
+                }
+                if initialState.libraryToken == nil { initialState.libraryToken = cs.libraryToken }
+                if initialState.transcriptToken == nil { initialState.transcriptToken = cs.transcriptToken }
+                if initialState.scheduleToken == nil { initialState.scheduleToken = cs.scheduleToken }
+                for (k, v) in cs.zoneGenerations where initialState.zoneGenerations[k] == nil {
+                    initialState.zoneGenerations[k] = v
+                }
+            } else {
+                initialState.libraryToken = cs.libraryToken ?? initialState.libraryToken
+                initialState.transcriptToken = cs.transcriptToken ?? initialState.transcriptToken
+                initialState.scheduleToken = cs.scheduleToken ?? initialState.scheduleToken
+                if !cs.zoneGenerations.isEmpty { initialState.zoneGenerations = cs.zoneGenerations }
+                if !cs.acknowledgedLibraryDigests.isEmpty { initialState.acknowledgedLibraryDigests = cs.acknowledgedLibraryDigests }
+                if !cs.acknowledgedTranscriptDigests.isEmpty { initialState.acknowledgedTranscriptDigests = cs.acknowledgedTranscriptDigests }
+                if !cs.acknowledgedScheduleDigests.isEmpty { initialState.acknowledgedScheduleDigests = cs.acknowledgedScheduleDigests }
+            }
+            initialState.workspaceDoc.restoreCloudTranscriptIndex(cs.cloudTranscriptIndex)
+        }
         let initialMetaDigest: String?
-        if let stored, !stored.migratedFromLegacyFormat, stored.workspaceDoc.transcriptChunks.isEmpty {
+        if let stored, !stored.migratedFromLegacyFormat, stored.workspaceDoc.transcriptChunks.isEmpty, !hasInlineCursors {
             initialMetaDigest = SyncRecordDigest.sha256(stored)
         } else {
             initialMetaDigest = nil
@@ -307,11 +348,29 @@ final class MacWorkspaceSyncCoordinator: ObservableObject {
         self.replica = initialState
         let diskState = OSAllocatedUnfairLock(initialState: ReplicaDiskState(
             metaDigest: initialMetaDigest,
+            cursorsDigest: cursorSidecar.digest,
             chunkDigests: sidecar.digests
         ))
         self.replicaWriter = MacWorkspaceReplicaWriter(persisted: nil, debounce: .seconds(2)) { snapshot in
+            let cursors = WorkspaceSyncCursorState(
+                libraryToken: snapshot.state.libraryToken,
+                transcriptToken: snapshot.state.transcriptToken,
+                scheduleToken: snapshot.state.scheduleToken,
+                zoneGenerations: snapshot.state.zoneGenerations,
+                acknowledgedLibraryDigests: snapshot.state.acknowledgedLibraryDigests,
+                acknowledgedTranscriptDigests: snapshot.state.acknowledgedTranscriptDigests,
+                acknowledgedScheduleDigests: snapshot.state.acknowledgedScheduleDigests,
+                cloudTranscriptIndex: snapshot.state.workspaceDoc.cloudTranscriptIndex
+            )
             var metadata = snapshot.state
-            metadata.workspaceDoc = metadata.workspaceDoc.withoutTranscriptChunks()
+            metadata.workspaceDoc = metadata.workspaceDoc.withoutSyncSidecars()
+            metadata.libraryToken = nil
+            metadata.transcriptToken = nil
+            metadata.scheduleToken = nil
+            metadata.zoneGenerations = [:]
+            metadata.acknowledgedLibraryDigests = [:]
+            metadata.acknowledgedTranscriptDigests = [:]
+            metadata.acknowledgedScheduleDigests = [:]
             let metadataData = try SyncRecordDigest.makeCanonicalEncoder().encode(metadata)
             let metaDigest = SyncRecordDigest.sha256(metadataData)
             var state = diskState.withLock { $0 }
@@ -320,6 +379,11 @@ final class MacWorkspaceSyncCoordinator: ObservableObject {
                 try metadataData.write(to: replicaURL, options: .atomic)
                 state.metaDigest = metaDigest
             }
+            try WorkspaceSyncCursorSidecar.sync(
+                cursors,
+                persistedDigest: &state.cursorsDigest,
+                to: cursorsURL
+            )
             try WorkspaceTranscriptChunkSidecar.sync(
                 chunks: snapshot.state.workspaceDoc.transcriptChunks,
                 persistedDigests: &state.chunkDigests,
@@ -774,9 +838,10 @@ final class MacWorkspaceSyncCoordinator: ObservableObject {
             observeAssistantPref(attentionStore.$lastBoardURL)
         }
 
-        meetingLibrary.workspaceJournal.$sessions.removeDuplicates().dropFirst().sink { [weak self] _ in
+        meetingLibrary.workspaceJournal.$sessions.removeDuplicates().dropFirst().sink { [weak self] sessions in
             guard let self, !self.applyingRemoteTranscript else { return }
-            self.scheduleSync()
+            let hasLiveCall = sessions.contains { $0.endedAt == nil }
+            self.scheduleSync(delayMilliseconds: hasLiveCall ? 5_000 : 2_000)
         }.store(in: &cancellables)
 
         if let calendar {
@@ -949,11 +1014,12 @@ final class MacWorkspaceSyncCoordinator: ObservableObject {
         for redirect in redirects {
             report.changedSessions.formUnion([redirect.winner, redirect.loser])
         }
-        replica.pendingHistoryApply = report.changedSessions
         guard !report.changedSessions.isEmpty else {
+            replica.pendingHistoryApply = nil
             persistReplica()
             return
         }
+        replica.pendingHistoryApply = report.changedSessions
         try await persistReplicaCheckpoint()
         guard !report.changedSessions.contains(where: { notes.draft(sessionID: $0)?.isDirty == true }) else {
             throw DeferredHistoryMerge.unsavedNotes
@@ -1017,7 +1083,7 @@ final class MacWorkspaceSyncCoordinator: ObservableObject {
         }
 
         let requiresApply = !report.changedSessions.isEmpty || !report.changedTaskIDs.isEmpty ||
-            !report.changedProfileIDs.isEmpty || !report.changedSettingsKeys.isEmpty || !changes.records.isEmpty
+            !report.changedProfileIDs.isEmpty || !report.changedSettingsKeys.isEmpty
         if requiresApply {
             replica.pendingCloudSessions = report.changedSessions
             replica.pendingCloudSettings = report.changedSettingsKeys
