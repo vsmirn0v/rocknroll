@@ -57,7 +57,7 @@ final class NativeScreenSender {
                 },
                 onSelection: { _ in },
                 onEnd: { [weak self] message in self?.onEnd(message) },
-                onError: { [weak self] message in self?.onEnd(message) }
+                onError: { _ in }
             ) else {
                 throw IOSNativeScreenCaptureUnavailableError()
             }

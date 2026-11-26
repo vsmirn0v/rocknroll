@@ -781,6 +781,35 @@ import XCTest
         ok(await owner.shutdown())
     }
 
+    func testSpontaneousStopDuringActivationAbortsUnmuteAndKeepsRebuilding() async throws {
+        let (engine, module) = make()
+        let meeting = try await engine.attach(meetingID: UUID())
+        let sender = FakeSender()
+        meeting.addSender(sender)
+        ok(await meeting.assumeTalk())
+
+        // A spontaneous .stopped arriving during activateMicrophone must abort unmute and preserve rebuilding.
+        module.onActivate = {
+            _ = engine.engineChanged(.stopped)
+        }
+        no(await meeting.setMuted(false), "Spontaneous stop mid-activation must abort unmute")
+        await engine.waitForWork()
+        XCTAssertFalse(sender.isEnabled)
+        XCTAssertTrue(module.muted)
+        XCTAssertTrue(engine.rebuilding)
+
+        // Even if rebuilding was already true, another .stopped during activation still aborts unmute.
+        module.onActivate = {
+            _ = engine.engineChanged(.stopped)
+        }
+        no(await meeting.setMuted(false), "Second spontaneous stop mid-activation must also abort unmute")
+        await engine.waitForWork()
+        XCTAssertFalse(sender.isEnabled)
+        XCTAssertTrue(module.muted)
+        XCTAssertTrue(engine.rebuilding)
+        _ = await meeting.detach()
+    }
+
     private func ok(_ value: Bool, _ message: String = "", file: StaticString = #filePath, line: UInt = #line) {
         XCTAssertTrue(value, message, file: file, line: line)
     }
@@ -810,6 +839,7 @@ private final class DiagnosticSender: MeetingAudioSender {
     var unmutes = 0, replies = 0
     var failUnmute = false, failActivation = false, failShutdown = false, failRecover = false
     var onUnmute: (() -> Void)?
+    var onActivate: (() -> Void)?
     var onRecover: (() -> Void)?
     var participationGraph: GuestVoiceReplyGraph?
     private var sink: ((AVAudioPCMBuffer) -> Void)?
@@ -828,7 +858,7 @@ private final class DiagnosticSender: MeetingAudioSender {
         muted = true; return true
     }
     func activateMicrophone(timeout: TimeInterval?) async -> Bool {
-        log.append("activate"); guard !failActivation, permitted else { return false }; active = true; return true
+        log.append("activate"); onActivate?(); guard !failActivation, permitted else { return false }; active = true; return true
     }
     func setMicrophoneMuted(_ muted: Bool, timeout: TimeInterval) async -> Bool {
         log.append("mute:\(muted)")

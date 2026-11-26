@@ -113,6 +113,8 @@ final class CameraQualityMonitor {
 /// never enter this policy; runtime support governs background camera access.
 enum CameraBackgroundAccess {
     @discardableResult static func configure(_ session: AVCaptureSession) -> Bool {
+        session.beginConfiguration()
+        defer { session.commitConfiguration() }
         for output in session.outputs.compactMap({ $0 as? AVCaptureVideoDataOutput }) {
             output.alwaysDiscardsLateVideoFrames = true
         }

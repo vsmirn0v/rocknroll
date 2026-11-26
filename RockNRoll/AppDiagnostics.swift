@@ -76,6 +76,22 @@ enum AppDiagnostics {
                               (UIApplication.didReceiveMemoryWarningNotification, "memory-warning")] {
             observers.append(center.addObserver(forName: name, object: nil, queue: nil) { _ in log(event) })
         }
+        observers.append(center.addObserver(forName: AVCaptureSession.wasInterruptedNotification, object: nil, queue: observerQueue) { note in
+            var fields: [String: Any] = [:]
+            if let reason = note.userInfo?[AVCaptureSessionInterruptionReasonKey] as? Int {
+                fields["reason"] = reason
+            }
+            if let session = note.object as? AVCaptureSession {
+                #if os(iOS) && !targetEnvironment(macCatalyst)
+                fields["multitaskingSupported"] = session.isMultitaskingCameraAccessSupported
+                fields["multitaskingEnabled"] = session.isMultitaskingCameraAccessEnabled
+                #endif
+            }
+            log("camera-interrupted", fields)
+        })
+        observers.append(center.addObserver(forName: AVCaptureSession.interruptionEndedNotification, object: nil, queue: observerQueue) { _ in
+            log("camera-interruption-ended")
+        })
         pathMonitor.pathUpdateHandler = { path in
             let summary = network(path)
             lock.lock()

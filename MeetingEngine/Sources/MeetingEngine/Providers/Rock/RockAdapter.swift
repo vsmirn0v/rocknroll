@@ -628,9 +628,26 @@ import LiveKitWebRTC
         }
     }
 
+    private static func configureMultitaskingCameraAccess(for capturer: CameraCapturer) {
+        #if os(iOS) && !targetEnvironment(macCatalyst)
+        let session = capturer.captureSession
+        session.beginConfiguration()
+        defer { session.commitConfiguration() }
+        for output in session.outputs.compactMap({ $0 as? AVCaptureVideoDataOutput }) {
+            output.alwaysDiscardsLateVideoFrames = true
+        }
+        guard session.isMultitaskingCameraAccessSupported else { return }
+        if !session.isMultitaskingCameraAccessEnabled, !session.isRunning {
+            session.isMultitaskingCameraAccessEnabled = true
+        }
+        #else
+        _ = capturer
+        #endif
+    }
+
     func setCamera(_ enabled: Bool) async throws {
         let room = try connectedRoom(), token = revision
-        var options: CameraCaptureOptions?
+        let publishOptions = VideoPublishOptions(preferredCodec: .h264)
         if enabled {
             guard try await GuestCaptureAuthorization.request(.video) else { throw GuestCameraError.permissionDenied }
             guard revision == token, self.room === room else { throw NativeDesktopRockError.staleOperation }
@@ -639,7 +656,7 @@ import LiveKitWebRTC
             let devices = try await CameraCapturer.captureDevices()
             guard revision == token, self.room === room else { throw NativeDesktopRockError.staleOperation }
             try Task.checkCancellation()
-            options = try await Task.detached(priority: .userInitiated) {
+            let options = try await Task.detached(priority: .userInitiated) {
                 let device = selectedID.isEmpty ? AVCaptureDevice.default(for: .video) : devices.first { $0.uniqueID == selectedID }
                 guard let device else { throw NativeDesktopRockError.cameraUnavailable }
                 let format = device.activeFormat
@@ -652,18 +669,44 @@ import LiveKitWebRTC
             }.value
             guard revision == token, self.room === room else { throw NativeDesktopRockError.staleOperation }
             try Task.checkCancellation()
-            if let options,
-               let track = room.localParticipant.videoTracks.first(where: { $0.source == .camera })?.track as? LocalVideoTrack,
-               let capturer = track.capturer as? CameraCapturer, !capturer.options.isEqual(options) {
-                try await capturer.set(options: options)
+            if let existing = room.localParticipant.videoTracks.first(where: { $0.source == .camera }) {
+                if let track = existing.track as? LocalVideoTrack,
+                   let capturer = track.capturer as? CameraCapturer {
+                    Self.configureMultitaskingCameraAccess(for: capturer)
+                    if !capturer.options.isEqual(options) {
+                        try await capturer.set(options: options)
+                    }
+                }
+                guard revision == token, self.room === room else { throw NativeDesktopRockError.staleOperation }
+                try Task.checkCancellation()
+                cameraIntent = true
+                _ = try await room.localParticipant.setCamera(enabled: true,
+                    captureOptions: options,
+                    publishOptions: publishOptions)
+            } else {
+                let track = await LocalVideoTrack.createCameraTrack(options: options, reportStatistics: collectStatistics)
+                guard revision == token, self.room === room else { throw NativeDesktopRockError.staleOperation }
+                try Task.checkCancellation()
+                if let capturer = track.capturer as? CameraCapturer {
+                    Self.configureMultitaskingCameraAccess(for: capturer)
+                }
+                cameraIntent = true
+                let publication = try await room.localParticipant.publish(videoTrack: track, options: publishOptions)
+                if Task.isCancelled {
+                    Task { try? await room.localParticipant.unpublish(publication: publication) }
+                    throw CancellationError()
+                }
+                if revision != token || self.room !== room || !cameraIntent {
+                    try? await room.localParticipant.unpublish(publication: publication)
+                    throw NativeDesktopRockError.staleOperation
+                }
             }
-            guard revision == token, self.room === room else { throw NativeDesktopRockError.staleOperation }
-            try Task.checkCancellation()
+        } else {
+            cameraIntent = false
+            _ = try await room.localParticipant.setCamera(enabled: false,
+                captureOptions: nil,
+                publishOptions: publishOptions)
         }
-        cameraIntent = enabled
-        _ = try await room.localParticipant.setCamera(enabled: enabled,
-            captureOptions: options,
-            publishOptions: VideoPublishOptions(preferredCodec: .h264))
         guard revision == token, self.room === room else { throw NativeDesktopRockError.staleOperation }
         refresh(room)
     }

@@ -203,6 +203,11 @@ final class IOSCameraCapture: NSObject, GuestCameraCapture, LKRTCVideoCapturerDe
 
             let newCapturer = LKRTCCameraVideoCapturer(delegate: self)
             let multitasking = CameraBackgroundAccess.configure(newCapturer.captureSession)
+            AppDiagnostics.log("camera-capture-start", [
+                "multitaskingSupported": newCapturer.captureSession.isMultitaskingCameraAccessSupported,
+                "multitaskingEnabled": multitasking,
+                "fps": fps
+            ])
             let dimensions = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
             let clamped = Self.boundedDimensions(dimensions, maxWidth: 1280, maxHeight: 720)
             source.adaptOutputFormat(toWidth: clamped.width, height: clamped.height, fps: Int32(fps))
@@ -306,6 +311,11 @@ final class IOSCameraCapture: NSObject, GuestCameraCapture, LKRTCVideoCapturerDe
 
         let newCapturer = LKRTCCameraVideoCapturer(delegate: self)
         let multitasking = CameraBackgroundAccess.configure(newCapturer.captureSession)
+        AppDiagnostics.log("camera-capture-start", [
+            "multitaskingSupported": newCapturer.captureSession.isMultitaskingCameraAccessSupported,
+            "multitaskingEnabled": multitasking,
+            "fps": fps
+        ])
         let dimensions = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
         let clamped = Self.boundedDimensions(dimensions, maxWidth: 1280, maxHeight: 720)
         source.adaptOutputFormat(toWidth: clamped.width, height: clamped.height, fps: Int32(fps))

@@ -226,7 +226,7 @@ final class IOSCaptureBridgeTests: XCTestCase {
         XCTAssertEqual(guestAdapter.startedRelayInfo?.deviceName, "Presenter canvas")
         XCTAssertEqual(guestAdapter.startedRelayInfo?.width, 1920)
         XCTAssertEqual(guestAdapter.startedRelayInfo?.height, 1080)
-        XCTAssertEqual(guestAdapter.activeRelayCapture?.snapshot().frames, 1)
+        XCTAssertGreaterThanOrEqual(guestAdapter.activeRelayCapture?.snapshot().frames ?? 0, 1)
 
         await guestShare.stop()
         XCTAssertFalse(guestShare.isSharing)

@@ -70,4 +70,14 @@ final class CameraOutputTests: XCTestCase {
         XCTAssertEqual(session.isMultitaskingCameraAccessEnabled, supported)
         XCTAssertFalse(session.isRunning)
     }
+
+    @MainActor func testAppInfoPlistDeclaresBackgroundCameraAndScreenCaptureModes() throws {
+        let modes = try XCTUnwrap(
+            Bundle(for: ConferenceModel.self).object(forInfoDictionaryKey: "UIBackgroundModes") as? [String],
+            "RockNRoll Info.plist must declare UIBackgroundModes"
+        )
+        XCTAssertTrue(modes.contains("audio"))
+        XCTAssertTrue(modes.contains("voip"), "voip background mode is required for iPhone multitasking camera access")
+        XCTAssertTrue(modes.contains("screen-capture"), "screen-capture background mode is required for ScreenCaptureKit background sharing")
+    }
 }

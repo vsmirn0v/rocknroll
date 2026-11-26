@@ -32,7 +32,7 @@
 		</dict>
 	</array>
 	<key>CFBundleVersion</key>
-	<string>172</string>
+	<string>173</string>
 	<key>ITSAppUsesNonExemptEncryption</key>
 	<false/>
 	<key>JoinLinkHost</key>
@@ -94,6 +94,8 @@
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>audio</string>
+		<string>voip</string>
+		<string>screen-capture</string>
 		<string>remote-notification</string>
 	</array>
 	<key>UILaunchScreen</key>

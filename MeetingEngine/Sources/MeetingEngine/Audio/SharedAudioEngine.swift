@@ -194,6 +194,7 @@ public enum SharedAudioEngineError: LocalizedError, Equatable {
     public private(set) var talkUnmuted = false
     /// Between an engine stop the app did not ask for and the next start (guarantee 9).
     public private(set) var rebuilding = false
+    private var rebuildEpoch: UInt64 = 0
     private var pendingRebuildStart = false
     public private(set) var recoveries = 0
     public private(set) var silentInputRecoveries = 0
@@ -552,6 +553,7 @@ public enum SharedAudioEngineError: LocalizedError, Equatable {
     @discardableResult public func engineChanged(_ change: GuestEngineChange) -> Task<Bool, Never>? {
         switch change {
         case .stopped:
+            rebuildEpoch &+= 1
             guard !rebuilding else { return nil }
             rebuilding = true
             pendingRebuildStart = false
@@ -895,17 +897,22 @@ public enum SharedAudioEngineError: LocalizedError, Equatable {
 
     /// Every other sender off, input active, then this meeting's senders and the module.
     private func unmuteLocked(_ attachment: MeetingAudioAttachment, module: SharedAudioModule, epoch: UInt64) async -> Bool {
+        let stopEpoch = rebuildEpoch
         for other in attachments.values where other !== attachment { other.disableSenders() }
         guard attachments.values.allSatisfy({ $0 === attachment || !$0.anySenderEnabled }) else { return false }
         guard await module.activateMicrophone(timeout: timeouts.activation) else { return false }
-        // Still the attached talk meeting at the same epoch and not rebuilding after activation.
+        // Still the attached talk meeting at the same epoch with no new spontaneous stop during activation.
         guard talkMeetingID == attachment.meetingID,
               epoch == talkEpoch,
               attachments[attachment.meetingID] === attachment,
-              !rebuilding else { return false }
+              rebuildEpoch == stopEpoch else { return false }
         attachment.enableSenders()
         muteConfirmed = false
-        guard await module.setMicrophoneMuted(false, timeout: timeouts.mute) else {
+        guard await module.setMicrophoneMuted(false, timeout: timeouts.mute),
+              talkMeetingID == attachment.meetingID,
+              epoch == talkEpoch,
+              attachments[attachment.meetingID] === attachment,
+              rebuildEpoch == stopEpoch else {
             attachment.disableSenders(); module.suppressMicrophone(); moduleMuted = true
             return false
         }

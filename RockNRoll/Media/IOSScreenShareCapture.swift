@@ -322,12 +322,19 @@ private final class IOSNativeScreenCapture: NSObject, PresenterScreenSource, SCS
     }
 
     nonisolated func stream(_ stream: SCStream, didStopWithError error: Error) {
+        let ns = error as NSError
+        let isUserStopped = ns.domain == SCStreamErrorDomain && ns.code == SCStreamError.Code.userStopped.rawValue
+        AppDiagnostics.log("screen-share-stream-stopped", [
+            "errorDomain": ns.domain,
+            "errorCode": ns.code,
+            "userStopped": isUserStopped
+        ])
         Task { @MainActor [weak self] in
             guard let self, self.stream === stream else { return }
             let retirementGeneration = self.generation + 1
             await self.stop()
             guard self.generation == retirementGeneration else { return }
-            if (error as NSError).code != SCStreamError.Code.userStopped.rawValue {
+            if !isUserStopped {
                 let message = L("Screen sharing stopped: %@", error.localizedDescription)
                 self.onError(message)
                 self.onEnd(message)
