@@ -205,24 +205,52 @@ final class CallPresentationTests: XCTestCase {
         XCTAssertEqual(focusedName(call.view), "Person 0", "Following speaker must clear the browsing cursor")
     }
 
-    func testEmptyStageShowsRecoveryUntilConferenceReturns() {
-        let call = RockCallViewController(title: "Meeting", catchUp: CatchUpStore(), chat: ChatStore())
+    func testEmptyStageShowsRecoveryUntilConferenceReturns() throws {
+        let invitation = URL(string: "https://salutejazz.ru/calls/recovery-ios?psw=secret")!
+        let call = RockCallViewController(
+            title: "Meeting",
+            catchUp: CatchUpStore(),
+            chat: ChatStore(),
+            invitationURL: invitation,
+            roomIdentifier: "recovery-ios",
+            invitationCopiedOnJoin: true
+        )
         call.loadViewIfNeeded()
+        call.view.frame = CGRect(x: 0, y: 0, width: 390, height: 844)
         let snapshot = CallMediaSnapshot(participants: [])
         let recoveryMessage = L("Restoring meeting media…")
         let waitingMessage = L("You're connected. Waiting for others.")
 
         call.setConnectionRecovering(true)
         call.render(snapshot: snapshot)
-        var labels = descendants(call.view).compactMap { ($0 as? UILabel)?.text }
+        call.view.layoutIfNeeded()
+        var allViews = descendants(call.view)
+        var labels = allViews.compactMap { ($0 as? UILabel)?.text }
+        var buttonTitles = allViews.compactMap { $0 as? UIButton }.compactMap { $0.configuration?.title ?? $0.currentTitle }
         XCTAssertTrue(labels.contains(recoveryMessage))
         XCTAssertFalse(labels.contains(waitingMessage))
+        XCTAssertTrue(allViews.contains { $0.accessibilityIdentifier == "call.waiting-card" })
+        let reconnectingDot = try XCTUnwrap(allViews.first { $0.accessibilityIdentifier == "waiting.status-dot" })
+        XCTAssertEqual(reconnectingDot.backgroundColor, .systemOrange)
+        XCTAssertFalse(labels.contains("salutejazz.ru/calls/recovery-ios"))
+        XCTAssertFalse(labels.contains(L("Link copied · Ready to paste")))
+        XCTAssertFalse(allViews.contains { $0.accessibilityIdentifier == "waiting.copied-badge" })
+        XCTAssertFalse(buttonTitles.contains(L("Invite musicians")))
+        XCTAssertFalse(buttonTitles.contains(L("Copy link")))
 
         call.setConnectionRecovering(false)
         call.render(snapshot: snapshot)
-        labels = descendants(call.view).compactMap { ($0 as? UILabel)?.text }
+        call.view.layoutIfNeeded()
+        allViews = descendants(call.view)
+        labels = allViews.compactMap { ($0 as? UILabel)?.text }
+        buttonTitles = allViews.compactMap { $0 as? UIButton }.compactMap { $0.configuration?.title ?? $0.currentTitle }
         XCTAssertFalse(labels.contains(recoveryMessage))
         XCTAssertTrue(labels.contains(waitingMessage))
+        let connectedDot = try XCTUnwrap(allViews.first { $0.accessibilityIdentifier == "waiting.status-dot" })
+        XCTAssertEqual(connectedDot.backgroundColor, .systemGreen)
+        XCTAssertTrue(labels.contains("salutejazz.ru/calls/recovery-ios"))
+        XCTAssertTrue(buttonTitles.contains(L("Invite musicians")))
+        XCTAssertTrue(buttonTitles.contains(L("Copy link")))
     }
 
     func testReconnectingWithPreservedParticipantsKeepsTilesShowsReconnectingCountAndHidesWaitingCard() throws {
@@ -239,22 +267,63 @@ final class CallPresentationTests: XCTestCase {
         call.view.frame = CGRect(x: 0, y: 0, width: 390, height: 844)
 
         let emptySnapshot = CallMediaSnapshot(participants: [])
+        call.setStagePhase(.idle)
+        call.render(snapshot: emptySnapshot)
+        call.view.layoutIfNeeded()
+        var allViews = descendants(call.view)
+        var labels = allViews.compactMap { ($0 as? UILabel)?.text }
+        var buttonTitles = allViews.compactMap { $0 as? UIButton }.compactMap { $0.configuration?.title ?? $0.currentTitle }
+        XCTAssertTrue(labels.contains(L("Connecting…")))
+        XCTAssertFalse(labels.contains(L("You're connected. Waiting for others.")))
+        XCTAssertTrue(labels.contains("salutejazz.ru/calls/daily-ios"))
+        XCTAssertTrue(buttonTitles.contains(L("Invite musicians")))
+        XCTAssertTrue(buttonTitles.contains(L("Copy link")))
+        XCTAssertEqual(allViews.first { $0.accessibilityIdentifier == "waiting.status-dot" }?.backgroundColor, .systemOrange)
+
         call.setStagePhase(.connecting)
         call.render(snapshot: emptySnapshot)
         call.view.layoutIfNeeded()
-        var labels = descendants(call.view).compactMap { ($0 as? UILabel)?.text }
-        var buttonTitles = descendants(call.view).compactMap { $0 as? UIButton }.compactMap { $0.configuration?.title ?? $0.currentTitle }
+        allViews = descendants(call.view)
+        labels = allViews.compactMap { ($0 as? UILabel)?.text }
+        let buttons = allViews.compactMap { $0 as? UIButton }
+        buttonTitles = buttons.compactMap { $0.configuration?.title ?? $0.currentTitle }
         XCTAssertTrue(labels.contains(L("Connecting…")))
         XCTAssertFalse(labels.contains(L("You're connected. Waiting for others.")))
-        XCTAssertFalse(buttonTitles.contains(L("Invite musicians")))
+        XCTAssertTrue(labels.contains("salutejazz.ru/calls/daily-ios"))
+        XCTAssertTrue(labels.contains(L("Link copied · Ready to paste")))
+        XCTAssertTrue(buttonTitles.contains(L("Invite musicians")))
+        XCTAssertTrue(buttonTitles.contains(L("Copy link")))
+        let connectingDot = try XCTUnwrap(allViews.first { $0.accessibilityIdentifier == "waiting.status-dot" })
+        XCTAssertEqual(connectingDot.backgroundColor, .systemOrange)
 
-        call.setStagePhase(.lobby, lobbyMessage: L("Waiting for the host to admit you…"))
+        let toast = try XCTUnwrap(allViews.first { $0.accessibilityIdentifier == "call.copied-link-toast" })
+        XCTAssertTrue(toast.isHidden)
+        let copyButton = try XCTUnwrap(buttons.first { ($0.configuration?.title ?? $0.currentTitle) == L("Copy link") })
+        copyButton.sendActions(for: .touchUpInside)
+        XCTAssertEqual(UIPasteboard.general.url, invitation)
+        XCTAssertFalse(toast.isHidden)
+
+        call.setStagePhase(.lobby, lobbyMessage: "   ")
         call.view.layoutIfNeeded()
-        labels = descendants(call.view).compactMap { ($0 as? UILabel)?.text }
+        allViews = descendants(call.view)
+        labels = allViews.compactMap { ($0 as? UILabel)?.text }
+        buttonTitles = allViews.compactMap { $0 as? UIButton }.compactMap { $0.configuration?.title ?? $0.currentTitle }
         XCTAssertTrue(labels.contains(L("Waiting for the host to admit you…")))
         XCTAssertFalse(labels.contains(L("You're connected. Waiting for others.")))
+        XCTAssertTrue(labels.contains("salutejazz.ru/calls/daily-ios"))
+        XCTAssertTrue(buttonTitles.contains(L("Invite musicians")))
+        XCTAssertTrue(buttonTitles.contains(L("Copy link")))
+        let lobbyDot = try XCTUnwrap(allViews.first { $0.accessibilityIdentifier == "waiting.status-dot" })
+        XCTAssertEqual(lobbyDot.backgroundColor, .systemOrange)
 
         call.setStagePhase(.connected)
+        call.view.layoutIfNeeded()
+        allViews = descendants(call.view)
+        labels = allViews.compactMap { ($0 as? UILabel)?.text }
+        XCTAssertTrue(labels.contains(L("You're connected. Waiting for others.")))
+        let connectedDot = try XCTUnwrap(allViews.first { $0.accessibilityIdentifier == "waiting.status-dot" })
+        XCTAssertEqual(connectedDot.backgroundColor, .systemGreen)
+
         let populated = CallMediaSnapshot(participants: [
             .init(id: "local", name: "Vitalii", isLocal: true, microphoneOn: false, cameraOn: false, screenShareOn: false, isSpeaking: false, videoTracks: []),
             .init(id: "alex", name: "Alex", isLocal: false, microphoneOn: true, cameraOn: false, screenShareOn: false, isSpeaking: true, videoTracks: [])
@@ -265,10 +334,12 @@ final class CallPresentationTests: XCTestCase {
 
         let tiles = try XCTUnwrap(descendants(call.view).compactMap { $0 as? CallTileContainer }.first)
         XCTAssertEqual(tiles.arrangedSubviews.map(\.accessibilityIdentifier), ["camera-off.local", "camera-off.alex"])
-        labels = descendants(call.view).compactMap { ($0 as? UILabel)?.text }
-        buttonTitles = descendants(call.view).compactMap { $0 as? UIButton }.compactMap { $0.configuration?.title ?? $0.currentTitle }
+        allViews = descendants(call.view)
+        labels = allViews.compactMap { ($0 as? UILabel)?.text }
+        buttonTitles = allViews.compactMap { $0 as? UIButton }.compactMap { $0.configuration?.title ?? $0.currentTitle }
         XCTAssertTrue(labels.contains { $0.hasPrefix(L("Reconnecting…")) && $0.contains(L("%ld musicians", 2)) })
         XCTAssertFalse(labels.contains(L("You're connected. Waiting for others.")))
+        XCTAssertFalse(allViews.contains { $0.accessibilityIdentifier == "call.waiting-card" })
         XCTAssertFalse(buttonTitles.contains(L("Invite musicians")))
     }
 

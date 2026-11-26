@@ -1823,11 +1823,11 @@ final class RockCallViewController: UIViewController, UIScrollViewDelegate, UICo
             if !pin.isScreenShare { layoutMode = .grid }
         }
         let identifier = workspace.roomIdentifier.map { " · \($0)" } ?? ""
-        if preservingPinDuringReconnect {
+        if preservingPinDuringReconnect || stagePhase == .reconnecting {
             countLabel.text = snapshot.remoteParticipants.isEmpty
                 ? L("Reconnecting…")
                 : L("Reconnecting…") + " · " + L("%ld musicians", participants.count) + identifier
-        } else if stagePhase == .connecting && snapshot.remoteParticipants.isEmpty {
+        } else if (stagePhase == .connecting || stagePhase == .idle) && snapshot.remoteParticipants.isEmpty {
             countLabel.text = L("Connecting…")
         } else if stagePhase == .lobby && snapshot.remoteParticipants.isEmpty {
             countLabel.text = L("Waiting for host…")
@@ -1955,32 +1955,20 @@ final class RockCallViewController: UIViewController, UIScrollViewDelegate, UICo
                 }
             }
         }
-        if preservingPinDuringReconnect {
+        if preservingPinDuringReconnect || stagePhase == .reconnecting {
             if tiles.arrangedSubviews.isEmpty {
-                let status = UILabel()
-                status.text = L("Restoring meeting media…")
-                status.textColor = .lightGray
-                status.textAlignment = .center
-                status.numberOfLines = 0
-                tiles.addArrangedSubview(status)
+                tiles.addArrangedSubview(waitingRoomView(state: .reconnecting))
             }
-        } else if stagePhase == .connecting || stagePhase == .lobby {
+        } else if stagePhase == .connecting || stagePhase == .idle || stagePhase == .lobby {
             if tiles.arrangedSubviews.isEmpty {
-                let status = UILabel()
-                status.text = stagePhase == .lobby
-                    ? (stageLobbyMessage ?? L("Waiting for the host to admit you…"))
-                    : L("Connecting…")
-                status.textColor = .lightGray
-                status.textAlignment = .center
-                status.numberOfLines = 0
-                tiles.addArrangedSubview(status)
+                tiles.addArrangedSubview(waitingRoomView(state: stagePhase == .lobby ? .lobby(stageLobbyMessage) : .connecting))
             }
         } else if displayMode == .screenShares && tiles.arrangedSubviews.isEmpty {
             let empty = UILabel(); empty.text = L("No screen share is live. Audio continues.")
             empty.textColor = .lightGray; empty.textAlignment = .center; empty.numberOfLines = 0
             tiles.addArrangedSubview(empty)
         } else if snapshot.remoteParticipants.isEmpty && streams.isEmpty && displayMode == .all {
-            tiles.addArrangedSubview(waitingRoomView())
+            tiles.addArrangedSubview(waitingRoomView(state: .connected))
         }
         participantsPanel?.update(participants.map(\.status), pinnedKey: pinnedStreamKey)
         tiles.arrange(size: streamScroll.bounds.size, mode: effectiveLayoutMode)
@@ -2112,9 +2100,51 @@ final class RockCallViewController: UIViewController, UIScrollViewDelegate, UICo
         }
     }
 
-    private func waitingRoomView() -> UIView {
+    private enum WaitingCardState {
+        case connecting
+        case lobby(String?)
+        case reconnecting
+        case connected
+
+        var title: String {
+            switch self {
+            case .connecting:
+                return L("Connecting…")
+            case .lobby(let message):
+                if let trimmed = message?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty {
+                    return trimmed
+                }
+                return L("Waiting for the host to admit you…")
+            case .reconnecting:
+                return L("Restoring meeting media…")
+            case .connected:
+                return L("You're connected. Waiting for others.")
+            }
+        }
+
+        var statusColor: UIColor {
+            switch self {
+            case .connected:
+                return .systemGreen
+            case .connecting, .lobby, .reconnecting:
+                return .systemOrange
+            }
+        }
+
+        var showsInvitationControls: Bool {
+            switch self {
+            case .connecting, .lobby, .connected:
+                return true
+            case .reconnecting:
+                return false
+            }
+        }
+    }
+
+    private func waitingRoomView(state: WaitingCardState) -> UIView {
         let view = UIView()
         let card = UIView()
+        card.accessibilityIdentifier = "call.waiting-card"
         card.layer.cornerRadius = 24
         card.layer.cornerCurve = .continuous
         card.layer.borderWidth = 1
@@ -2127,20 +2157,44 @@ final class RockCallViewController: UIViewController, UIScrollViewDelegate, UICo
         surface.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         card.addSubview(surface)
 
+        let statusDot = UIView()
+        statusDot.backgroundColor = state.statusColor
+        statusDot.layer.cornerRadius = 4
+        statusDot.isAccessibilityElement = false
+        statusDot.accessibilityIdentifier = "waiting.status-dot"
+        statusDot.translatesAutoresizingMaskIntoConstraints = false
+        statusDot.setContentHuggingPriority(.required, for: .horizontal)
+        statusDot.setContentCompressionResistancePriority(.required, for: .horizontal)
+        NSLayoutConstraint.activate([
+            statusDot.widthAnchor.constraint(equalToConstant: 8),
+            statusDot.heightAnchor.constraint(equalToConstant: 8)
+        ])
+
         let title = UILabel()
-        title.text = L("You're connected. Waiting for others.")
+        title.text = state.title
         title.textColor = .white
         title.font = .preferredFont(forTextStyle: .title3)
         title.adjustsFontForContentSizeCategory = true
         title.numberOfLines = 0
         title.textAlignment = .center
+        title.setContentCompressionResistancePriority(.required, for: .vertical)
 
-        let column = UIStackView(arrangedSubviews: [title])
+        let titleRow = UIStackView(arrangedSubviews: [statusDot, title])
+        titleRow.axis = .horizontal
+        titleRow.alignment = .center
+        titleRow.spacing = 8
+
+        let titleWrapper = UIStackView(arrangedSubviews: [titleRow])
+        titleWrapper.axis = .vertical
+        titleWrapper.alignment = .center
+        titleRow.widthAnchor.constraint(lessThanOrEqualTo: titleWrapper.widthAnchor).isActive = true
+
+        let column = UIStackView(arrangedSubviews: [titleWrapper])
         column.axis = .vertical
         column.alignment = .fill
         column.spacing = 10
 
-        if let url = workspace.invitationURL {
+        if state.showsInvitationControls, let url = workspace.invitationURL {
             let linkLabel = UILabel()
             let hostAndPath = (url.host() ?? "") + url.path()
             linkLabel.text = hostAndPath.isEmpty ? url.absoluteString : hostAndPath
