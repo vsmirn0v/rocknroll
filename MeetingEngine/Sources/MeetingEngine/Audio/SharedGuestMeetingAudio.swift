@@ -52,11 +52,13 @@ import LiveKitWebRTC
     func prepareAttemptHandoff(timeout: TimeInterval) async -> Bool {
         attachment.removeAllSenders()
         let muted = await attachment.setMuted(true)
-        guard attachment.isTalk else { return muted }
+        let warmInput = owner.snapshot["microphoneOptIn"] as? Bool == true
+        guard attachment.isTalk || warmInput || attachment.soundOn || attachment.transcriptionOutput else { return muted }
         return await owner.prepareAttemptHandoff(timeout: timeout) && muted
     }
     func completeAttemptHandoff(timeout: TimeInterval) async -> Bool {
-        guard attachment.isTalk else { return true }
+        let warmInput = owner.snapshot["microphoneOptIn"] as? Bool == true
+        guard attachment.isTalk || warmInput || attachment.soundOn || attachment.transcriptionOutput else { return true }
         return await owner.completeAttemptHandoff(timeout: timeout)
     }
 

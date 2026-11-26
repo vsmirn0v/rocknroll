@@ -168,6 +168,8 @@ public final class NativeGuestEngine {
     private var startupPlayoutEpoch: UUID?
     private var sharedPlayoutClosed = true
     private var startupAudioDeadline: TimeInterval?
+    private var startupObservedReceiveDemand = false
+    private var startupExtendedForViableICE = false
     private var startupReadyTopology: GuestStartupAudioObservation.Topology?
     private var startupDecision: GuestStartupAudioReport.Decision?
     private var startupConnected = false
@@ -266,7 +268,11 @@ public final class NativeGuestEngine {
         }
     }
 
-    func join(_ invitation: GuestInvitation, sessionID: String? = nil) async throws {
+    func join(_ invitation: GuestInvitation, sessionID: String?) async throws {
+        try await join(invitation, sessionID: sessionID, isRecovery: false)
+    }
+
+    func join(_ invitation: GuestInvitation, sessionID: String? = nil, isRecovery: Bool = false) async throws {
 #if DEBUG
         if let joinForTesting {
             try await joinForTesting(invitation, sessionID)
@@ -274,8 +280,14 @@ public final class NativeGuestEngine {
         }
 #endif
         LKRTCInitializeSSL()
+        let connectBudget: TimeInterval = isRecovery ? 6 : 15
+        let joinBudget: TimeInterval = isRecovery ? 6 : 10
         let tlsDelegate = SiteTLSDelegate(preferredOrigin: invitation.origin, lookup: SiteClientIdentityRegistry.shared)
-        let httpSession = SiteTLSDelegate.makeEphemeralSession(preferredOrigin: invitation.origin, lookup: SiteClientIdentityRegistry.shared)
+        let httpSession = SiteTLSDelegate.makeEphemeralSession(
+            preferredOrigin: invitation.origin,
+            lookup: SiteClientIdentityRegistry.shared,
+            timeout: connectBudget
+        )
         defer { httpSession.finishTasksAndInvalidate() }
         let bootstrap = GuestBootstrap(session: httpSession, useBoundedHTTP: true)
         var creds = await SiteAuthCoordinator.shared.validCredentials(for: invitation.origin, engine: .guest)
@@ -354,12 +366,12 @@ public final class NativeGuestEngine {
                 recordFailure(await transport.terminalError ?? GuestTransportError.closed)
             }
         }
-        try await transport.connect()
+        try await transport.connect(timeout: connectBudget)
         try checkActive()
         probeLog("transport-open", ["client": probeClient, "nativeMacOS": true, "resumingSession": sessionID != nil])
         joinAttempted = true
         do {
-            let response = try await transport.request(event: "join", payload: prepared.joinPayload)
+            let response = try await transport.request(event: "join", payload: prepared.joinPayload, timeout: connectBudget)
             try checkActive()
             if let payload = response["payload"] as? [String: Any], payload["participant"] != nil {
                 try await receive(["event": "joined", "payload": payload])
@@ -394,12 +406,12 @@ public final class NativeGuestEngine {
                     recordFailure(await anonTransport.terminalError ?? GuestTransportError.closed)
                 }
             }
-            try await anonTransport.connect()
+            try await anonTransport.connect(timeout: connectBudget)
             try checkActive()
             var anonPayload = prepared.joinPayload
             anonPayload.removeValue(forKey: "jazzToken")
             do {
-                let response = try await anonTransport.request(event: "join", payload: anonPayload)
+                let response = try await anonTransport.request(event: "join", payload: anonPayload, timeout: connectBudget)
                 try checkActive()
                 if let payload = response["payload"] as? [String: Any], payload["participant"] != nil {
                     try await receive(["event": "joined", "payload": payload])
@@ -414,7 +426,7 @@ public final class NativeGuestEngine {
             }
         }
         let lobbyDeadline = ProcessInfo.processInfo.systemUptime + 1800
-        var nonLobbyDeadline: TimeInterval? = lobbyState.inLobby ? nil : (ProcessInfo.processInfo.systemUptime + 10)
+        var nonLobbyDeadline: TimeInterval? = lobbyState.inLobby ? nil : (ProcessInfo.processInfo.systemUptime + joinBudget)
         while true {
             try checkActive()
             if let failure { throw failure }
@@ -424,7 +436,7 @@ public final class NativeGuestEngine {
                 nonLobbyDeadline = nil
                 guard now < lobbyDeadline else { throw GuestTransportError.timedOut }
             } else {
-                let deadline = nonLobbyDeadline ?? (now + 10)
+                let deadline = nonLobbyDeadline ?? (now + joinBudget)
                 nonLobbyDeadline = deadline
                 guard now < deadline else { throw GuestTransportError.timedOut }
             }
@@ -767,6 +779,7 @@ public final class NativeGuestEngine {
         expectedVideoSubscriptions = Set(activeVideoIDs.prefix(6))
         activePublicationDemand = activeAudio || !expectedVideoSubscriptions.isEmpty
         refreshSubscriberDemand()
+        if activeAudio { continueArmedStartupAudio() }
         var videoIDs = Array(activeVideoIDs.prefix(6))
         // A camera can resume RTP before the SFU's unmute snapshot arrives.
         // Keep already-subscribed muted tracks warm while gallery capacity is
@@ -912,6 +925,8 @@ public final class NativeGuestEngine {
 
     func configureStartupPlayback(sound: Bool) {
         guard !closing else { return }
+        startupObservedReceiveDemand = false
+        startupExtendedForViableICE = false
         startupPlayoutEpoch = systemAudio?.playoutEpoch
         if systemAudio?.closeSharedPlayout(expected: startupPlayoutEpoch) == false {
             sharedPlayoutClosed = false; recordFailure(GuestEngineError.disconnected); return
@@ -1101,18 +1116,29 @@ public final class NativeGuestEngine {
                             confirmTCPRelay?(peer.target)
                         }
                     }
+                    if peer.icePolicy == .tcpRelay, let stalls = delta?.stalledStreams, !stalls.isEmpty {
+                        let repeated = !stalledStreams.isDisjoint(with: stalls)
+                        stalledStreams = stalls
+                        if repeated, discardTCPRelay?(peer.target) == true {
+                            probeLog("ice-tcp-relay-withdrawn", ["target": peer.target.rawValue, "reason": "media-stall"])
+                            recordFailure(GuestPeerError.iceFailed)
+                            return
+                        }
+                    } else {
+                        stalledStreams.removeAll()
+                    }
                 } else {
                     tcpRelayEvidence[peer.target] = nil
+                    if peer.icePolicy == .automatic, peer.advertisesTCPRelay, sample.route == .udp,
+                       let stalls = delta?.stalledStreams {
+                        let repeated = !stalledStreams.isDisjoint(with: stalls)
+                        stalledStreams = stalls
+                        if repeated, scheduleTCPRelay?(peer.target) == true {
+                            recordFailure(GuestPeerError.iceFailed)
+                            return
+                        }
+                    } else { stalledStreams.removeAll() }
                 }
-                if peer.icePolicy == .automatic, peer.advertisesTCPRelay, sample.route == .udp,
-                   let stalls = delta?.stalledStreams {
-                    let repeated = !stalledStreams.isDisjoint(with: stalls)
-                    stalledStreams = stalls
-                    if repeated, scheduleTCPRelay?(peer.target) == true {
-                        recordFailure(GuestPeerError.iceFailed)
-                        return
-                    }
-                } else { stalledStreams.removeAll() }
             }
         }
     }
@@ -1179,19 +1205,47 @@ public final class NativeGuestEngine {
             guard let publication = knownPublication(source, type: "AUDIO") else { return true }
             return !publication.muted
         }
-        return .init(activePublication: active, sourceRequiresTransport: sourceRequiresTransport,
-                     transportConnected: subscriber?.transportConnected == true)
+        let transportConnected = subscriber?.transportConnected == true
+        if transportConnected {
+            startupObservedReceiveDemand = false
+        } else if active || sourceRequiresTransport {
+            startupObservedReceiveDemand = true
+        }
+        return .init(activePublication: active || (startupObservedReceiveDemand && !transportConnected),
+                     sourceRequiresTransport: sourceRequiresTransport,
+                     transportConnected: transportConnected)
     }
 
     func waitForStartupAudio() async throws {
         guard !outputSuppressed, let gain = startupPlaybackGain, !gain.isOpen, let owner = systemAudio else { return }
         if let task = startupAudioTask { try await task.value; return }
         let generation = startupAudioGeneration
-        if startupAudioDeadline == nil { startupAudioDeadline = ProcessInfo.processInfo.systemUptime + 8 }
+        if startupAudioDeadline == nil {
+            startupAudioDeadline = ProcessInfo.processInfo.systemUptime + 8
+            startupExtendedForViableICE = false
+        }
         let task = Task { @MainActor [weak self] in
             guard let self else { throw CancellationError() }
             defer { self.startupAudioTask = nil }
             var stability = GuestStartupAudioStability()
+            @MainActor func extendDeadlineForViableUDPIfEligible() async -> Bool {
+                guard !startupExtendedForViableICE,
+                      owner.startupAudioObservation.supports(input: startupRequiresInput),
+                      let subscriber, !subscriber.transportConnected else { return false }
+                let viable: Bool
+                if subscriber.iceConnected {
+                    viable = true
+                } else {
+                    viable = await subscriber.hasViableUDPCandidatePair()
+                }
+                guard viable, !closing, generation == startupAudioGeneration else { return false }
+                startupExtendedForViableICE = true
+                let extended = ProcessInfo.processInfo.systemUptime + 6
+                startupAudioDeadline = extended
+                subscriber.extendInitialDeadline(atLeast: extended)
+                probeLog("startup-audio-ice-grace", ["client": probeClient, "iceConnected": subscriber.iceConnected])
+                return true
+            }
 #if DEBUG
             @MainActor func record(_ event: String) {
                 let now = ProcessInfo.processInfo.systemUptime
@@ -1205,16 +1259,23 @@ public final class NativeGuestEngine {
             }
 #endif
             do {
-            while ProcessInfo.processInfo.systemUptime < (startupAudioDeadline ?? 0) {
+            while true {
+                if ProcessInfo.processInfo.systemUptime >= (startupAudioDeadline ?? 0) {
+                    guard await extendDeadlineForViableUDPIfEligible() else { break }
+                }
                 try checkActive()
                 guard generation == startupAudioGeneration else { throw CancellationError() }
                 if !gain.soundEnabled { startupDecision = .soundDisabled; return }
                 if !startupRequiresInput && !gain.hasSources && !startupReceiveReadiness(gain.sourceSnapshot).requiresTransport {
                     startupDecision = .noDemand; return
                 }
-                guard await GuestStartupAudioBudget.refresh(deadline: startupAudioDeadline ?? 0,
+                let refreshed = await GuestStartupAudioBudget.refresh(deadline: startupAudioDeadline ?? 0,
                     clock: { ProcessInfo.processInfo.systemUptime },
-                    read: { await owner.refreshSnapshot(timeout: $0) }) else { throw GuestStartupAudioError.timedOut }
+                    read: { await owner.refreshSnapshot(timeout: $0) })
+                if !refreshed {
+                    if await extendDeadlineForViableUDPIfEligible() { continue }
+                    throw GuestStartupAudioError.timedOut
+                }
                 try checkActive()
                 guard generation == startupAudioGeneration else { throw CancellationError() }
                 let value = owner.startupAudioObservation
@@ -1238,7 +1299,10 @@ public final class NativeGuestEngine {
                     if receive.requiresTransport && !receive.transportConnected {
                         subscriber?.logStallDiagnostics(reason: "startup-audio")
                         reportSubscriberStartupStall()
-                        subscriber?.reportICEPathFailure()
+                        let viableUDP = await subscriber?.hasViableUDPCandidatePair() ?? false
+                        if !viableUDP || subscriber?.icePolicy == .tcpRelay {
+                            subscriber?.reportICEPathFailure()
+                        }
                     }
                     let observation = owner.startupAudioObservation
                     // Off this thread and bounded: the device lock this read needs is the one
@@ -1320,6 +1384,7 @@ public final class NativeGuestEngine {
         guard startupConnected, let gain = startupPlaybackGain, !gain.isOpen, gain.soundEnabled,
               !closing, failure == nil, startupAudioTask == nil else { return }
         startupAudioDeadline = nil
+        startupExtendedForViableICE = false
         Task { @MainActor [weak self] in
             guard let self else { return }
             do {
@@ -1790,12 +1855,34 @@ public final class NativeGuestEngine {
         guard interval.isFinite, interval >= 0, interval <= 300, timeout.isFinite, timeout >= 0, timeout <= 300 else { recordFailure(GuestEngineError.malformed); return }
         lastMediaEvent = ProcessInfo.processInfo.systemUptime
         guard interval > 0 || timeout > 0 else { return }
+        let sleepSeconds = interval > 0 ? interval : min(timeout, 1)
         ping = Task { [weak self] in
+            var awaitingPostWakePong = false
             while !Task.isCancelled {
                 do {
-                    try await Task.sleep(nanoseconds: UInt64((interval > 0 ? interval : min(timeout, 1)) * 1_000_000_000))
+                    let sleepStart = ProcessInfo.processInfo.systemUptime
+                    try await Task.sleep(nanoseconds: UInt64(sleepSeconds * 1_000_000_000))
                     guard let self, !closing else { return }
-                    if timeout > 0 && ProcessInfo.processInfo.systemUptime - lastMediaEvent > timeout + 1 { throw GuestTransportError.timedOut }
+                    let now = ProcessInfo.processInfo.systemUptime
+                    let overshoot = max(0, (now - sleepStart) - sleepSeconds)
+                    if timeout > 0 && now - lastMediaEvent > timeout + 2 {
+                        // iOS background timer coalescing can delay wakeup past `timeout` before
+                        // a fresh ping is sent. Send one probe and allow a bounded reply window.
+                        if overshoot > 1.5, !awaitingPostWakePong, interval > 0 {
+                            awaitingPostWakePong = true
+                            try await media(["method": "rtc:ping", "ping_req": ["timestamp": Int64(Date().timeIntervalSince1970 * 1000), "rtt": 0]])
+                            let graceStart = lastMediaEvent
+                            try await Task.sleep(for: .seconds(3))
+                            guard !closing else { return }
+                            if lastMediaEvent <= graceStart && ProcessInfo.processInfo.systemUptime - lastMediaEvent > timeout + 2 {
+                                throw GuestTransportError.timedOut
+                            }
+                            awaitingPostWakePong = false
+                            continue
+                        }
+                        throw GuestTransportError.timedOut
+                    }
+                    awaitingPostWakePong = false
                     if interval > 0 { try await media(["method": "rtc:ping", "ping_req": ["timestamp": Int64(Date().timeIntervalSince1970 * 1000), "rtt": 0]]) }
                 } catch { if !Task.isCancelled { self?.recordFailure(error) }; return }
             }
@@ -1819,6 +1906,13 @@ public final class NativeGuestEngine {
     }
     private func recordFailure(_ error: Error) {
         guard !closing, failure == nil else { return }
+        for peer in [subscriber, publisher].compactMap({ $0 }) where peer.icePolicy == .tcpRelay {
+            if !peer.transportConnected || peer.isICEFailedOrDisconnected {
+                if discardTCPRelay?(peer.target) == true {
+                    probeLog("ice-tcp-relay-withdrawn", ["target": peer.target.rawValue, "reason": "engine-failure"])
+                }
+            }
+        }
         failure = error
         setScreenShareIntent(false)
         meetingFeatures.setConnected(false); emitMeetingChange()
@@ -1924,7 +2018,26 @@ public final class NativeGuestEngine {
         // For non-terminal recovery on the shared owner, keep the muted input graph warm
         // across peer teardown so Bluetooth HFP does not tear down and rebuild.
         let handoffAudio = !sendLeave && releaseSystemAudio != nil && cameraStopped && screenStopped
-        if handoffAudio, let systemAudio { _ = await systemAudio.prepareAttemptHandoff() }
+        if !sendLeave {
+            for peer in [subscriber, publisher].compactMap({ $0 }) where peer.icePolicy == .tcpRelay {
+                if !peer.transportConnected || peer.isICEFailedOrDisconnected {
+                    if discardTCPRelay?(peer.target) == true {
+                        probeLog("ice-tcp-relay-withdrawn", ["target": peer.target.rawValue, "reason": "recovery-cleanup"])
+                    }
+                }
+            }
+        }
+        if handoffAudio, let systemAudio {
+            _ = await systemAudio.prepareAttemptHandoff()
+        } else if sendLeave, let systemAudio {
+            // Withdraw playout intent before closing WebRTC receivers on terminal leave so
+            // StopPlayout does not trigger restoreMeetingPlayoutIfNeeded() to spin up a
+            // throwaway AVAudioEngine right before attachment detach.
+            _ = await systemAudio.setTranscriptionOutput(false)
+            if systemAudio.playoutEpoch == startupPlayoutEpoch {
+                _ = await systemAudio.setPlayoutEnabled(false, expectedEpoch: startupPlayoutEpoch)
+            }
+        }
         await subscriber?.closeAndDrain(timeout: 1)
         await publisher?.closeAndDrain(timeout: 1)
         subscriber = nil; publisher = nil

@@ -669,6 +669,7 @@ public final class GuestSystemAudio: NSObject, LKRTCAudioDeviceModuleDelegate, @
     // Confined to audioQueue: output runs while sound is off for local transcription.
     private var transcriptionOutput = false
     private var handoffPreparedRecording = false
+    private var attemptHandoffActive = false
 
     /// App-only meeting level (0...1). macOS output volume is never changed;
     /// mute and sound-on intent remain separate.
@@ -1289,7 +1290,10 @@ public final class GuestSystemAudio: NSObject, LKRTCAudioDeviceModuleDelegate, @
         setWatchdogInputUnmuted(false)
         return await perform("idle-input-release", timeout: timeout) {
             guard !self.closed, let module = self.currentModule else { return true }
-            self.locked { self.handoffPreparedRecording = false }
+            self.locked {
+                self.handoffPreparedRecording = false
+                self.attemptHandoffActive = false
+            }
             self.startedRecordingForPrivateCheck = false
             self.deferredActivation = false
             self.inputPermitted = false
@@ -1318,7 +1322,10 @@ public final class GuestSystemAudio: NSObject, LKRTCAudioDeviceModuleDelegate, @
             guard !self.closed, let module = self.currentModule,
                   self.inputPermitted, self.microphoneOptIn,
                   GuestSystemAudio.microphoneAuthorized else { return false }
-            self.locked { self.handoffPreparedRecording = false }
+            self.locked {
+                self.handoffPreparedRecording = false
+                self.attemptHandoffActive = false
+            }
             self.update(["microphoneMutedRequested": true])
             let clearedPrepared = !module.isRecordingAlwaysPreparedMode ||
                 self.nativeCall("set-recording-prepared", { module.setRecordingAlwaysPreparedMode(false) }) == 0
@@ -1373,7 +1380,10 @@ public final class GuestSystemAudio: NSObject, LKRTCAudioDeviceModuleDelegate, @
         if sharedNativeOwner, !(await sharedPlayoutGate.reset(sound: playout)) { _ = await shutdown(); return false }
         return await perform("room-audio-reset", timeout: 8) {
             guard !self.closed, let module = self.currentModule else { return false }
-            self.locked { self.handoffPreparedRecording = false }
+            self.locked {
+                self.handoffPreparedRecording = false
+                self.attemptHandoffActive = false
+            }
             self.startedRecordingForPrivateCheck = false
             // A new room or recovery attempt starts permitted; the meeting reapplies
             // its own withdrawal before any session can activate input.
@@ -1399,6 +1409,7 @@ public final class GuestSystemAudio: NSObject, LKRTCAudioDeviceModuleDelegate, @
         setWatchdogInputUnmuted(false)
         return await perform("attempt-handoff-prepare", timeout: timeout) {
             guard !self.closed, let module = self.currentModule else { return true }
+            self.locked { self.attemptHandoffActive = true }
             self.update(["microphoneMutedRequested": true])
             let muted = self.nativeCall("set-microphone-muted", { module.setMicrophoneMuted(true) }) == 0 && module.isMicrophoneMuted
             if self.inputPermitted, self.microphoneOptIn, GuestSystemAudio.microphoneAuthorized,
@@ -1421,6 +1432,7 @@ public final class GuestSystemAudio: NSObject, LKRTCAudioDeviceModuleDelegate, @
             let wasPrepared = self.locked {
                 let value = self.handoffPreparedRecording
                 self.handoffPreparedRecording = false
+                self.attemptHandoffActive = false
                 return value
             }
             guard !self.closed, let module = self.currentModule else { return true }
@@ -1579,7 +1591,10 @@ public final class GuestSystemAudio: NSObject, LKRTCAudioDeviceModuleDelegate, @
                 self.readSnapshot(module)
                 return muted && module.isMicrophoneMuted
             }
-            self.locked { self.handoffPreparedRecording = false }
+            self.locked {
+                self.handoffPreparedRecording = false
+                self.attemptHandoffActive = false
+            }
             self.deferredActivation = self.deferredActivation || self.microphoneOptIn
             self.inputPermitted = false
             self.update(["microphoneMutedRequested": true])
@@ -1669,7 +1684,10 @@ public final class GuestSystemAudio: NSObject, LKRTCAudioDeviceModuleDelegate, @
         setWatchdogInputUnmuted(false)
         if sharedNativeOwner { _ = await sharedPlayoutGate.close(retire: true) }
         let success = await perform("shutdown", timeout: timeout) {
-            self.locked { self.handoffPreparedRecording = false }
+            self.locked {
+                self.handoffPreparedRecording = false
+                self.attemptHandoffActive = false
+            }
             if self.closed { return self.snapshot["cleanupSucceeded"] as? Bool == true }
             self.closed = true
             guard let module = self.currentModule else { self.update(["cleanupSucceeded": true]); return true }
@@ -1895,7 +1913,7 @@ public final class GuestSystemAudio: NSObject, LKRTCAudioDeviceModuleDelegate, @
             isPlayoutEnabled: isPlayoutEnabled, isRecordingEnabled: isRecordingEnabled) ?? 0
         locked { cached["engineStops"] = (cached["engineStops"] as? Int ?? 0) + 1 }
         logLifecycle("engine-stop", ["playout": isPlayoutEnabled, "recording": isRecordingEnabled])
-        if !locked({ handoffPreparedRecording && isRecordingEnabled }) {
+        if !locked({ attemptHandoffActive || (handoffPreparedRecording && isRecordingEnabled) }) {
             reportSpontaneous(.stopped)
         }
 #if os(iOS)
@@ -1948,7 +1966,10 @@ public final class GuestSystemAudio: NSObject, LKRTCAudioDeviceModuleDelegate, @
             cached["enginesReleased"] = (cached["enginesReleased"] as? Int ?? 0) + 1
         }
         logLifecycle("engine-released")
-        reportSpontaneous(.stopped); return forwarded
+        if !locked({ attemptHandoffActive }) {
+            reportSpontaneous(.stopped)
+        }
+        return forwarded
     }
     public func audioDeviceModule(_ audioDeviceModule: LKRTCAudioDeviceModule, engine: AVAudioEngine,
                                   configureInputFromSource source: AVAudioNode?, toDestination destination: AVAudioNode,

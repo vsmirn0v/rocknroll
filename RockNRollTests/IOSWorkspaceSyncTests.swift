@@ -1612,4 +1612,63 @@ final class IOSWorkspaceSyncTests: XCTestCase {
             "Deferred iOS workspace sync should flush after leaving the meeting"
         )
     }
+
+    func testFinishSessionDefersAutomaticSummaryAndSyncWhileAnotherMeetingIsActive() async throws {
+        let f = try await makeCoordinator(isOnline: { true }, graceOverride: 0.05)
+        f.workspace.outcomeConfig = PortableOutcomeConfiguration(
+            autoGenerateOnLeave: true,
+            providerKind: .openAI,
+            model: "gpt-4.1-mini"
+        )
+        f.workspace.setRemoteAIConsent(true)
+        f.workspace.saveAPIKey("sk-test-token", for: .openAI)
+        await f.workspace.synchronizeNow()
+
+        var inMeeting = true
+        f.workspace.hasActiveMeeting = { inMeeting }
+
+        let cid = UUID()
+        let url = try XCTUnwrap(URL(string: "https://meet.example.com/deferred-summary"))
+        let sid = f.workspace.beginSession(
+            controllerID: cid,
+            requestedWorkspaceID: nil,
+            title: "First Call",
+            invitation: url,
+            roomIdentity: url.absoluteString,
+            calendarMeeting: nil
+        )
+        f.workspace.recordLiveEvents(
+            controllerID: cid,
+            events: [
+                SyncedTranscriptEvent(
+                    id: "ev-1",
+                    kind: "transcript",
+                    occurredAt: Date(),
+                    speaker: "Alice",
+                    isOwn: false,
+                    text: "Let's ship the reconnect fix today",
+                    deviceID: f.roomSync.deviceID
+                )
+            ],
+            micIntervals: []
+        )
+
+        let baselineConnects = f.libraryCloud.connectCalls
+        f.workspace.finishSession(controllerID: cid, endedAt: Date())
+        try await Task.sleep(for: .milliseconds(350))
+
+        XCTAssertNil(f.workspace.outcomesBySession[sid], "Automatic post-leave summary must defer while another meeting is active")
+        XCTAssertEqual(f.libraryCloud.connectCalls, baselineConnects, "Post-leave CloudKit sync must defer while another meeting is active")
+
+        inMeeting = false
+        f.workspace.noteActiveMeetingsChanged()
+        let deadline = ContinuousClock.now + .seconds(4)
+        while (f.workspace.outcomesBySession[sid]?.state != "ready" || f.libraryCloud.connectCalls <= baselineConnects)
+            && ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(25))
+        }
+
+        XCTAssertEqual(f.workspace.outcomesBySession[sid]?.state, "ready", "Deferred automatic summary should run once active meetings end")
+        XCTAssertGreaterThan(f.libraryCloud.connectCalls, baselineConnects)
+    }
 }

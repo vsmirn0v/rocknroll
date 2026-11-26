@@ -120,6 +120,8 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
     private var lastLoggedVideoCount = -1
     private var appLifecycleObservers: [NSObjectProtocol] = []
     private var backgroundRecoveryTask: UIBackgroundTaskIdentifier = .invalid
+    private var backgroundTransitionTask: UIBackgroundTaskIdentifier = .invalid
+    private var backgroundTransitionTimer: Task<Void, Never>?
     private var privateCheckAudioSink: ((AVAudioPCMBuffer) -> Void)?
     let assistantSpeechLedger = AssistantSpeechLedger()
     private var assistantTranscriptSegments: [TranscriptSegment] = []
@@ -364,10 +366,13 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
 
     deinit {
         appLifecycleObservers.forEach(NotificationCenter.default.removeObserver)
+        backgroundTransitionTimer?.cancel()
         let sessionID = id
         let recoveryTask = backgroundRecoveryTask
+        let transitionTask = backgroundTransitionTask
         Task { @MainActor in
             if recoveryTask != .invalid { UIApplication.shared.endBackgroundTask(recoveryTask) }
+            if transitionTask != .invalid { UIApplication.shared.endBackgroundTask(transitionTask) }
             IOSCameraCapture.removeObserver(id: sessionID)
         }
     }
@@ -1105,11 +1110,18 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
     private func observeLifecycle() {
         let center = NotificationCenter.default
         for name in [UIApplication.didBecomeActiveNotification, UIApplication.didEnterBackgroundNotification] {
-            appLifecycleObservers.append(center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+            appLifecycleObservers.append(center.addObserver(forName: name, object: nil, queue: .main) { [weak self] notification in
+                let enteredBackground = notification.name == UIApplication.didEnterBackgroundNotification
                 Task { @MainActor [weak self] in
-                    self?.updateBackgroundRecoveryTask()
-                    self?.updateVideoDemand()
-                    self?.refreshCameraReactionStatus()
+                    guard let self else { return }
+                    if enteredBackground {
+                        self.beginBackgroundTransitionLease()
+                    } else {
+                        self.endBackgroundTransitionLease()
+                    }
+                    self.updateBackgroundRecoveryTask()
+                    self.updateVideoDemand()
+                    self.refreshCameraReactionStatus()
                 }
             })
         }
@@ -1119,10 +1131,46 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
         phase == .reconnecting || (phase == .connecting && everConnected)
     }
 
+    private var needsBackgroundConnectionLease: Bool {
+        isRecoveringConnection || (joinStarted && phase == .connecting)
+    }
+
+    private func beginBackgroundTransitionLease() {
+        guard !leaving, joinStarted,
+              everConnected || phase == .connecting || phase == .reconnecting,
+              UIApplication.shared.applicationState == .background else {
+            endBackgroundTransitionLease()
+            return
+        }
+        if backgroundTransitionTask == .invalid {
+            backgroundTransitionTask = UIApplication.shared.beginBackgroundTask(withName: "Stabilize meeting background transition") { [weak self] in
+                self?.endBackgroundTransitionLease()
+            }
+        }
+        backgroundTransitionTimer?.cancel()
+        backgroundTransitionTimer = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(12))
+            guard !Task.isCancelled else { return }
+            self?.endBackgroundTransitionLease()
+        }
+    }
+
+    private func endBackgroundTransitionLease() {
+        backgroundTransitionTimer?.cancel()
+        backgroundTransitionTimer = nil
+        guard backgroundTransitionTask != .invalid else { return }
+        let task = backgroundTransitionTask
+        backgroundTransitionTask = .invalid
+        UIApplication.shared.endBackgroundTask(task)
+    }
+
     private func updateBackgroundRecoveryTask() {
-        guard !leaving, everConnected, isRecoveringConnection,
+        guard !leaving, needsBackgroundConnectionLease,
               UIApplication.shared.applicationState == .background else {
             endBackgroundRecoveryTask()
+            if leaving || UIApplication.shared.applicationState != .background {
+                endBackgroundTransitionLease()
+            }
             return
         }
         guard backgroundRecoveryTask == .invalid else { return }
@@ -2418,6 +2466,7 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
         emitWorkspaceEvents()
         leaving = true
         endBackgroundRecoveryTask()
+        endBackgroundTransitionLease()
         connectTask?.cancel()
         connectTask = nil
         microphoneTask?.cancel()

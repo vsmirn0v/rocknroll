@@ -118,6 +118,7 @@ protocol GuestSessionEngine: AnyObject {
     func waitForTransportRecovery() async throws
     func releaseStartupAudio() -> Bool
     func join(_ invitation: GuestInvitation, sessionID: String?) async throws
+    func join(_ invitation: GuestInvitation, sessionID: String?, isRecovery: Bool) async throws
     func publishPattern(codec: String, camera: Bool, audioMuted: Bool, videoMuted: Bool) async throws
     func mute(_ muted: Bool, video: Bool) async throws
     func setLocalMuteIntent(_ muted: Bool, video: Bool)
@@ -136,6 +137,9 @@ extension GuestSessionEngine {
     func waitForStartupAudio() async throws {}
     func waitForTransportRecovery() async throws {}
     func releaseStartupAudio() -> Bool { true }
+    func join(_ invitation: GuestInvitation, sessionID: String?, isRecovery: Bool) async throws {
+        try await join(invitation, sessionID: sessionID)
+    }
 }
 
 enum GuestSessionError: LocalizedError {
@@ -450,7 +454,7 @@ public final class GuestSession {
                     next.onLobbyChange = { [weak self] lobby in
                         self?.lobbyChanged(lobby, generation: expected, attempt: attempt)
                     }
-                    try await next.join(invitation, sessionID: sessionID)
+                    try await next.join(invitation, sessionID: sessionID, isRecovery: recoveryAttempts > 0)
                     relayTrialAwaitingJoin = false
                     try check(expected, attempt: attempt)
                     sessionID = next.sessionID ?? sessionID

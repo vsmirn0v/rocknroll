@@ -367,6 +367,109 @@ final class AdaptiveICERecoveryTests: XCTestCase {
         XCTAssertTrue(clean)
     }
 
+    func testChecklistViableUDPPairDistinguishesSucceededUDPRelayFromDeadOrTCPRelay() {
+        let deadUDPPairs: [[String: Any]] = [
+            ["id": "local-host", "type": "local-candidate", "candidateType": "host", "protocol": "udp"],
+            ["id": "local-tcp", "type": "local-candidate", "candidateType": "relay", "protocol": "udp", "relayProtocol": "tcp"],
+            ["id": "p1", "type": "candidate-pair", "state": "in-progress", "writable": false, "responsesReceived": 0, "localCandidateId": "local-host"],
+            ["id": "p2", "type": "candidate-pair", "state": "succeeded", "writable": true, "responsesReceived": 5, "localCandidateId": "local-tcp"]
+        ]
+        XCTAssertFalse(GuestPeer.checklistHasViableUDPPair(deadUDPPairs))
+
+        let viableUDPRelay = deadUDPPairs + [
+            ["id": "local-udp-relay", "type": "local-candidate", "candidateType": "relay", "protocol": "udp", "relayProtocol": "udp"],
+            ["id": "p3", "type": "candidate-pair", "state": "succeeded", "writable": true, "responsesReceived": 7, "localCandidateId": "local-udp-relay"]
+        ]
+        XCTAssertTrue(GuestPeer.checklistHasViableUDPPair(viableUDPRelay))
+    }
+
+    @MainActor func testEngineFailureWithDisconnectedTCPRelayWithdrawsPinnedRelay() async throws {
+        var recovery = GuestRelayRecovery()
+        XCTAssertTrue(recovery.schedule(.subscriber))
+        XCTAssertEqual(recovery.beginAttempt(), [.subscriber])
+        XCTAssertTrue(recovery.verify(.subscriber))
+        XCTAssertEqual(recovery.confirmed, [.subscriber])
+
+        let engine = NativeGuestEngine(label: "Withdraw broken TCP relay", icePolicy: .automatic)
+        engine.tcpRelayTargets = recovery.beginAttempt()
+        var discarded: [GuestPeerTarget] = []
+        engine.discardTCPRelay = { target in
+            discarded.append(target)
+            return recovery.discard(target)
+        }
+        _ = try await engine.prepareJoinForTesting()
+        let sub = try await engine.prepareSubscriberForTesting()
+        XCTAssertEqual(sub.icePolicy, .tcpRelay)
+
+        await withCheckedContinuation { done in
+            sub.iceEventFinishedForTesting = { sub.iceEventFinishedForTesting = nil; done.resume() }
+            sub.peerConnection(sub.connection, didChange: LKRTCIceConnectionState.connected)
+        }
+        await withCheckedContinuation { done in
+            sub.transportEventFinishedForTesting = { sub.transportEventFinishedForTesting = nil; done.resume() }
+            sub.peerConnection(sub.connection, didChange: LKRTCPeerConnectionState.connected)
+        }
+        await withCheckedContinuation { done in
+            sub.iceEventFinishedForTesting = { sub.iceEventFinishedForTesting = nil; done.resume() }
+            sub.peerConnection(sub.connection, didChange: LKRTCIceConnectionState.failed)
+        }
+
+        let clean = await engine.leave(sendLeave: false)
+        XCTAssertTrue(clean)
+        XCTAssertEqual(discarded, [.subscriber])
+        XCTAssertTrue(recovery.confirmed.isEmpty, "Failed TCP relay peer must withdraw so next recovery tries automatic UDP")
+    }
+
+    @MainActor func testTransientRemoteMuteDuringDisconnectedSubscriberDoesNotPrematurelyCompleteStartupAudio() async throws {
+        let shared = SharedAudioEngine.live(manualRenderingForTesting: true)
+        let audio = try await SharedGuestMeetingAudio.attach(to: shared)
+        _ = await audio.beginAttempt(sound: true)
+        let engine = NativeGuestEngine(label: "No zombie connect on transient mute", systemAudio: audio)
+        engine.configureStartupPlayback(sound: true)
+        engine.mediaNotifyForTesting = { _ in }
+        _ = try await engine.prepareJoinForTesting()
+        let sub = try await engine.prepareSubscriberForTesting()
+
+        try await engine.processEventForTesting(["event": "media-out", "payload": [
+            "method": "rtc:participants:update", "update": ["participants": [[
+                "sid": "PA_remote", "identity": "remote", "version": 1, "state": "ACTIVE", "tracks": [
+                    ["sid": "TR_audio", "type": "AUDIO", "source": "MICROPHONE", "muted": false]]]]]]])
+
+        var completed = false
+        let waitTask = Task { @MainActor in
+            try await engine.waitForStartupAudio()
+            completed = true
+        }
+
+        try await Task.sleep(for: .milliseconds(150))
+        XCTAssertFalse(completed, "Startup audio must wait while subscriber transport is disconnected")
+
+        // Remote speaker momentarily mutes while subscriber ICE/DTLS is still connecting.
+        try await engine.processEventForTesting(["event": "media-out", "payload": [
+            "method": "rtc:participants:update", "update": ["participants": [[
+                "sid": "PA_remote", "identity": "remote", "version": 2, "state": "ACTIVE", "tracks": [
+                    ["sid": "TR_audio", "type": "AUDIO", "source": "MICROPHONE", "muted": true]]]]]]])
+        try await Task.sleep(for: .milliseconds(200))
+        XCTAssertFalse(completed, "Transient remote mute must not mark startup audio ready while subscriber is still disconnected")
+
+        await withCheckedContinuation { done in
+            sub.iceEventFinishedForTesting = { sub.iceEventFinishedForTesting = nil; done.resume() }
+            sub.peerConnection(sub.connection, didChange: LKRTCIceConnectionState.connected)
+        }
+        await withCheckedContinuation { done in
+            sub.transportEventFinishedForTesting = { sub.transportEventFinishedForTesting = nil; done.resume() }
+            sub.peerConnection(sub.connection, didChange: LKRTCPeerConnectionState.connected)
+        }
+
+        try await waitTask.value
+        XCTAssertTrue(completed)
+        XCTAssertTrue(engine.releaseStartupAudio())
+
+        let clean = await engine.leave(sendLeave: false)
+        XCTAssertTrue(clean)
+        _ = await audio.shutdown(timeout: 2)
+    }
+
     private func sample(_ rows: [[String: Any]], tracks: Set<String> = ["remote-audio", "remote-video"]) throws -> GuestICETransportSample {
         try XCTUnwrap(GuestICETransportSample(rows, target: .subscriber, demandedTracks: tracks))
     }

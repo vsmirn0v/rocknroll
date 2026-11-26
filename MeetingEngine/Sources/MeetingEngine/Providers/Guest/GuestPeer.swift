@@ -78,6 +78,7 @@ public final class GuestPeer: NSObject, LKRTCPeerConnectionDelegate {
     private var closed = false
     private(set) var iceConnected = false
     private(set) var transportConnected = false
+    var isICEFailedOrDisconnected: Bool { lastICEState == .failed || lastICEState == .disconnected }
     private var incomingVideo: [(video: GuestRemoteVideo, sink: GuestTrackRenderer)] = []
     var onIncomingVideoChange: (([GuestRemoteVideo]) -> Void)? {
         didSet { onIncomingVideoChange?(receivedVideo) }
@@ -132,6 +133,7 @@ public final class GuestPeer: NSObject, LKRTCPeerConnectionDelegate {
     private(set) var receiverDetachmentsForTesting = 0
     var receiverEventFinishedForTesting: (() -> Void)?
     var statsOverrideForTesting: (() async -> [[String: Any]]?)?
+    var viableUDPPairOverrideForTesting: (() async -> Bool)?
     var onNativeCloseForTesting: (@Sendable () -> Void)?
     var retainedReceiverTracksForTesting: Int { incomingVideo.count + incomingAudio.count }
     struct SoundOffSourceProof {
@@ -690,6 +692,58 @@ public final class GuestPeer: NSObject, LKRTCPeerConnectionDelegate {
              (selectedRoute == .udp || (!hasEstablishedConnection && selectedRoute == nil))) {
             onICEPathFailure?()
         }
+    }
+
+    func extendInitialDeadline(atLeast minimumDeadline: TimeInterval) {
+        guard !closed, !hasEstablishedConnection, !iceFailureReported else { return }
+        if let current = initialRequiredDeadline, current >= minimumDeadline { return }
+        initialRequiredDeadline = minimumDeadline
+        if lastICEState == .checking || lastICEState == .failed || lastICEState == .disconnected {
+            refreshICETimeout()
+        }
+    }
+
+    func hasViableUDPCandidatePair(timeout: TimeInterval = 0.6) async -> Bool {
+        guard !closed else { return false }
+#if DEBUG
+        if let viableUDPPairOverrideForTesting { return await viableUDPPairOverrideForTesting() }
+        if let statsOverrideForTesting, let rows = await statsOverrideForTesting() {
+            return Self.checklistHasViableUDPPair(rows)
+        }
+#endif
+        let connection = connection!
+        guard let report: LKRTCStatisticsReport = try? await native.call("viable-udp-statistics", timeout: timeout, { done in
+            connection.statistics { done(.success($0)) }
+        }) else { return false }
+        let rows = report.statistics.values.compactMap { stat -> [String: Any]? in
+            guard stat.type == "candidate-pair" || stat.type == "local-candidate" else { return nil }
+            var row: [String: Any] = ["type": stat.type, "id": stat.id]
+            for key in ["state", "writable", "responsesReceived", "protocol", "relayProtocol", "localCandidateId"] {
+                if let value = stat.values[key] { row[key] = value }
+            }
+            return row
+        }
+        return Self.checklistHasViableUDPPair(rows)
+    }
+
+    nonisolated static func checklistHasViableUDPPair(_ stats: [[String: Any]]) -> Bool {
+        var localByID: [String: [String: Any]] = [:]
+        for row in stats where row["type"] as? String == "local-candidate" {
+            if let id = row["id"] as? String { localByID[id] = row }
+        }
+        for pair in stats where pair["type"] as? String == "candidate-pair" {
+            let state = (pair["state"] as? String)?.lowercased() ?? ""
+            let writable = (pair["writable"] as? Bool) ?? ((pair["writable"] as? NSNumber)?.boolValue ?? false)
+            let responses = (pair["responsesReceived"] as? NSNumber)?.intValue ?? (pair["responsesReceived"] as? Int) ?? 0
+            guard state == "succeeded" || writable || responses > 0 else { continue }
+            guard let localID = pair["localCandidateId"] as? String, let local = localByID[localID] else { continue }
+            let proto = (local["protocol"] as? String)?.lowercased() ?? ""
+            let relayProto = (local["relayProtocol"] as? String)?.lowercased() ?? ""
+            if proto == "udp" && (relayProto.isEmpty || relayProto == "udp" || relayProto == "other") {
+                return true
+            }
+        }
+        return false
     }
 
     /// An idle subscriber may remain checking until the SFU has media to send.

@@ -460,4 +460,44 @@ final class GuestPermissionsAndSignalingTests: XCTestCase {
         XCTAssertTrue(mediaEvents.isEmpty, "High-frequency rtc:speakers:changed and rtc:quality should not flood event logs")
         _ = await engine.leave(sendLeave: false)
     }
+
+    @MainActor
+    func testMutedAttemptHandoffSuppressesSpontaneousStopAndTerminalLeaveAvoidsExtraEngine() async throws {
+        let audio = try await GuestSystemAudio.create(
+            microphoneEnabled: false,
+            playoutEnabled: true,
+            concurrent: true,
+            manualRendering: true,
+            keepOutputAvailableWithInput: true
+        )
+        var spontaneousStops = 0
+        audio.onSpontaneousEngineChange = { change in
+            if change == .stopped { spontaneousStops += 1 }
+        }
+        do {
+            let sub = try await GuestPeer(target: .subscriber, factory: audio.factory, physicalAudio: true)
+            let pub = try await GuestPeer(target: .publisher, factory: audio.factory, physicalAudio: true)
+            let prepared = await audio.prepareAttemptHandoff()
+            XCTAssertTrue(prepared)
+            await sub.closeAndDrain(timeout: 1)
+            await pub.closeAndDrain(timeout: 1)
+            let completed = await audio.completeAttemptHandoff()
+            XCTAssertTrue(completed)
+            XCTAssertEqual(spontaneousStops, 0, "Planned attempt handoff must not report spontaneous hardware stops")
+
+            let engine = NativeGuestEngine(label: "TerminalLeaveNoExtraEngine", systemAudio: audio, verifyReceivedPixels: false)
+            engine.configureStartupPlayback(sound: true)
+            _ = try await engine.prepareJoinForTesting()
+            _ = try await engine.prepareSubscriberForTesting()
+            let createdBeforeLeave = audio.snapshot["enginesCreated"] as? Int ?? 0
+            let clean = await engine.leave(sendLeave: true)
+            XCTAssertTrue(clean)
+            let createdAfterLeave = audio.snapshot["enginesCreated"] as? Int ?? 0
+            XCTAssertEqual(createdAfterLeave, createdBeforeLeave, "Terminal leave must not spin up a throwaway AVAudioEngine")
+        } catch {
+            _ = await audio.shutdown()
+            throw error
+        }
+        _ = await audio.shutdown()
+    }
 }

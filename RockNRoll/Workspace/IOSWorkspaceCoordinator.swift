@@ -718,7 +718,7 @@ final class IOSWorkspaceCoordinator: ObservableObject {
             try? await self.store.upsertSession(session)
             await self.reloadFromStore()
             await self.archiveSessionIfNeeded(sessionID: sid)
-            await self.synchronizeNow()
+            self.scheduleSync(delayMilliseconds: 250)
 
             await self.coordinateOutcomeAfterLeave(sessionID: sid)
         }
@@ -726,11 +726,24 @@ final class IOSWorkspaceCoordinator: ObservableObject {
 
     // MARK: - Outcome Coordination & Generation
 
+    private var deferredOutcomeSessionIDs: [UUID] = []
+
+    private func enqueueDeferredOutcome(_ sessionID: UUID) {
+        let canonical = replica.workspaceDoc.resolveCanonicalSessionID(for: sessionID)
+        guard !deferredOutcomeSessionIDs.contains(canonical) else { return }
+        deferredOutcomeSessionIDs.append(canonical)
+        AppDiagnostics.log("meeting-summary-deferred", ["reason": "activeMeeting"])
+    }
+
     private func coordinateOutcomeAfterLeave(sessionID: UUID) async {
         let sid = replica.workspaceDoc.resolveCanonicalSessionID(for: sessionID)
         let overrides = resolvedAutoExportOverrides(for: sid)
         guard overrides.autoGenerateSummary ?? outcomeConfig.autoGenerateOnLeave else { return }
         if outcomesBySession[sid]?.state == "ready" { return }
+        if hasActiveMeeting() {
+            enqueueDeferredOutcome(sid)
+            return
+        }
 
         guard let syncedSession = replica.workspaceDoc.sessions[sid] else { return }
         if let deadline = OutcomeCoordinatorPolicy.deferToMacDeadline(
@@ -748,12 +761,20 @@ final class IOSWorkspaceCoordinator: ObservableObject {
             if waitSeconds > 0 {
                 try? await Task.sleep(for: .milliseconds(Int(waitSeconds * 1000)))
             }
+            if hasActiveMeeting() {
+                enqueueDeferredOutcome(sid)
+                return
+            }
             await synchronizeNow()
         }
 
         let resolvedSID = replica.workspaceDoc.resolveCanonicalSessionID(for: sid)
         if outcomesBySession[resolvedSID]?.state == "ready" ||
             replica.workspaceDoc.sessions[resolvedSID]?.outcomeClaim?.value?.state == "ready" {
+            return
+        }
+        if hasActiveMeeting() {
+            enqueueDeferredOutcome(resolvedSID)
             return
         }
 
@@ -792,6 +813,10 @@ final class IOSWorkspaceCoordinator: ObservableObject {
 
     func generateOutcomeNow(sessionID: UUID, automatic: Bool = false) async {
         let sid = replica.workspaceDoc.resolveCanonicalSessionID(for: sessionID)
+        if automatic && hasActiveMeeting() {
+            enqueueDeferredOutcome(sid)
+            return
+        }
         if outcomeConfig.providerKind.needsKey && !remoteAISharingAllowed {
             if !automatic { outcomeErrors[sid] = IOSRemoteAIConsentError.permissionRequired.localizedDescription }
             return
@@ -2204,11 +2229,27 @@ final class IOSWorkspaceCoordinator: ObservableObject {
     }
 
     func noteActiveMeetingsChanged() {
-        guard deferredForActiveMeeting, !hasActiveMeeting() else { return }
-        let zones = deferredZones.isEmpty ? Set(SyncZoneKind.allCases) : deferredZones
-        deferredForActiveMeeting = false
-        deferredZones.removeAll()
-        scheduleSync(zones: zones, delayMilliseconds: 400)
+        guard !hasActiveMeeting() else { return }
+        if deferredForActiveMeeting {
+            let zones = deferredZones.isEmpty ? Set(SyncZoneKind.allCases) : deferredZones
+            deferredForActiveMeeting = false
+            deferredZones.removeAll()
+            scheduleSync(zones: zones, delayMilliseconds: 400)
+        }
+        if !deferredOutcomeSessionIDs.isEmpty {
+            let queued = deferredOutcomeSessionIDs
+            deferredOutcomeSessionIDs.removeAll()
+            Task { @MainActor [weak self] in
+                for sid in queued {
+                    guard let self else { return }
+                    if self.hasActiveMeeting() {
+                        self.enqueueDeferredOutcome(sid)
+                        continue
+                    }
+                    await self.coordinateOutcomeAfterLeave(sessionID: sid)
+                }
+            }
+        }
     }
 
     func synchronizeNow(

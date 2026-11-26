@@ -1502,8 +1502,11 @@ import UserNotifications
                 chapters: chapters))
         }
 
+        let otherMeetingActive = meetings.contains { $0 !== model && !$0.isClosed }
         for spec in specs {
-            await workspaceSync.pullAndMergeTranscripts(for: spec.sessionID)
+            if !otherMeetingActive {
+                await workspaceSync.pullAndMergeTranscripts(for: spec.sessionID)
+            }
             workspaceSync.noteLocalSessionLeft(sessionID: spec.sessionID, leftAt: spec.endedAt)
         }
         let awaiting = attention.captureOutcomes(for: model, segments: specs)
