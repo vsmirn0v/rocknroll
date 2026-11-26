@@ -203,6 +203,7 @@ final class RockCallViewController: UIViewController, UIScrollViewDelegate, UICo
     private var hasShownInitialCopiedToast = false
     private var textCapture: SharedTextOverlay?
     var workspaceSessionIDProvider: (() -> UUID)?
+    var transcriptExcerptProvider: (() -> String)?
     private let snapshotController = IOSMeetingSnapshotController()
     private var snapshotPillHost: UIHostingController<IOSSnapshotPillView>?
     private var snapshotBannerHost: UIHostingController<IOSSnapshotHardwareBannerView>?
@@ -997,6 +998,9 @@ final class RockCallViewController: UIViewController, UIScrollViewDelegate, UICo
     private func installSnapshotUI() {
         snapshotController.sessionIDProvider = { [weak self] in
             self?.workspaceSessionIDProvider?() ?? UUID()
+        }
+        snapshotController.transcriptExcerptProvider = { [weak self] in
+            self?.transcriptExcerptProvider?() ?? ""
         }
         snapshotController.primaryKeyProvider = { [weak self] in
             self?.currentPrimaryKey

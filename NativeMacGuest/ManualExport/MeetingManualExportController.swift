@@ -10,14 +10,17 @@ import Foundation
     private let notes: MeetingNotesController
     private let flushOutcomeWrites: @MainActor () async -> Void
     private let transcriptLoader: @MainActor (MeetingLibraryCard, MeetingSessionRecord?) async -> String?
+    private let snapshotSessionIDsProvider: @MainActor (UUID) -> [UUID]
 
     init(library: MeetingLibraryController, notes: MeetingNotesController,
          flushOutcomeWrites: @escaping @MainActor () async -> Void,
-         transcriptLoader: @escaping @MainActor (MeetingLibraryCard, MeetingSessionRecord?) async -> String? = { _, _ in nil }) {
+         transcriptLoader: @escaping @MainActor (MeetingLibraryCard, MeetingSessionRecord?) async -> String? = { _, _ in nil },
+         snapshotSessionIDsProvider: @escaping @MainActor (UUID) -> [UUID] = { [$0] }) {
         self.library = library
         self.notes = notes
         self.flushOutcomeWrites = flushOutcomeWrites
         self.transcriptLoader = transcriptLoader
+        self.snapshotSessionIDsProvider = snapshotSessionIDsProvider
     }
 
     func export(cards: [MeetingLibraryCard], options: MeetingManualExportOptions) async {
@@ -65,7 +68,7 @@ import Foundation
                         endedAt: card.endedAt, state: card.state, startProvenance: card.startProvenance,
                         outcomeEndFallback: card.outcomeEndFallback)
                     let transcriptBody = await transcriptLoader(card, session)
-                    let snaps = await MeetingSnapshotStore.shared.snapshots(for: card.sessionID)
+                    let snaps = await MeetingSnapshotStore.shared.snapshots(for: snapshotSessionIDsProvider(card.sessionID))
                     var urls: [UUID: URL] = [:]
                     for snap in snaps { urls[snap.id] = await MeetingSnapshotStore.shared.imageURL(for: snap) }
                     items.append(.init(session: session, note: Self.draftNote(draft.text, session: session),
@@ -85,7 +88,7 @@ import Foundation
                 if !unsaved, let revision = draft.revision { note?.revision = revision }
             }
             let transcriptBody = await transcriptLoader(card, snapshot.session)
-            let snaps = await MeetingSnapshotStore.shared.snapshots(for: card.sessionID)
+            let snaps = await MeetingSnapshotStore.shared.snapshots(for: snapshotSessionIDsProvider(card.sessionID))
             var urls: [UUID: URL] = [:]
             for snap in snaps { urls[snap.id] = await MeetingSnapshotStore.shared.imageURL(for: snap) }
             items.append(.init(session: snapshot.session, note: note, outcome: snapshot.outcome,

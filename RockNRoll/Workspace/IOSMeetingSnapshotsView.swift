@@ -3,68 +3,27 @@ import SwiftUI
 import UIKit
 
 struct IOSMeetingSnapshotsSection: View {
-    let sessionIDs: [UUID]
-    @State private var snapshots: [MeetingSnapshotRecord] = []
-    @State private var selected: MeetingSnapshotRecord?
-
-    private var sessionKey: String {
-        sessionIDs.map(\.uuidString).joined(separator: ",")
-    }
+    let snapshots: [MeetingSnapshotRecord]
+    let onSelect: (MeetingSnapshotRecord) -> Void
 
     var body: some View {
-        Group {
-            if !snapshots.isEmpty {
-                Section {
-                    ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(spacing: 10) {
-                            ForEach(snapshots) { snap in
-                                Button {
-                                    selected = snap
-                                } label: {
-                                    IOSSnapshotThumbnailCard(record: snap)
-                                }
-                                .buttonStyle(.plain)
-                            }
+        Section {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 10) {
+                    ForEach(snapshots) { snap in
+                        Button {
+                            onSelect(snap)
+                        } label: {
+                            IOSSnapshotThumbnailCard(record: snap)
                         }
-                        .padding(.vertical, 4)
-                    }
-                } header: {
-                    Text(L("Visual Snapshots (%ld)", snapshots.count))
-                }
-            }
-        }
-        .task(id: sessionKey) {
-            await reload()
-        }
-        .onReceive(NotificationCenter.default.publisher(for: MeetingSnapshotStore.didChangeNotification)) { notification in
-            if let changedID = notification.userInfo?["sessionID"] as? UUID,
-               !sessionIDs.contains(changedID) {
-                return
-            }
-            Task { await reload() }
-        }
-        .sheet(item: $selected) { snap in
-            IOSMeetingSnapshotLightboxView(
-                record: snap,
-                onSaveCaption: { caption in
-                    Task {
-                        _ = try? await MeetingSnapshotStore.shared.updateCaption(caption, snapshotID: snap.id, sessionID: snap.sessionID)
-                        await reload()
-                    }
-                },
-                onDelete: {
-                    Task {
-                        try? await MeetingSnapshotStore.shared.delete(snapshotID: snap.id, sessionID: snap.sessionID)
-                        selected = nil
-                        await reload()
+                        .buttonStyle(.plain)
                     }
                 }
-            )
+                .padding(.vertical, 4)
+            }
+        } header: {
+            Text(L("Visual Snapshots (%ld)", snapshots.count))
         }
-    }
-
-    private func reload() async {
-        snapshots = await MeetingSnapshotStore.shared.snapshots(for: sessionIDs)
     }
 }
 

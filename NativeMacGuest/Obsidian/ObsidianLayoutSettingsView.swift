@@ -77,6 +77,9 @@ struct ObsidianLayoutSettingsView: View {
                         section(L("Open questions"), .questions)
                         section(L("Transcript"), .transcript)
                     }
+                    GridRow {
+                        section(L("Visual snapshots"), .snapshots)
+                    }
                 }.toggleStyle(.checkbox)
             }.formStyle(.grouped).disabled(loading)
             if let issue { Text(issue).foregroundStyle(.red).padding(.horizontal, 16) }

@@ -25,7 +25,8 @@ import Foundation
     var hasVaultBookmark: Bool { destination?.vaultBookmark != nil }
 
     init(library: MeetingLibraryController, worker: ObsidianExportWorker? = nil,
-         archive: TranscriptArchiveStore = TranscriptArchiveStore()) {
+         archive: TranscriptArchiveStore = TranscriptArchiveStore(),
+         snapshotSessionIDsProvider: @escaping @Sendable (UUID) async -> [UUID] = { [$0] }) {
         self.library = library
         let root = library.store.storeRoot.appendingPathComponent("ExportBackups", isDirectory: true)
         let journal = library.workspaceJournal
@@ -36,7 +37,7 @@ import Foundation
             }
             let archived = await archive.loadTranscript(sessionID: session.id) ?? []
             return MeetingMarkdownTemplate.transcriptBody(events: archived, startedAt: session.recordedStart)
-        }) { event, fields in
+        }, snapshotSessionIDsProvider: snapshotSessionIDsProvider) { event, fields in
             probeLog(event, fields)
         }
         self.worker = resolvedWorker

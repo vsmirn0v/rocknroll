@@ -62,6 +62,7 @@ private final class HistoryViewCache: ObservableObject {
         let catalogKey: CatalogKey
         let outcomesRevision: UInt64
         let outcomeStatusKeys: Set<UUID>
+        let snapshotSessionIDs: Set<UUID>
         let showEmptyMeetings: Bool
         let calendar: Calendar
     }
@@ -214,6 +215,7 @@ private final class HistoryViewCache: ObservableObject {
                     catalog: catalog,
                     outcomesByID: outcomesByID,
                     outcomeStatusKeys: key.outcomeStatusKeys,
+                    snapshotSessionIDs: key.snapshotSessionIDs,
                     journal: journal,
                     sync: sync
                 )
@@ -352,6 +354,7 @@ private final class HistoryViewCache: ObservableObject {
         catalog: CatalogSnapshot,
         outcomesByID: [UUID: MeetingOutcome],
         outcomeStatusKeys: Set<UUID>,
+        snapshotSessionIDs: Set<UUID>,
         journal: MeetingWorkspaceJournal,
         sync: MacWorkspaceSyncCoordinator?
     ) -> Bool {
@@ -361,6 +364,8 @@ private final class HistoryViewCache: ObservableObject {
                source.outcomeState == .ready || source.outcomeState == .draft {
                 return true
             }
+            let relatedIDs = sync?.relatedSnapshotSessionIDs(for: source.sessionID, includeHistoryGroup: false) ?? [source.sessionID]
+            let hasSnapshots = relatedIDs.contains { snapshotSessionIDs.contains($0) }
             let input = MeetingMeaningfulnessInput(
                 hasNotes: source.hasNotes,
                 notePreview: source.notePreview,
@@ -369,7 +374,8 @@ private final class HistoryViewCache: ObservableObject {
                 tasksCount: outcome?.tasks.count ?? 0,
                 openQuestionsCount: outcome?.openQuestions.count ?? 0,
                 isGeneratingOutcome: source.outcomeState == .pending || outcomeStatusKeys.contains(source.sessionID),
-                hasFailedOutcomeWithInput: source.outcomeState == .failed && source.hasOutcomeInput
+                hasFailedOutcomeWithInput: source.outcomeState == .failed && source.hasOutcomeInput,
+                hasSnapshots: hasSnapshots
             )
             return MeetingContentMeaningfulness.isMeaningful(input) {
                 let session = sync?.historyConversation(for: source.sessionID, in: journal) ?? journal.session(id: source.sessionID)
@@ -437,6 +443,10 @@ struct MeetingHistoryView: View {
     @State private var syncTopologyRevision: UInt64 = 0
     @State private var archivedEvents: [SyncedTranscriptEvent] = []
     @State private var loadedArchiveID: UUID?
+    @State private var snapshotSessionIDs: Set<UUID> = []
+    @State private var selectedMeetingSnapshots: [MeetingSnapshotRecord] = []
+    @State private var loadedSnapshotKey = ""
+    @State private var currentSnapshotKey = ""
     private let workspace: NativeDesktopWorkspace?
     @AppStorage("native.meetingHistory.readingMode") private var readingMode = false
     @AppStorage("native.meetingHistory.showEmptyMeetings") private var showEmptyMeetings = false
@@ -501,6 +511,7 @@ struct MeetingHistoryView: View {
             catalogKey: catalogKey,
             outcomesRevision: data.outcomesRevision,
             outcomeStatusKeys: Set(attention.outcomeStatus.keys),
+            snapshotSessionIDs: snapshotSessionIDs,
             showEmptyMeetings: showEmptyMeetings,
             calendar: calendar
         )
@@ -583,6 +594,12 @@ struct MeetingHistoryView: View {
         .onReceive(NotificationCenter.default.publisher(for: .NSSystemTimeZoneDidChange)) { _ in
             calendar = Calendar.current
         }
+        .task {
+            snapshotSessionIDs = await MeetingSnapshotStore.shared.allSessionIDsWithSnapshots()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: MeetingSnapshotStore.didChangeNotification)) { _ in
+            Task { snapshotSessionIDs = await MeetingSnapshotStore.shared.allSessionIDsWithSnapshots() }
+        }
         .onDisappear { data.flushOutcomeEdits() }
     }
 
@@ -639,7 +656,14 @@ struct MeetingHistoryView: View {
                 RenameMeetingSheet(library: library, sessionID: value.id, currentTitle: value.title)
             }
             .sheet(item: $exportRequest) { value in
-                MeetingManualExportView(attention: attention, archiveStore: workspace?.workspaceSync.archiveStore, singleSessionID: value.sessionID)
+                MeetingManualExportView(
+                    attention: attention,
+                    archiveStore: workspace?.workspaceSync.archiveStore,
+                    snapshotSessionIDsProvider: { id in
+                        workspace?.workspaceSync.relatedSnapshotSessionIDs(for: id, includeHistoryGroup: false) ?? [id]
+                    },
+                    singleSessionID: value.sessionID
+                )
             }
             .sheet(item: $reviewedDraft) { draft in
                 if let selectedCard, selectedCard.sessionID == draft.id {
@@ -980,16 +1004,43 @@ struct MeetingHistoryView: View {
         sources: [MeetingLibraryCard],
         base: HistoryViewCache.BaseSnapshot
     ) -> some View {
-        ScrollViewReader { scroll in
+        let baseIDs = Set([card.sessionID] + sources.map(\.sessionID))
+        let snapshotIDs = Array(Set(baseIDs.flatMap {
+            workspace?.workspaceSync.relatedSnapshotSessionIDs(for: $0, includeHistoryGroup: true) ?? [$0]
+        })).sorted { $0.uuidString < $1.uuidString }
+        let snapshotKey = snapshotIDs.map(\.uuidString).joined(separator: ",")
+        let visibleSnapshots = loadedSnapshotKey == snapshotKey ? selectedMeetingSnapshots : []
+        return ScrollViewReader { scroll in
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
-                    MacMeetingSnapshotsStripView(
-                        sessionIDs: Array(Set([card.sessionID] + sources.map(\.sessionID))),
-                        onSnapshotUpdated: { updatedSessionID in
-                            Task { try? await library.store.markSnapshotExportDirty(sessionID: updatedSessionID) }
-                        }
-                    )
-                    .padding([.top, .horizontal], 20)
+                    if !visibleSnapshots.isEmpty {
+                        MacMeetingSnapshotsStripView(
+                            snapshots: visibleSnapshots,
+                            onSaveCaption: { snap, caption in
+                                Task {
+                                    _ = try? await MeetingSnapshotStore.shared.updateCaption(caption, snapshotID: snap.id, sessionID: snap.sessionID)
+                                    let refreshed = await MeetingSnapshotStore.shared.snapshots(for: snapshotIDs)
+                                    selectedMeetingSnapshots = refreshed
+                                    loadedSnapshotKey = snapshotKey
+                                    for dirtyID in Set([card.sessionID, snap.sessionID]) {
+                                        try? await library.store.markSnapshotExportDirty(sessionID: dirtyID)
+                                    }
+                                }
+                            },
+                            onDelete: { snap in
+                                Task {
+                                    try? await MeetingSnapshotStore.shared.delete(snapshotID: snap.id, sessionID: snap.sessionID)
+                                    let refreshed = await MeetingSnapshotStore.shared.snapshots(for: snapshotIDs)
+                                    selectedMeetingSnapshots = refreshed
+                                    loadedSnapshotKey = snapshotKey
+                                    for dirtyID in Set([card.sessionID, snap.sessionID]) {
+                                        try? await library.store.markSnapshotExportDirty(sessionID: dirtyID)
+                                    }
+                                }
+                            }
+                        )
+                        .padding([.top, .horizontal], 20)
+                    }
                     VStack(alignment: .leading, spacing: 10) {
                         if sources.count > 1 {
                             Picker(L("Notes"), selection: Binding(get: {
@@ -1012,6 +1063,27 @@ struct MeetingHistoryView: View {
                     AssistantOutcomeHistoryView(store: library.store, sessionID: card.sessionID, updatedAt: card.updatedAt)
                     ParticipationOutcomeActivity(sessionID: card.sessionID, root: attention.store.root)
                 }.padding(.bottom, 20)
+            }
+            .task(id: snapshotKey) {
+                currentSnapshotKey = snapshotKey
+                let loaded = await MeetingSnapshotStore.shared.snapshots(for: snapshotIDs)
+                guard !Task.isCancelled, currentSnapshotKey == snapshotKey else { return }
+                selectedMeetingSnapshots = loaded
+                loadedSnapshotKey = snapshotKey
+            }
+            .onReceive(NotificationCenter.default.publisher(for: MeetingSnapshotStore.didChangeNotification)) { notification in
+                if let changedID = notification.userInfo?["sessionID"] as? UUID,
+                   !snapshotIDs.contains(changedID) {
+                    return
+                }
+                let targetKey = snapshotKey
+                let targetIDs = snapshotIDs
+                Task {
+                    let loaded = await MeetingSnapshotStore.shared.snapshots(for: targetIDs)
+                    guard currentSnapshotKey == targetKey else { return }
+                    selectedMeetingSnapshots = loaded
+                    loadedSnapshotKey = targetKey
+                }
             }
             .task(id: navigation.taskID) {
                 if let id = navigation.taskID { scroll.scrollTo(id, anchor: .center) }
@@ -1227,7 +1299,10 @@ struct MeetingHistoryView: View {
 
     private func triggerRegenerate(_ card: MeetingLibraryCard, base: HistoryViewCache.BaseSnapshot? = nil) {
         let resolvedBase = base ?? currentBaseSnapshot()
-        let sourceIDs = resolvedBase.groupedCards(for: card.sessionID).map(\.sessionID)
+        let rawSourceIDs = resolvedBase.groupedCards(for: card.sessionID).map(\.sessionID)
+        let sourceIDs = Array(Set(([card.sessionID] + rawSourceIDs).flatMap {
+            workspace?.workspaceSync.relatedSnapshotSessionIDs(for: $0, includeHistoryGroup: true) ?? [$0]
+        }))
         let events = conversation(card.sessionID)?.events ?? []
         let synced = workspace?.workspaceSync.syncedTranscriptEvents(for: sourceIDs) ?? []
         let archive = loadedArchiveID == card.sessionID ? archivedEvents : []

@@ -389,6 +389,7 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
         view.sharingAvailable = false
         view.studio = studio
         view.workspaceSessionIDProvider = { [weak self] in self?.workspaceSessionID ?? self?.id ?? UUID() }
+        view.transcriptExcerptProvider = { [weak self] in self?.latestTranscriptExcerpt() ?? "" }
         view.onMinimize = { [weak self] in self?.onMinimize?() }
         view.onSelectMeeting = { [weak self] id in self?.onSelectMeeting?(id) }
         view.onTalkHere = { [weak self] id in self?.onTalkHere?(id) }
@@ -2023,6 +2024,15 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
         }
         let partialEventIDs = Set(localTranscriber.partialSegmentIDs.map { "local:" + $0 })
         handler(id, out, micActiveIntervals, partialEventIDs)
+    }
+
+    func latestTranscriptExcerpt() -> String {
+        let merged = providerTranscriptSegments + assistantTranscriptSegments + sanitizedLocalSegmentsForEmission()
+        for seg in merged.reversed() {
+            let clean = seg.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !clean.isEmpty { return String(clean.prefix(120)) }
+        }
+        return ""
     }
 
     func configureAssistantHUD(talk: IOSAssistantTalkController, speech: IOSAssistantSpeechCoordinator) {

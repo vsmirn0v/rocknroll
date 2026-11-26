@@ -158,4 +158,62 @@ final class MeetingSnapshotsTests: XCTestCase {
         let afterDelete = await store.snapshots(for: sessionID)
         XCTAssertTrue(afterDelete.isEmpty)
     }
+
+    func testSnapshotStoreIndexListingAndSessionMigration() async throws {
+        let tempRoot = FileManager.default.temporaryDirectory.appendingPathComponent("SnapshotMigrateTests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempRoot) }
+
+        let store = MeetingSnapshotStore(root: tempRoot)
+        let sourceID = UUID()
+        let targetID = UUID()
+        let img1 = try XCTUnwrap(MeetingSnapshotEncoder.encode(makeTestImage(width: 90, height: 60), scope: .screenShare, format: .jpeg))
+        let img2 = try XCTUnwrap(MeetingSnapshotEncoder.encode(makeTestImage(width: 60, height: 60, red: 200, green: 30, blue: 30), scope: .participantCamera, format: .png))
+
+        let saved1 = try await store.save(sessionID: sourceID, scope: .screenShare, sourceID: "s1", sourceName: "Alex", encoded: img1)
+        let saved2 = try await store.save(sessionID: targetID, scope: .participantCamera, sourceID: "c1", sourceName: "Maya", encoded: img2)
+
+        var indexedSessions = await store.allSessionIDsWithSnapshots()
+        XCTAssertEqual(indexedSessions, [sourceID, targetID])
+
+        try await store.migrate(from: sourceID, to: targetID)
+
+        indexedSessions = await store.allSessionIDsWithSnapshots()
+        XCTAssertEqual(indexedSessions, [targetID])
+        let sourceAfter = await store.snapshots(for: sourceID)
+        XCTAssertTrue(sourceAfter.isEmpty)
+        let targetAfter = await store.snapshots(for: targetID)
+        XCTAssertEqual(Set(targetAfter.map(\.id)), [saved1.id, saved2.id])
+        let migratedRecord = try XCTUnwrap(targetAfter.first(where: { $0.id == saved1.id }))
+        XCTAssertEqual(migratedRecord.sessionID, targetID)
+        let migratedFileURL = await store.imageURL(for: migratedRecord)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: migratedFileURL.path))
+    }
+
+    func testSummaryPromptContextIncludesPlainFramesAndTranscriptExcerpt() throws {
+        let sessionID = UUID()
+        let plainRecord = MeetingSnapshotRecord(
+            sessionID: sessionID,
+            scope: .screenShare,
+            sourceID: "share:1",
+            sourceName: "Alex",
+            relativeFileName: "a.jpg",
+            fileExtension: "jpg",
+            pixelWidth: 1280,
+            pixelHeight: 720
+        )
+        let excerptRecord = MeetingSnapshotRecord(
+            sessionID: sessionID,
+            scope: .fullStage,
+            sourceID: "full-stage",
+            sourceName: "Full stage",
+            relativeFileName: "b.jpg",
+            fileExtension: "jpg",
+            pixelWidth: 1920,
+            pixelHeight: 1080,
+            transcriptExcerpt: "Let's ship the release candidate tonight."
+        )
+        let context = try XCTUnwrap(MeetingSnapshotMarkdown.summaryPromptContext(snapshots: [plainRecord, excerptRecord]))
+        XCTAssertTrue(context.contains("Captured visual frame"))
+        XCTAssertTrue(context.contains("Transcript moment: Let's ship the release candidate tonight."))
+    }
 }

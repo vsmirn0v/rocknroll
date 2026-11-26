@@ -1897,6 +1897,9 @@ final class ConferenceModel: ObservableObject {
                         calendarMeeting: matchedCalendar,
                         engine: controller.kind
                     )
+                    if let wsID = controller.workspaceSessionID, wsID != id {
+                        Task { try? await MeetingSnapshotStore.shared.migrate(from: id, to: wsID) }
+                    }
                     if var updated = sessionRecords[id] {
                         updated.requestedWorkspaceSessionID = nil
                         sessionRecords[id] = updated

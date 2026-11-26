@@ -17,7 +17,9 @@ struct MeetingManualExportView: View {
     @State private var options = MeetingManualExportOptions()
     private let singleSessionID: UUID?
 
-    init(attention: AttentionCoordinator, archiveStore: TranscriptArchiveStore? = nil, singleSessionID: UUID? = nil) {
+    init(attention: AttentionCoordinator, archiveStore: TranscriptArchiveStore? = nil,
+         snapshotSessionIDsProvider: @escaping @MainActor (UUID) -> [UUID] = { [$0] },
+         singleSessionID: UUID? = nil) {
         let library = attention.store.meetingLibrary
         _library = ObservedObject(wrappedValue: library)
         _exporter = StateObject(wrappedValue: MeetingManualExportController(
@@ -34,7 +36,8 @@ struct MeetingManualExportView: View {
                     return MeetingMarkdownTemplate.transcriptBody(events: archived, startedAt: startedAt)
                 }
                 return nil
-            }
+            },
+            snapshotSessionIDsProvider: snapshotSessionIDsProvider
         ))
         self.singleSessionID = singleSessionID
         _selected = State(initialValue: Set(singleSessionID.map { [$0] } ?? []))
@@ -148,13 +151,18 @@ struct MeetingManualExportView: View {
                     Toggle(L("Newest meetings first"), isOn: $options.newestMeetingsFirst)
                 }
             }
-            HStack(spacing: 10) {
-                sectionToggle(L("Notes"), section: .notes)
-                sectionToggle(L("Summary"), section: .summary)
-                sectionToggle(L("Decisions"), section: .decisions)
-                sectionToggle(L("Tasks"), section: .tasks)
-                sectionToggle(L("Open questions"), section: .questions)
-                sectionToggle(L("Transcript"), section: .transcript)
+            Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 6) {
+                GridRow {
+                    sectionToggle(L("Notes"), section: .notes)
+                    sectionToggle(L("Summary"), section: .summary)
+                    sectionToggle(L("Decisions"), section: .decisions)
+                    sectionToggle(L("Tasks"), section: .tasks)
+                }
+                GridRow {
+                    sectionToggle(L("Open questions"), section: .questions)
+                    sectionToggle(L("Transcript"), section: .transcript)
+                    sectionToggle(L("Visual snapshots"), section: .snapshots)
+                }
             }
         }.disabled(exporter.exporting)
     }

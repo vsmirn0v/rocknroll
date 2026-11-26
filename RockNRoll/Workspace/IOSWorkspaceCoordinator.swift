@@ -85,6 +85,7 @@ final class IOSWorkspaceCoordinator: ObservableObject {
 
     @Published private(set) var generatingSessionIDs: Set<UUID> = []
     @Published private(set) var outcomeErrors: [UUID: String] = [:]
+    @Published private(set) var snapshotSessionIDs: Set<UUID> = []
     @Published private(set) var archiveStats = TranscriptArchiveStats(archivedCount: 0, totalBytes: 0, folderName: nil, usesCustomFolder: false)
     @Published private(set) var lastSyncedAt: Date?
     @Published private(set) var syncError: String?
@@ -128,6 +129,13 @@ final class IOSWorkspaceCoordinator: ObservableObject {
     private var needsAnotherPass = false
     private var pathMonitor: NWPathMonitor?
     private var reachabilityOnline = true
+    private var snapshotObserver: NSObjectProtocol?
+
+    deinit {
+        if let snapshotObserver {
+            NotificationCenter.default.removeObserver(snapshotObserver)
+        }
+    }
 
     private var controllerToSessionID: [UUID: UUID] = [:]
     private var noteDrafts: [UUID: String] = [:]
@@ -360,8 +368,21 @@ final class IOSWorkspaceCoordinator: ObservableObject {
             }
         }
 
+        if snapshotObserver == nil {
+            snapshotObserver = NotificationCenter.default.addObserver(
+                forName: MeetingSnapshotStore.didChangeNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    self?.snapshotSessionIDs = await MeetingSnapshotStore.shared.allSessionIDsWithSnapshots()
+                }
+            }
+        }
+
         Task { @MainActor [weak self] in
             guard let self else { return }
+            self.snapshotSessionIDs = await MeetingSnapshotStore.shared.allSessionIDsWithSnapshots()
             await self.loadReplicaFromDiskIfNeeded()
             await self.ingestLocalAssistantStateIntoDocument()
             await self.reloadFromStore()
@@ -753,6 +774,22 @@ final class IOSWorkspaceCoordinator: ObservableObject {
         replica.workspaceDoc.resolveCanonicalSessionID(for: sessionID)
     }
 
+    func relatedSnapshotSessionIDs(for sessionID: UUID, includeHistoryGroup: Bool = true) -> [UUID] {
+        let canonical = replica.workspaceDoc.resolveCanonicalSessionID(for: sessionID)
+        var ids: Set<UUID> = [sessionID, canonical]
+        if includeHistoryGroup {
+            for source in linkedHistorySources(for: canonical) {
+                ids.insert(source.id)
+            }
+        }
+        for sid in replica.workspaceDoc.sessions.keys {
+            if replica.workspaceDoc.resolveCanonicalSessionID(for: sid) == canonical {
+                ids.insert(sid)
+            }
+        }
+        return ids.sorted { $0.uuidString < $1.uuidString }
+    }
+
     func generateOutcomeNow(sessionID: UUID, automatic: Bool = false) async {
         let sid = replica.workspaceDoc.resolveCanonicalSessionID(for: sessionID)
         if outcomeConfig.providerKind.needsKey && !remoteAISharingAllowed {
@@ -808,7 +845,7 @@ final class IOSWorkspaceCoordinator: ObservableObject {
         do {
             // Reading the transcript can suspend while the user changes providers or revokes consent.
             _ = try permittedAIConfiguration()
-            let visualRecords = await MeetingSnapshotStore.shared.snapshots(for: sid)
+            let visualRecords = await MeetingSnapshotStore.shared.snapshots(for: relatedSnapshotSessionIDs(for: sid))
             let visualContext = MeetingSnapshotMarkdown.summaryPromptContext(snapshots: visualRecords)
             let trimmedNotes = noteText.trimmingCharacters(in: .whitespacesAndNewlines)
             let combinedNotes: String = {
@@ -1994,6 +2031,9 @@ final class IOSWorkspaceCoordinator: ObservableObject {
                 let outcome = outcomesBySession[src.id]
                 let texts = transcriptTextsBySession[canonicalID] ?? []
                 let hasFailedWithInput = (outcome?.state == "failed" || outcomeErrors[src.id] != nil) && !texts.isEmpty
+                let hasSnapshots = relatedSnapshotSessionIDs(for: src.id, includeHistoryGroup: false).contains {
+                    snapshotSessionIDs.contains($0)
+                }
                 return MeetingContentMeaningfulness.isMeaningful(
                     MeetingMeaningfulnessInput(
                         hasNotes: note?.isEmpty == false,
@@ -2004,6 +2044,7 @@ final class IOSWorkspaceCoordinator: ObservableObject {
                         openQuestionsCount: outcome?.openQuestions.count ?? 0,
                         isGeneratingOutcome: generatingSessionIDs.contains(src.id) || outcome?.state == "pending",
                         hasFailedOutcomeWithInput: hasFailedWithInput,
+                        hasSnapshots: hasSnapshots,
                         transcriptTexts: texts
                     )
                 )
@@ -2552,6 +2593,10 @@ final class IOSWorkspaceCoordinator: ObservableObject {
             if let synced = replica.workspaceDoc.sessions[sid] {
                 _ = try await store.applyRemoteSession(synced)
                 if synced.isDeleted.value || (synced.canonicalSessionID?.value != nil && synced.canonicalSessionID?.value != sid) {
+                    let canonical = replica.workspaceDoc.resolveCanonicalSessionID(for: sid)
+                    if !synced.isDeleted.value, canonical != sid {
+                        Task { try? await MeetingSnapshotStore.shared.migrate(from: sid, to: canonical) }
+                    }
                     noteDrafts.removeValue(forKey: sid)
                     dirtyNoteSessions.remove(sid)
                     exportedNotes.removeValue(forKey: sid)

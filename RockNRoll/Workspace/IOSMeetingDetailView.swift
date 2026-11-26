@@ -68,9 +68,35 @@ struct IOSMeetingDetailView: View {
     @State private var newRuleDraft = ""
     @State private var settingsSaved = false
     @State private var isLoadingContext = false
+    @State private var meetingSnapshots: [MeetingSnapshotRecord] = []
+    @State private var loadedSnapshotKey = ""
+    @State private var currentSnapshotKey = ""
+    @State private var selectedSnapshotID: UUID?
 
     private var resolvedSessionID: UUID {
         workspace.canonicalSessionID(for: sessionID)
+    }
+
+    private var snapshotSessionIDs: [UUID] {
+        workspace.relatedSnapshotSessionIDs(for: sessionID)
+    }
+
+    private var snapshotSessionKey: String {
+        snapshotSessionIDs.map(\.uuidString).joined(separator: ",")
+    }
+
+    private var visibleMeetingSnapshots: [MeetingSnapshotRecord] {
+        loadedSnapshotKey == snapshotSessionKey ? meetingSnapshots : []
+    }
+
+    private var selectedSnapshotBinding: Binding<MeetingSnapshotRecord?> {
+        Binding(
+            get: {
+                guard let id = selectedSnapshotID else { return nil }
+                return visibleMeetingSnapshots.first(where: { $0.id == id })
+            },
+            set: { selectedSnapshotID = $0?.id }
+        )
     }
 
     private var session: IOSMeetingSessionItem? {
@@ -363,9 +389,11 @@ struct IOSMeetingDetailView: View {
                 }
             }
 
-            IOSMeetingSnapshotsSection(
-                sessionIDs: [resolvedSessionID] + workspace.linkedHistorySources(for: sessionID).map(\.id)
-            )
+            if !visibleMeetingSnapshots.isEmpty {
+                IOSMeetingSnapshotsSection(snapshots: visibleMeetingSnapshots) { snap in
+                    selectedSnapshotID = snap.id
+                }
+            }
 
             if let outcome {
                 Section {
@@ -571,6 +599,49 @@ struct IOSMeetingDetailView: View {
             }
         }
         .listStyle(.insetGrouped)
+        .task(id: snapshotSessionKey) {
+            currentSnapshotKey = snapshotSessionKey
+            let loaded = await MeetingSnapshotStore.shared.snapshots(for: snapshotSessionIDs)
+            guard !Task.isCancelled, currentSnapshotKey == snapshotSessionKey else { return }
+            meetingSnapshots = loaded
+            loadedSnapshotKey = snapshotSessionKey
+        }
+        .onReceive(NotificationCenter.default.publisher(for: MeetingSnapshotStore.didChangeNotification)) { notification in
+            if let changedID = notification.userInfo?["sessionID"] as? UUID,
+               !snapshotSessionIDs.contains(changedID) {
+                return
+            }
+            let targetKey = snapshotSessionKey
+            let targetIDs = snapshotSessionIDs
+            Task {
+                let loaded = await MeetingSnapshotStore.shared.snapshots(for: targetIDs)
+                guard currentSnapshotKey == targetKey else { return }
+                meetingSnapshots = loaded
+                loadedSnapshotKey = targetKey
+            }
+        }
+        .sheet(item: selectedSnapshotBinding) { snap in
+            IOSMeetingSnapshotLightboxView(
+                record: snap,
+                onSaveCaption: { caption in
+                    Task {
+                        _ = try? await MeetingSnapshotStore.shared.updateCaption(caption, snapshotID: snap.id, sessionID: snap.sessionID)
+                        let loaded = await MeetingSnapshotStore.shared.snapshots(for: snapshotSessionIDs)
+                        meetingSnapshots = loaded
+                        loadedSnapshotKey = snapshotSessionKey
+                    }
+                },
+                onDelete: {
+                    Task {
+                        try? await MeetingSnapshotStore.shared.delete(snapshotID: snap.id, sessionID: snap.sessionID)
+                        selectedSnapshotID = nil
+                        let loaded = await MeetingSnapshotStore.shared.snapshots(for: snapshotSessionIDs)
+                        meetingSnapshots = loaded
+                        loadedSnapshotKey = snapshotSessionKey
+                    }
+                }
+            )
+        }
     }
 
     // MARK: - Notes Tab

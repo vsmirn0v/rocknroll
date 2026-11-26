@@ -802,7 +802,15 @@ struct NativeDesktopMeetingView: View {
         } else {
             VStack(spacing: 16) {
                 if let camera = model.localCamera {
-                    NativeDesktopVideoView(track: camera, mirrored: true)
+                    NativeDesktopVideoView(
+                        track: camera,
+                        mirrored: true,
+                        snapshotRegistry: model.snapshotRegistry,
+                        snapshotSourceID: "local-camera",
+                        snapshotParticipantID: model.participants.first(where: { $0.isLocal })?.id ?? "local",
+                        snapshotSourceName: L("You"),
+                        snapshotScope: .participantCamera
+                    )
                     NativeDesktopWaitingInviteCard(model: model, compact: true)
                 } else {
                     Image(systemName: "person.2").font(.system(size: 48)).foregroundStyle(.secondary)

@@ -12,6 +12,8 @@ actor ObsidianExportWorker {
     private let writer: ObsidianFileWriter
     private let vaultResolver: (Data) -> (resolution: ObsidianVaultAccess.Resolution, refreshedBookmark: Data?)
     private let transcriptProvider: @Sendable (MeetingSessionRecord) async -> String?
+    private let snapshotSessionIDsProvider: @Sendable (UUID) async -> [UUID]
+    private let snapshotStore: MeetingSnapshotStore
     private var running = false
     private var processing = false
     private var pendingWake = false
@@ -33,6 +35,8 @@ actor ObsidianExportWorker {
     init(store: MeetingLibraryStore, backupRoot: URL, writer: ObsidianFileWriter? = nil,
          vaultResolver: ((Data) -> ObsidianVaultAccess.Resolution)? = nil,
          transcriptProvider: @escaping @Sendable (MeetingSessionRecord) async -> String? = { _ in nil },
+         snapshotSessionIDsProvider: @escaping @Sendable (UUID) async -> [UUID] = { [$0] },
+         snapshotStore: MeetingSnapshotStore = .shared,
          onLog: @escaping (String, [String: Any]) -> Void = { _, _ in }) {
         self.store = store
         self.backupRoot = backupRoot
@@ -43,6 +47,8 @@ actor ObsidianExportWorker {
             self.vaultResolver = { ObsidianVaultAccess.resolveWithRefresh($0) }
         }
         self.transcriptProvider = transcriptProvider
+        self.snapshotSessionIDsProvider = snapshotSessionIDsProvider
+        self.snapshotStore = snapshotStore
         self.onLog = onLog
     }
 
@@ -347,9 +353,22 @@ actor ObsidianExportWorker {
             try await store.commitExportWrite(prepared)
             binding = prepared
         }
+        let includeSnapshots = destination.layout.sections.contains(.snapshots) && component != .index && component != .transcript
+        let visualSnapshots: [MeetingSnapshotRecord]
+        let snapshotsSignature: String?
+        if includeSnapshots {
+            let snapshotSessionIDs = await snapshotSessionIDsProvider(session.id)
+            visualSnapshots = await snapshotStore.snapshots(for: snapshotSessionIDs)
+            snapshotsSignature = Self.snapshotsDigest(visualSnapshots)
+        } else {
+            visualSnapshots = []
+            snapshotsSignature = nil
+        }
+
         let approval = try await store.approvedObsidianConflict(row: row, component: component)
         if approval == nil, binding.lastExportedRevision >= row.desiredRevision, binding.lastExportedRevision > 0,
-           binding.transcriptSignature == transcriptSignature {
+           binding.transcriptSignature == transcriptSignature,
+           binding.snapshotsSignature == snapshotsSignature {
             guard let nonce = binding.markerID,
                   MarkdownFilePatcher.managedBlockHash(in: existingText, sessionID: session.id,
                     nonce: nonce, component: component) == binding.lastBlockSHA256,
@@ -373,8 +392,6 @@ actor ObsidianExportWorker {
                 binding.lastMetadataSHA256 = approved
             }
         }
-        let visualSnapshots = destination.layout.sections.contains(.snapshots) && component != .index && component != .transcript
-            ? await MeetingSnapshotStore.shared.snapshots(for: session.id) : []
         if !visualSnapshots.isEmpty {
             try await copySnapshotAttachments(visualSnapshots, destination: destination, relativeMarkdownPath: relativePath, in: vault)
         }
@@ -393,12 +410,30 @@ actor ObsidianExportWorker {
         receipt.lastMetadataSHA256 = result.metadataSHA256
         receipt.metadataOwnershipEvaluated = component == .meeting ? true : nil
         receipt.transcriptSignature = transcriptSignature
+        receipt.snapshotsSignature = snapshotsSignature
         guard try await store.prepareExportWrite(row: row, binding: receipt) else { return nil }
         let outcome = try await writer.write(target: fileTarget, content: result.text, expectedIdentity: expected,
             vaultRoot: vault, relativePath: relativePath)
         receipt.lastFileSHA256 = outcome.identity.sha256
         try await store.commitExportWrite(receipt)
         return receipt
+    }
+
+    private static func snapshotsDigest(_ snapshots: [MeetingSnapshotRecord]) -> String {
+        guard !snapshots.isEmpty else { return "" }
+        let ordered = snapshots.sorted { ($0.capturedAt, $0.id.uuidString) < ($1.capturedAt, $1.id.uuidString) }
+        let payload = ordered.map { snap in
+            [
+                snap.id.uuidString,
+                snap.relativeFileName,
+                snap.fileExtension,
+                String(snap.updatedAt.timeIntervalSinceReferenceDate),
+                snap.caption,
+                snap.ocrText,
+                snap.transcriptExcerpt
+            ].joined(separator: "\u{1F}")
+        }.joined(separator: "\u{1E}")
+        return MarkdownFilePatcher.sha256(payload)
     }
 
     private func copySnapshotAttachments(
@@ -415,11 +450,11 @@ actor ObsidianExportWorker {
                   case .success(let fileURL) = ObsidianVaultAccess.validateFileTarget(targetURL) else {
                 continue
             }
-            if FileManager.default.fileExists(atPath: fileURL.path) { continue }
-            let sourceURL = await MeetingSnapshotStore.shared.imageURL(for: snap)
+            let sourceURL = await snapshotStore.imageURL(for: snap)
             guard FileManager.default.fileExists(atPath: sourceURL.path) else { continue }
-            try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
             let data = try Data(contentsOf: sourceURL)
+            if let existing = try? Data(contentsOf: fileURL), existing == data { continue }
+            try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
             try data.write(to: fileURL, options: .atomic)
         }
     }
@@ -470,7 +505,7 @@ actor ObsidianExportWorker {
         let destination = rawDestination.effective(for: overrides)
         let transcript = destination.layout.sections.contains(.transcript) ? await transcriptProvider(snapshot.session) : nil
         let visualSnapshots = destination.layout.sections.contains(.snapshots)
-            ? await MeetingSnapshotStore.shared.snapshots(for: snapshot.session.id) : []
+            ? await snapshotStore.snapshots(for: await snapshotSessionIDsProvider(snapshot.session.id)) : []
         let copy = MeetingMarkdownTemplate.managedContent(session: snapshot.session, note: snapshot.note,
             outcome: snapshot.outcome, outcomeState: snapshot.outcomeState, sections: destination.layout.sections,
             snapshots: visualSnapshots, useWikiLinksForSnapshots: true)

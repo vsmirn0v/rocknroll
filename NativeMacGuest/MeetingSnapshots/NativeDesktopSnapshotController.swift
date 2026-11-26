@@ -15,38 +15,61 @@ final class NativeDesktopSnapshotRegistry {
         let capture: () async -> CGImage?
     }
 
-    private var entries: [String: Entry] = [:]
+    private struct Registration {
+        let token: UUID
+        let entry: Entry
+    }
+
+    private var registrations: [String: [Registration]] = [:]
 
     func register(
         id: String,
+        token: UUID = UUID(),
         participantID: String,
         participantName: String,
         scope: MeetingSnapshotScope,
         capture: @escaping () async -> CGImage?
     ) {
-        entries[id] = Entry(
+        let entry = Entry(
             id: id,
             participantID: participantID,
             participantName: participantName,
             scope: scope,
             capture: capture
         )
+        var list = registrations[id] ?? []
+        if let index = list.firstIndex(where: { $0.token == token }) {
+            list[index] = Registration(token: token, entry: entry)
+        } else {
+            list.append(Registration(token: token, entry: entry))
+        }
+        registrations[id] = list
+    }
+
+    func unregister(id: String, token: UUID) {
+        guard var list = registrations[id] else { return }
+        list.removeAll { $0.token == token }
+        if list.isEmpty {
+            registrations.removeValue(forKey: id)
+        } else {
+            registrations[id] = list
+        }
     }
 
     func unregister(id: String) {
-        entries.removeValue(forKey: id)
+        registrations.removeValue(forKey: id)
     }
 
     func removeAll() {
-        entries.removeAll()
+        registrations.removeAll()
     }
 
     var allEntries: [Entry] {
-        Array(entries.values)
+        registrations.values.compactMap(\.last?.entry)
     }
 
     func entry(id: String) -> Entry? {
-        entries[id]
+        registrations[id]?.last?.entry
     }
 }
 
@@ -176,7 +199,10 @@ final class NativeDesktopSnapshotController: ObservableObject {
         guard let model else { return }
         let registry = model.snapshotRegistry
         let entries = registry.allEntries
-        guard !entries.isEmpty else { return }
+        guard !entries.isEmpty else {
+            probeLog("snapshot-capture-skipped", ["reason": "no-entries", "target": targetID])
+            return
+        }
 
         let sessionID = model.workspaceSessionID
         let excerpt = latestTranscriptExcerpt(from: model)
@@ -210,7 +236,10 @@ final class NativeDesktopSnapshotController: ObservableObject {
                     capturedFrames.append((item.id, item.scope, item.name, image))
                 }
             }
-            guard !capturedFrames.isEmpty else { return }
+            guard !capturedFrames.isEmpty else {
+                probeLog("snapshot-capture-skipped", ["reason": "no-frames", "target": targetID, "session": sessionID.uuidString])
+                return
+            }
 
             let primaryScope: MeetingSnapshotScope
             let primarySourceID: String
@@ -227,7 +256,10 @@ final class NativeDesktopSnapshotController: ObservableObject {
                 }
                 guard let stage = await Task.detached(priority: .userInitiated, operation: {
                     MeetingSnapshotCompositor.composeStage(tiles: tiles)
-                }).value else { return }
+                }).value else {
+                    probeLog("snapshot-capture-failed", ["reason": "compose-stage", "session": sessionID.uuidString])
+                    return
+                }
                 primaryScope = .fullStage
                 primarySourceID = "full-stage"
                 primarySourceName = L("Full stage")
@@ -243,16 +275,32 @@ final class NativeDesktopSnapshotController: ObservableObject {
 
             guard let encoded = await Task.detached(priority: .userInitiated, operation: {
                 MeetingSnapshotEncoder.encode(primaryImage, scope: primaryScope, format: format)
-            }).value else { return }
+            }).value else {
+                probeLog("snapshot-capture-failed", ["reason": "encode", "scope": primaryScope.rawValue, "session": sessionID.uuidString])
+                return
+            }
 
-            guard let record = try? await MeetingSnapshotStore.shared.save(
-                sessionID: sessionID,
-                scope: primaryScope,
-                sourceID: primarySourceID,
-                sourceName: primarySourceName,
-                encoded: encoded,
-                transcriptExcerpt: excerpt
-            ) else { return }
+            let record: MeetingSnapshotRecord
+            do {
+                record = try await MeetingSnapshotStore.shared.save(
+                    sessionID: sessionID,
+                    scope: primaryScope,
+                    sourceID: primarySourceID,
+                    sourceName: primarySourceName,
+                    encoded: encoded,
+                    transcriptExcerpt: excerpt
+                )
+            } catch {
+                probeLog("snapshot-capture-failed", ["reason": "store-save", "error": error.localizedDescription, "session": sessionID.uuidString])
+                return
+            }
+            probeLog("snapshot-captured", [
+                "session": sessionID.uuidString,
+                "snapshot": record.id.uuidString,
+                "scope": primaryScope.rawValue,
+                "width": record.pixelWidth,
+                "height": record.pixelHeight
+            ])
 
             var candidates: [RetroactiveSnapshotCandidate] = capturedFrames.map { frame in
                 let prefix = frame.scope == .screenShare ? L("Screen") : L("Camera")
@@ -433,7 +481,7 @@ final class NativeDesktopSnapshotController: ObservableObject {
     }
 
     private func runOCRInBackground(image: CGImage, snapshotID: UUID, sessionID: UUID) {
-        Task.detached(priority: .utility) {
+        Task.detached(priority: .utility) { [weak self] in
             let request = VNRecognizeTextRequest()
             request.recognitionLevel = .accurate
             request.usesLanguageCorrection = false
@@ -445,6 +493,10 @@ final class NativeDesktopSnapshotController: ObservableObject {
                 .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             guard !recognized.isEmpty else { return }
             _ = try? await MeetingSnapshotStore.shared.updateOCRText(recognized, snapshotID: snapshotID, sessionID: sessionID)
+            await MainActor.run { [weak self] in
+                guard let self, let model = self.model else { return }
+                self.notifyObsidianExportIfNeeded(sessionID: sessionID, in: model)
+            }
         }
     }
 

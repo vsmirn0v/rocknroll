@@ -9,6 +9,7 @@ public struct MeetingMeaningfulnessInput: Equatable, Sendable {
     public var openQuestionsCount: Int
     public var isGeneratingOutcome: Bool
     public var hasFailedOutcomeWithInput: Bool
+    public var hasSnapshots: Bool
     public var transcriptTexts: [String]
 
     public init(
@@ -20,6 +21,7 @@ public struct MeetingMeaningfulnessInput: Equatable, Sendable {
         openQuestionsCount: Int = 0,
         isGeneratingOutcome: Bool = false,
         hasFailedOutcomeWithInput: Bool = false,
+        hasSnapshots: Bool = false,
         transcriptTexts: [String] = []
     ) {
         self.hasNotes = hasNotes
@@ -30,6 +32,7 @@ public struct MeetingMeaningfulnessInput: Equatable, Sendable {
         self.openQuestionsCount = openQuestionsCount
         self.isGeneratingOutcome = isGeneratingOutcome
         self.hasFailedOutcomeWithInput = hasFailedOutcomeWithInput
+        self.hasSnapshots = hasSnapshots
         self.transcriptTexts = transcriptTexts
     }
 }
@@ -145,7 +148,7 @@ public enum MeetingContentMeaningfulness {
         _ input: MeetingMeaningfulnessInput,
         lazyTranscriptTexts: () -> AnySequence<String>
     ) -> Bool {
-        if input.isGeneratingOutcome || input.hasFailedOutcomeWithInput {
+        if input.isGeneratingOutcome || input.hasFailedOutcomeWithInput || input.hasSnapshots {
             return true
         }
         if let preview = input.notePreview {

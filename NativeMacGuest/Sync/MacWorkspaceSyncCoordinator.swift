@@ -603,6 +603,19 @@ final class MacWorkspaceSyncCoordinator: ObservableObject {
         }
     }
 
+    func relatedSnapshotSessionIDs(for id: UUID, includeHistoryGroup: Bool = true) -> [UUID] {
+        let canonical = canonicalSessionID(id)
+        let root = includeHistoryGroup ? historySessionID(canonical) : canonical
+        var ids: Set<UUID> = [id, canonical, root]
+        for sid in replica.workspaceDoc.sessions.keys {
+            let sidCanonical = canonicalSessionID(sid)
+            if sidCanonical == canonical || (includeHistoryGroup && (sidCanonical == root || historySessionID(sid) == root)) {
+                ids.insert(sid)
+            }
+        }
+        return ids.sorted { $0.uuidString < $1.uuidString }
+    }
+
     func setHistoryGroup(sessionID: UUID, parent: UUID?) {
         let source = canonicalSessionID(sessionID)
         let target = parent.map(historySessionID)
@@ -1860,7 +1873,10 @@ final class MacWorkspaceSyncCoordinator: ObservableObject {
         let store = meetingLibrary.store
         for sessionID in report.changedSessions {
             let canonical = replica.workspaceDoc.resolveCanonicalSessionID(for: sessionID)
-            if canonical != sessionID { try await store.preserveRedirectedHistory(from: sessionID, to: canonical) }
+            if canonical != sessionID {
+                try await store.preserveRedirectedHistory(from: sessionID, to: canonical)
+                try? await MeetingSnapshotStore.shared.migrate(from: sessionID, to: canonical)
+            }
         }
         // Preserve source versions above, then release their unique task IDs before
         // the canonical outcome claims them. pendingHistoryApply makes retries durable.

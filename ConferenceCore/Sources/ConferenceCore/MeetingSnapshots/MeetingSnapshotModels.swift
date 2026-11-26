@@ -205,7 +205,11 @@ public enum MeetingSnapshotMarkdown {
             if !caption.isEmpty { parts.append("User note: \(caption)") }
             let ocr = snap.ocrText.split(whereSeparator: \.isWhitespace).joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
             if !ocr.isEmpty { parts.append("Visible text: \(String(ocr.prefix(400)))") }
-            guard parts.count > 1 else { continue }
+            let excerpt = snap.transcriptExcerpt.split(whereSeparator: \.isWhitespace).joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+            if !excerpt.isEmpty { parts.append("Transcript moment: \(String(excerpt.prefix(200)))") }
+            if parts.count == 1 {
+                parts.append("Captured visual frame")
+            }
             let line = parts.joined(separator: " | ")
             if total + line.count > maxCharacters { break }
             blocks.append(line)

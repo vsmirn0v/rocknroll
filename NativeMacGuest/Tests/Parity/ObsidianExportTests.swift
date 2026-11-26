@@ -1,3 +1,5 @@
+import ConferenceCore
+import CoreGraphics
 import Foundation
 import XCTest
 @testable import MeetingEngine
@@ -666,5 +668,124 @@ final class ObsidianExportTests: XCTestCase {
         XCTAssertEqual(resolverCalls, 3)
         let remaining = try await store.outboxCount()
         XCTAssertEqual(remaining, 0)
+    }
+
+    func testLegacyLayoutDecodeEnablesSnapshotsAndPreservesExplicitOptOut() throws {
+        // Legacy layout persisted before `.snapshots` existed (rawValue 31 = notes+summary+decisions+tasks+questions).
+        let legacyJSON = #"{"documentPath":"Meeting worklog.md","monthly":false,"sections":31,"groupByDay":false,"newestDaysFirst":true,"insertAtBeginning":false,"withinDayAtBeginning":false,"timeZoneID":"UTC","runtimeStyle":false}"#
+        let decodedLegacy = try JSONDecoder().decode(ObsidianExportLayout.self, from: Data(legacyJSON.utf8))
+        XCTAssertTrue(decodedLegacy.sections.contains(.snapshots))
+
+        // Explicit opt-out saved by the new encoder must stay disabled across decode round-trips.
+        var optedOut = ObsidianExportLayout()
+        optedOut.sections.remove(.snapshots)
+        let encoded = try JSONEncoder().encode(optedOut)
+        let decodedOptedOut = try JSONDecoder().decode(ObsidianExportLayout.self, from: encoded)
+        XCTAssertFalse(decodedOptedOut.sections.contains(.snapshots))
+    }
+
+    func testWorkerExportsSnapshotsReexportsOnOCRUpdateAndRefreshesAttachmentOnFlip() async throws {
+        let (store, _) = try await makeStoreWithDestination()
+        let snapshotStore = MeetingSnapshotStore(root: temp.appendingPathComponent("Snapshots", isDirectory: true))
+        let session = MeetingSessionRecord(title: "Snapshot Export", startedAt: Date())
+        try await store.upsertSession(session)
+        _ = try await store.saveNote(sessionID: session.id, markdown: "Initial note")
+
+        let imgA = try XCTUnwrap(MeetingSnapshotEncoder.encode(makeSolidTestImage(red: 20, green: 100, blue: 220), scope: .screenShare, format: .jpeg))
+        let snap = try await snapshotStore.save(
+            sessionID: session.id,
+            scope: .screenShare,
+            sourceID: "share:1",
+            sourceName: "Alex",
+            encoded: imgA
+        )
+        try await store.endSession(session.id, at: Date(), awaitingOutcome: false)
+
+        let worker = ObsidianExportWorker(
+            store: store,
+            backupRoot: backups,
+            vaultResolver: { _ in .granted(self.vault) },
+            snapshotStore: snapshotStore
+        )
+        await worker.runOnce()
+
+        let mdURL = vault.appendingPathComponent("Meetings/" + MeetingMarkdownTemplate.meetingFileName(title: session.title, sessionID: session.id))
+        let attachmentURL = vault.appendingPathComponent("Meetings/Attachments/" + snap.exportFileName)
+        let firstMarkdown = try String(contentsOf: mdURL, encoding: .utf8)
+        XCTAssertTrue(firstMarkdown.contains("## Visual Snapshots"))
+        XCTAssertTrue(firstMarkdown.contains(snap.exportFileName))
+        XCTAssertEqual(try Data(contentsOf: attachmentURL), imgA.data)
+
+        // Update OCR and replace image without changing note/outcome; markSnapshotExportDirty triggers re-export.
+        let imgB = try XCTUnwrap(MeetingSnapshotEncoder.encode(makeSolidTestImage(red: 210, green: 40, blue: 40), scope: .participantCamera, format: .jpeg))
+        let maybeFlipped = try await snapshotStore.replaceImage(
+            snapshotID: snap.id,
+            sessionID: session.id,
+            scope: .participantCamera,
+            sourceID: "cam:1",
+            sourceName: "Maya",
+            encoded: imgB
+        )
+        let flipped = try XCTUnwrap(maybeFlipped)
+        _ = try await snapshotStore.updateOCRText("Quarterly budget = $42k", snapshotID: snap.id, sessionID: session.id)
+        try await store.markSnapshotExportDirty(sessionID: session.id)
+        await worker.runOnce()
+
+        let updatedMarkdown = try String(contentsOf: mdURL, encoding: .utf8)
+        XCTAssertTrue(updatedMarkdown.contains("Quarterly budget = $42k"))
+        XCTAssertTrue(updatedMarkdown.contains("Maya"))
+        XCTAssertEqual(try Data(contentsOf: attachmentURL), imgB.data)
+        XCTAssertEqual(flipped.exportFileName, snap.exportFileName)
+    }
+
+    @MainActor
+    func testSnapshotRegistryTokenPreventsStaleUnregisterFromWipingLiveView() async {
+        let registry = NativeDesktopSnapshotRegistry()
+        let tokenA = UUID()
+        let tokenB = UUID()
+        let imageB = makeSolidTestImage(red: 50, green: 180, blue: 90)
+
+        registry.register(id: "video-1", token: tokenA, participantID: "p1", participantName: "Alice", scope: .screenShare) {
+            nil
+        }
+        registry.register(id: "video-1", token: tokenB, participantID: "p1", participantName: "Alice", scope: .screenShare) {
+            imageB
+        }
+        // View A dismantles after View B mounted under the same sourceID.
+        registry.unregister(id: "video-1", token: tokenA)
+
+        XCTAssertEqual(registry.allEntries.count, 1)
+        let captured = await registry.entry(id: "video-1")?.capture()
+        XCTAssertNotNil(captured)
+        XCTAssertEqual(captured?.width, imageB.width)
+
+        registry.unregister(id: "video-1", token: tokenB)
+        XCTAssertTrue(registry.allEntries.isEmpty)
+    }
+
+    private func makeSolidTestImage(width: Int = 48, height: Int = 36, red: UInt8, green: UInt8, blue: UInt8) -> CGImage {
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        let bytesPerRow = width * 4
+        var pixels = [UInt8](repeating: 255, count: height * bytesPerRow)
+        for index in stride(from: 0, to: pixels.count, by: 4) {
+            pixels[index] = red
+            pixels[index + 1] = green
+            pixels[index + 2] = blue
+            pixels[index + 3] = 255
+        }
+        let provider = CGDataProvider(data: Data(pixels) as CFData)!
+        return CGImage(
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bitsPerPixel: 32,
+            bytesPerRow: bytesPerRow,
+            space: colorSpace,
+            bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+            provider: provider,
+            decode: nil,
+            shouldInterpolate: false,
+            intent: .defaultIntent
+        )!
     }
 }

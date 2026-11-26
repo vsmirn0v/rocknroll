@@ -198,6 +198,81 @@ struct ObsidianExportLayout: Codable, Equatable, Sendable {
     var legacyRuntimeYears: [String: [String: Int]]?
     var startAfter: String?
     var endBefore: String?
+    private var snapshotsOptionMigrated = true
+
+    enum CodingKeys: String, CodingKey {
+        case documentPath, monthly, sections, groupByDay, newestDaysFirst, insertAtBeginning
+        case withinDayAtBeginning, timeZoneID, runtimeStyle, legacyRuntimeYears, startAfter, endBefore
+        case snapshotsOptionMigrated
+    }
+
+    init(
+        documentPath: String = "Meeting worklog.md",
+        monthly: Bool = false,
+        sections: MeetingMarkdownSections = .all,
+        groupByDay: Bool = false,
+        newestDaysFirst: Bool = true,
+        insertAtBeginning: Bool = false,
+        withinDayAtBeginning: Bool = false,
+        timeZoneID: String = TimeZone.current.identifier,
+        runtimeStyle: Bool = false,
+        legacyRuntimeYears: [String: [String: Int]]? = nil,
+        startAfter: String? = nil,
+        endBefore: String? = nil
+    ) {
+        self.documentPath = documentPath
+        self.monthly = monthly
+        self.sections = sections
+        self.groupByDay = groupByDay
+        self.newestDaysFirst = newestDaysFirst
+        self.insertAtBeginning = insertAtBeginning
+        self.withinDayAtBeginning = withinDayAtBeginning
+        self.timeZoneID = timeZoneID
+        self.runtimeStyle = runtimeStyle
+        self.legacyRuntimeYears = legacyRuntimeYears
+        self.startAfter = startAfter
+        self.endBefore = endBefore
+        self.snapshotsOptionMigrated = true
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        documentPath = try c.decodeIfPresent(String.self, forKey: .documentPath) ?? "Meeting worklog.md"
+        monthly = try c.decodeIfPresent(Bool.self, forKey: .monthly) ?? false
+        var decodedSections = try c.decodeIfPresent(MeetingMarkdownSections.self, forKey: .sections) ?? .all
+        groupByDay = try c.decodeIfPresent(Bool.self, forKey: .groupByDay) ?? false
+        newestDaysFirst = try c.decodeIfPresent(Bool.self, forKey: .newestDaysFirst) ?? true
+        insertAtBeginning = try c.decodeIfPresent(Bool.self, forKey: .insertAtBeginning) ?? false
+        withinDayAtBeginning = try c.decodeIfPresent(Bool.self, forKey: .withinDayAtBeginning) ?? false
+        timeZoneID = try c.decodeIfPresent(String.self, forKey: .timeZoneID) ?? TimeZone.current.identifier
+        runtimeStyle = try c.decodeIfPresent(Bool.self, forKey: .runtimeStyle) ?? false
+        legacyRuntimeYears = try c.decodeIfPresent([String: [String: Int]].self, forKey: .legacyRuntimeYears)
+        startAfter = try c.decodeIfPresent(String.self, forKey: .startAfter)
+        endBefore = try c.decodeIfPresent(String.self, forKey: .endBefore)
+        let migrated = try c.decodeIfPresent(Bool.self, forKey: .snapshotsOptionMigrated)
+        if migrated != true {
+            decodedSections.insert(.snapshots)
+        }
+        sections = decodedSections
+        snapshotsOptionMigrated = true
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(documentPath, forKey: .documentPath)
+        try c.encode(monthly, forKey: .monthly)
+        try c.encode(sections, forKey: .sections)
+        try c.encode(groupByDay, forKey: .groupByDay)
+        try c.encode(newestDaysFirst, forKey: .newestDaysFirst)
+        try c.encode(insertAtBeginning, forKey: .insertAtBeginning)
+        try c.encode(withinDayAtBeginning, forKey: .withinDayAtBeginning)
+        try c.encode(timeZoneID, forKey: .timeZoneID)
+        try c.encode(runtimeStyle, forKey: .runtimeStyle)
+        try c.encodeIfPresent(legacyRuntimeYears, forKey: .legacyRuntimeYears)
+        try c.encodeIfPresent(startAfter, forKey: .startAfter)
+        try c.encodeIfPresent(endBefore, forKey: .endBefore)
+        try c.encode(true, forKey: .snapshotsOptionMigrated)
+    }
 
     mutating func applyRuntimePreset() {
         monthly = false
@@ -266,6 +341,8 @@ struct ObsidianExportBindingRecord: Codable, Equatable, Sendable {
     var metadataOwnershipEvaluated: Bool?
     /// Nil when disabled, empty when enabled but unavailable, otherwise a content hash.
     var transcriptSignature: String?
+    /// Nil when disabled, empty when enabled with no snapshots, otherwise a content hash.
+    var snapshotsSignature: String? = nil
 }
 
 enum ObsidianExportIntent: String, Codable, Sendable {

@@ -714,10 +714,20 @@ final class AttentionMemoryPressure: @unchecked Sendable {
                     summaryPrompt = await loadAssistantPrompt(.meetingSummary).content
                 }
                 let noteMarkdown = (try? await store.meetingLibrary.store.note(sessionID))?.markdown
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                let visualRecords = await MeetingSnapshotStore.shared.snapshots(for: sessionID)
+                let visualContext = MeetingSnapshotMarkdown.summaryPromptContext(snapshots: visualRecords)
+                let combinedNotes: String? = {
+                    switch (noteMarkdown.isEmpty ? nil : noteMarkdown, visualContext) {
+                    case (let n?, let v?): return n + "\n\n" + v
+                    case (let n?, nil): return n
+                    case (nil, let v?): return v
+                    case (nil, nil): return nil
+                    }
+                }()
                 let content = try await writer.outcome(.init(meetingTitle: title, endedAt: endedAt,
                     window: window, language: language, customInstructions: summaryPrompt,
-                    notes: noteMarkdown?.isEmpty == false ? noteMarkdown : nil))
+                    notes: combinedNotes))
                 historyOutcomeDrafts[sessionID] = .init(id: sessionID, content: content,
                     evidence: MeetingOutcomePrompt.verifiedEvidence(content, window: window), fingerprint: fingerprint)
             } catch {
@@ -818,8 +828,10 @@ final class AttentionMemoryPressure: @unchecked Sendable {
                    retained.request.window.lines.contains(where: { $0.source != .note }) {
                     window = retained.request.window
                 }
+                let visualRecords = await MeetingSnapshotStore.shared.snapshots(for: sessionIDs)
+                let visualContext = MeetingSnapshotMarkdown.summaryPromptContext(snapshots: visualRecords)
                 if !window.lines.contains(where: { $0.source != .note }) {
-                    guard !noteMarkdown.isEmpty else {
+                    guard !noteMarkdown.isEmpty || visualContext != nil else {
                         outcomeError[card.sessionID] = L("No saved transcript or assistant reply text is available for this meeting.")
                         return
                     }
@@ -836,8 +848,6 @@ final class AttentionMemoryPressure: @unchecked Sendable {
                     )
                 }
 
-                let visualRecords = await MeetingSnapshotStore.shared.snapshots(for: sessionIDs)
-                let visualContext = MeetingSnapshotMarkdown.summaryPromptContext(snapshots: visualRecords)
                 let combinedNotes: String? = {
                     switch (noteMarkdown.isEmpty ? nil : noteMarkdown, visualContext) {
                     case (let n?, let v?): return n + "\n\n" + v

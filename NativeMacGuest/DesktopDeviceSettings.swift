@@ -524,6 +524,7 @@ struct NativeDesktopVideoView: NSViewRepresentable {
         private var snapshotSourceName: String?
         private var snapshotScope: MeetingSnapshotScope = .participantCamera
         private var registeredSnapshotID: String?
+        private let snapshotToken = UUID()
         func bindSnapshot(
             registry: NativeDesktopSnapshotRegistry?,
             sourceID: String?,
@@ -532,7 +533,7 @@ struct NativeDesktopVideoView: NSViewRepresentable {
             scope: MeetingSnapshotScope
         ) {
             if let old = registeredSnapshotID, (registry !== snapshotRegistry || sourceID != old) {
-                snapshotRegistry?.unregister(id: old)
+                snapshotRegistry?.unregister(id: old, token: snapshotToken)
                 registeredSnapshotID = nil
             }
             snapshotRegistry = registry
@@ -574,6 +575,7 @@ struct NativeDesktopVideoView: NSViewRepresentable {
                 let expectedMirrored = mirrored
                 registry.register(
                     id: sourceID,
+                    token: snapshotToken,
                     participantID: participantID,
                     participantName: snapshotSourceName ?? "",
                     scope: snapshotScope
@@ -586,7 +588,7 @@ struct NativeDesktopVideoView: NSViewRepresentable {
         }
         private func retireRenderer() {
             if let old = registeredSnapshotID {
-                snapshotRegistry?.unregister(id: old)
+                snapshotRegistry?.unregister(id: old, token: snapshotToken)
                 registeredSnapshotID = nil
             }
             sink?.stop()

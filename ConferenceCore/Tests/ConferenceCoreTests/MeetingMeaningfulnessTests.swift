@@ -225,4 +225,10 @@ final class MeetingMeaningfulnessTests: XCTestCase {
         XCTAssertTrue(meaningful)
         XCTAssertLessThanOrEqual(yielded, 2, "Should stop iterating as soon as substantive threshold is reached")
     }
+
+    func testSnapshotsMakeMeetingMeaningfulWithoutNotesOrTranscript() {
+        XCTAssertTrue(MeetingContentMeaningfulness.isMeaningful(
+            MeetingMeaningfulnessInput(hasSnapshots: true)
+        ))
+    }
 }

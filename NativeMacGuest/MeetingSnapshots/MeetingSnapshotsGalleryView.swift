@@ -4,80 +4,60 @@ import ImageIO
 import SwiftUI
 
 struct MacMeetingSnapshotsStripView: View {
-    let sessionIDs: [UUID]
-    var onSnapshotUpdated: ((UUID) -> Void)? = nil
+    let snapshots: [MeetingSnapshotRecord]
+    let onSaveCaption: (MeetingSnapshotRecord, String) -> Void
+    let onDelete: (MeetingSnapshotRecord) -> Void
 
-    @State private var snapshots: [MeetingSnapshotRecord] = []
-    @State private var selectedSnapshot: MeetingSnapshotRecord?
+    @State private var selectedSnapshotID: UUID?
 
-    private var sessionKey: String {
-        sessionIDs.map(\.uuidString).joined(separator: ",")
+    private var selectedBinding: Binding<MeetingSnapshotRecord?> {
+        Binding(
+            get: {
+                guard let id = selectedSnapshotID else { return nil }
+                return snapshots.first(where: { $0.id == id })
+            },
+            set: { selectedSnapshotID = $0?.id }
+        )
     }
 
     var body: some View {
-        Group {
-            if !snapshots.isEmpty {
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack {
-                        Label(L("Visual snapshots (%ld)", snapshots.count), systemImage: "photo.on.rectangle.angled")
-                            .font(.headline)
-                        Spacer()
-                        Text(L("Click any frame for Live Text & details"))
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(spacing: 10) {
-                            ForEach(snapshots) { snap in
-                                Button {
-                                    selectedSnapshot = snap
-                                } label: {
-                                    MacSnapshotCard(record: snap)
-                                }
-                                .buttonStyle(.plain)
-                            }
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Label(L("Visual snapshots (%ld)", snapshots.count), systemImage: "photo.on.rectangle.angled")
+                    .font(.headline)
+                Spacer()
+                Text(L("Click any frame for Live Text & details"))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 10) {
+                    ForEach(snapshots) { snap in
+                        Button {
+                            selectedSnapshotID = snap.id
+                        } label: {
+                            MacSnapshotCard(record: snap)
                         }
-                        .padding(.vertical, 2)
+                        .buttonStyle(.plain)
                     }
                 }
-                .padding(14)
-                .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 10))
+                .padding(.vertical, 2)
             }
         }
-        .task(id: sessionKey) {
-            await reload()
-        }
-        .onReceive(NotificationCenter.default.publisher(for: MeetingSnapshotStore.didChangeNotification)) { notification in
-            if let changedID = notification.userInfo?["sessionID"] as? UUID,
-               !sessionIDs.contains(changedID) {
-                return
-            }
-            Task { await reload() }
-        }
-        .sheet(item: $selectedSnapshot) { snap in
+        .padding(14)
+        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 10))
+        .sheet(item: selectedBinding) { snap in
             MacMeetingSnapshotLightbox(
                 record: snap,
                 onSaveCaption: { caption in
-                    Task {
-                        _ = try? await MeetingSnapshotStore.shared.updateCaption(caption, snapshotID: snap.id, sessionID: snap.sessionID)
-                        await reload()
-                        onSnapshotUpdated?(snap.sessionID)
-                    }
+                    onSaveCaption(snap, caption)
                 },
                 onDelete: {
-                    Task {
-                        try? await MeetingSnapshotStore.shared.delete(snapshotID: snap.id, sessionID: snap.sessionID)
-                        selectedSnapshot = nil
-                        await reload()
-                        onSnapshotUpdated?(snap.sessionID)
-                    }
+                    selectedSnapshotID = nil
+                    onDelete(snap)
                 }
             )
         }
-    }
-
-    private func reload() async {
-        snapshots = await MeetingSnapshotStore.shared.snapshots(for: sessionIDs)
     }
 }
 

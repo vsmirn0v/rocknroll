@@ -47,7 +47,15 @@ import UserNotifications
     var mcpService: NativeDesktopMCPService?
     /// Obsidian one-way export coordinator, created with the meeting library.
     lazy var obsidian: ObsidianExportCoordinator = {
-        let coord = ObsidianExportCoordinator(library: attention.store.meetingLibrary, archive: transcriptArchive)
+        let coord = ObsidianExportCoordinator(
+            library: attention.store.meetingLibrary,
+            archive: transcriptArchive,
+            snapshotSessionIDsProvider: { [weak self] sessionID in
+                await MainActor.run {
+                    self?.workspaceSync.relatedSnapshotSessionIDs(for: sessionID, includeHistoryGroup: false) ?? [sessionID]
+                }
+            }
+        )
         coord.onDestinationChanged = { [weak self] in
             await self?.attention.startSkillFolderWatcher()
         }
@@ -1323,6 +1331,7 @@ import UserNotifications
                     await notes.flush(sessionID: parentID)
                 }
                 notes.discard(sessionID: childID)
+                try? await MeetingSnapshotStore.shared.migrate(from: childID, to: parentID)
                 await self.attention.store.meetingLibrary.deleteSession(childID)
                 await self.attention.store.meetingLibrary.updateSessionTitle(parentID, title: chaptered)
             }
@@ -1426,6 +1435,7 @@ import UserNotifications
                         model.mergeWorkspaceSessionBack(into: previous.sessionID, title: previous.title,
                                                         seriesID: previous.seriesID, calendarMeeting: nil, at: leftAt)
                         attention.store.notes.discard(sessionID: last.sessionID)
+                        try? await MeetingSnapshotStore.shared.migrate(from: last.sessionID, to: previous.sessionID)
                         await attention.store.meetingLibrary.deleteSession(last.sessionID)
                     } else {
                         let restored = chapteredTitle(for: previous.sessionID, in: model.segments)

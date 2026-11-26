@@ -2337,6 +2337,7 @@ extension MeetingLibraryStore {
         let metadataSHA256: String?
         let metadataOwnershipEvaluated: Bool?
         let transcriptSignature: String?
+        let snapshotsSignature: String?
     }
 
     private static func writeBinding(_ binding: ObsidianExportBindingRecord, db: MeetingSQLiteConnection) throws {
@@ -2357,9 +2358,11 @@ extension MeetingLibraryStore {
             try Self.bindText($0, binding.relativePath, at: 4)
             try Self.bindText($0, binding.markerID, at: 5)
             let layout: Data?
-            if binding.lastMetadataSHA256 != nil || binding.metadataOwnershipEvaluated != nil || binding.transcriptSignature != nil {
+            if binding.lastMetadataSHA256 != nil || binding.metadataOwnershipEvaluated != nil || binding.transcriptSignature != nil || binding.snapshotsSignature != nil {
                 layout = try JSONEncoder().encode(BindingLayoutReceipt(metadataSHA256: binding.lastMetadataSHA256,
-                    metadataOwnershipEvaluated: binding.metadataOwnershipEvaluated, transcriptSignature: binding.transcriptSignature))
+                    metadataOwnershipEvaluated: binding.metadataOwnershipEvaluated,
+                    transcriptSignature: binding.transcriptSignature,
+                    snapshotsSignature: binding.snapshotsSignature))
             } else {
                 layout = nil
             }
@@ -2750,7 +2753,7 @@ extension MeetingLibraryStore {
             errorCode: row.text(13),
             updatedAt: Self.date(row.integer(16)) ?? .distantPast,
             lastMetadataSHA256: layout?.metadataSHA256, metadataOwnershipEvaluated: layout?.metadataOwnershipEvaluated,
-            transcriptSignature: layout?.transcriptSignature)
+            transcriptSignature: layout?.transcriptSignature, snapshotsSignature: layout?.snapshotsSignature)
     }
 
     private static func outboxRecord(from row: MeetingSQLiteRow) -> ObsidianOutboxRecord? {

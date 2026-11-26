@@ -28,6 +28,25 @@ public actor MeetingSnapshotStore {
         }
     }
 
+    public func allSessionIDsWithSnapshots() -> Set<UUID> {
+        guard let entries = try? fileManager.contentsOfDirectory(
+            at: root,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return []
+        }
+        var result: Set<UUID> = []
+        for url in entries {
+            guard let id = UUID(uuidString: url.lastPathComponent),
+                  !readIndex(sessionID: id).isEmpty else {
+                continue
+            }
+            result.insert(id)
+        }
+        return result
+    }
+
     public func snapshots(for sessionID: UUID) -> [MeetingSnapshotRecord] {
         readIndex(sessionID: sessionID).sorted { ($0.capturedAt, $0.id.uuidString) > ($1.capturedAt, $1.id.uuidString) }
     }
@@ -168,6 +187,66 @@ public actor MeetingSnapshotStore {
             try fileManager.removeItem(at: dir)
         }
         postDidChange(sessionID: sessionID)
+    }
+
+    public func migrate(from sourceSessionID: UUID, to targetSessionID: UUID) throws {
+        guard sourceSessionID != targetSessionID else { return }
+        let sourceRecords = readIndex(sessionID: sourceSessionID)
+        guard !sourceRecords.isEmpty else { return }
+
+        let sourceDir = sessionDirectory(sourceSessionID)
+        let targetDir = sessionDirectory(targetSessionID)
+        try fileManager.createDirectory(at: targetDir, withIntermediateDirectories: true)
+
+        var byID = Dictionary(
+            readIndex(sessionID: targetSessionID).map { ($0.id, $0) },
+            uniquingKeysWith: { lhs, rhs in lhs.updatedAt >= rhs.updatedAt ? lhs : rhs }
+        )
+
+        for record in sourceRecords {
+            if let existing = byID[record.id],
+               existing.updatedAt >= record.updatedAt,
+               fileManager.fileExists(atPath: targetDir.appendingPathComponent(existing.relativeFileName).path) {
+                continue
+            }
+            let preferredFileName = record.relativeFileName
+            let targetOwnsFile = byID.values.contains { $0.id != record.id && $0.relativeFileName == preferredFileName }
+            let destFileName = targetOwnsFile
+                ? "\(record.id.uuidString)-\(UUID().uuidString.prefix(6)).\(record.fileExtension)"
+                : preferredFileName
+            let srcURL = sourceDir.appendingPathComponent(record.relativeFileName)
+            let destURL = targetDir.appendingPathComponent(destFileName)
+            if fileManager.fileExists(atPath: srcURL.path) {
+                if fileManager.fileExists(atPath: destURL.path) {
+                    try? fileManager.removeItem(at: destURL)
+                }
+                try fileManager.moveItem(at: srcURL, to: destURL)
+            }
+            byID[record.id] = MeetingSnapshotRecord(
+                id: record.id,
+                sessionID: targetSessionID,
+                capturedAt: record.capturedAt,
+                scope: record.scope,
+                sourceID: record.sourceID,
+                sourceName: record.sourceName,
+                relativeFileName: destFileName,
+                fileExtension: record.fileExtension,
+                pixelWidth: record.pixelWidth,
+                pixelHeight: record.pixelHeight,
+                caption: record.caption,
+                ocrText: record.ocrText,
+                transcriptExcerpt: record.transcriptExcerpt,
+                updatedAt: record.updatedAt
+            )
+        }
+
+        let merged = byID.values.sorted { ($0.capturedAt, $0.id.uuidString) > ($1.capturedAt, $1.id.uuidString) }
+        try writeIndex(merged, sessionID: targetSessionID)
+        if fileManager.fileExists(atPath: sourceDir.path) {
+            try? fileManager.removeItem(at: sourceDir)
+        }
+        postDidChange(sessionID: sourceSessionID)
+        postDidChange(sessionID: targetSessionID)
     }
 
     private func sessionDirectory(_ sessionID: UUID) -> URL {
