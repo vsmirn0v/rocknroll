@@ -39,16 +39,21 @@ struct NativeSegmentedControl<Selection: Hashable>: NSViewRepresentable {
     }
 
     func sizeThatFits(_ proposal: ProposedViewSize, nsView: NSSegmentedControl, context: Context) -> CGSize? {
-        let intrinsic = nsView.intrinsicContentSize
+        let raw = nsView.intrinsicContentSize
+        let fitting = nsView.fittingSize
+        let fallbackWidth = fitting.width.isFinite ? max(0, fitting.width) : 0
+        let fallbackHeight = fitting.height.isFinite ? max(0, fitting.height) : 0
+        let intrinsicWidth = raw.width.isFinite && raw.width > 0 ? raw.width : fallbackWidth
+        let intrinsicHeight = raw.height.isFinite && raw.height > 0 ? raw.height : fallbackHeight
         let width: CGFloat
         if expandsToFill, let proposed = proposal.width, proposed.isFinite {
             width = proposed
         } else if let proposed = proposal.width, proposed.isFinite {
-            width = min(intrinsic.width, proposed)
+            width = min(intrinsicWidth, proposed)
         } else {
-            width = intrinsic.width
+            width = intrinsicWidth
         }
-        return CGSize(width: width, height: intrinsic.height)
+        return CGSize(width: width, height: intrinsicHeight)
     }
 
     private func apply(to control: NSSegmentedControl) {

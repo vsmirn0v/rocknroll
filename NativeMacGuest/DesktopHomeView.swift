@@ -162,66 +162,67 @@ struct NativeDesktopHomeView: View {
         }
     }
     var body: some View {
-        GeometryReader { geometry in
-            navigation
-                .frame(width: geometry.size.width, height: geometry.size.height)
-        }
-        .tint(.orange)
-        .accentColor(.orange)
+        navigation
+            .tint(.orange)
+            .accentColor(.orange)
     }
     private var navigation: some View {
         NavigationSplitView {
             sidebar
         } detail: {
-            ZStack {
-                if workspace.selectedMeeting == nil {
-                    Group {
-                        switch workspace.selection {
-                        case .settings: settingsView
-                        case .favorites: roomList(library.favorites, title: L("Favorites"), search: $favoritesSearch, reorder: true)
-                        case .recent: roomList(library.recent, title: L("Recent rooms"), search: $recentSearch)
-                        case .calendar: NativeDesktopCalendarView(workspace: workspace, library: library, cache: calendarCache)
-                        case .workspace: NativeDesktopMeetingWorkspaceView(workspace: workspace)
-                        case .history: MeetingHistoryView(attention: workspace.attention, workspace: workspace)
-                            .onAppear { workspace.workspaceSync.scheduleSync(delayMilliseconds: 100, localChanges: false) }
-                        case .assistant: AttentionMomentsView(attention: workspace.attention, store: workspace.attention.store)
-                        case .tasks:
-                            PersonalTasksView(attention: workspace.attention) { sessionID, taskID in
-                                workspace.openMeetingHistory(sessionID, tab: .tasks, taskID: taskID, source: .tasks)
-                            }.navigationTitle(L("Tasks"))
-                        case .home: home
+            GeometryReader { geometry in
+                ZStack {
+                    if workspace.selectedMeeting == nil {
+                        VStack(spacing: 0) {
+                            #if NATIVE_DIRECT_UPDATES
+                            if let updates = workspace.updates { NativeDesktopUpdateBanner(updates: updates) }
+                            #endif
+                            Group {
+                                switch workspace.selection {
+                                case .settings: settingsView
+                                case .favorites: roomList(library.favorites, title: L("Favorites"), search: $favoritesSearch, reorder: true)
+                                case .recent: roomList(library.recent, title: L("Recent rooms"), search: $recentSearch)
+                                case .calendar: NativeDesktopCalendarView(workspace: workspace, library: library, cache: calendarCache)
+                                case .workspace: NativeDesktopMeetingWorkspaceView(workspace: workspace)
+                                case .history: MeetingHistoryView(attention: workspace.attention, workspace: workspace)
+                                    .onAppear { workspace.workspaceSync.scheduleSync(delayMilliseconds: 100, localChanges: false) }
+                                case .assistant: AttentionMomentsView(attention: workspace.attention, store: workspace.attention.store)
+                                case .tasks:
+                                    PersonalTasksView(attention: workspace.attention) { sessionID, taskID in
+                                        workspace.openMeetingHistory(sessionID, tab: .tasks, taskID: taskID, source: .tasks)
+                                    }.navigationTitle(L("Tasks"))
+                                case .home: home
+                                }
+                            }.frame(maxWidth: .infinity, maxHeight: .infinity)
                         }
-                    }.frame(maxWidth: .infinity, maxHeight: .infinity)
-                    #if NATIVE_DIRECT_UPDATES
-                    .safeAreaInset(edge: .top) {
-                        if let updates = workspace.updates { NativeDesktopUpdateBanner(updates: updates) }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
                     }
-                    #endif
-                }
-                // Every embedded meeting stays mounted so switching keeps its panels,
-                // zoom and Presenter draft; only the selected one renders media.
-                ForEach(workspace.embeddedMeetings, id: \.sessionID) { model in
-                    let shown = workspace.selectedMeetingID == model.sessionID
-                    NativeDesktopMeetingView(model: model, onMini: { workspace.showMini(model) }, continuation: library.continuation,
-                                             workspace: workspace, onWindowToggle: { workspace.toggleWindow(model) }, embedded: true,
-                                             presentsErrors: shown && workspace.error == nil && workspace.notice == nil)
-                        .opacity(shown ? 1 : 0).allowsHitTesting(shown).disabled(!shown).accessibilityHidden(!shown)
-                }
-                if let selected = workspace.selectedMeeting {
-                    if workspace.isDetached(selected) { detachedMeeting(selected) }
-                    Color.clear.allowsHitTesting(false)
-                        .navigationTitle(selected.title)
-                        .navigationSubtitle(meetingSubtitle(selected))
-                }
-                AttentionCardStack(attention: workspace.attention, openAssistant: { workspace.openAssistantMoments() })
-                if !(workspace.selectedMeeting == nil && workspace.selection == .assistant) {
-                    VStack {
-                        Spacer()
-                        AssistantVoiceHUDView(attention: workspace.attention, openAssistant: { workspace.show(section: .assistant) })
-                            .padding(.bottom, workspace.selectedMeeting != nil && !workspace.isDetached(workspace.selectedMeeting!) ? 72 : 0)
+                    // Every embedded meeting stays mounted so switching keeps its panels,
+                    // zoom and Presenter draft; only the selected one renders media.
+                    ForEach(workspace.embeddedMeetings, id: \.sessionID) { model in
+                        let shown = workspace.selectedMeetingID == model.sessionID
+                        NativeDesktopMeetingView(model: model, onMini: { workspace.showMini(model) }, continuation: library.continuation,
+                                                 workspace: workspace, onWindowToggle: { workspace.toggleWindow(model) }, embedded: true,
+                                                 presentsErrors: shown && workspace.error == nil && workspace.notice == nil)
+                            .opacity(shown ? 1 : 0).allowsHitTesting(shown).disabled(!shown).accessibilityHidden(!shown)
                     }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    if let selected = workspace.selectedMeeting {
+                        if workspace.isDetached(selected) { detachedMeeting(selected) }
+                        Color.clear.allowsHitTesting(false)
+                            .navigationTitle(selected.title)
+                            .navigationSubtitle(meetingSubtitle(selected))
+                    }
+                    AttentionCardStack(attention: workspace.attention, openAssistant: { workspace.openAssistantMoments() })
+                    if !(workspace.selectedMeeting == nil && workspace.selection == .assistant) {
+                        VStack {
+                            Spacer()
+                            AssistantVoiceHUDView(attention: workspace.attention, openAssistant: { workspace.show(section: .assistant) })
+                                .padding(.bottom, workspace.selectedMeeting != nil && !workspace.isDetached(workspace.selectedMeeting!) ? 72 : 0)
+                        }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    }
                 }
+                .frame(width: geometry.size.width, height: geometry.size.height)
             }
             .sheet(item: Binding(get: { workspace.attention.inspecting }, set: { workspace.attention.inspecting = $0 })) { card in
                 AttentionInspector(attention: workspace.attention, card: card)

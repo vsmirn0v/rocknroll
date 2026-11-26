@@ -36,7 +36,8 @@ struct AttentionMomentsView: View {
             case .talk: AssistantTalkView(attention: attention)
             case .moments: momentsView
             }
-        }.navigationTitle(L("Assistant"))
+        }.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .navigationTitle(L("Assistant"))
         .onAppear {
             if attention.opensAssistantMoments {
                 area = .moments
@@ -95,6 +96,7 @@ struct AttentionMomentsView: View {
             Divider()
             detail.frame(maxWidth: .infinity, maxHeight: .infinity)
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private func scrollToSelection(_ proxy: ScrollViewProxy) {

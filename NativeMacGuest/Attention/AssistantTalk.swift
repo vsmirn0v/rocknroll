@@ -1061,6 +1061,7 @@ struct AssistantTalkView: View {
                         }
                     }
                 }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .onAppear {
                     if let id = reviewIDs.first { proxy.scrollTo(id, anchor: .top) }
                 }
@@ -1071,6 +1072,7 @@ struct AssistantTalkView: View {
                     if error != nil { proxy.scrollTo("assistant.audio-error", anchor: .bottom) }
                 }
             }
+            .layoutPriority(1)
             if talk.working { ProgressView(L("Interpreting…")).controlSize(.small).padding(6) }
             if store.agentAssistantEnabled {
                 HStack(spacing: 8) {
@@ -1177,6 +1179,7 @@ struct AssistantTalkView: View {
                     .accessibilityIdentifier("assistant.listen")
             }.padding(12)
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .onAppear { talk.reconcileMeetingTarget() }
         .onChange(of: liveMeetings.map(\.sessionID)) { _ in talk.reconcileMeetingTarget() }
     }

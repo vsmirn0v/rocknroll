@@ -253,6 +253,101 @@ private struct CompactSettingsFixture: View {
         XCTAssertEqual(workspace.sidebarSelection, .section(.history))
     }
 
+    func testAssistantTabStaysAnchoredInFullSizeContentWindowWithActiveMeeting() async throws {
+        let fixture = fixture(), workspace = fixture.workspace, library = fixture.library
+        let frameAutosaveKey = "NSWindow Frame nativeDesktop.library"
+        let previousSavedFrame = UserDefaults.standard.object(forKey: frameAutosaveKey)
+        try library.createFavorite(invitation: "https://meeting.example.test/calls/cto-daily", title: "cto daily")
+        addTeardownBlock { @MainActor in
+            let window = NSApp.windows.first { $0.delegate === workspace }
+            _ = await workspace.leave()
+            window?.close()
+            if let previousSavedFrame {
+                UserDefaults.standard.set(previousSavedFrame, forKey: frameAutosaveKey)
+            } else {
+                UserDefaults.standard.removeObject(forKey: frameAutosaveKey)
+            }
+        }
+
+        let url = try XCTUnwrap(URL(string: "https://example.test/calls/assistant-layout"))
+        workspace.join(url, engine: .guest, title: "Active layout call", quiet: true)
+        try await eventually { workspace.meetings.count == 1 && workspace.meetings.allSatisfy(\.connected) && !workspace.preparing }
+
+        let window = try XCTUnwrap(NSApp.windows.first { $0.delegate === workspace })
+        let host = try XCTUnwrap(window.contentView)
+        XCTAssertTrue(window.styleMask.contains(.fullSizeContentView))
+        window.makeKeyAndOrderFront(nil)
+
+        workspace.sidebarSelection = .section(.assistant)
+
+        func allViews(_ root: NSView) -> [NSView] {
+            [root] + root.subviews.flatMap(allViews)
+        }
+
+        for size in [NSSize(width: 1100, height: 700), NSSize(width: 900, height: 560)] {
+            window.setContentSize(size)
+            await settleUI(host)
+            XCTAssertLessThanOrEqual(host.bounds.height, size.height + 1)
+
+            let views = allViews(host)
+            let splitViews = views.filter { String(describing: type(of: $0)) == "NSSplitView" }
+            XCTAssertFalse(splitViews.isEmpty)
+            for splitView in splitViews {
+                let rect = splitView.convert(splitView.bounds, to: nil)
+                XCTAssertGreaterThanOrEqual(rect.minY, -1)
+                XCTAssertLessThanOrEqual(rect.maxY, host.bounds.height + 1)
+                XCTAssertLessThanOrEqual(rect.height, host.bounds.height + 1)
+            }
+
+            let scrollViews = views.compactMap { $0 as? NSScrollView }
+            let sidebarScrollViews = scrollViews.filter { scrollView in
+                String(describing: type(of: scrollView)).contains("ListCoreScrollView")
+                    || allViews(scrollView).contains { $0 is NSOutlineView }
+            }
+            XCTAssertFalse(sidebarScrollViews.isEmpty)
+            for sidebarScroll in sidebarScrollViews {
+                let rect = sidebarScroll.convert(sidebarScroll.bounds, to: nil)
+                XCTAssertGreaterThanOrEqual(rect.minY, -1)
+                XCTAssertLessThanOrEqual(rect.maxY, host.bounds.height + 1)
+                XCTAssertLessThanOrEqual(rect.height, host.bounds.height + 1)
+            }
+
+            let segmentedControl = try XCTUnwrap(views.compactMap { $0 as? NSSegmentedControl }.first { control in
+                (0..<control.segmentCount).contains { control.label(forSegment: $0) == L("Talk") }
+            })
+            let segRect = segmentedControl.convert(segmentedControl.bounds, to: nil)
+            XCTAssertGreaterThan(segRect.minY, host.bounds.height * 0.5, "Assistant segmented control must stay in the upper half of the window: \(segRect)")
+            XCTAssertLessThanOrEqual(segRect.maxY, host.bounds.height + 1)
+
+            let detailScrollViews = scrollViews.filter { scrollView in
+                !sidebarScrollViews.contains { $0 === scrollView }
+            }
+            XCTAssertTrue(
+                detailScrollViews.contains { $0.convert($0.bounds, to: nil).height > 100 },
+                "Assistant conversation scroll view collapsed: \(detailScrollViews.map { $0.convert($0.bounds, to: nil) })"
+            )
+
+            for identifier in ["assistant.input", "assistant.ask", "assistant.listen", "sidebar.section.\(NativeDesktopWorkspace.Section.home.id)"] {
+                let item = try XCTUnwrap(accessibilityElement(in: window, identifier: identifier), identifier)
+                let position = try XCTUnwrap(accessibilityValue(item, kAXPositionAttribute)) as! AXValue
+                let dimensionsValue = try XCTUnwrap(accessibilityValue(item, kAXSizeAttribute)) as! AXValue
+                var origin = CGPoint.zero, dimensions = CGSize.zero
+                XCTAssertTrue(AXValueGetValue(position, .cgPoint, &origin))
+                XCTAssertTrue(AXValueGetValue(dimensionsValue, .cgSize, &dimensions))
+                let rect = NSRect(x: origin.x, y: NSScreen.screens[0].frame.maxY - origin.y - dimensions.height,
+                                  width: dimensions.width, height: dimensions.height)
+                XCTAssertTrue(window.frame.contains(rect), "\(identifier) outside window: \(rect) vs \(window.frame)")
+                if identifier == "sidebar.section.\(NativeDesktopWorkspace.Section.home.id)" {
+                    XCTAssertLessThanOrEqual(
+                        rect.maxY,
+                        window.frame.minY + window.contentLayoutRect.maxY + 1,
+                        "Sidebar row overlapped titlebar/traffic lights: \(rect) vs contentLayoutRect \(window.contentLayoutRect)"
+                    )
+                }
+            }
+        }
+    }
+
     /// Render the actual SwiftUI surfaces using isolated, no-network fixtures.
     /// Screenshots remain in the xcresult for visual review.
     func testRedesignedHomeAndSettingsNavigationAtBothWidths() async throws {
