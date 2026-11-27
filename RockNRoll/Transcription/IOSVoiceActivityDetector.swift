@@ -100,6 +100,17 @@ final class IOSVoiceActivityDetector {
         silenceFrames = 0
     }
 
+    /// Seeds leading zero pre-roll frames when upstream silence gating skipped idle frames,
+    /// preserving the onset of the first syllable without running RMS loops over long silences.
+    func primePreRollIfNeeded() {
+        guard !active, ringPreRoll.count < config.leadInFrames else { return }
+        let missing = config.leadInFrames - ringPreRoll.count
+        let zeroFrame = [Float](repeating: 0, count: config.frameSamples)
+        for _ in 0..<missing {
+            ringPreRoll.append(zeroFrame)
+        }
+    }
+
     private func processFrame(_ frame: [Float]) -> CompletedSegment? {
         var rms: Float = 0
         vDSP_rmsqv(frame, 1, &rms, vDSP_Length(frame.count))

@@ -206,13 +206,13 @@ final class IOSListenModelStore: ObservableObject {
     }
 
     func installedGigaAMDirectoryIfReady() -> URL? {
-        Self.hasAllFilesInstalled(in: gigaamDirectory) ? gigaamDirectory : nil
+        gigaamState.isInstalled ? gigaamDirectory : nil
     }
 
     func effectiveBackend(for preferred: IOSListenModel? = nil) -> IOSListenModel {
         switch preferred ?? selectedModel {
         case .gigaamV3CoreML:
-            return Self.hasAllFilesInstalled(in: gigaamDirectory) ? .gigaamV3CoreML : .appleSpeech
+            return gigaamState.isInstalled ? .gigaamV3CoreML : .appleSpeech
         case .appleSpeech:
             return .appleSpeech
         }

@@ -126,7 +126,12 @@ struct ListenModelCatalog: Decodable, Equatable {
 
     let catalog: ListenModelCatalog
     let root: URL
-    @Published private(set) var states: [String: State] = [:]
+    @Published private(set) var states: [String: State] = [:] {
+        didSet {
+            if states != oldValue { configurationReadyCache.removeAll() }
+        }
+    }
+    private var configurationReadyCache: [String: Bool] = [:]
     /// Transient local-only measurements; never include these in diagnostics.
     @Published private(set) var storageFailures: [String: VoiceStorageSnapshot] = [:]
     @Published var enabled: Bool { didSet { defaults.set(enabled, forKey: Self.enabledKey) } }
@@ -214,6 +219,7 @@ struct ListenModelCatalog: Decodable, Equatable {
 
     /// A model is installed once every file was verified and the marker names its hashes.
     func refresh() {
+        configurationReadyCache.removeAll()
         for model in catalog.models where downloads[model.id] == nil {
             let recorded = (try? String(contentsOf: marker(model), encoding: .utf8)) ?? ""
             let expected = model.files.map { "\($0.name) \($0.sha256)" }.joined(separator: "\n")
@@ -473,22 +479,35 @@ struct ListenModelCatalog: Decodable, Equatable {
     }
 
     func modelConfigurationReady(_ model: ListenModelCatalog.Model) -> Bool {
-        guard model.role == "listen", recognizerModel(for: model) != nil,
-              pinnedConfigurationPath("tokens", model: model) != nil else { return false }
-        switch model.kind {
-        case Self.coreMLGigaAMKind:
-            return ["encoder", "decoder", "joint"].allSatisfy { pinnedConfigurationPath($0, model: model, directoryAllowed: true) != nil }
-        case "nemo_transducer":
-            return ["encoder", "decoder", "joiner"].allSatisfy { pinnedConfigurationPath($0, model: model) != nil }
-        case "nemo_ctc": return pinnedConfigurationPath("model", model: model) != nil
-        case "whisper": return ["encoder", "decoder"].allSatisfy { pinnedConfigurationPath($0, model: model) != nil }
-        default: return false
+        guard model.role == "listen", state(model).installed else { return false }
+        if let cached = configurationReadyCache[model.id] { return cached }
+        let ready: Bool
+        if recognizerModel(for: model) == nil || pinnedConfigurationPath("tokens", model: model) == nil {
+            ready = false
+        } else {
+            switch model.kind {
+            case Self.coreMLGigaAMKind:
+                ready = ["encoder", "decoder", "joint"].allSatisfy { pinnedConfigurationPath($0, model: model, directoryAllowed: true) != nil }
+            case "nemo_transducer":
+                ready = ["encoder", "decoder", "joiner"].allSatisfy { pinnedConfigurationPath($0, model: model) != nil }
+            case "nemo_ctc":
+                ready = pinnedConfigurationPath("model", model: model) != nil
+            case "whisper":
+                ready = ["encoder", "decoder"].allSatisfy { pinnedConfigurationPath($0, model: model) != nil }
+            default:
+                ready = false
+            }
         }
+        configurationReadyCache[model.id] = ready
+        return ready
     }
 
     var detectorConfigurationReady: Bool {
         guard let vad = catalog.vad, state(vad).installed, vad.kind == "silero_vad" else { return false }
-        return pinnedConfigurationPath("model", model: vad) != nil
+        if let cached = configurationReadyCache[vad.id] { return cached }
+        let ready = pinnedConfigurationPath("model", model: vad) != nil
+        configurationReadyCache[vad.id] = ready
+        return ready
     }
     /// Native Core ML GigaAM: encoder on the Neural Engine, packages as nested files.
     static let coreMLGigaAMKind = "coreml_gigaam_rnnt"

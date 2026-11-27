@@ -810,6 +810,47 @@ import XCTest
         _ = await meeting.detach()
     }
 
+    func testMutedInputCooldownReleasesOnlyWhenReadinessDoesNotKeepWarm() async throws {
+        let module = FakeModule()
+        let engine = SharedAudioEngine(mutedInputHold: .milliseconds(40), authorized: { true }, reportFailedStop: {}) { module }
+        let meeting = try await engine.attach(meetingID: UUID())
+        let sender = FakeSender()
+        meeting.addSender(sender)
+        ok(await meeting.assumeTalk())
+        ok(await meeting.setMuted(false))
+        XCTAssertTrue(module.active)
+
+        // When foreground microphone readiness is enabled, muting keeps VPIO warm past the hold window.
+        engine.setForeground(true, microphone: true)
+        ok(await meeting.setMuted(true))
+        try await Task.sleep(for: .milliseconds(90))
+        await engine.waitForWork()
+        XCTAssertTrue(module.active, "Warm microphone readiness keeps VPIO active while muted")
+        XCTAssertFalse(module.log.contains("release-muted-talk"))
+
+        // Turning microphone readiness off while muted starts the cooldown and releases physical input.
+        engine.setForeground(true, microphone: false)
+        try await Task.sleep(for: .milliseconds(90))
+        await engine.waitForWork()
+        XCTAssertFalse(module.active, "Cooldown releases VPIO capture when warm readiness is disabled")
+        XCTAssertTrue(module.log.contains("release-muted-talk"))
+
+        // Subsequent unmute seamlessly re-activates input, and rapid mute->unmute cancels the cooldown.
+        module.log.removeAll()
+        ok(await meeting.setMuted(false))
+        XCTAssertTrue(module.active)
+        XCTAssertTrue(module.log.contains("activate"))
+        module.log.removeAll()
+        ok(await meeting.setMuted(true))
+        try await Task.sleep(for: .milliseconds(10))
+        ok(await meeting.setMuted(false))
+        try await Task.sleep(for: .milliseconds(70))
+        await engine.waitForWork()
+        XCTAssertTrue(module.active, "Unmuting inside the grace window cancels muted input release")
+        XCTAssertFalse(module.log.contains("release-muted-talk"))
+        _ = await meeting.detach()
+    }
+
     private func ok(_ value: Bool, _ message: String = "", file: StaticString = #filePath, line: UInt = #line) {
         XCTAssertTrue(value, message, file: file, line: line)
     }
@@ -852,6 +893,9 @@ private final class DiagnosticSender: MeetingAudioSender {
     }
     func releaseIdleInput(timeout: TimeInterval) async -> Bool {
         log.append("release-idle"); muted = true; permitted = false; active = false; return true
+    }
+    func releaseMutedTalkInput(timeout: TimeInterval) async -> Bool {
+        log.append("release-muted-talk"); muted = true; active = false; return true
     }
     func recoverSilentInput(timeout: TimeInterval) async -> Bool {
         log.append("recover-silent"); onRecover?(); guard !failRecover else { return false }

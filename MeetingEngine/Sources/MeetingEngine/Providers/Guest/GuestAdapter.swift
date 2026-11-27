@@ -627,6 +627,9 @@ public enum NativeDesktopGuestError: LocalizedError {
         guard let systemAudio else { return open }
         if !open, !snapshot.microphoneOn, !systemAudio.hasParticipationVoiceGraph {
             try? await prepareMutedCaptureForAccessories()
+            if !systemAudio.hasParticipationVoiceGraph, inputPermitted, microphoneAuthorized() {
+                _ = await systemAudio.activateMicrophone()
+            }
             guard self.systemAudio === systemAudio, !Task.isCancelled else { return false }
         }
         return systemAudio.setMicrophoneGate(open: open)

@@ -1092,6 +1092,119 @@ final class IOSLocalTranscriptionAndVoiceTests: XCTestCase {
         XCTAssertEqual(transcriber.state, .off)
     }
 
+    func testMeetingTranscriberSkipsSilentRemoteTracksAndAcceptsNewSpeakerImmediately() async throws {
+        let store = try installedGigaAMStore()
+        store.selectedModel = .appleSpeech
+
+        final class MockAudioHarness: @unchecked Sendable {
+            private let lock = NSLock()
+            private var sinks: [String: MeetingAudioSink] = [:]
+
+            func source(id: String, identity: String) -> MeetingAudioSource {
+                MeetingAudioSource(
+                    id: id,
+                    participantIdentity: identity,
+                    attach: { [weak self] sink in
+                        self?.lock.withLock { self?.sinks[id] = sink }
+                    },
+                    detach: { [weak self] _ in
+                        _ = self?.lock.withLock { self?.sinks.removeValue(forKey: id) }
+                    }
+                )
+            }
+
+            func emit(to id: String, buffer: AVAudioPCMBuffer) {
+                let sink = lock.withLock { sinks[id] }
+                sink?.render(pcmBuffer: buffer)
+            }
+        }
+
+        let harness = MockAudioHarness()
+        let transcriber = IOSMeetingTranscriber(
+            modelStore: store,
+            localDisplayName: { "Listener" },
+            participantNameLookup: { id in "User-\(id)" },
+            setOutputDemand: { _ in true },
+            speechAuthorization: { true },
+            localAppleSpeechAvailable: { true }
+        )
+
+        let started = await transcriber.start()
+        XCTAssertTrue(started)
+
+        var sources = (0..<35).map { idx in
+            harness.source(id: "silent-\(idx)", identity: "guest-\(idx)")
+        }
+        transcriber.updateRemoteSources(sources)
+
+        let format48k = try XCTUnwrap(AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 48_000, channels: 1, interleaved: false))
+        let silentBuffer = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: format48k, frameCapacity: 480))
+        silentBuffer.frameLength = 480
+
+        for round in 0..<4 {
+            _ = round
+            for idx in 0..<35 {
+                harness.emit(to: "silent-\(idx)", buffer: silentBuffer)
+            }
+        }
+
+        let silentPipelineCount = await transcriber.activePipelineCountForTesting()
+        XCTAssertEqual(silentPipelineCount, 0, "Silent remote tracks must not allocate SpeakerPipelines or converters")
+
+        // Simulate a new participant joining while running (e.g. in background) and speaking immediately.
+        sources.append(harness.source(id: "late-joiner", identity: "newcomer"))
+        transcriber.updateRemoteSources(sources)
+
+        let activeBuffer = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: format48k, frameCapacity: 960))
+        activeBuffer.frameLength = 960
+        if let ch = activeBuffer.floatChannelData?[0] {
+            for i in 0..<960 {
+                ch[i] = 0.2 * sin(2 * Float.pi * 320 * Float(i) / 48_000)
+            }
+        }
+        harness.emit(to: "late-joiner", buffer: activeBuffer)
+
+        var activePipelineCount = 0
+        for _ in 0..<50 {
+            activePipelineCount = await transcriber.activePipelineCountForTesting()
+            if activePipelineCount == 1 { break }
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+        XCTAssertEqual(activePipelineCount, 1, "New unmuted participant must immediately create a recognition pipeline")
+
+        await transcriber.stop()
+        let stoppedPipelineCount = await transcriber.activePipelineCountForTesting()
+        XCTAssertEqual(stoppedPipelineCount, 0)
+    }
+
+    func testCoreMLGigaAMSharedLeaseReleasesOnFailedLoadAndFallbackRefreshesInstallState() async throws {
+        let store = try installedGigaAMStore()
+        XCTAssertEqual(store.gigaamState, .installed)
+        XCTAssertEqual(CoreMLGigaAMRecognizer.activeLeaseCount(for: store.gigaamDirectory), 0)
+
+        // Delete one model file behind the store's back: cached state initially says installed,
+        // then start() catches missing/invalid model, releases the shared lease, refreshes install state,
+        // and falls back cleanly to Apple Speech.
+        let encoderManifest = store.gigaamDirectory.appendingPathComponent("GigaAMv3Encoder.mlpackage/Manifest.json")
+        try FileManager.default.removeItem(at: encoderManifest)
+
+        let transcriber = IOSMeetingTranscriber(
+            modelStore: store,
+            localDisplayName: { "Tester" },
+            participantNameLookup: { _ in nil },
+            setOutputDemand: { _ in true },
+            speechAuthorization: { true },
+            localAppleSpeechAvailable: { true }
+        )
+
+        let started = await transcriber.start()
+        XCTAssertTrue(started)
+        XCTAssertEqual(transcriber.state, .active(.appleSpeech))
+        XCTAssertEqual(store.gigaamState, .notInstalled)
+        XCTAssertEqual(CoreMLGigaAMRecognizer.activeLeaseCount(for: store.gigaamDirectory), 0)
+        await transcriber.stop()
+    }
+
     private static func makeSpeechWithStopTap(
         rate: Int,
         totalSeconds: Double,

@@ -459,6 +459,8 @@ public final class GuestSystemAudio: NSObject, LKRTCAudioDeviceModuleDelegate, @
     private var inputActivation: GuestInputActivationPolicy
     private let sharedNativeOwner: Bool
     private let sharedInputOutputDependency: Bool
+    private let bypassVoiceProcessingWhenMuted: Bool
+    private var keepVoiceProcessingWhenMuted = false
     private let sharedPlayoutGate: GuestSharedPlayoutGate
     public let profile: GuestAudioProfile
     private var ownerLease: GuestAudioOwnerLease?
@@ -1087,12 +1089,14 @@ public final class GuestSystemAudio: NSObject, LKRTCAudioDeviceModuleDelegate, @
 
     private init(microphoneEnabled: Bool, playoutEnabled: Bool, profile: GuestAudioProfile,
                  lease: GuestAudioOwnerLease, sharedNativeOwner: Bool,
-                 sharedInputOutputDependency: Bool = false) {
+                 sharedInputOutputDependency: Bool = false,
+                 bypassVoiceProcessingWhenMuted: Bool = false) {
         microphoneOptIn = microphoneEnabled
         inputActivation = .init(persistent: microphoneEnabled)
         self.profile = profile; ownerLease = lease
         self.sharedNativeOwner = sharedNativeOwner
         self.sharedInputOutputDependency = sharedNativeOwner || sharedInputOutputDependency
+        self.bypassVoiceProcessingWhenMuted = bypassVoiceProcessingWhenMuted
         sharedPlayoutGate = GuestSharedPlayoutGate(enabled: sharedNativeOwner)
         self.playoutEnabled = playoutEnabled
         cached = ["mode": "system", "module": "audioEngine", "ownerLeaseID": lease.diagnosticID,
@@ -1133,6 +1137,7 @@ public final class GuestSystemAudio: NSObject, LKRTCAudioDeviceModuleDelegate, @
                               voiceProcessingEnabled: Bool = true, profile: GuestAudioProfile = .speech,
                               privateCheckOnly: Bool = false, exclusive: Bool = false, concurrent: Bool = false,
                               manualRendering: Bool = false, keepOutputAvailableWithInput: Bool = false,
+                              bypassVoiceProcessingWhenMuted: Bool = false,
                               makeFactory: ((_ voiceProcessing: Bool) -> LKRTCPeerConnectionFactory)? = nil,
                               timeout: TimeInterval = 3) async throws -> GuestSystemAudio {
         NativeScreenEncoderQuality.prepare()
@@ -1144,7 +1149,8 @@ public final class GuestSystemAudio: NSObject, LKRTCAudioDeviceModuleDelegate, @
                                                concurrent: concurrent) else { throw GuestSystemAudioError.physicalOwnerBusy }
         let owner = GuestSystemAudio(microphoneEnabled: microphoneEnabled, playoutEnabled: playoutEnabled,
             profile: profile, lease: lease, sharedNativeOwner: exclusive,
-            sharedInputOutputDependency: exclusive || keepOutputAvailableWithInput)
+            sharedInputOutputDependency: exclusive || keepOutputAvailableWithInput,
+            bypassVoiceProcessingWhenMuted: bypassVoiceProcessingWhenMuted)
         // Manual rendering (tests) has no device for the platform's voice processing to run on.
         let voiceProcessingEnabled = voiceProcessingEnabled && profile.usesPlatformVoiceProcessing && !manualRendering
         let success = await owner.perform("create", timeout: timeout) {
@@ -1190,7 +1196,9 @@ public final class GuestSystemAudio: NSObject, LKRTCAudioDeviceModuleDelegate, @
             owner.update(["voiceProcessingRequested": voiceProcessingEnabled])
             let prepared = owner.nativeCall("set-recording-prepared", { module.setRecordingAlwaysPreparedMode(false) }) == 0
             let muteMode = owner.nativeCall("set-mute-mode", { module.setMuteMode(.inputMixer) }) == 0
+            if microphoneEnabled { owner.syncMutedVoiceProcessingBypass(module, muted: false) }
             let muted = owner.nativeCall("set-microphone-muted", { module.setMicrophoneMuted(!microphoneEnabled) }) == 0
+            if !microphoneEnabled { owner.syncMutedVoiceProcessingBypass(module, muted: true) }
             let available = owner.applyAvailability(module)
             owner.readSnapshot(module)
             return prepared && muteMode && muted && available
@@ -1278,8 +1286,65 @@ public final class GuestSystemAudio: NSObject, LKRTCAudioDeviceModuleDelegate, @
                 makeAvailable: { self.applyAvailability(module) },
                 startRecording: { module.isRecording || self.nativeCall("start-recording", { module.initAndStartRecording(audioProcessingOptions: nil) }) == 0 },
                 isMuted: { module.isMicrophoneMuted })
+            if success { self.syncMutedVoiceProcessingBypass(module, muted: true) }
             self.readSnapshot(module)
             return success
+        }
+    }
+
+    /// Releases muted physical capture for an active talk meeting after an idle cooldown when
+    /// microphone readiness is off, leaving playout intact and re-arming deferred activation.
+    public func releaseMutedTalkInput(timeout: TimeInterval = 8) async -> Bool {
+        setWatchdogInputUnmuted(false)
+        return await perform("muted-talk-input-release", timeout: timeout) {
+            guard !self.closed, let module = self.currentModule else { return true }
+            guard (self.microphoneOptIn || module.isRecording),
+                  self.inputPermitted, module.isMicrophoneMuted,
+                  !self.startedRecordingForPrivateCheck,
+                  self.locked({ self.microphoneGateOpen }) else {
+                self.readSnapshot(module)
+                return true
+            }
+            self.locked {
+                self.handoffPreparedRecording = false
+                self.attemptHandoffActive = false
+            }
+            let clearedPrepared = !module.isRecordingAlwaysPreparedMode ||
+                self.nativeCall("set-recording-prepared", { module.setRecordingAlwaysPreparedMode(false) }) == 0
+            let muted = self.nativeCall("set-microphone-muted", { module.setMicrophoneMuted(true) }) == 0
+            self.deferredActivation = self.deferredActivation || self.microphoneOptIn
+            self.inputActivation = .init(persistent: false)
+            self.microphoneOptIn = false
+            let available = self.applyAvailability(module)
+            let stoppedRecording = !module.isRecording ||
+                self.nativeCall("stop-recording", { module.stopRecording() }) == 0
+            self.update(["deferredActivation": self.deferredActivation, "microphoneOptIn": false])
+            self.readSnapshot(module)
+            return clearedPrepared && muted && module.isMicrophoneMuted && available && stoppedRecording
+        }
+    }
+
+    public func setKeepVoiceProcessingWhenMuted(_ keep: Bool) {
+        locked { keepVoiceProcessingWhenMuted = keep }
+        audioQueue.async {
+            guard !self.closed, let module = self.currentModule else { return }
+            GuestAudioEngineGate.shared.run(for: ObjectIdentifier(self)) {
+                self.syncMutedVoiceProcessingBypass(module, muted: module.isMicrophoneMuted)
+                self.readSnapshot(module)
+            }
+        }
+    }
+
+    private func syncMutedVoiceProcessingBypass(_ module: LKRTCAudioDeviceModule, muted: Bool) {
+        guard bypassVoiceProcessingWhenMuted,
+              !manualRenderingMode,
+              snapshot["voiceProcessingRequested"] as? Bool == true else { return }
+        let shouldBypass = muted && !locked({ keepVoiceProcessingWhenMuted })
+        let activeMismatch = !shouldBypass && module.platformAudioProcessingState.isVoiceProcessingBypassedActive
+        if module.isVoiceProcessingBypassed != shouldBypass || activeMismatch {
+            nativeCall(shouldBypass ? "bypass-vpio-muted" : "restore-vpio-unmuted") {
+                module.isVoiceProcessingBypassed = shouldBypass
+            }
         }
     }
 
@@ -1339,6 +1404,7 @@ public final class GuestSystemAudio: NSObject, LKRTCAudioDeviceModuleDelegate, @
                 makeAvailable: { self.applyAvailability(module) },
                 startRecording: { module.isRecording || self.nativeCall("start-recording", { module.initAndStartRecording(audioProcessingOptions: nil) }) == 0 },
                 isMuted: { module.isMicrophoneMuted })
+            if restarted { self.syncMutedVoiceProcessingBypass(module, muted: true) }
             self.readSnapshot(module)
             return clearedPrepared && muted && gated && stoppedRecording && restarted
         }
@@ -1350,6 +1416,7 @@ public final class GuestSystemAudio: NSObject, LKRTCAudioDeviceModuleDelegate, @
             guard !self.closed, let module = self.currentModule,
                   GuestSystemAudio.microphoneAuthorized, module.isMicrophoneMuted else { return false }
             if module.isRecording {
+                self.syncMutedVoiceProcessingBypass(module, muted: true)
                 self.readSnapshot(module)
                 return module.isMicrophoneMuted
             }
@@ -1362,7 +1429,9 @@ public final class GuestSystemAudio: NSObject, LKRTCAudioDeviceModuleDelegate, @
                 makeAvailable: { self.applyAvailability(module) },
                 startRecording: { module.isRecording || self.nativeCall("start-recording", { module.initAndStartRecording(audioProcessingOptions: nil) }) == 0 },
                 isMuted: { module.isMicrophoneMuted })
-            if !success {
+            if success {
+                self.syncMutedVoiceProcessingBypass(module, muted: true)
+            } else {
                 self.inputActivation = wasActivated
                 self.microphoneOptIn = self.inputActivation.inputAvailable
                 _ = self.applyAvailability(module)
@@ -1444,6 +1513,7 @@ public final class GuestSystemAudio: NSObject, LKRTCAudioDeviceModuleDelegate, @
                     makeAvailable: { self.applyAvailability(module) },
                     startRecording: { module.isRecording || self.nativeCall("start-recording", { module.initAndStartRecording(audioProcessingOptions: nil) }) == 0 },
                     isMuted: { module.isMicrophoneMuted })
+                if started { self.syncMutedVoiceProcessingBypass(module, muted: true) }
                 let cleared = self.nativeCall("set-recording-prepared", { module.setRecordingAlwaysPreparedMode(false) }) == 0
                 self.readSnapshot(module)
                 return started && cleared
@@ -1496,14 +1566,17 @@ public final class GuestSystemAudio: NSObject, LKRTCAudioDeviceModuleDelegate, @
             let success: Bool
             if !module.isRecording, self.mediaContext != nil || self.manualRenderingMode {
                 let wasMuted = module.isMicrophoneMuted
+                if !wasMuted { self.syncMutedVoiceProcessingBypass(module, muted: false) }
                 success = GuestMutedInputPreparation.start(
                     mute: { self.nativeCall("set-microphone-muted", { module.setMicrophoneMuted(true) }) == 0 },
                     makeAvailable: { self.applyAvailability(module) },
                     startRecording: { module.isRecording || self.nativeCall("start-recording", { module.initAndStartRecording(audioProcessingOptions: nil) }) == 0 },
                     isMuted: { module.isMicrophoneMuted }) &&
                     (wasMuted || self.nativeCall("restore-microphone-unmuted", { module.setMicrophoneMuted(false) }) == 0)
+                if success { self.syncMutedVoiceProcessingBypass(module, muted: wasMuted) }
             } else {
                 success = self.applyAvailability(module)
+                if success { self.syncMutedVoiceProcessingBypass(module, muted: module.isMicrophoneMuted) }
             }
             if !success { self.inputActivation = wasActivated; self.microphoneOptIn = self.inputActivation.inputAvailable; _ = self.applyAvailability(module) }
             self.update(["microphoneOptIn": self.microphoneOptIn])
@@ -1518,10 +1591,13 @@ public final class GuestSystemAudio: NSObject, LKRTCAudioDeviceModuleDelegate, @
         setWatchdogInputUnmuted(false)
         audioQueue.async {
             guard !self.closed, let module = self.currentModule else { return }
-            self.update(["microphoneMutedRequested": true])
-            let muted = self.nativeCall("set-microphone-muted", { module.setMicrophoneMuted(true) }) == 0 && module.isMicrophoneMuted
-            self.readSnapshot(module)
-            self.update(["lastCompletedOperation": "microphone-suppress", "lastOperationSucceeded": muted])
+            GuestAudioEngineGate.shared.run(for: ObjectIdentifier(self)) {
+                self.update(["microphoneMutedRequested": true])
+                let muted = self.nativeCall("set-microphone-muted", { module.setMicrophoneMuted(true) }) == 0 && module.isMicrophoneMuted
+                if muted { self.syncMutedVoiceProcessingBypass(module, muted: true) }
+                self.readSnapshot(module)
+                self.update(["lastCompletedOperation": "microphone-suppress", "lastOperationSucceeded": muted])
+            }
         }
     }
 
@@ -1564,8 +1640,11 @@ public final class GuestSystemAudio: NSObject, LKRTCAudioDeviceModuleDelegate, @
                 }
             }
             self.update(["microphoneMutedRequested": muted])
+            if !muted { self.syncMutedVoiceProcessingBypass(module, muted: false) }
             let changed = self.nativeCall("set-microphone-muted", { module.setMicrophoneMuted(muted) }) == 0
             let success = changed && module.isMicrophoneMuted == muted
+            if muted && success { self.syncMutedVoiceProcessingBypass(module, muted: true) }
+            else if !muted && !success && module.isMicrophoneMuted { self.syncMutedVoiceProcessingBypass(module, muted: true) }
             self.readSnapshot(module)
             return success
         }
@@ -1630,6 +1709,7 @@ public final class GuestSystemAudio: NSObject, LKRTCAudioDeviceModuleDelegate, @
                 _ = self.applyAvailability(module); self.readSnapshot(module); return false
             }
             self.deferredActivation = false
+            self.syncMutedVoiceProcessingBypass(module, muted: true)
             self.update(["inputKeptWarm": true, "deferredActivation": false, "microphoneOptIn": self.microphoneOptIn])
             self.readSnapshot(module)
             return module.isMicrophoneMuted

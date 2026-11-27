@@ -500,4 +500,137 @@ final class GuestPermissionsAndSignalingTests: XCTestCase {
         }
         _ = await audio.shutdown()
     }
+
+    @MainActor
+    func testAudioSenderDeactivatesEncodingWhenMutedAndRestoresForSyntheticReply() async throws {
+        let factory = LKRTCPeerConnectionFactory(
+            encoderFactory: LKRTCDefaultVideoEncoderFactory(),
+            decoderFactory: LKRTCDefaultVideoDecoderFactory()
+        )
+        let peer = try await GuestPeer(target: .publisher, factory: factory, physicalAudio: false, verifyReceivedPixels: false)
+        defer { peer.close() }
+
+        let mic = try await peer.prepareAudio(cid: "mic-cid")
+        try await peer.attach(mic, codec: "h264")
+        let initial = await peer.localAudioStateForTesting()
+        XCTAssertEqual(initial["enabled"] as? Bool, false)
+        XCTAssertEqual(initial["encodingActive"] as? [Bool], [false], "Muted audio attachment starts with inactive encoding")
+
+        try await peer.setMuted(false, video: false)
+        let unmuted = await peer.localAudioStateForTesting()
+        XCTAssertEqual(unmuted["enabled"] as? Bool, true)
+        XCTAssertEqual(unmuted["encodingActive"] as? [Bool], [true])
+
+        try await peer.setMuted(true, video: false)
+        let muted = await peer.localAudioStateForTesting()
+        XCTAssertEqual(muted["enabled"] as? Bool, false)
+        XCTAssertEqual(muted["encodingActive"] as? [Bool], [false], "Muting deactivates Opus encoding while keeping transceiver")
+
+        let synth = try await peer.native.run("make-synth") {
+            factory.audioTrack(with: factory.syntheticAudioSource(), trackId: "synth-cid")
+        }
+        let attachedSynth = await peer.setSyntheticAudioTrack(synth)
+        XCTAssertTrue(attachedSynth)
+        let duringSynth = await peer.localAudioStateForTesting()
+        XCTAssertEqual(duringSynth["senderTrackID"] as? String, "synth-cid")
+        XCTAssertEqual(duringSynth["encodingActive"] as? [Bool], [true], "Synthetic voice reply activates audio sender encoding")
+
+        let restoredMuted = await peer.setSyntheticAudioTrack(nil, restoreAudioEnabled: false)
+        XCTAssertTrue(restoredMuted)
+        let afterSynth = await peer.localAudioStateForTesting()
+        XCTAssertEqual(afterSynth["senderTrackID"] as? String, "mic-cid")
+        XCTAssertEqual(afterSynth["enabled"] as? Bool, false)
+        XCTAssertEqual(afterSynth["encodingActive"] as? [Bool], [false])
+    }
+
+    func testNativeVideoPixelBufferInterleavesUVPlanesAccuratelyAcrossWidths() throws {
+        let width: Int32 = 22, height: Int32 = 14 // chromaWidth = 11 (tests 4-wide SWAR + 3-pixel scalar tail)
+        let i420 = LKRTCMutableI420Buffer(width: width, height: height)
+        for y in 0..<Int(height) {
+            for x in 0..<Int(width) {
+                i420.mutableDataY[y * Int(i420.strideY) + x] = UInt8((y * 17 + x * 3) & 0xFF)
+            }
+        }
+        for cy in 0..<Int((height + 1) / 2) {
+            for cx in 0..<Int((width + 1) / 2) {
+                i420.mutableDataU[cy * Int(i420.strideU) + cx] = UInt8((0x20 + cy * 7 + cx * 5) & 0xFF)
+                i420.mutableDataV[cy * Int(i420.strideV) + cx] = UInt8((0x90 + cy * 11 + cx * 9) & 0xFF)
+            }
+        }
+        let frame = LKRTCVideoFrame(buffer: i420, rotation: ._0, timeStampNs: 1_000)
+        let converter = NativeVideoPixelBuffer()
+        let out = try XCTUnwrap(converter.convert(frame))
+        XCTAssertEqual(CVPixelBufferLockBaseAddress(out, .readOnly), kCVReturnSuccess)
+        defer { CVPixelBufferUnlockBaseAddress(out, .readOnly) }
+
+        let luma = try XCTUnwrap(CVPixelBufferGetBaseAddressOfPlane(out, 0)).assumingMemoryBound(to: UInt8.self)
+        let yStride = CVPixelBufferGetBytesPerRowOfPlane(out, 0)
+        for y in 0..<Int(height) {
+            for x in 0..<Int(width) {
+                XCTAssertEqual(luma[y * yStride + x], UInt8((y * 17 + x * 3) & 0xFF))
+            }
+        }
+
+        let uv = try XCTUnwrap(CVPixelBufferGetBaseAddressOfPlane(out, 1)).assumingMemoryBound(to: UInt8.self)
+        let uvStride = CVPixelBufferGetBytesPerRowOfPlane(out, 1)
+        for cy in 0..<Int((height + 1) / 2) {
+            for cx in 0..<Int((width + 1) / 2) {
+                XCTAssertEqual(uv[cy * uvStride + cx * 2], UInt8((0x20 + cy * 7 + cx * 5) & 0xFF))
+                XCTAssertEqual(uv[cy * uvStride + cx * 2 + 1], UInt8((0x90 + cy * 11 + cx * 9) & 0xFF))
+            }
+        }
+    }
+
+    func testSpeakerUpdatesPreserveSortedRosterAndUpdateInPlace() {
+        var features = GuestMeetingFeatures()
+        var memberPayloads: [[String: Any]] = [
+            ["participantId": "local-id", "name": "Zoe Local", "role": "GUEST"]
+        ]
+        var rtcPayloads: [[String: Any]] = [
+            ["sid": "sid-local", "identity": "local-id", "version": 1, "tracks": [["source": "MICROPHONE", "muted": true]]]
+        ]
+        for index in 1...52 {
+            let id = "remote-\(index)"
+            memberPayloads.append(["participantId": id, "name": "Participant \(index)", "role": "GUEST"])
+            rtcPayloads.append(["sid": "sid-\(index)", "identity": id, "version": 1, "tracks": [["source": "MICROPHONE", "muted": index > 2]]])
+        }
+        features.receive([
+            "event": "joined",
+            "payload": [
+                "roomId": "room-53",
+                "participant": [
+                    "participantId": "local-id",
+                    "name": "Zoe Local",
+                    "permissions": ["canViewParticipants": true]
+                ],
+                "participantGroup": [
+                    "groupId": "group-1",
+                    "name": "All Hands",
+                    "participants": memberPayloads
+                ]
+            ]
+        ])
+        features.updateRTC(rtcPayloads)
+        features.setLocalMute(true, video: false)
+        let initialIDs = features.snapshot.participants.map(\.id)
+        XCTAssertEqual(initialIDs.count, 53)
+        XCTAssertEqual(initialIDs.first, "local-id")
+        XCTAssertEqual(initialIDs[1], "remote-1")
+        XCTAssertEqual(initialIDs[2], "remote-2")
+        XCTAssertEqual(initialIDs[10], "remote-10", "localizedStandardCompare keeps natural numeric order")
+
+        features.updateSpeakers([
+            ["sid": "sid-local", "level": 0.9, "active": true],
+            ["sid": "sid-10", "level": 0.65, "active": true]
+        ])
+        XCTAssertEqual(features.snapshot.participants.map(\.id), initialIDs)
+        let local = features.snapshot.participants.first { $0.id == "local-id" }
+        let remote10 = features.snapshot.participants.first { $0.id == "remote-10" }
+        XCTAssertEqual(local?.isSpeaking, false, "Local mute suppresses server speaker echo")
+        XCTAssertEqual(remote10?.isSpeaking, true)
+        XCTAssertEqual(remote10?.audioLevel ?? 0, 0.65, accuracy: 1e-6)
+
+        features.updateSpeakers([])
+        XCTAssertTrue(features.snapshot.participants.allSatisfy { !$0.isSpeaking && $0.audioLevel == 0 })
+    }
 }

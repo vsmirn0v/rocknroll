@@ -1892,14 +1892,20 @@ import UniformTypeIdentifiers
     }
     private func update(_ value: NativeDesktopExternalSnapshot) {
         guard !closed, value != snapshot else { return }
-        let previous = snapshot; snapshot = value
-        if value.phase == .connected && !everConnected {
+        let previous = snapshot
+        let isFirstConnected = value.phase == .connected && !everConnected
+        if snapshot != value {
+            snapshot = value
+        }
+        if isFirstConnected {
             let now = Date()
             if connectedSince == nil { connectedSince = now }
             workspaceStartedAt = now
             observeWorkspace([])
         }
-        participation.updateAudience(participationAudience)
+        if previous.phase != value.phase || !Self.sameExternalAudienceMembers(previous.participants, value.participants) {
+            participation.updateAudience(participationAudience)
+        }
         if !participationVoiceEligible || participationRemoteSpeaking { participation.interruptVoice() }
         if previous.playoutOn && !value.playoutOn { workspaceSoundTurnedOff() }
         if previous.playoutOn != value.playoutOn, value.phase == .connected {
@@ -2399,23 +2405,73 @@ import UniformTypeIdentifiers
             setLocalShare: { [weak self] track in self?.localShare = track },
             onError: { [weak self] message in self?.error = message })
     }
+    private static func sameExternalAudienceMembers(
+        _ lhs: [NativeDesktopParticipant],
+        _ rhs: [NativeDesktopParticipant]
+    ) -> Bool {
+        guard lhs.count == rhs.count else { return false }
+        for (a, b) in zip(lhs, rhs) where a.id != b.id || a.name != b.name || a.isLocal != b.isLocal {
+            return false
+        }
+        return true
+    }
+
+    private static func sameGuestAudienceMembers(
+        _ lhs: [GuestMeetingParticipant],
+        _ rhs: [GuestMeetingParticipant]
+    ) -> Bool {
+        guard lhs.count == rhs.count else { return false }
+        for (a, b) in zip(lhs, rhs) where a.id != b.id || a.name != b.name || a.isLocal != b.isLocal {
+            return false
+        }
+        return true
+    }
+
     private func updateFeatures(_ features: GuestMeetingSnapshot) {
         guard !closed else { return }
-        let previousTranscription = guestFeatures.transcriptionStatus
-        let oldMessages = guestFeatures.messages
+        let old = guestFeatures
+        guard old != features else { return }
+        let previousTranscription = old.transcriptionStatus
+        let oldMessages = old.messages
+        let transcriptionMetaChanged = old.transcriptionStatus != features.transcriptionStatus ||
+            old.permissions.canViewTranscript != features.permissions.canViewTranscript ||
+            old.permissions.canManageTranscript != features.permissions.canManageTranscript ||
+            old.transcriptNetworkRestricted != features.transcriptNetworkRestricted ||
+            old.connected != features.connected
+        let transcriptContentChanged = old.transcript != features.transcript
+        let audienceChanged = old.connected != features.connected ||
+            old.permissions != features.permissions ||
+            old.localParticipantID != features.localParticipantID ||
+            !Self.sameGuestAudienceMembers(old.participants, features.participants)
+        let reactionsChanged = old.reactions != features.reactions
+
         guestFeatures = features
         if features.transcriptionStatus != .active || features.permissions.canViewTranscript { localFallbackDeclined = false }
         if features.transcriptionStatus == .active && !features.permissions.canViewTranscript {
             transcriptionSince = nil
         }
-        participation.updateAudience(participationAudience)
-        noteTranscription(from: previousTranscription, to: features.transcriptionStatus)
-        updateLocalTranscription()
+        if audienceChanged {
+            participation.updateAudience(participationAudience)
+        }
+        if transcriptionMetaChanged {
+            noteTranscription(from: previousTranscription, to: features.transcriptionStatus)
+            updateLocalTranscription()
+        }
         observeParticipation()
-        observeTranscript()
-        chat.reactionHistoryAvailable = features.permissions.canSendReaction
-        chat.canSend = features.permissions.canSendChat && features.connected
-        chat.unavailableReason = features.permissions.canViewChat ? nil : L("Chat is unavailable in this meeting.")
+        if transcriptContentChanged || transcriptionMetaChanged {
+            observeTranscript()
+        }
+        if chat.reactionHistoryAvailable != features.permissions.canSendReaction {
+            chat.reactionHistoryAvailable = features.permissions.canSendReaction
+        }
+        let nextCanSend = features.permissions.canSendChat && features.connected
+        if chat.canSend != nextCanSend {
+            chat.canSend = nextCanSend
+        }
+        let nextReason = features.permissions.canViewChat ? nil : L("Chat is unavailable in this meeting.")
+        if chat.unavailableReason != nextReason {
+            chat.unavailableReason = nextReason
+        }
         if features.messages != oldMessages {
             chat.replace(features.messages.map { message in
                 ChatEntry(id: message.id, sender: message.participantName, text: message.text,
@@ -2423,13 +2479,15 @@ import UniformTypeIdentifiers
                     delivery: message.delivery == .pending ? .pending : message.delivery == .failed ? .failed : .sent)
             })
         }
-        for event in features.reactions where receivedReactions.insert(event.id).inserted {
-            guard event.participantID != features.localParticipantID else { continue }
-            if let kind = MeetingReaction.allCases.first(where: { $0.emoji == event.reaction.symbol }),
-               let recorded = chat.reactionHistory.receive(kind: kind, participantID: event.participantID,
-                    displayName: event.participantName, receivedAt: event.receivedAt) { floatReaction(recorded) }
+        if reactionsChanged {
+            for event in features.reactions where receivedReactions.insert(event.id).inserted {
+                guard event.participantID != features.localParticipantID else { continue }
+                if let kind = MeetingReaction.allCases.first(where: { $0.emoji == event.reaction.symbol }),
+                   let recorded = chat.reactionHistory.receive(kind: kind, participantID: event.participantID,
+                        displayName: event.participantName, receivedAt: event.receivedAt) { floatReaction(recorded) }
+            }
+            if receivedReactions.count > 512 { receivedReactions = Set(features.reactions.map(\.id)) }
         }
-        if receivedReactions.count > 512 { receivedReactions = Set(features.reactions.map(\.id)) }
     }
     private func refreshSystemReactions() {
         let enabled = UserDefaults.standard.object(forKey: "nativeDesktop.shareCameraReactions") == nil || UserDefaults.standard.bool(forKey: "nativeDesktop.shareCameraReactions")

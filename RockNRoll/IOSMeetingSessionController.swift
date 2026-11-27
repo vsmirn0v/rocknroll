@@ -107,6 +107,7 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
     private var cachedLiveCaptureDevice: AVCaptureDevice?
     private var compositeSources: [String: CompositeVideoSource] = [:]
     private var receivedReactionIDs: Set<UUID> = []
+    private var lastAppliedFeatures: GuestMeetingSnapshot?
     private var screenShare: IOSScreenShareCapture?
     private var connectTask: Task<Void, Never>?
     private var broadcastObservation: AnyCancellable?
@@ -1341,120 +1342,151 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
 
     private func applyFeaturesSnapshot(_ features: GuestMeetingSnapshot) {
         guard !leaving else { return }
-        chat.reactionHistoryAvailable = features.permissions.canSendReaction || session.capabilities.supportsReactions
+        let previousFeatures = lastAppliedFeatures
+        lastAppliedFeatures = features
+
+        let reactionHistoryAvailable = features.permissions.canSendReaction || session.capabilities.supportsReactions
+        if chat.reactionHistoryAvailable != reactionHistoryAvailable {
+            chat.reactionHistoryAvailable = reactionHistoryAvailable
+        }
         let managesStore = session.chatService?.managesChatStoreSendCallbacks ?? false
         if !managesStore {
-            chat.canSend = features.permissions.canSendChat && features.connected
-            chat.unavailableReason = features.permissions.canViewChat
+            let canSend = features.permissions.canSendChat && features.connected
+            if chat.canSend != canSend {
+                chat.canSend = canSend
+            }
+            let unavailableReason = features.permissions.canViewChat
                 ? nil
                 : (session.chatService?.unavailableReason ?? L("Chat is unavailable in this meeting."))
-            if !features.messages.isEmpty || chat.items.isEmpty {
+            if chat.unavailableReason != unavailableReason {
+                chat.unavailableReason = unavailableReason
+            }
+            let messagesChanged = previousFeatures == nil || previousFeatures?.messages != features.messages
+            if messagesChanged && (!features.messages.isEmpty || chat.items.isEmpty) {
                 chat.replace(features.messages.map(Self.chatEntry(from:)))
                 emitWorkspaceEvents()
             }
         }
 
         if session.capabilities.supportsProviderTranscript {
-            var segments: [TranscriptSegment] = []
-            segments.reserveCapacity(features.transcript.count)
-            for msg in features.transcript {
-                let rawText = String(msg.text.prefix(4_096))
-                let occurredAt = msg.sentAt ?? msg.receivedAt
-                func appendAssistantIfMissing(_ assistantText: String, segmentID: String) {
-                    let cleanAssistant = assistantText.trimmingCharacters(in: .whitespacesAndNewlines)
-                    guard !cleanAssistant.isEmpty else { return }
-                    let alreadyRecorded = assistantTranscriptSegments.contains { existing in
-                        guard let existingAt = existing.spokenAt, let msgAt = occurredAt else {
-                            return existing.text == cleanAssistant
+            let transcriptMessagesChanged = previousFeatures == nil || previousFeatures?.transcript != features.transcript
+            let transcriptMetaChanged = previousFeatures == nil
+                || previousFeatures?.permissions.canViewTranscript != features.permissions.canViewTranscript
+                || previousFeatures?.permissions.canManageTranscript != features.permissions.canManageTranscript
+                || previousFeatures?.transcriptionStatus != features.transcriptionStatus
+                || previousFeatures?.connected != features.connected
+            if transcriptMessagesChanged || transcriptMetaChanged {
+                if transcriptMessagesChanged {
+                    var segments: [TranscriptSegment] = []
+                    segments.reserveCapacity(features.transcript.count)
+                    for msg in features.transcript {
+                        let rawText = String(msg.text.prefix(4_096))
+                        let occurredAt = msg.sentAt ?? msg.receivedAt
+                        func appendAssistantIfMissing(_ assistantText: String, segmentID: String) {
+                            let cleanAssistant = assistantText.trimmingCharacters(in: .whitespacesAndNewlines)
+                            guard !cleanAssistant.isEmpty else { return }
+                            let alreadyRecorded = assistantTranscriptSegments.contains { existing in
+                                guard let existingAt = existing.spokenAt, let msgAt = occurredAt else {
+                                    return existing.text == cleanAssistant
+                                }
+                                return abs(existingAt.timeIntervalSince(msgAt)) <= 25.0 &&
+                                    AssistantWakePhraseMatcher.isLikelySelfEcho(
+                                        candidate: rawText,
+                                        lastSpoken: existing.text,
+                                        isLocal: true,
+                                        withinEchoWindow: true
+                                    )
+                            }
+                            guard !alreadyRecorded else { return }
+                            segments.append(TranscriptSegment(
+                                id: segmentID,
+                                speaker: AssistantSpeechLedger.canonicalSpeakerName,
+                                text: cleanAssistant,
+                                spokenAt: occurredAt,
+                                isOwn: false,
+                                speakerRole: AssistantSpeechLedger.speakerRoleAssistant
+                            ))
                         }
-                        return abs(existingAt.timeIntervalSince(msgAt)) <= 25.0 &&
-                            AssistantWakePhraseMatcher.isLikelySelfEcho(
-                                candidate: rawText,
-                                lastSpoken: existing.text,
-                                isLocal: true,
-                                withinEchoWindow: true
-                            )
+                        if msg.isOwn {
+                            switch assistantSpeechLedger.classifyOwnServerSegment(text: rawText, occurredAt: occurredAt) {
+                            case .pureUser(let cleanUser):
+                                segments.append(TranscriptSegment(
+                                    id: msg.id,
+                                    speaker: msg.participantName,
+                                    text: cleanUser,
+                                    spokenAt: occurredAt,
+                                    isOwn: true,
+                                    speakerRole: AssistantSpeechLedger.speakerRoleUser
+                                ))
+                            case .mixed(let cleanUser, let assistantText):
+                                segments.append(TranscriptSegment(
+                                    id: msg.id,
+                                    speaker: msg.participantName,
+                                    text: cleanUser,
+                                    spokenAt: occurredAt,
+                                    isOwn: true,
+                                    speakerRole: AssistantSpeechLedger.speakerRoleUser
+                                ))
+                                appendAssistantIfMissing(assistantText, segmentID: msg.id + ":assistant")
+                            case .pureAssistant(let assistantText):
+                                appendAssistantIfMissing(assistantText, segmentID: msg.id)
+                            }
+                        } else {
+                            segments.append(TranscriptSegment(
+                                id: msg.id,
+                                speaker: msg.participantName,
+                                text: rawText,
+                                spokenAt: occurredAt,
+                                isOwn: false,
+                                speakerRole: AssistantSpeechLedger.speakerRoleParticipant
+                            ))
+                        }
                     }
-                    guard !alreadyRecorded else { return }
-                    segments.append(TranscriptSegment(
-                        id: segmentID,
-                        speaker: AssistantSpeechLedger.canonicalSpeakerName,
-                        text: cleanAssistant,
-                        spokenAt: occurredAt,
-                        isOwn: false,
-                        speakerRole: AssistantSpeechLedger.speakerRoleAssistant
-                    ))
+                    providerTranscriptSegments = segments
                 }
-                if msg.isOwn {
-                    switch assistantSpeechLedger.classifyOwnServerSegment(text: rawText, occurredAt: occurredAt) {
-                    case .pureUser(let cleanUser):
-                        segments.append(TranscriptSegment(
-                            id: msg.id,
-                            speaker: msg.participantName,
-                            text: cleanUser,
-                            spokenAt: occurredAt,
-                            isOwn: true,
-                            speakerRole: AssistantSpeechLedger.speakerRoleUser
-                        ))
-                    case .mixed(let cleanUser, let assistantText):
-                        segments.append(TranscriptSegment(
-                            id: msg.id,
-                            speaker: msg.participantName,
-                            text: cleanUser,
-                            spokenAt: occurredAt,
-                            isOwn: true,
-                            speakerRole: AssistantSpeechLedger.speakerRoleUser
-                        ))
-                        appendAssistantIfMissing(assistantText, segmentID: msg.id + ":assistant")
-                    case .pureAssistant(let assistantText):
-                        appendAssistantIfMissing(assistantText, segmentID: msg.id)
+                let wasServerVisible = providerTranscriptActive && (providerCanViewTranscript == true)
+                providerCanViewTranscript = features.permissions.canViewTranscript
+                providerTranscriptActive = (features.transcriptionStatus == .active)
+                providerCanManageTranscript = features.permissions.canManageTranscript && features.connected
+                let isServerVisible = providerTranscriptActive && (providerCanViewTranscript == true)
+                syncCatchUpTranscript()
+                if wasServerVisible != isServerVisible {
+                    Task { @MainActor [weak self] in
+                        await self?.reconcileLocalTranscriptionMode()
                     }
-                } else {
-                    segments.append(TranscriptSegment(
-                        id: msg.id,
-                        speaker: msg.participantName,
-                        text: rawText,
-                        spokenAt: occurredAt,
-                        isOwn: false,
-                        speakerRole: AssistantSpeechLedger.speakerRoleParticipant
-                    ))
                 }
             }
-            let wasServerVisible = providerTranscriptActive && (providerCanViewTranscript == true)
-            providerTranscriptSegments = segments
-            providerCanViewTranscript = features.permissions.canViewTranscript
-            providerTranscriptActive = (features.transcriptionStatus == .active)
-            providerCanManageTranscript = features.permissions.canManageTranscript && features.connected
-            let isServerVisible = providerTranscriptActive && (providerCanViewTranscript == true)
-            syncCatchUpTranscript()
-            if wasServerVisible != isServerVisible {
-                Task { @MainActor [weak self] in
-                    await self?.reconcileLocalTranscriptionMode()
-                }
-            }
-        } else {
+        } else if previousFeatures == nil {
             syncCatchUpTranscript()
         }
 
-        reactions.available = session.capabilities.supportsReactions || features.permissions.canSendReaction
-        reactions.ready = features.connected && phase == .connected
+        let reactionsAvailable = session.capabilities.supportsReactions || features.permissions.canSendReaction
+        if reactions.available != reactionsAvailable {
+            reactions.available = reactionsAvailable
+        }
+        let reactionsReady = features.connected && phase == .connected
+        if reactions.ready != reactionsReady {
+            reactions.ready = reactionsReady
+        }
         refreshCameraReactionStatus()
 
-        for event in features.reactions where receivedReactionIDs.insert(event.id).inserted {
-            guard event.participantID != features.localParticipantID,
-                  let kind = MeetingReaction.allCases.first(where: { $0.emoji == event.reaction.symbol }) else {
-                continue
+        if previousFeatures == nil || previousFeatures?.reactions != features.reactions {
+            for event in features.reactions where receivedReactionIDs.insert(event.id).inserted {
+                guard event.participantID != features.localParticipantID,
+                      let kind = MeetingReaction.allCases.first(where: { $0.emoji == event.reaction.symbol }) else {
+                    continue
+                }
+                _ = chat.reactionHistory.receive(
+                    kind: kind,
+                    participantID: event.participantID,
+                    displayName: event.participantName,
+                    receivedAt: event.receivedAt
+                )
+                callView?.showReaction(kind, from: event.participantName)
             }
-            _ = chat.reactionHistory.receive(
-                kind: kind,
-                participantID: event.participantID,
-                displayName: event.participantName,
-                receivedAt: event.receivedAt
-            )
-            callView?.showReaction(kind, from: event.participantName)
-        }
-        if receivedReactionIDs.count > 1_024 {
-            receivedReactionIDs = Set(features.reactions.map(\.id))
+            if receivedReactionIDs.count > 1_024 {
+                receivedReactionIDs = Set(features.reactions.map(\.id))
+            }
         }
     }
 
@@ -1540,12 +1572,16 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
     }
 
     private func refreshCameraReactionStatus() {
+        var nextStatus = reactions.cameraStatus
         if !isCameraOn || localCameraTrack == nil {
-            reactions.cameraStatus = .off
+            nextStatus = .off
         } else if !isForegroundVisible || isHeld || quiet {
-            reactions.cameraStatus = .paused
+            nextStatus = .paused
         } else {
-            reactions.cameraStatus = IOSCameraCapture.current?.cameraReactionStatus ?? .unavailable
+            nextStatus = IOSCameraCapture.current?.cameraReactionStatus ?? .unavailable
+        }
+        if reactions.cameraStatus != nextStatus {
+            reactions.cameraStatus = nextStatus
         }
     }
 
@@ -2491,6 +2527,7 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
         screenShare = nil
         if wasBroadcast { onBroadcastOwnershipChanged?(false) }
         compositeSources.removeAll()
+        lastAppliedFeatures = nil
         callView?.endFloatingVideo()
         studio.end()
         chat.clear()

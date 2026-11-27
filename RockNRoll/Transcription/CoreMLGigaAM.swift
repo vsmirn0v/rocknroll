@@ -48,27 +48,117 @@ final class CoreMLGigaAMRecognizer: @unchecked Sendable {
     static let maxSymbolsPerFrame = 10
 
     private static let sharedLock = NSLock()
+    static let defaultIdleUnloadDelay: Duration = .seconds(30)
     private nonisolated(unsafe) static var sharedRecognizers: [URL: CoreMLGigaAMRecognizer] = [:]
     private nonisolated(unsafe) static var sharedInflight: [URL: (id: UUID, task: Task<CoreMLGigaAMRecognizer, Error>)] = [:]
+    private nonisolated(unsafe) static var sharedActiveLeaseCounts: [URL: Int] = [:]
+    private nonisolated(unsafe) static var sharedIdleUnloadTasks: [URL: (id: UUID, task: Task<Void, Never>)] = [:]
     private nonisolated(unsafe) static var memoryWarningObserver: NSObjectProtocol?
+    private nonisolated(unsafe) static var backgroundObserver: NSObjectProtocol?
 
-    private static func installMemoryWarningObserverLocked() {
-        guard memoryWarningObserver == nil else { return }
-        memoryWarningObserver = NotificationCenter.default.addObserver(
-            forName: UIApplication.didReceiveMemoryWarningNotification,
-            object: nil,
-            queue: nil
-        ) { _ in
-            CoreMLGigaAMRecognizer.invalidateCache()
+    private static func installLifecycleObserversLocked() {
+        if memoryWarningObserver == nil {
+            memoryWarningObserver = NotificationCenter.default.addObserver(
+                forName: UIApplication.didReceiveMemoryWarningNotification,
+                object: nil,
+                queue: nil
+            ) { _ in
+                CoreMLGigaAMRecognizer.invalidateCache()
+            }
         }
+        if backgroundObserver == nil {
+            backgroundObserver = NotificationCenter.default.addObserver(
+                forName: UIApplication.didEnterBackgroundNotification,
+                object: nil,
+                queue: nil
+            ) { _ in
+                CoreMLGigaAMRecognizer.evictUnleasedRecognizers()
+            }
+        }
+    }
+
+    private static func scheduleIdleUnloadLocked(for key: URL, delay: Duration) {
+        sharedIdleUnloadTasks[key]?.task.cancel()
+        sharedIdleUnloadTasks.removeValue(forKey: key)
+        guard sharedActiveLeaseCounts[key, default: 0] == 0 else { return }
+        guard sharedRecognizers[key] != nil else { return }
+        if delay <= .zero {
+            sharedRecognizers.removeValue(forKey: key)
+            return
+        }
+        let unloadID = UUID()
+        let task = Task.detached(priority: .utility) {
+            try? await Task.sleep(for: delay)
+            guard !Task.isCancelled else { return }
+            CoreMLGigaAMRecognizer.completeScheduledUnload(for: key, unloadID: unloadID)
+        }
+        sharedIdleUnloadTasks[key] = (unloadID, task)
+    }
+
+    private static func completeScheduledUnload(for key: URL, unloadID: UUID) {
+        sharedLock.withLock {
+            guard sharedIdleUnloadTasks[key]?.id == unloadID else { return }
+            sharedIdleUnloadTasks.removeValue(forKey: key)
+            guard sharedActiveLeaseCounts[key, default: 0] == 0 else { return }
+            sharedRecognizers.removeValue(forKey: key)
+        }
+    }
+
+    private static func evictUnleasedRecognizers() {
+        sharedLock.withLock {
+            for key in Array(sharedRecognizers.keys) where sharedActiveLeaseCounts[key, default: 0] == 0 {
+                sharedIdleUnloadTasks[key]?.task.cancel()
+                sharedIdleUnloadTasks.removeValue(forKey: key)
+                sharedRecognizers.removeValue(forKey: key)
+            }
+        }
+    }
+
+    static func acquireShared(directory: URL) async throws -> CoreMLGigaAMRecognizer {
+        let key = directory.standardizedFileURL
+        sharedLock.withLock {
+            installLifecycleObserversLocked()
+            sharedActiveLeaseCounts[key, default: 0] += 1
+            sharedIdleUnloadTasks[key]?.task.cancel()
+            sharedIdleUnloadTasks.removeValue(forKey: key)
+        }
+        do {
+            return try await shared(directory: key)
+        } catch {
+            releaseShared(directory: key, idleUnloadDelay: .zero)
+            throw error
+        }
+    }
+
+    static func releaseShared(directory: URL, idleUnloadDelay: Duration = defaultIdleUnloadDelay) {
+        let key = directory.standardizedFileURL
+        sharedLock.withLock {
+            let current = sharedActiveLeaseCounts[key, default: 0]
+            if current > 1 {
+                sharedActiveLeaseCounts[key] = current - 1
+                return
+            }
+            sharedActiveLeaseCounts.removeValue(forKey: key)
+            scheduleIdleUnloadLocked(for: key, delay: idleUnloadDelay)
+        }
+    }
+
+    static func activeLeaseCount(for directory: URL) -> Int {
+        let key = directory.standardizedFileURL
+        return sharedLock.withLock { sharedActiveLeaseCounts[key, default: 0] }
     }
 
     static func shared(directory: URL) async throws -> CoreMLGigaAMRecognizer {
         let key = directory.standardizedFileURL
         let token = UUID()
         let entry: (id: UUID, task: Task<CoreMLGigaAMRecognizer, Error>) = sharedLock.withLock {
-            installMemoryWarningObserverLocked()
+            installLifecycleObserversLocked()
+            sharedIdleUnloadTasks[key]?.task.cancel()
+            sharedIdleUnloadTasks.removeValue(forKey: key)
             if let existing = sharedRecognizers[key] {
+                if sharedActiveLeaseCounts[key, default: 0] == 0 {
+                    scheduleIdleUnloadLocked(for: key, delay: defaultIdleUnloadDelay)
+                }
                 return (token, Task { existing })
             }
             if let existingEntry = sharedInflight[key] {
@@ -80,6 +170,9 @@ final class CoreMLGigaAMRecognizer: @unchecked Sendable {
                     if sharedInflight[key]?.id == token {
                         sharedRecognizers[key] = recognizer
                         sharedInflight.removeValue(forKey: key)
+                        if sharedActiveLeaseCounts[key, default: 0] == 0 {
+                            scheduleIdleUnloadLocked(for: key, delay: defaultIdleUnloadDelay)
+                        }
                     }
                 }
                 return recognizer
@@ -104,10 +197,14 @@ final class CoreMLGigaAMRecognizer: @unchecked Sendable {
         sharedLock.withLock {
             if let directory {
                 let key = directory.standardizedFileURL
+                sharedIdleUnloadTasks[key]?.task.cancel()
+                sharedIdleUnloadTasks.removeValue(forKey: key)
                 sharedRecognizers.removeValue(forKey: key)
                 sharedInflight[key]?.task.cancel()
                 sharedInflight.removeValue(forKey: key)
             } else {
+                sharedIdleUnloadTasks.values.forEach { $0.task.cancel() }
+                sharedIdleUnloadTasks.removeAll()
                 sharedRecognizers.removeAll()
                 sharedInflight.values.forEach { $0.task.cancel() }
                 sharedInflight.removeAll()

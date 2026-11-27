@@ -467,7 +467,8 @@ import UIKit
             return await transcribeOverride(samples)
         }
         if let gigaamDir = IOSListenModelStore.shared.installedGigaAMDirectoryIfReady(),
-           let recognizer = try? await CoreMLGigaAMRecognizer.shared(directory: gigaamDir) {
+           let recognizer = try? await CoreMLGigaAMRecognizer.acquireShared(directory: gigaamDir) {
+            defer { CoreMLGigaAMRecognizer.releaseShared(directory: gigaamDir) }
             let trimmed = try? await Task.detached(priority: .userInitiated) {
                 try recognizer.transcribe(samples16k: samples)
             }.value.trimmingCharacters(in: .whitespacesAndNewlines)

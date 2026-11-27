@@ -126,17 +126,94 @@ private final class AudioIngressRouter: @unchecked Sendable {
     private var localSpeaker = ""
     private var speakerNames: [String: String] = [:]
     private var pendingWorkCount = 0
-    private static let maxPendingWorkCount = 24
+    private var audibleTailUntil: [String: TimeInterval] = [:]
+    private static let maxPendingWorkCount = 64
+    private static let audiblePeakThreshold: Float = 1e-4
+    private static let silenceHangoverSeconds: TimeInterval = 1.2
+    private static let idlePipelineTTLSeconds: TimeInterval = 60
+    private static let idleSweepIntervalSeconds: TimeInterval = 15
 
     // Worker-queue-only state
     private var pipelines: [String: SpeakerPipeline] = [:]
     private var rawConverters: [String: IOSPCM16kConverter] = [:]
     private var timeline = IOSSpeakingTimeline()
+    private var lastIdleSweepUptime: TimeInterval = 0
 
     var onText: (@Sendable (String, String?, String, Bool, Date) -> Void)?
     private var onPCM16Audio: (@Sendable (String, Data) -> Void)?
 
     init() {}
+
+    static func hasAudibleSignal(_ buffer: AVAudioPCMBuffer) -> Bool {
+        let frames = Int(buffer.frameLength)
+        guard frames > 0 else { return false }
+        let format = buffer.format
+        let channels = max(1, Int(format.channelCount))
+        switch format.commonFormat {
+        case .pcmFormatFloat32:
+            if !format.isInterleaved, let data = buffer.floatChannelData {
+                for ch in 0..<channels {
+                    var peak: Float = 0
+                    vDSP_maxmgv(data[ch], 1, &peak, vDSP_Length(frames))
+                    if peak >= audiblePeakThreshold { return true }
+                }
+                return false
+            } else if let raw = buffer.audioBufferList.pointee.mBuffers.mData {
+                var peak: Float = 0
+                vDSP_maxmgv(raw.assumingMemoryBound(to: Float.self), 1, &peak, vDSP_Length(frames * channels))
+                return peak >= audiblePeakThreshold
+            }
+            return true
+        case .pcmFormatInt16:
+            let intThreshold = Int16(max(4, Int((audiblePeakThreshold * 32768.0).rounded())))
+            if !format.isInterleaved, let data = buffer.int16ChannelData {
+                for ch in 0..<channels {
+                    let ptr = data[ch]
+                    for i in 0..<frames {
+                        let s = ptr[i]
+                        let mag = s == .min ? Int16.max : abs(s)
+                        if mag >= intThreshold { return true }
+                    }
+                }
+                return false
+            } else if let raw = buffer.audioBufferList.pointee.mBuffers.mData {
+                let ptr = raw.assumingMemoryBound(to: Int16.self)
+                let total = frames * channels
+                for i in 0..<total {
+                    let s = ptr[i]
+                    let mag = s == .min ? Int16.max : abs(s)
+                    if mag >= intThreshold { return true }
+                }
+                return false
+            }
+            return true
+        case .pcmFormatInt32:
+            let intThreshold = Int32(max(256, Int64((Double(audiblePeakThreshold) * 2_147_483_648.0).rounded())))
+            if !format.isInterleaved, let data = buffer.int32ChannelData {
+                for ch in 0..<channels {
+                    let ptr = data[ch]
+                    for i in 0..<frames {
+                        let s = ptr[i]
+                        let mag = s == .min ? Int32.max : abs(s)
+                        if mag >= intThreshold { return true }
+                    }
+                }
+                return false
+            } else if let raw = buffer.audioBufferList.pointee.mBuffers.mData {
+                let ptr = raw.assumingMemoryBound(to: Int32.self)
+                let total = frames * channels
+                for i in 0..<total {
+                    let s = ptr[i]
+                    let mag = s == .min ? Int32.max : abs(s)
+                    if mag >= intThreshold { return true }
+                }
+                return false
+            }
+            return true
+        default:
+            return true
+        }
+    }
 
     func setPCM16AudioHandler(_ handler: (@Sendable (String, Data) -> Void)?) {
         lock.withLock { onPCM16Audio = handler }
@@ -161,6 +238,11 @@ private final class AudioIngressRouter: @unchecked Sendable {
             self.gigaam = gigaam
             self.localSpeaker = localSpeaker
             self.speakerNames = speakerNames
+            if localMicOnly && onPCM16Audio == nil {
+                let localTail = audibleTailUntil["local"]
+                audibleTailUntil.removeAll()
+                if let localTail { audibleTailUntil["local"] = localTail }
+            }
         }
         workerQueue.async { [self] in
             if !audioTapOnly {
@@ -181,11 +263,61 @@ private final class AudioIngressRouter: @unchecked Sendable {
         }
     }
 
-    func canAcceptRemote() -> Bool {
-        lock.withLock { running && pendingWorkCount < Self.maxPendingWorkCount }
+    /// Evaluates capacity and fast peak-amplitude gating on the borrowed buffer before copying PCM
+    /// or dispatching onto `workerQueue`.
+    func shouldAcceptLocal(_ borrowed: AVAudioPCMBuffer) -> (accept: Bool, isAudible: Bool) {
+        let gateState: (canRun: Bool, needsSilenceGate: Bool) = lock.withLock {
+            guard running, pendingWorkCount < Self.maxPendingWorkCount else { return (false, false) }
+            if audioTapOnly && onPCM16Audio == nil { return (false, false) }
+            return (true, onPCM16Audio == nil)
+        }
+        guard gateState.canRun else { return (false, false) }
+        guard gateState.needsSilenceGate else { return (true, true) }
+
+        let audible = Self.hasAudibleSignal(borrowed)
+        let now = ProcessInfo.processInfo.systemUptime
+        let accepted = lock.withLock { () -> Bool in
+            guard running, pendingWorkCount < Self.maxPendingWorkCount else { return false }
+            if audible {
+                audibleTailUntil["local"] = now + Self.silenceHangoverSeconds
+                return true
+            }
+            guard let until = audibleTailUntil["local"], now < until else { return false }
+            return true
+        }
+        return (accepted, audible)
     }
 
-    func enqueueLocal(_ buffer: AVAudioPCMBuffer) {
+    /// Evaluates capacity and fast peak-amplitude gating on the borrowed remote WebRTC buffer
+    /// so muted/silent participants allocate zero `AVAudioPCMBuffer` copies, `AVAudioConverter`s,
+    /// or `SpeakerPipeline`s.
+    func shouldAcceptRemote(streamID: String, borrowed: AVAudioPCMBuffer) -> (accept: Bool, isAudible: Bool) {
+        let gateState: (canRun: Bool, needsSilenceGate: Bool) = lock.withLock {
+            guard running, pendingWorkCount < Self.maxPendingWorkCount else { return (false, false) }
+            let effectiveTapOnly = audioTapOnly || localMicOnly
+            if effectiveTapOnly && onPCM16Audio == nil { return (false, false) }
+            return (true, onPCM16Audio == nil)
+        }
+        guard gateState.canRun else { return (false, false) }
+        guard gateState.needsSilenceGate else { return (true, true) }
+
+        let audible = Self.hasAudibleSignal(borrowed)
+        let now = ProcessInfo.processInfo.systemUptime
+        let accepted = lock.withLock { () -> Bool in
+            guard running, pendingWorkCount < Self.maxPendingWorkCount else { return false }
+            let effectiveTapOnly = audioTapOnly || localMicOnly
+            if effectiveTapOnly && onPCM16Audio == nil { return false }
+            if audible {
+                audibleTailUntil[streamID] = now + Self.silenceHangoverSeconds
+                return true
+            }
+            guard let until = audibleTailUntil[streamID], now < until else { return false }
+            return true
+        }
+        return (accepted, audible)
+    }
+
+    func enqueueLocal(_ buffer: AVAudioPCMBuffer, isAudible: Bool = true) {
         let state: (running: Bool, tapOnly: Bool, backend: IOSListenModel, language: IOSTranscriptionLanguage, gigaam: CoreMLGigaAMRecognizer?, speaker: String)? = lock.withLock {
             guard running, pendingWorkCount < Self.maxPendingWorkCount else { return nil }
             pendingWorkCount += 1
@@ -205,12 +337,13 @@ private final class AudioIngressRouter: @unchecked Sendable {
                 backend: state.backend,
                 language: state.language,
                 gigaam: state.gigaam,
-                buffer: buffer
+                buffer: buffer,
+                isAudible: isAudible
             )
         }
     }
 
-    func enqueueRemote(streamID: String, buffer: AVAudioPCMBuffer) {
+    func enqueueRemote(streamID: String, buffer: AVAudioPCMBuffer, isAudible: Bool = true) {
         let state: (running: Bool, tapOnly: Bool, backend: IOSListenModel, language: IOSTranscriptionLanguage, gigaam: CoreMLGigaAMRecognizer?, speaker: String?)? = lock.withLock {
             guard running, pendingWorkCount < Self.maxPendingWorkCount else { return nil }
             let effectiveTapOnly = audioTapOnly || localMicOnly
@@ -234,12 +367,16 @@ private final class AudioIngressRouter: @unchecked Sendable {
                 backend: state.backend,
                 language: state.language,
                 gigaam: state.gigaam,
-                buffer: buffer
+                buffer: buffer,
+                isAudible: isAudible
             )
         }
     }
 
     func finishStream(id: String) {
+        lock.withLock {
+            _ = audibleTailUntil.removeValue(forKey: id)
+        }
         workerQueue.async { [self] in
             let closing = self.pipelines.removeValue(forKey: id)
             closing?.finishAndFlush()
@@ -248,6 +385,9 @@ private final class AudioIngressRouter: @unchecked Sendable {
     }
 
     func discardLocalSpeechBuffers() {
+        lock.withLock {
+            _ = audibleTailUntil.removeValue(forKey: "local")
+        }
         workerQueue.async { [self] in
             self.pipelines["local"]?.discardPendingSpeech()
         }
@@ -258,6 +398,7 @@ private final class AudioIngressRouter: @unchecked Sendable {
             self.running = true
             self.audioTapOnly = true
             self.gigaam = nil
+            self.audibleTailUntil.removeAll()
         }
         workerQueue.async { [self] in
             let active = self.pipelines.values
@@ -273,6 +414,7 @@ private final class AudioIngressRouter: @unchecked Sendable {
             self.running = false
             self.audioTapOnly = false
             self.gigaam = nil
+            self.audibleTailUntil.removeAll()
         }
         workerQueue.async { [self] in
             let active = self.pipelines.values
@@ -287,6 +429,26 @@ private final class AudioIngressRouter: @unchecked Sendable {
         }
     }
 
+    func activePipelineCountForTesting() async -> Int {
+        await withCheckedContinuation { continuation in
+            workerQueue.async { [self] in
+                continuation.resume(returning: self.pipelines.count)
+            }
+        }
+    }
+
+    private func sweepIdlePipelinesIfNeeded(nowUptime: TimeInterval) {
+        guard nowUptime - lastIdleSweepUptime >= Self.idleSweepIntervalSeconds else { return }
+        lastIdleSweepUptime = nowUptime
+        guard !pipelines.isEmpty else { return }
+        for (id, pipeline) in Array(pipelines) {
+            if !pipeline.isSpeechActive,
+               (nowUptime - pipeline.lastAudibleUptime) >= Self.idlePipelineTTLSeconds {
+                pipelines.removeValue(forKey: id)?.finishAndFlush()
+            }
+        }
+    }
+
     private func processOnWorker(
         streamID: String,
         speakerName: String?,
@@ -294,8 +456,10 @@ private final class AudioIngressRouter: @unchecked Sendable {
         backend: IOSListenModel,
         language: IOSTranscriptionLanguage,
         gigaam: CoreMLGigaAMRecognizer?,
-        buffer: AVAudioPCMBuffer
+        buffer: AVAudioPCMBuffer,
+        isAudible: Bool
     ) {
+        let nowUptime = ProcessInfo.processInfo.systemUptime
         let isTapOnly = lock.withLock { self.audioTapOnly } || tapOnly
         if isTapOnly {
             let converter = rawConverters[streamID] ?? {
@@ -312,11 +476,15 @@ private final class AudioIngressRouter: @unchecked Sendable {
             }
             return
         }
+        sweepIdlePipelinesIfNeeded(nowUptime: nowUptime)
         let pipeline: SpeakerPipeline
         if let existing = pipelines[streamID] {
             pipeline = existing
             pipeline.updateSpeaker(speakerName)
         } else {
+            if !isAudible && lock.withLock({ onPCM16Audio == nil }) {
+                return
+            }
             AppDiagnostics.log("local-transcription-audio", ["source": streamID == "local" ? "microphone" : "remote", "backend": backend.rawValue])
             pipeline = SpeakerPipeline(
                 streamID: streamID,
@@ -341,10 +509,34 @@ private final class AudioIngressRouter: @unchecked Sendable {
             }
             pipelines[streamID] = pipeline
         }
-        if let speakerName, !speakerName.isEmpty {
+        if isAudible, let speakerName, !speakerName.isEmpty {
             timeline.record(speaker: speakerName)
         }
-        pipeline.append(buffer)
+        pipeline.append(buffer, isAudible: isAudible, nowUptime: nowUptime)
+    }
+}
+
+private final class SharedGigaAMLeaseBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var directory: URL?
+
+    func replace(with newDirectory: URL?) {
+        let previous: URL? = lock.withLock {
+            let old = directory
+            directory = newDirectory
+            return old
+        }
+        if let previous {
+            CoreMLGigaAMRecognizer.releaseShared(directory: previous)
+        }
+    }
+
+    func release() {
+        replace(with: nil)
+    }
+
+    deinit {
+        release()
     }
 }
 
@@ -372,6 +564,8 @@ final class IOSMeetingTranscriber: ObservableObject {
     private let participantNameLookup: (String) -> String?
     private let setOutputDemand: (Bool) async -> Bool
     private let gigaamLoader: @Sendable (URL) async throws -> CoreMLGigaAMRecognizer
+    private let usesSharedGigaAMLease: Bool
+    private let sharedGigaAMLease = SharedGigaAMLeaseBox()
     private let speechAuthorization: @MainActor () async -> Bool
     private let localAppleSpeechAvailable: @MainActor () -> Bool
 
@@ -401,10 +595,11 @@ final class IOSMeetingTranscriber: ObservableObject {
         self.localDisplayName = localDisplayName
         self.participantNameLookup = participantNameLookup
         self.setOutputDemand = setOutputDemand
+        self.usesSharedGigaAMLease = (gigaamLoader == nil)
         self.speechAuthorization = speechAuthorization ?? Self.requestSpeechAuthorization
         self.localAppleSpeechAvailable = localAppleSpeechAvailable ?? modelStore.appleSpeechAvailableOnDevice
         self.gigaamLoader = gigaamLoader ?? { dir in
-            try await CoreMLGigaAMRecognizer.shared(directory: dir)
+            try await CoreMLGigaAMRecognizer.acquireShared(directory: dir)
         }
         self.router.onText = { [weak self] stream, speaker, text, isFinal, spokenAt in
             Task { @MainActor [weak self] in
@@ -432,14 +627,21 @@ final class IOSMeetingTranscriber: ObservableObject {
     }
 
     nonisolated func enqueueLocalAudio(_ buffer: AVAudioPCMBuffer) {
-        guard let copy = MeetingAudioSink.copy(buffer) else { return }
-        router.enqueueLocal(copy)
+        let decision = router.shouldAcceptLocal(buffer)
+        guard decision.accept, let copy = MeetingAudioSink.copy(buffer) else { return }
+        router.enqueueLocal(copy, isAudible: decision.isAudible)
     }
 
     func receiveLocalAudio(_ buffer: AVAudioPCMBuffer) {
-        guard isCapturingAudio, let copy = MeetingAudioSink.copy(buffer) else { return }
+        guard isCapturingAudio else { return }
+        let decision = router.shouldAcceptLocal(buffer)
+        guard decision.accept, let copy = MeetingAudioSink.copy(buffer) else { return }
         pushRouterMetadata()
-        router.enqueueLocal(copy)
+        router.enqueueLocal(copy, isAudible: decision.isAudible)
+    }
+
+    func activePipelineCountForTesting() async -> Int {
+        await router.activePipelineCountForTesting()
     }
 
     /// Streams raw 16 kHz PCM16 audio to Realtime voice providers without running
@@ -475,7 +677,15 @@ final class IOSMeetingTranscriber: ObservableObject {
         if backend == .gigaamV3CoreML, let dir = modelStore.installedGigaAMDirectoryIfReady() {
             do {
                 let recognizer = try await gigaamLoader(dir)
-                guard activeRun == run else { return false }
+                guard activeRun == run else {
+                    if usesSharedGigaAMLease {
+                        CoreMLGigaAMRecognizer.releaseShared(directory: dir)
+                    }
+                    return false
+                }
+                if usesSharedGigaAMLease {
+                    sharedGigaAMLease.replace(with: dir)
+                }
                 self.gigaamRecognizer = recognizer
                 self.currentBackend = .gigaamV3CoreML
                 state = .active(.gigaamV3CoreML)
@@ -484,21 +694,25 @@ final class IOSMeetingTranscriber: ObservableObject {
             } catch is CancellationError {
                 guard activeRun == run else { return false }
                 self.gigaamRecognizer = nil
+                sharedGigaAMLease.release()
                 activeRun = nil
                 if case .starting = state { state = .off }
                 return false
             } catch {
                 guard activeRun == run else { return false }
+                modelStore.refreshInstallState()
                 AppDiagnostics.log("local-transcription-fallback", [
                     "from": IOSListenModel.gigaamV3CoreML.rawValue,
                     "to": IOSListenModel.appleSpeech.rawValue
                 ])
                 self.gigaamRecognizer = nil
+                sharedGigaAMLease.release()
                 guard await startAppleSpeech(for: run) else { return false }
                 let ms = Int(((ProcessInfo.processInfo.systemUptime - startedAt) * 1000).rounded())
                 AppDiagnostics.log("local-transcription-ready", ["backend": IOSListenModel.appleSpeech.rawValue, "ms": ms])
             }
         } else {
+            sharedGigaAMLease.release()
             guard await startAppleSpeech(for: run) else { return false }
             let ms = Int(((ProcessInfo.processInfo.systemUptime - startedAt) * 1000).rounded())
             AppDiagnostics.log("local-transcription-ready", ["backend": IOSListenModel.appleSpeech.rawValue, "ms": ms])
@@ -524,6 +738,7 @@ final class IOSMeetingTranscriber: ObservableObject {
             activeUtteranceByStream.removeAll()
             currentBackend = nil
             gigaamRecognizer = nil
+            sharedGigaAMLease.release()
             state = .off
             isAudioTapOnly = true
             router.stopASRKeepAudioTap()
@@ -539,6 +754,7 @@ final class IOSMeetingTranscriber: ObservableObject {
         activeUtteranceByStream.removeAll()
         currentBackend = nil
         gigaamRecognizer = nil
+        sharedGigaAMLease.release()
         state = .off
         _ = await setOutputDemand(false)
     }
@@ -634,9 +850,10 @@ final class IOSMeetingTranscriber: ObservableObject {
         let audioRouter = router
         for source in remoteSources where taps[source.id] == nil {
             let sink = MeetingAudioSink(borrowingBuffersFor: source.id) { id, borrowed in
-                guard audioRouter.canAcceptRemote(),
+                let decision = audioRouter.shouldAcceptRemote(streamID: id, borrowed: borrowed)
+                guard decision.accept,
                       let copy = MeetingAudioSink.copy(borrowed) else { return }
-                audioRouter.enqueueRemote(streamID: id, buffer: copy)
+                audioRouter.enqueueRemote(streamID: id, buffer: copy, isAudible: decision.isAudible)
             }
             source.attach(sink)
             taps[source.id] = (source, sink)
@@ -750,6 +967,11 @@ private final class SpeakerPipeline {
     private let converter = IOSPCM16kConverter()
     private let vad = IOSVoiceActivityDetector()
     private var stopped = false
+    private(set) var lastAudibleUptime: TimeInterval = ProcessInfo.processInfo.systemUptime
+
+    var isSpeechActive: Bool {
+        vad.isSpeechActive || appleTask != nil
+    }
 
     // Apple Speech state (accessed on workerQueue)
     private var speechRecognizer: SFSpeechRecognizer?
@@ -794,8 +1016,12 @@ private final class SpeakerPipeline {
         }
     }
 
-    func append(_ buffer: AVAudioPCMBuffer) {
+    func append(_ buffer: AVAudioPCMBuffer, isAudible: Bool = true, nowUptime: TimeInterval = ProcessInfo.processInfo.systemUptime) {
         guard !stopped else { return }
+        if isAudible {
+            lastAudibleUptime = nowUptime
+            vad.primePreRollIfNeeded()
+        }
         let samples = converter.convert(buffer)
         guard !samples.isEmpty else { return }
         onSamples16k?(streamID, samples)

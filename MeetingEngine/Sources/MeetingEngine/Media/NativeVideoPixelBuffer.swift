@@ -44,12 +44,45 @@ public final class NativeVideoPixelBuffer {
         CVPixelBufferLockBaseAddress(result, []); defer { CVPixelBufferUnlockBaseAddress(result, []) }
         guard let luma = CVPixelBufferGetBaseAddressOfPlane(result, 0), let uv = CVPixelBufferGetBaseAddressOfPlane(result, 1) else { return nil }
         let yStride = CVPixelBufferGetBytesPerRowOfPlane(result, 0), uvStride = CVPixelBufferGetBytesPerRowOfPlane(result, 1)
-        for row in 0..<height { memcpy(luma.advanced(by: row * yStride), source.dataY.advanced(by: (row + y) * Int(source.strideY) + x), width) }
-        let destination = uv.assumingMemoryBound(to: UInt8.self)
-        for row in 0..<(height + 1) / 2 {
-            for column in 0..<(width + 1) / 2 {
-                destination[row * uvStride + column * 2] = source.dataU[(row + y / 2) * Int(source.strideU) + column + x / 2]
-                destination[row * uvStride + column * 2 + 1] = source.dataV[(row + y / 2) * Int(source.strideV) + column + x / 2]
+        let srcY = source.dataY, srcU = source.dataU, srcV = source.dataV
+        let srcStrideY = Int(source.strideY), srcStrideU = Int(source.strideU), srcStrideV = Int(source.strideV)
+        if x == 0 && width == srcStrideY && width == yStride {
+            memcpy(luma, srcY.advanced(by: y * srcStrideY), height * width)
+        } else {
+            for row in 0..<height {
+                memcpy(luma.advanced(by: row * yStride), srcY.advanced(by: (row + y) * srcStrideY + x), width)
+            }
+        }
+        let chromaHeight = (height + 1) / 2, chromaWidth = (width + 1) / 2
+        let chromaX = x / 2, chromaY = y / 2
+        let dstUV = UnsafeMutableRawPointer(uv)
+        let srcRawU = UnsafeRawPointer(srcU), srcRawV = UnsafeRawPointer(srcV)
+        let simdWidth = chromaWidth & ~3
+        for row in 0..<chromaHeight {
+            let dstRow = dstUV.advanced(by: row * uvStride)
+            let rowU = srcRawU.advanced(by: (row + chromaY) * srcStrideU + chromaX)
+            let rowV = srcRawV.advanced(by: (row + chromaY) * srcStrideV + chromaX)
+            var col = 0
+            while col < simdWidth {
+                var u = UInt64(UInt32(littleEndian: rowU.loadUnaligned(fromByteOffset: col, as: UInt32.self)))
+                var v = UInt64(UInt32(littleEndian: rowV.loadUnaligned(fromByteOffset: col, as: UInt32.self)))
+                u = (u | (u &<< 16)) & 0x0000_FFFF_0000_FFFF
+                u = (u | (u &<< 8)) & 0x00FF_00FF_00FF_00FF
+                v = (v | (v &<< 16)) & 0x0000_FFFF_0000_FFFF
+                v = (v | (v &<< 8)) & 0x00FF_00FF_00FF_00FF
+                let interleaved = (u | (v &<< 8)).littleEndian
+                dstRow.storeBytes(of: interleaved, toByteOffset: col * 2, as: UInt64.self)
+                col += 4
+            }
+            if col < chromaWidth {
+                let dstBytes = dstRow.assumingMemoryBound(to: UInt8.self)
+                let bytesU = rowU.assumingMemoryBound(to: UInt8.self)
+                let bytesV = rowV.assumingMemoryBound(to: UInt8.self)
+                while col < chromaWidth {
+                    dstBytes[col * 2] = bytesU[col]
+                    dstBytes[col * 2 + 1] = bytesV[col]
+                    col += 1
+                }
             }
         }
         CVBufferRemoveAllAttachments(result)

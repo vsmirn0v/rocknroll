@@ -99,7 +99,7 @@ public final class SherpaVoiceActivityDetector: @unchecked Sendable {
     ///   - minSilence: a pause this long ends an utterance.
     ///   - maxSpeech: a longer utterance is split (GigaAM handles up to ~25 s).
     public init(model: URL, threshold: Float = 0.5, minSilence: Float = 0.4, minSpeech: Float = 0.25,
-                maxSpeech: Float = 20, bufferSeconds: Float = 60) throws {
+                maxSpeech: Float = 20, bufferSeconds: Float = 25) throws {
         let strings = CStrings()
         var config = SherpaOnnxVadModelConfig()
         config.silero_vad.model = strings.make(model.path)

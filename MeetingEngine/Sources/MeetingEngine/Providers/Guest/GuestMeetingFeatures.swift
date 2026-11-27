@@ -185,6 +185,7 @@ struct GuestMeetingFeatures {
     private(set) var transcriptPage: Any?
     private var members: [String: GuestMeetingParticipant] = [:]
     private var rtc: [String: (identity: String, tracks: [[String: Any]])] = [:]
+    private var sidByIdentity: [String: String] = [:]
     private var rtcVersions: [String: Int] = [:]
     private var speakers: [String: Double] = [:]
     private var localMute: [Bool: Bool] = [:]
@@ -310,15 +311,18 @@ struct GuestMeetingFeatures {
 
     mutating func updateSpeakers(_ values: [[String: Any]]) {
         guard !stopped else { return }
-        speakers.removeAll()
+        var next: [String: Double] = [:]
+        next.reserveCapacity(values.count)
         for value in values {
             guard let sid = Self.identifier(value["sid"]), rtc[sid] != nil,
                   value["active"] as? Bool != false else { continue }
             let level = (value["level"] as? NSNumber)?.doubleValue ?? 1
             guard level.isFinite else { continue }
-            speakers[sid] = min(1, max(0, level))
+            next[sid] = min(1, max(0, level))
         }
-        rebuildRoster()
+        guard next != speakers else { return }
+        speakers = next
+        applySpeakersInPlace()
     }
 
     mutating func setConnected(_ value: Bool) { snapshot.connected = value && !stopped }
@@ -362,7 +366,7 @@ struct GuestMeetingFeatures {
 
     mutating func stop() {
         stopped = true; epoch &+= 1
-        snapshot = GuestMeetingSnapshot(); members.removeAll(); rtc.removeAll(); rtcVersions.removeAll(); speakers.removeAll()
+        snapshot = GuestMeetingSnapshot(); members.removeAll(); rtc.removeAll(); sidByIdentity.removeAll(); rtcVersions.removeAll(); speakers.removeAll()
         roomID = nil; groupID = nil; chatPage = nil; transcriptPage = nil
     }
 
@@ -400,11 +404,24 @@ struct GuestMeetingFeatures {
         }
     }
     private mutating func rebuildRoster() {
-        snapshot.participants = members.values.filter { snapshot.permissions.canViewParticipants || $0.isLocal }.map { member in
+        var rtcByIdentity: [String: (sid: String, tracks: [[String: Any]])] = Dictionary(minimumCapacity: rtc.count)
+        var nextSidByIdentity: [String: String] = Dictionary(minimumCapacity: rtc.count)
+        for (sid, value) in rtc {
+            rtcByIdentity[value.identity] = (sid, value.tracks)
+            nextSidByIdentity[value.identity] = sid
+        }
+        sidByIdentity = nextSidByIdentity
+        let canViewAll = snapshot.permissions.canViewParticipants
+        let localAudioMuted = localMute[false] == true
+        let localVideoMuted = localMute[true] == true
+        let localSharing = snapshot.screenSharing
+        snapshot.participants = members.values.filter { canViewAll || $0.isLocal }.map { member in
             var member = member
-            for (sid, value) in rtc where value.identity == member.id {
-                member.isSpeaking = speakers[sid] != nil; member.audioLevel = speakers[sid] ?? 0
-                for track in value.tracks {
+            if let entry = rtcByIdentity[member.id] {
+                let level = speakers[entry.sid]
+                member.isSpeaking = level != nil
+                member.audioLevel = level ?? 0
+                for track in entry.tracks {
                     let muted = track["muted"] as? Bool ?? true
                     switch track["source"] as? String {
                     case "MICROPHONE": member.microphoneMuted = muted
@@ -415,12 +432,37 @@ struct GuestMeetingFeatures {
                 }
             }
             if member.isLocal {
-                if localMute[false] == true { member.microphoneMuted = true; member.isSpeaking = false; member.audioLevel = 0 }
-                if localMute[true] == true { member.cameraMuted = true }
-                member.sharingScreen = snapshot.screenSharing
+                if localAudioMuted { member.microphoneMuted = true; member.isSpeaking = false; member.audioLevel = 0 }
+                if localVideoMuted { member.cameraMuted = true }
+                member.sharingScreen = localSharing
             }
             return member
         }.sorted { $0.isLocal != $1.isLocal ? $0.isLocal : $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+    }
+
+    private mutating func applySpeakersInPlace() {
+        guard !snapshot.participants.isEmpty else { return }
+        let localAudioMuted = localMute[false] == true
+        for index in snapshot.participants.indices {
+            let id = snapshot.participants[index].id
+            let isLocal = snapshot.participants[index].isLocal
+            let nextSpeaking: Bool
+            let nextLevel: Double
+            if isLocal && localAudioMuted {
+                nextSpeaking = false
+                nextLevel = 0
+            } else if let sid = sidByIdentity[id], let level = speakers[sid] {
+                nextSpeaking = true
+                nextLevel = level
+            } else {
+                nextSpeaking = false
+                nextLevel = 0
+            }
+            if snapshot.participants[index].isSpeaking != nextSpeaking || snapshot.participants[index].audioLevel != nextLevel {
+                snapshot.participants[index].isSpeaking = nextSpeaking
+                snapshot.participants[index].audioLevel = nextLevel
+            }
+        }
     }
     private var loggedTranscriptShape = false
     private func archiveMessage(_ message: GuestMeetingMessage, raw: Any?) -> GuestMeetingMessage {

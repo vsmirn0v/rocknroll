@@ -693,6 +693,27 @@ import XCTest
         model.reconsiderLocalTranscriptFallback()
         XCTAssertTrue(model.transcribingLocally)
     }
+
+    func testSilentRemoteTracksSkipVADAllocation() async throws {
+        let transcriber = MeetingTranscriber(model: unavailableSpeechModel, vadModel: temporaryFolder()) { _ in }
+        var sinks: [MeetingAudioSink] = []
+        let sources = (0..<20).map { index in
+            MeetingAudioSource(id: "silent-\(index)", participantIdentity: "p-\(index)",
+                attach: { sinks.append($0) }, detach: { _ in })
+        }
+        transcriber.update(sources)
+        let format = try XCTUnwrap(AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 1))
+        let silent = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 480))
+        silent.frameLength = 480
+        for _ in 0..<10 {
+            for sink in sinks { sink.render(pcmBuffer: silent) }
+            transcriber.waitForTesting()
+        }
+        XCTAssertEqual(transcriber.activeSpeakerCountForTesting, 0, "Digital silence on muted remote tracks must not instantiate per-speaker VADs")
+        XCTAssertEqual(transcriber.currentSummary.audioSeconds, 0)
+        transcriber.stop()
+        _ = await transcriber.waitForDelivery()
+    }
 }
 
 @MainActor private final class LocalFallbackEngine: NativeDesktopMeetingEngine {

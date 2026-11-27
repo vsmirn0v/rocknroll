@@ -1,3 +1,4 @@
+import Accelerate
 import AVFoundation
 import Combine
 import Foundation
@@ -330,6 +331,17 @@ final class MeetingTranscriber: @unchecked Sendable {
     // All tracks and the microphone share a budget for PCM storage and worker jobs.
     static let maxPendingBuffers = 128
     static let maxPendingBytes = 4 * 1024 * 1024
+    /// Peak amplitude (~ -80 dBFS) below which a buffer is treated as digital silence.
+    static let silencePeakThreshold: Float = 1e-4
+    /// Trailing silence (16 kHz samples) still fed after audible speech so Silero VAD
+    /// cleanly closes the active utterance (`minSilence` is 0.4 s).
+    static let silenceHangoverSamples = 16_000
+    /// Idle speaker detectors are released after sustained silence so large meetings
+    /// do not keep dozens of inactive ONNX sessions and ring buffers in memory.
+    static let idleSpeakerLifetime: TimeInterval = 60
+    private static let primeSilenceWindow = [Float](repeating: 0, count: SherpaVoiceActivityDetector.windowSize)
+    private let idleSpeakerTTL: TimeInterval
+    private var lastIdleSweepAt: Date = .distantPast
     private let queue: DispatchQueue
     private let ingressLock = NSLock()
     private let audioCopies = DispatchGroup()
@@ -382,14 +394,19 @@ final class MeetingTranscriber: @unchecked Sendable {
         var origin: Date?
         /// 16 kHz samples given to the detector so far (its segment indices count these).
         var fed: Int64 = 0
+        var activeGate = false
+        var hangoverRemainingSamples = 0
+        var lastAudibleAt: Date = .distantPast
         init(detector: SherpaVoiceActivityDetector) { self.detector = detector }
     }
 
     init(model: ListenRecognizerModel, vadModel: URL, recognizer: LocalSpeechRecognizer = .shared,
+         idleSpeakerTTL: TimeInterval = MeetingTranscriber.idleSpeakerLifetime,
          queue: DispatchQueue = DispatchQueue(label: "attention.listen.meeting", qos: .userInitiated, autoreleaseFrequency: .workItem),
          onDropped: (@MainActor (Date, Date, LocalSpeechRecognizer.DropReason) -> Void)? = nil,
          onLine: @escaping @MainActor (Line) -> Void) {
         self.model = model; self.vadModel = vadModel; self.recognizer = recognizer; self.onLine = onLine
+        self.idleSpeakerTTL = max(1, idleSpeakerTTL)
         self.onDropped = onDropped; self.queue = queue
     }
 
@@ -538,13 +555,57 @@ final class MeetingTranscriber: @unchecked Sendable {
     // MARK: Queue
 
     private func receiveOnQueue(_ trackID: String, _ buffer: AVAudioPCMBuffer, receivedAt: Date) {
-        guard !stopped, let speaker = speaker(trackID), let samples = convert(buffer, speaker) else { return }
-        if let handler = ingressLock.withLock({ onPCM16Audio }), !samples.isEmpty {
-            handler(trackID, RealtimeVoiceAudio.floatSamplesToPCM16Data(samples))
-        }
-        if ingressLock.withLock({ localMicOnly }) && trackID != Self.localTrackID {
+        guard !stopped else { return }
+        let pcmHandler = ingressLock.withLock { onPCM16Audio }
+        let micOnly = ingressLock.withLock { localMicOnly }
+        if micOnly && trackID != Self.localTrackID && pcmHandler == nil { return }
+
+        if pcmHandler == nil {
+            sweepIdleSpeakersIfNeeded(at: receivedAt)
+            let audible = Self.hasAudibleSignal(buffer)
+            if !audible {
+                guard let existing = speakers[trackID] else { return }
+                guard existing.detector.speaking || existing.hangoverRemainingSamples > 0 else {
+                    existing.activeGate = false
+                    if existing.lastAudibleAt != .distantPast,
+                       receivedAt.timeIntervalSince(existing.lastAudibleAt) >= idleSpeakerTTL {
+                        finish(trackID)
+                    }
+                    return
+                }
+                guard let samples = convert(buffer, existing), !samples.isEmpty else { return }
+                existing.hangoverRemainingSamples = max(0, existing.hangoverRemainingSamples - samples.count)
+                feedSamples(samples, to: existing, trackID: trackID, receivedAt: receivedAt)
+                if !existing.detector.speaking && existing.hangoverRemainingSamples == 0 {
+                    existing.activeGate = false
+                }
+                return
+            }
+            guard let speaker = speaker(trackID), let samples = convert(buffer, speaker), !samples.isEmpty else { return }
+            speaker.lastAudibleAt = receivedAt
+            speaker.hangoverRemainingSamples = Self.silenceHangoverSamples
+            if !speaker.activeGate {
+                speaker.activeGate = true
+                speaker.fed += Int64(Self.primeSilenceWindow.count)
+                speaker.origin = receivedAt.addingTimeInterval(-Double(speaker.fed + Int64(samples.count)) / 16_000)
+                handle(trackID, speaker, speaker.detector.accept(Self.primeSilenceWindow))
+            }
+            feedSamples(samples, to: speaker, trackID: trackID, receivedAt: receivedAt)
             return
         }
+
+        guard let speaker = speaker(trackID), let samples = convert(buffer, speaker) else { return }
+        if let pcmHandler, !samples.isEmpty {
+            pcmHandler(trackID, RealtimeVoiceAudio.floatSamplesToPCM16Data(samples))
+        }
+        if micOnly && trackID != Self.localTrackID {
+            return
+        }
+        speaker.lastAudibleAt = receivedAt
+        feedSamples(samples, to: speaker, trackID: trackID, receivedAt: receivedAt)
+    }
+
+    private func feedSamples(_ samples: [Float], to speaker: Speaker, trackID: String, receivedAt: Date) {
         // Sample counts advance only while audio flows; a playout stall (device change,
         // audio service restart) would date every later line early by the gap. Each
         // buffer re-anchors the timeline to the wall clock at its arrival.
@@ -555,6 +616,61 @@ final class MeetingTranscriber: @unchecked Sendable {
         if trackID == Self.localTrackID { summary.microphoneSeconds += seconds }
         handle(trackID, speaker, speaker.detector.accept(samples))
     }
+
+    private func sweepIdleSpeakersIfNeeded(at now: Date) {
+        guard now.timeIntervalSince(lastIdleSweepAt) >= 15 else { return }
+        lastIdleSweepAt = now
+        guard !speakers.isEmpty else { return }
+        for (id, speaker) in Array(speakers) {
+            if !speaker.detector.speaking, speaker.hangoverRemainingSamples == 0,
+               speaker.lastAudibleAt != .distantPast,
+               now.timeIntervalSince(speaker.lastAudibleAt) >= idleSpeakerTTL {
+                finish(id)
+            }
+        }
+    }
+
+    static func hasAudibleSignal(_ buffer: AVAudioPCMBuffer) -> Bool {
+        guard buffer.frameLength > 0 else { return false }
+        let audioBuffers = UnsafeMutableAudioBufferListPointer(buffer.mutableAudioBufferList)
+        switch buffer.format.commonFormat {
+        case .pcmFormatFloat32:
+            for ab in audioBuffers {
+                let count = Int(ab.mDataByteSize) / MemoryLayout<Float>.size
+                guard count > 0, let base = ab.mData?.assumingMemoryBound(to: Float.self) else { continue }
+                var peak: Float = 0
+                vDSP_maxmgv(base, 1, &peak, vDSP_Length(count))
+                if peak >= silencePeakThreshold { return true }
+            }
+            return false
+        case .pcmFormatInt16:
+            let threshold = Int16(max(1, Int(silencePeakThreshold * Float(Int16.max))))
+            for ab in audioBuffers {
+                let count = Int(ab.mDataByteSize) / MemoryLayout<Int16>.size
+                guard count > 0, let base = ab.mData?.assumingMemoryBound(to: Int16.self) else { continue }
+                for i in 0..<count {
+                    let sample = base[i]
+                    if sample >= threshold || sample <= -threshold { return true }
+                }
+            }
+            return false
+        case .pcmFormatInt32:
+            let threshold = Int32(max(1, Int64(Double(silencePeakThreshold) * Double(Int32.max))))
+            for ab in audioBuffers {
+                let count = Int(ab.mDataByteSize) / MemoryLayout<Int32>.size
+                guard count > 0, let base = ab.mData?.assumingMemoryBound(to: Int32.self) else { continue }
+                for i in 0..<count {
+                    let sample = base[i]
+                    if sample >= threshold || sample <= -threshold { return true }
+                }
+            }
+            return false
+        default:
+            return true
+        }
+    }
+
+    @MainActor var activeSpeakerCountForTesting: Int { queue.sync { speakers.count } }
 
     private func speaker(_ trackID: String) -> Speaker? {
         if let existing = speakers[trackID] { return existing }

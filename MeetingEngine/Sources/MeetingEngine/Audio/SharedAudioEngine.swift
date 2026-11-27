@@ -16,6 +16,8 @@ import LiveKitWebRTC
     var factory: LKRTCPeerConnectionFactory { get }
     func prepareIdleInput(timeout: TimeInterval) async -> Bool
     func releaseIdleInput(timeout: TimeInterval) async -> Bool
+    func releaseMutedTalkInput(timeout: TimeInterval) async -> Bool
+    func setKeepVoiceProcessingWhenMuted(_ keep: Bool)
     func recoverSilentInput(timeout: TimeInterval) async -> Bool
     func ensureAssistantMutedInput(timeout: TimeInterval) async -> Bool
     func activateMicrophone(timeout: TimeInterval?) async -> Bool
@@ -57,6 +59,8 @@ public extension SharedAudioModule {
     func releaseIdleInput(timeout: TimeInterval) async -> Bool {
         await setInputPermitted(false, keepWarm: false, timeout: timeout)
     }
+    func releaseMutedTalkInput(timeout: TimeInterval) async -> Bool { true }
+    func setKeepVoiceProcessingWhenMuted(_ keep: Bool) {}
     func recoverSilentInput(timeout: TimeInterval) async -> Bool { false }
     var onSilentInputDetected: (([String: Any]) -> Void)? {
         get { nil }
@@ -161,6 +165,7 @@ public enum SharedAudioEngineError: LocalizedError, Equatable {
     private let makeModule: @MainActor () async throws -> SharedAudioModule
     private let timeouts: Timeouts
     private let grace: Duration
+    private let mutedInputHold: Duration?
     private let authorized: () -> Bool
     private let sleep: (Duration) async throws -> Void
     private var module: SharedAudioModule?
@@ -189,7 +194,13 @@ public enum SharedAudioEngineError: LocalizedError, Equatable {
     /// A failed release quarantines the engine: no new meeting may attach.
     public private(set) var cleanupFailed = false
     /// Keep the device and voice processing running when the talk role leaves (warm move).
-    public var keepInputWarm = false
+    public var keepInputWarm = false {
+        didSet {
+            guard keepInputWarm != oldValue else { return }
+            if keepInputWarm { cancelMutedInputRelease() }
+            else { scheduleMutedInputReleaseIfNeeded() }
+        }
+    }
     /// The talk meeting's last confirmed unmute; recovery restores exactly this.
     public private(set) var talkUnmuted = false
     /// Between an engine stop the app did not ask for and the next start (guarantee 9).
@@ -211,6 +222,8 @@ public enum SharedAudioEngineError: LocalizedError, Equatable {
     private var idleSuspended = false
     private var idleRevision = UUID()
     private var idleDeadline: Task<Void, Never>?
+    private var mutedInputRevision = UUID()
+    private var mutedInputDeadline: Task<Void, Never>?
 
     private let reportFailedStop: () -> Void
     private let installIntoLiveKitOnCreate: Bool
@@ -221,6 +234,7 @@ public enum SharedAudioEngineError: LocalizedError, Equatable {
 
     /// `reportFailedStop` blocks every new physical owner in the process (tests replace it).
     public init(timeouts: Timeouts = .init(), grace: Duration = .seconds(2),
+         mutedInputHold: Duration? = nil,
          authorized: @escaping () -> Bool = { GuestSystemAudio.microphoneAuthorized },
          sleep: @escaping (Duration) async throws -> Void = { try await Task.sleep(for: $0) },
          reportFailedStop: @escaping () -> Void = { GuestAudioOwnerLease.reportFailedStop() },
@@ -230,7 +244,7 @@ public enum SharedAudioEngineError: LocalizedError, Equatable {
          silentInputRecoveryCooldown: TimeInterval = 60,
          maxSilentInputRecoveriesPerTalkEpoch: Int = 2,
          makeModule: @escaping @MainActor () async throws -> SharedAudioModule) {
-        self.timeouts = timeouts; self.grace = grace; self.authorized = authorized; self.sleep = sleep
+        self.timeouts = timeouts; self.grace = grace; self.mutedInputHold = mutedInputHold; self.authorized = authorized; self.sleep = sleep
         self.reportFailedStop = reportFailedStop; self.installIntoLiveKitOnCreate = installIntoLiveKitOnCreate
         self.processCaptureMuted = processCaptureMuted; self.uptime = uptime
         self.silentInputRecoveryCooldown = silentInputRecoveryCooldown
@@ -238,14 +252,27 @@ public enum SharedAudioEngineError: LocalizedError, Equatable {
         self.makeModule = makeModule
     }
 
+#if os(macOS)
+    public nonisolated static let defaultLiveMutedInputHold: Duration? = .seconds(20)
+    private nonisolated static let defaultBypassVoiceProcessingWhenMuted = true
+#else
+    // On iOS, CallKit + AVAudioSession(.voiceChat) owns background audio continuity; never
+    // stop/reconfigure AVAudioEngine input on a muted timer while a call may be backgrounded.
+    public nonisolated static let defaultLiveMutedInputHold: Duration? = nil
+    private nonisolated static let defaultBypassVoiceProcessingWhenMuted = false
+#endif
+
     /// The app's engine: one non-exclusive `GuestSystemAudio` owner whose factory
     /// LiveKit adopts up front when `installIntoLiveKitOnCreate` is true.
     public static func live(manualRenderingForTesting: Bool = false,
-                     installIntoLiveKitOnCreate: Bool = false) -> SharedAudioEngine {
-        SharedAudioEngine(installIntoLiveKitOnCreate: installIntoLiveKitOnCreate) {
+                     installIntoLiveKitOnCreate: Bool = false,
+                     mutedInputHold: Duration? = defaultLiveMutedInputHold) -> SharedAudioEngine {
+        SharedAudioEngine(mutedInputHold: manualRenderingForTesting ? nil : mutedInputHold,
+                          installIntoLiveKitOnCreate: installIntoLiveKitOnCreate) {
             try await GuestSystemAudio.create(microphoneEnabled: false, playoutEnabled: false,
                 profile: manualRenderingForTesting ? .speech : .saved, concurrent: true,
                 manualRendering: manualRenderingForTesting, keepOutputAvailableWithInput: true,
+                bypassVoiceProcessingWhenMuted: Self.defaultBypassVoiceProcessingWhenMuted && !manualRenderingForTesting,
                 makeFactory: { SharedAudioEngine.liveKitFactory(voiceProcessing: $0) })
         }
     }
@@ -302,6 +329,43 @@ public enum SharedAudioEngineError: LocalizedError, Equatable {
         foreground && (foregroundMicrophone || assistantWakeListening) && !idleSuspended && !cleanupFailed && authorized()
     }
 
+    private var keepsMutedInputWarm: Bool {
+        foregroundMicrophone || keepInputWarm || assistantWakeListening
+    }
+
+    private func cancelMutedInputRelease() {
+        mutedInputRevision = UUID()
+        mutedInputDeadline?.cancel()
+        mutedInputDeadline = nil
+    }
+
+    private func scheduleMutedInputReleaseIfNeeded() {
+        cancelMutedInputRelease()
+        guard let hold = mutedInputHold, !keepsMutedInputWarm,
+              let expectedTalk = talkMeetingID, !talkUnmuted, moduleMuted,
+              participationSender == nil, !privateCheckActive, !cleanupFailed else { return }
+        let token = mutedInputRevision
+        let expectedEpoch = talkEpoch
+        mutedInputDeadline = Task { [weak self, sleep] in
+            do { try await sleep(hold) } catch { return }
+            guard let self, self.mutedInputRevision == token else { return }
+            _ = await self.work.run {
+                guard self.mutedInputRevision == token,
+                      let module = self.module,
+                      !self.keepsMutedInputWarm,
+                      self.talkMeetingID == expectedTalk,
+                      self.talkEpoch == expectedEpoch,
+                      !self.talkUnmuted,
+                      self.moduleMuted,
+                      self.participationSender == nil,
+                      !self.privateCheckActive,
+                      !self.cleanupFailed else { return true }
+                self.mutedInputDeadline = nil
+                return await module.releaseMutedTalkInput(timeout: self.timeouts.activation)
+            }
+        }
+    }
+
     public func setAssistantInputObserver(_ handler: ((AVAudioPCMBuffer) -> Void)?) {
         assistantInputSink.set(handler)
     }
@@ -309,6 +373,9 @@ public enum SharedAudioEngineError: LocalizedError, Equatable {
     public func setAssistantWakeListening(_ enabled: Bool) {
         guard assistantWakeListening != enabled else { return }
         assistantWakeListening = enabled
+        module?.setKeepVoiceProcessingWhenMuted(enabled)
+        if enabled { cancelMutedInputRelease() }
+        else { scheduleMutedInputReleaseIfNeeded() }
         guard attachments.isEmpty, !privateCheckActive, !idleSuspended, !cleanupFailed else { return }
         idleRevision = UUID(); idleDeadline?.cancel(); idleDeadline = nil
         if foreground {
@@ -354,6 +421,8 @@ public enum SharedAudioEngineError: LocalizedError, Equatable {
     public func setForeground(_ active: Bool, microphone: Bool) {
         guard foreground != active || foregroundMicrophone != microphone else { return }
         foreground = active; foregroundMicrophone = microphone
+        if microphone { cancelMutedInputRelease() }
+        else { scheduleMutedInputReleaseIfNeeded() }
         idleRevision = UUID(); idleDeadline?.cancel(); idleDeadline = nil
         guard attachments.isEmpty, !privateCheckActive, !idleSuspended, !cleanupFailed else { return }
         if active {
@@ -421,6 +490,7 @@ public enum SharedAudioEngineError: LocalizedError, Equatable {
 
     public func shutdownIdle() async -> Bool {
         foreground = false; foregroundMicrophone = false; idleSuspended = true
+        cancelMutedInputRelease()
         idleRevision = UUID(); idleDeadline?.cancel(); idleDeadline = nil
         guard attachments.isEmpty, !privateCheckActive else { return false }
         return await work.run { [self] in await retireIdleLocked() }
@@ -465,6 +535,7 @@ public enum SharedAudioEngineError: LocalizedError, Equatable {
             var hardwareStopFailed = false
             let lastAttachment = attachments.count == 1
             if talkMeetingID == attachment.meetingID {
+                cancelMutedInputRelease()
                 let released = await releaseTalkLocked(keepForegroundWarm: lastAttachment && shouldPrepareForegroundInput)
                 if !released { hardwareStopFailed = true }
             }
@@ -502,12 +573,14 @@ public enum SharedAudioEngineError: LocalizedError, Equatable {
                 return true
             }
             guard await muteEverythingLocked() else { return false }
+            cancelMutedInputRelease()
             talkUnmuted = false
             talkMeetingID = attachment.meetingID; talkEpoch &+= 1; silentInputRecoveriesForTalkEpoch = 0
             inputSink.set(attachment.inputSinkHandler)
             _ = module?.setMicrophoneGate(open: true)
             let permitted = await module?.setInputPermitted(true, keepWarm: false, timeout: timeouts.mute) ?? false
             if permitted && exclusively { exclusiveTalkMeetingID = attachment.meetingID }
+            if permitted { scheduleMutedInputReleaseIfNeeded() }
             return permitted
         }
     }
@@ -535,12 +608,16 @@ public enum SharedAudioEngineError: LocalizedError, Equatable {
                 guard isTalk else { return true }
                 participationSender = nil
                 talkUnmuted = false
-                return await muteModuleLocked(module)
+                let ok = await muteModuleLocked(module)
+                if ok { scheduleMutedInputReleaseIfNeeded() }
+                return ok
             }
             guard isTalk, epoch == talkEpoch, !privateCheckActive, !cleanupFailed else { return false }
             guard participationSender == nil else { return false }
+            cancelMutedInputRelease()
             let unmuted = await unmuteLocked(attachment, module: module, epoch: epoch)
             if unmuted { talkUnmuted = true }
+            else { scheduleMutedInputReleaseIfNeeded() }
             return unmuted
         }
     }
@@ -716,7 +793,9 @@ public enum SharedAudioEngineError: LocalizedError, Equatable {
         await work.run { [self] in
             guard let module, attachments[attachment.meetingID] === attachment, !cleanupFailed else { return false }
             guard talkMeetingID == attachment.meetingID else { return true }
-            return await module.activateMicrophone(timeout: timeouts.activation)
+            let ok = await module.activateMicrophone(timeout: timeouts.activation)
+            if ok, !talkUnmuted { scheduleMutedInputReleaseIfNeeded() }
+            return ok
         }
     }
 
@@ -751,6 +830,7 @@ public enum SharedAudioEngineError: LocalizedError, Equatable {
                 return false
             }
             privateCheckActive = true
+            cancelMutedInputRelease()
             muteConfirmed = false
             return true
         }
@@ -761,7 +841,10 @@ public enum SharedAudioEngineError: LocalizedError, Equatable {
             guard privateCheckActive, let module else { return true }
             privateCheckActive = false
             let ended = await module.endPrivateInputCheck(timeout: timeouts.mute)
-            guard talkMeetingID == nil else { return ended }
+            guard talkMeetingID == nil else {
+                if !talkUnmuted { scheduleMutedInputReleaseIfNeeded() }
+                return ended
+            }
             let keepWarm = keepInputWarm || (attachments.isEmpty && shouldPrepareForegroundInput)
             let released = await module.setInputPermitted(false, keepWarm: keepWarm, timeout: timeouts.activation) && ended
             if attachments.isEmpty, !shouldPrepareForegroundInput {
@@ -826,11 +909,14 @@ public enum SharedAudioEngineError: LocalizedError, Equatable {
                 guard !talkUnmuted, participationSender == nil || participationSender === permit else { return false }
                 attachment.disableSenders()
                 participationSender = nil
-                return await muteModuleLocked(module)
+                let ok = await muteModuleLocked(module)
+                if ok { scheduleMutedInputReleaseIfNeeded() }
+                return ok
             }
             guard permit.canStart, !talkUnmuted, participationSender == nil, !rebuilding, !privateCheckActive,
                   !cleanupFailed, module.participationVoiceGateClosed,
                   attachments.values.allSatisfy({ !$0.anySenderEnabled }) else { return false }
+            cancelMutedInputRelease()
             participationSender = permit
             muteConfirmed = false
             guard await module.setMicrophoneMuted(false, timeout: timeouts.mute),
@@ -943,6 +1029,7 @@ public enum SharedAudioEngineError: LocalizedError, Equatable {
         if let module { return .success(module) }
         do {
             let created = try await makeModule()
+            created.setKeepVoiceProcessingWhenMuted(assistantWakeListening)
             created.setInputTranscriptionSink { [inputSink, assistantInputSink] buffer in
                 inputSink.deliver(buffer)
                 assistantInputSink.deliver(buffer)
@@ -992,6 +1079,7 @@ public enum SharedAudioEngineError: LocalizedError, Equatable {
     }
 
     private func releaseTalkLocked(keepForegroundWarm: Bool = false) async -> Bool {
+        cancelMutedInputRelease()
         let muted = await muteEverythingLocked()
         talkUnmuted = false
         talkMeetingID = nil; exclusiveTalkMeetingID = nil; talkEpoch &+= 1; silentInputRecoveriesForTalkEpoch = 0

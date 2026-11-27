@@ -371,8 +371,18 @@ public final class GuestPeer: NSObject, LKRTCPeerConnectionDelegate {
         }
     }
 
-    /// Stops or starts one sender's RTP. Muting stops the track before the
-    /// encodings; unmuting activates the encodings first. Native queue only.
+    /// Stops or starts an audio sender's RTP and Opus encoding without altering transceiver direction.
+    nonisolated private static func setAudioSending(_ sending: Bool, track: LKRTCMediaStreamTrack?, sender: LKRTCRtpSender?) {
+        if !sending { track?.isEnabled = false }
+        if let sender {
+            let parameters = sender.parameters
+            if !parameters.encodings.isEmpty {
+                parameters.encodings.forEach { $0.isActive = sending }
+                sender.parameters = parameters
+            }
+        }
+        if sending { track?.isEnabled = true }
+    }
     nonisolated private static func setSending(_ sending: Bool, track: LKRTCVideoTrack, sender: LKRTCRtpSender) throws {
         if !sending { track.isEnabled = false }
         let parameters = sender.parameters
@@ -440,6 +450,8 @@ public final class GuestPeer: NSObject, LKRTCPeerConnectionDelegate {
                 let contentCapability = codec.lowercased() == "h264"
                     ? capabilities.filter { $0.name.lowercased() == "vp9" } : []
                 try transceiver.setCodecPreferences(matches + contentCapability + repair, error: ())
+            } else {
+                Self.setAudioSending(track.isEnabled, track: track, sender: transceiver.sender)
             }
             return (video, transceiver.sender)
         }
@@ -459,11 +471,17 @@ public final class GuestPeer: NSObject, LKRTCPeerConnectionDelegate {
         return (try? await native.run("set-synthetic-audio") { () -> Bool in
             guard let sender else { return false }
             if let track {
+                Self.setAudioSending(true, track: nil, sender: sender)
                 track.isEnabled = true
                 sender.track = track
             } else {
-                micTrack?.isEnabled = restoreAudioEnabled
+                if !restoreAudioEnabled {
+                    Self.setAudioSending(false, track: micTrack, sender: sender)
+                }
                 sender.track = micTrack
+                if restoreAudioEnabled {
+                    Self.setAudioSending(true, track: micTrack, sender: sender)
+                }
             }
             return true
         }) ?? false
@@ -499,8 +517,10 @@ public final class GuestPeer: NSObject, LKRTCPeerConnectionDelegate {
                 try Self.setSending(!mute, track: videoTrack, sender: videoSender)
             }
         } else {
-            let track = audioTrack
-            try await native.run(mute ? "mute-audio" : "unmute-audio") { track?.isEnabled = !mute }
+            let track = audioTrack, sender = audioSender
+            try await native.run(mute ? "mute-audio" : "unmute-audio") {
+                Self.setAudioSending(!mute, track: track, sender: sender)
+            }
         }
     }
 
@@ -514,8 +534,10 @@ public final class GuestPeer: NSObject, LKRTCPeerConnectionDelegate {
                 if let track, let sender { try? Self.setSending(false, track: track, sender: sender) }
             }
         } else {
-            let track = audioTrack
-            native.post("suppress-audio") { track?.isEnabled = false }
+            let track = audioTrack, sender = audioSender
+            native.post("suppress-audio") {
+                Self.setAudioSending(false, track: track, sender: sender)
+            }
         }
     }
 
@@ -580,6 +602,19 @@ public final class GuestPeer: NSObject, LKRTCPeerConnectionDelegate {
     }
 
 #if DEBUG
+    func localAudioStateForTesting() async -> [String: Any] {
+        guard !closed else { return [:] }
+        let track = audioTrack, sender = audioSender
+        return (try? await native.run("local-audio-state", timeout: 3) { () -> [String: Any] in
+            let parameters = sender?.parameters
+            return [
+                "enabled": track?.isEnabled ?? false,
+                "senderTrackID": sender?.track?.trackId ?? "",
+                "encodingActive": parameters?.encodings.map(\.isActive) ?? []
+            ]
+        }) ?? [:]
+    }
+
     /// Scalar correlation only: this must never query a native track or sender.
     var videoTraceStateForTesting: [String: Any] {
         ["peerID": diagnosticID, "target": target.rawValue, "generatedFrames": generatedFrames,
@@ -618,13 +653,25 @@ public final class GuestPeer: NSObject, LKRTCPeerConnectionDelegate {
         if let statsOverrideForTesting { return await statsOverrideForTesting() }
 #endif
         let connection = connection!
-        guard let report: LKRTCStatisticsReport = try? await native.call("statistics", timeout: 3, { done in
-            if let sender {
-                connection.statistics(for: sender) { done(.success($0)) }
-            } else {
-                connection.statistics { done(.success($0)) }
+        let targetRaw = target.rawValue
+        let diagnosticID = diagnosticID
+        return try? await native.call("statistics", timeout: 3, { done in
+            let parse: @Sendable (LKRTCStatisticsReport) -> Void = { report in
+                done(.success(Self.extractStatisticsRows(from: report, targetRaw: targetRaw, diagnosticID: diagnosticID)))
             }
-        }) else { return nil }
+            if let sender {
+                connection.statistics(for: sender, completionHandler: parse)
+            } else {
+                connection.statistics(completionHandler: parse)
+            }
+        })
+    }
+
+    nonisolated private static let allowedStatTypes: Set<String> = [
+        "inbound-rtp", "outbound-rtp", "remote-inbound-rtp", "codec", "media-source", "transport"
+    ]
+
+    nonisolated private static let statValueKeys: [String] = {
         var keys = ["kind", "mid", "bytesReceived", "bytesSent", "packetsReceived", "packetsSent",
             "frames", "framesSent", "framesDecoded", "framesEncoded",
             "qualityLimitationReason", "qualityLimitationDurations", "qualityLimitationResolutionChanges",
@@ -645,32 +692,42 @@ public final class GuestPeer: NSObject, LKRTCPeerConnectionDelegate {
         keys += ["remoteId", "ssrc", "reportsReceived", "roundTripTimeMeasurements",
             "nominated", "writable", "totalRoundTripTime"]
 #endif
-        let selectedPairs = Set(report.statistics.values.filter { $0.type == "transport" }
+        return keys
+    }()
+
+    nonisolated private static func extractStatisticsRows(
+        from report: LKRTCStatisticsReport,
+        targetRaw: String,
+        diagnosticID: String
+    ) -> [[String: Any]] {
+        let allStats = report.statistics.values
+        let selectedPairs = Set(allStats.filter { $0.type == "transport" }
             .compactMap { $0.values["selectedCandidatePairId"] as? String })
-        let candidateIDs = Set(report.statistics.values.filter { selectedPairs.contains($0.id) }
+        let candidateIDs = Set(allStats.filter { selectedPairs.contains($0.id) }
             .flatMap { [$0.values["localCandidateId"] as? String, $0.values["remoteCandidateId"] as? String].compactMap { $0 } })
         let sampledAt = ProcessInfo.processInfo.systemUptime
-        return report.statistics.values.filter {
-            ["inbound-rtp", "outbound-rtp", "remote-inbound-rtp", "codec", "media-source", "transport"].contains($0.type) ||
-            selectedPairs.contains($0.id) || candidateIDs.contains($0.id)
+        let keys = statValueKeys
+        return allStats.filter {
+            allowedStatTypes.contains($0.type) || selectedPairs.contains($0.id) || candidateIDs.contains($0.id)
         }.map { stat in
-            var value: [String: Any] = ["target": target.rawValue, "type": stat.type, "id": stat.id, "sampleUptime": sampledAt, "nativeTimestampUS": stat.timestamp_us]
+            let rawValues = stat.values
+            var value: [String: Any] = ["target": targetRaw, "type": stat.type, "id": stat.id, "sampleUptime": sampledAt, "nativeTimestampUS": stat.timestamp_us]
 #if DEBUG
             value["peerID"] = diagnosticID
-            let candidateType = stat.values["candidateType"] as? String
-            if candidateType == "relay" || (candidateType == "prflx" && (stat.values["relayProtocol"] as? String)?.isEmpty == false) {
+            let candidateType = rawValues["candidateType"] as? String
+            if candidateType == "relay" || (candidateType == "prflx" && (rawValues["relayProtocol"] as? String)?.isEmpty == false) {
                 // These identify the allocated relay socket, not the TURN server.
-                if let address = stat.values["address"] as? String, address.utf8.count <= 255,
+                if let address = rawValues["address"] as? String, address.utf8.count <= 255,
                    !address.contains(where: { $0.isWhitespace }) { value["relayAllocationAddress"] = address }
-                if let port = stat.values["port"] as? NSNumber, (1...65_535).contains(port.intValue),
+                if let port = rawValues["port"] as? NSNumber, (1...65_535).contains(port.intValue),
                    port.doubleValue == Double(port.intValue) { value["relayAllocationPort"] = port }
             }
             if stat.type == "local-candidate" {
-                value["turnServerEndpoint"] = (stat.values["url"] as? String)
+                value["turnServerEndpoint"] = (rawValues["url"] as? String)
                     .flatMap(GuestICEPolicy.diagnosticTurnServer).map { $0 as Any } ?? NSNull()
             }
 #endif
-            for key in keys { if let item = stat.values[key] { value[key] = item } }
+            for key in keys { if let item = rawValues[key] { value[key] = item } }
             return value
         }
     }
@@ -1292,14 +1349,40 @@ public final class GuestFrameCounter: NSObject, LKRTCVideoRenderer, @unchecked S
         let now = ProcessInfo.processInfo.systemUptime
         var digest: UInt64?
         if verifyPixels {
-            let i420 = frame.buffer.toI420()
             var value: UInt64 = 1469598103934665603
-            for y in stride(from: 0, to: Int(i420.height), by: 24) {
-                for x in stride(from: 0, to: Int(i420.width), by: 24) {
-                    value = (value ^ UInt64(i420.dataY[y * Int(i420.strideY) + x])) &* 1099511628211
+            if let native = frame.buffer as? LKRTCCVPixelBuffer,
+               native.cropX == 0, native.cropY == 0,
+               native.cropWidth == native.width, native.cropHeight == native.height,
+               CVPixelBufferIsPlanar(native.pixelBuffer),
+               CVPixelBufferLockBaseAddress(native.pixelBuffer, .readOnly) == kCVReturnSuccess {
+                defer { CVPixelBufferUnlockBaseAddress(native.pixelBuffer, .readOnly) }
+                if let base = CVPixelBufferGetBaseAddressOfPlane(native.pixelBuffer, 0) {
+                    let luma = base.assumingMemoryBound(to: UInt8.self)
+                    let strideY = CVPixelBufferGetBytesPerRowOfPlane(native.pixelBuffer, 0)
+                    let width = CVPixelBufferGetWidthOfPlane(native.pixelBuffer, 0)
+                    let height = CVPixelBufferGetHeightOfPlane(native.pixelBuffer, 0)
+                    for y in stride(from: 0, to: height, by: 24) {
+                        let rowOffset = y * strideY
+                        for x in stride(from: 0, to: width, by: 24) {
+                            value = (value ^ UInt64(luma[rowOffset + x])) &* 1099511628211
+                        }
+                    }
+                    digest = value
                 }
             }
-            digest = value
+            if digest == nil {
+                let i420 = frame.buffer.toI420()
+                let dataY = i420.dataY
+                let strideY = Int(i420.strideY)
+                let width = Int(i420.width), height = Int(i420.height)
+                for y in stride(from: 0, to: height, by: 24) {
+                    let rowOffset = y * strideY
+                    for x in stride(from: 0, to: width, by: 24) {
+                        value = (value ^ UInt64(dataY[rowOffset + x])) &* 1099511628211
+                    }
+                }
+                digest = value
+            }
         }
         lock.lock(); defer { lock.unlock() }
         if frame.timeStampNs > (lastTimestamps[sourceID] ?? -1) {
