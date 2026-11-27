@@ -96,11 +96,16 @@ extension MeetingLibraryStore {
             let newInvitation = remote.invitation.value ?? existing?.invitation
             let newRoom = remote.roomIdentity.isEmpty ? (existing?.roomIdentity ?? "") : remote.roomIdentity
             let newSeries = remote.calendarSeriesID ?? existing?.calendarSeriesID
+            let resolvedDominantRole = remote.dominantRole?.value ?? existing?.dominantRole
+            let resolvedRoleSegments = remote.roleSegments?.value ?? existing?.roleSegments ?? []
+            let resolvedDominantData = try resolvedDominantRole.map { try JSONEncoder.attention.encode($0) }
+            let resolvedSegmentsData = resolvedRoleSegments.isEmpty ? nil : try JSONEncoder.attention.encode(resolvedRoleSegments)
 
             let exportedChanged = existing == nil ||
                 existing?.title != newTitle ||
                 existing?.endedAt != newEndedAt ||
-                existing?.state != newState
+                existing?.state != newState ||
+                existing?.dominantRole != resolvedDominantRole
 
             var exportRevision = existing?.exportRevision ?? 0
             if exportedChanged { exportRevision += 1 }
@@ -111,7 +116,7 @@ extension MeetingLibraryStore {
                     UPDATE meeting_sessions SET
                         title=?, title_folded=?, invitation=?, room_identity=?, calendar_series_id=?,
                         started_at=?, ended_at=?, time_zone_id=?, state=?, export_revision=?,
-                        updated_at=?, start_provenance=?
+                        updated_at=?, start_provenance=?, dominant_role_json=?, role_segments_json=?
                     WHERE session_id=?
                     """) {
                     try Self.bindText($0, newTitle, at: 1)
@@ -126,15 +131,18 @@ extension MeetingLibraryStore {
                     try Self.bindInt($0, Int64(exportRevision), at: 10)
                     try Self.bindInt($0, now.syncMilliseconds, at: 11)
                     try Self.bindText($0, remote.startProvenance ?? existing.startProvenance?.rawValue ?? "recorded", at: 12)
-                    try Self.bindText($0, remote.id.uuidString, at: 13)
+                    try Self.bindBlob($0, resolvedDominantData, at: 13)
+                    try Self.bindBlob($0, resolvedSegmentsData, at: 14)
+                    try Self.bindText($0, remote.id.uuidString, at: 15)
                 }
             } else {
                 try db.run("""
                     INSERT INTO meeting_sessions(
                         session_id,title,title_folded,invitation,room_identity,calendar_series_id,
                         continuation_id,started_at,ended_at,time_zone_id,state,export_revision,
-                        created_at,updated_at,start_provenance,outcome_end_fallback
-                    ) VALUES(?,?,?,?,?,?,NULL,?,?,?,?,?,?,?,?,NULL)
+                        created_at,updated_at,start_provenance,outcome_end_fallback,
+                        dominant_role_json,role_segments_json
+                    ) VALUES(?,?,?,?,?,?,NULL,?,?,?,?,?,?,?,?,NULL,?,?)
                     """) {
                     try Self.bindText($0, remote.id.uuidString, at: 1)
                     try Self.bindText($0, newTitle, at: 2)
@@ -150,6 +158,8 @@ extension MeetingLibraryStore {
                     try Self.bindInt($0, remote.createdAt.syncMilliseconds, at: 12)
                     try Self.bindInt($0, now.syncMilliseconds, at: 13)
                     try Self.bindText($0, remote.startProvenance ?? "recorded", at: 14)
+                    try Self.bindBlob($0, resolvedDominantData, at: 15)
+                    try Self.bindBlob($0, resolvedSegmentsData, at: 16)
                 }
             }
 
@@ -539,8 +549,8 @@ extension MeetingLibraryStore {
         }
     }
 
-    /// Applies a complete synced session bundle (session + note + outcome + tasks + links) before
-    /// queueing Obsidian export so initial-end snapshots always include notes and outcomes.
+    /// Applies a complete synced session bundle (session + note + outcome + tasks + links + expert blocks) before
+    /// queueing Obsidian export so initial-end snapshots always include notes, outcomes, and expert evaluations.
     func applyRemoteSessionBundle(
         sessionID: UUID,
         session: SyncedMeetingSession?,
@@ -548,6 +558,8 @@ extension MeetingLibraryStore {
         outcome: SyncedMeetingOutcome?,
         tasks: [SyncedMeetingTask],
         links: [SyncedTaskLink],
+        expertBlocks: [SyncedMeetingExpertBlock] = [],
+        roleObservations: SyncedRoleObservationLog? = nil,
         localDeviceID: String,
         alreadyMergedFromLocalMarkdown: String? = nil,
         syncBaseMarkdown: String? = nil
@@ -585,12 +597,57 @@ extension MeetingLibraryStore {
             )
         }
 
+        var expertChanged = false
+        if !expertBlocks.isEmpty {
+            let db = try db()
+            try Self.ensureSessionExists(db: db, sessionID: sessionID)
+            let localByID = Dictionary(uniqueKeysWithValues: try Self.storedExpertBlocks(db: db, sessionID: sessionID, includeDeleted: true).map { ($0.id, $0) })
+            for remoteBlock in expertBlocks where remoteBlock.sessionID == sessionID {
+                let merged = localByID[remoteBlock.id]?.merging(remoteBlock) ?? remoteBlock
+                if localByID[remoteBlock.id] != merged {
+                    let payload = try JSONEncoder.attention.encode(merged)
+                    try db.run("""
+                    INSERT INTO meeting_expert_blocks(block_id, session_id, skill_id, preset_id, is_deleted, updated_at, payload_json)
+                    VALUES(?,?,?,?,?,?,?)
+                    ON CONFLICT(block_id) DO UPDATE SET
+                        skill_id=excluded.skill_id, preset_id=excluded.preset_id,
+                        is_deleted=excluded.is_deleted, updated_at=excluded.updated_at,
+                        payload_json=excluded.payload_json
+                    """) {
+                        try Self.bindText($0, merged.id.uuidString, at: 1)
+                        try Self.bindText($0, merged.sessionID.uuidString, at: 2)
+                        try Self.bindText($0, merged.skillID, at: 3)
+                        try Self.bindText($0, merged.presetID, at: 4)
+                        try Self.bindInt($0, merged.isDeleted.value ? 1 : 0, at: 5)
+                        try Self.bindInt($0, merged.updatedAt.syncMilliseconds, at: 6)
+                        try Self.bindBlob($0, payload, at: 7)
+                    }
+                    expertChanged = true
+                }
+            }
+        }
+        if let remoteRoleObs = roleObservations, remoteRoleObs.sessionID == sessionID {
+            let existingObs = try self.roleObservations(for: sessionID)
+            let mergedObs = existingObs?.merging(remoteRoleObs) ?? remoteRoleObs
+            if existingObs != mergedObs {
+                try upsertRoleObservations(mergedObs)
+            }
+        }
+
         let db = try db()
-        let latestRevision = Int(
+        var latestRevision = Int(
             try db.one("SELECT export_revision FROM meeting_sessions WHERE session_id=?", bind: {
                 try Self.bindText($0, sessionID.uuidString, at: 1)
             })?.integer(0) ?? Int64(sessionResult.exportRevision)
         )
+        if expertChanged {
+            latestRevision += 1
+            try db.run("UPDATE meeting_sessions SET export_revision=?, updated_at=? WHERE session_id=?") {
+                try Self.bindInt($0, Int64(latestRevision), at: 1)
+                try Self.bindInt($0, Date().syncMilliseconds, at: 2)
+                try Self.bindText($0, sessionID.uuidString, at: 3)
+            }
+        }
 
         if let manualAt = sessionResult.newManualSaveAt {
             let metaKey = "remote_manual_obsidian_" + sessionID.uuidString
@@ -601,10 +658,11 @@ extension MeetingLibraryStore {
                 try Self.bindText($0, metaKey, at: 1)
                 try Self.bindText($0, String(manualAt.syncMilliseconds), at: 2)
             }
-            if let destination = try Self.activeDestination(db),
-               destination.vaultBookmark != nil,
-               let snapshot = try Self.exportSnapshot(db, sessionID: sessionID) {
-                try Self.putExport(db: db, destination: destination, snapshot: snapshot, intent: .manualSave, held: false)
+            if let snapshot = try Self.exportSnapshot(db, sessionID: sessionID) {
+                for destination in try Self.targetDestinations(db: db, snapshot: snapshot).destinations
+                where destination.vaultBookmark != nil {
+                    try Self.putExport(db: db, destination: destination, snapshot: snapshot, intent: .manualSave, held: false)
+                }
             }
         } else if sessionResult.becameEnded {
             let awaiting = (outcome?.state.value != "ready") && (session?.outcomeClaim?.value?.state == "pending")
@@ -616,7 +674,7 @@ extension MeetingLibraryStore {
                 finalEnd: true,
                 awaitingOutcome: awaiting
             )
-        } else if sessionResult.changed || noteChanged || outcomeChanged {
+        } else if sessionResult.changed || noteChanged || outcomeChanged || expertChanged {
             _ = try Self.queueOutbox(
                 db: db,
                 sessionID: sessionID,
@@ -774,6 +832,8 @@ extension MeetingLibraryStore {
         var taskArchive: [UUID: [(profileID: String, archivedAt: Date)]]
         var taskProfile: PersonalTaskProfile
         var obsidianReceipts: [UUID: ObsidianSyncReceipt]
+        var expertBlocks: [SyncedMeetingExpertBlock]
+        var roleObservations: [SyncedRoleObservationLog]
     }
 
     func localSyncSnapshot(exporterDeviceID: String) throws -> LocalLibrarySyncSnapshot {
@@ -844,6 +904,8 @@ extension MeetingLibraryStore {
                 obsidianReceipts[session.id] = receipt
             }
         }
+        let expertBlocks = try allExpertBlocks(includeDeleted: true)
+        let roleObservations = try allRoleObservations()
 
         return LocalLibrarySyncSnapshot(
             sessions: sessions,
@@ -854,7 +916,9 @@ extension MeetingLibraryStore {
             taskLinks: taskLinks,
             taskArchive: taskArchive,
             taskProfile: taskProfile,
-            obsidianReceipts: obsidianReceipts
+            obsidianReceipts: obsidianReceipts,
+            expertBlocks: expertBlocks,
+            roleObservations: roleObservations
         )
     }
 }

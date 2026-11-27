@@ -277,7 +277,7 @@ final class MeetingLibraryTests: XCTestCase {
         XCTAssertEqual(versions.map(\.outcome.id), [outcome.id])
         XCTAssertTrue(versions.first?.isCurrent == true)
         XCTAssertTrue(FileManager.default.fileExists(atPath: path.deletingLastPathComponent()
-            .appendingPathComponent("meetings.before-v6.sqlite3").path))
+            .appendingPathComponent("meetings.before-v\(MeetingLibrarySchema.currentVersion).sqlite3").path))
     }
 
     private func withRawDatabase(at path: URL, statements: String) throws {

@@ -980,24 +980,58 @@ struct AttentionDecisionRecord: Codable, Equatable, Sendable {
     }
 
     func autoFacilitatorSkillID(room: URL?, latest: URL? = nil, seriesIDs: [String] = []) -> String? {
+        autoFacilitatorConfiguration(room: room, latest: latest, seriesIDs: seriesIDs).skillID
+    }
+
+    func autoFacilitatorConfiguration(
+        room: URL?,
+        latest: URL? = nil,
+        seriesIDs: [String] = []
+    ) -> (
+        skillID: String?,
+        presetID: String?,
+        mode: AssistantEngagementMode?,
+        coreOutcomePolicy: CoreOutcomePolicy?,
+        exportDestinationID: UUID?,
+        routeEntireMeeting: Bool?
+    ) {
         func sanitized(_ raw: String?) -> String? {
             guard let raw else { return nil }
             let slug = AssistantSkill.sanitizedSlug(from: raw)
             return slug.isEmpty ? nil : slug
         }
+        func extract(from match: MeetingPreset) -> (
+            skillID: String?,
+            presetID: String?,
+            mode: AssistantEngagementMode?,
+            coreOutcomePolicy: CoreOutcomePolicy?,
+            exportDestinationID: UUID?,
+            routeEntireMeeting: Bool?
+        )? {
+            let skill = sanitized(match.autoFacilitatorSkillID)
+            let preset = sanitized(match.autoFacilitatorPresetID)
+            let mode = match.autoEngagementMode
+            let policy = match.coreOutcomePolicyOverride ?? match.autoExportOverrides.coreOutcomePolicy
+            let dest = match.exportDestinationIDOverride
+            let route = match.routeEntireMeetingOverride
+            guard skill != nil || preset != nil || mode != nil || policy != nil || dest != nil || route != nil else {
+                return nil
+            }
+            return (skill, preset, mode, policy, dest, route)
+        }
         for sid in seriesIDs where !sid.trimmed.isEmpty {
             if let match = presets.first(where: { $0.bindings.contains(.calendarSeries(sid)) }),
-               let value = sanitized(match.autoFacilitatorSkillID) {
-                return value
+               let cfg = extract(from: match) {
+                return cfg
             }
         }
         let rooms = [room, latest].compactMap { $0?.absoluteString }.filter { !$0.isEmpty }
         if !rooms.isEmpty,
            let match = presets.first(where: { $0.bindings.contains { if case .room(let key) = $0 { rooms.contains(key) } else { false } } }),
-           let value = sanitized(match.autoFacilitatorSkillID) {
-            return value
+           let cfg = extract(from: match) {
+            return cfg
         }
-        return nil
+        return (nil, nil, nil, nil, nil, nil)
     }
 
     func resolvedAutoExportOverrides(

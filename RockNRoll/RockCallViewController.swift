@@ -2994,6 +2994,8 @@ final class RockCallViewController: UIViewController, UIScrollViewDelegate, UICo
             case .off: color = .label
             case .mentions: color = .systemBlue
             case .follow: color = .systemIndigo
+            case .observe: color = .systemCyan
+            case .advise: color = .systemPurple
             case .participating: color = .systemGreen
             }
         } else if currentFacilitatorSkillName != nil {

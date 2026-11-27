@@ -27,8 +27,8 @@ actor ObsidianExportWorker {
         var retryAt: Date
     }
     private var sleepWaiter: (id: UUID, continuation: CheckedContinuation<Void, Never>, timer: Task<Void, Never>)?
-    private var vaultCache: (destinationID: UUID, configRevision: Int, url: URL, started: Bool)?
-    private var vaultBackoff: VaultAccessBackoff?
+    private var vaultCaches: [UUID: (configRevision: Int, url: URL, started: Bool)] = [:]
+    private var vaultBackoffs: [UUID: VaultAccessBackoff] = [:]
 
     var onLog: (String, [String: Any]) -> Void = { _, _ in }
 
@@ -53,39 +53,48 @@ actor ObsidianExportWorker {
     }
 
     deinit {
-        vaultCache?.url.stopAccessingSecurityScopedResource()
+        for cache in vaultCaches.values {
+            cache.url.stopAccessingSecurityScopedResource()
+        }
     }
 
-    /// Runs one pass over every due outbox row; used by the timer and by tests.
+    /// Runs one pass over every due outbox row across all configured vault destinations.
     func runOnce(now: Date = Date()) async {
         guard !processing else { return }
         processing = true
         defer { processing = false }
-        guard let destination = try? await store.destination() else {
+        let destinations = (try? await store.destinations()) ?? []
+        guard !destinations.isEmpty else {
             stopVaultAccess()
             return
         }
-        let due = ((try? await store.dueOutbox(now: now)) ?? []).filter { row in
-            row.destinationID == destination.id
-        }
-        guard !due.isEmpty else { return }
-        if let backoff = vaultBackoff,
-           backoff.destinationID == destination.id,
-           backoff.configRevision == destination.configRevision,
-           now < backoff.retryAt {
-            return
-        }
-        guard let vault = await resolveVault(destination, now: now) else { return }
-        for row in due {
-            let overrides: MeetingAutoExportOverrides
-            if let snap = row.snapshot {
-                overrides = (try? await store.autoExportOverrides(for: snap.session)) ?? .init()
-            } else {
-                overrides = .init()
+        let allDue = (try? await store.dueOutbox(now: now)) ?? []
+        guard !allDue.isEmpty else { return }
+        let destinationsByID = Dictionary(uniqueKeysWithValues: destinations.map { ($0.id, $0) })
+        let grouped = Dictionary(grouping: allDue, by: \.destinationID)
+        for (destinationID, dueRows) in grouped {
+            guard let destination = destinationsByID[destinationID] else { continue }
+            if let backoff = vaultBackoffs[destinationID],
+               backoff.configRevision == destination.configRevision,
+               now < backoff.retryAt {
+                continue
             }
-            guard row.intent.permitted(by: destination, overrides: overrides) else { continue }
-            let effectiveDestination = destination.effective(for: overrides)
-            await export(row: row, destination: effectiveDestination, vault: vault, now: now)
+            guard let vault = await resolveVault(destination, now: now) else { continue }
+            for row in dueRows {
+                if row.intent == .retract {
+                    await retract(row: row, destination: destination, vault: vault, now: now)
+                    continue
+                }
+                let overrides: MeetingAutoExportOverrides
+                if let snap = row.snapshot {
+                    overrides = (try? await store.autoExportOverrides(for: snap.session)) ?? .init()
+                } else {
+                    overrides = .init()
+                }
+                guard row.intent.permitted(by: destination, overrides: overrides) else { continue }
+                let effectiveDestination = destination.effective(for: overrides)
+                await export(row: row, destination: effectiveDestination, vault: vault, now: now)
+            }
         }
     }
 
@@ -131,20 +140,23 @@ actor ObsidianExportWorker {
     }
 
     func nextSleepDelay(now: Date = Date()) async -> TimeInterval {
-        guard let destination = try? await store.destination(),
-              destination.vaultBookmark != nil else {
+        let destinations = ((try? await store.destinations()) ?? []).filter { $0.vaultBookmark != nil }
+        guard !destinations.isEmpty else {
             return 30.0
         }
-        if let backoff = vaultBackoff,
-           backoff.destinationID == destination.id,
-           backoff.configRevision == destination.configRevision,
-           backoff.retryAt > now {
-            return min(60.0, max(1.0, backoff.retryAt.timeIntervalSince(now)))
+        var earliest: TimeInterval = .greatestFiniteMagnitude
+        for destination in destinations {
+            if let backoff = vaultBackoffs[destination.id],
+               backoff.configRevision == destination.configRevision,
+               backoff.retryAt > now {
+                earliest = min(earliest, min(60.0, max(1.0, backoff.retryAt.timeIntervalSince(now))))
+                continue
+            }
+            if let nextAttempt = try? await store.earliestActiveOutboxAttempt(destinationID: destination.id) {
+                earliest = min(earliest, max(0.25, nextAttempt.timeIntervalSince(now)))
+            }
         }
-        if let nextAttempt = try? await store.earliestActiveOutboxAttempt(destinationID: destination.id) {
-            return min(15.0, max(0.25, nextAttempt.timeIntervalSince(now)))
-        }
-        return 15.0
+        return earliest == .greatestFiniteMagnitude ? 15.0 : earliest
     }
 
     private func waitForWakeOrDelay(_ delay: TimeInterval) async {
@@ -187,8 +199,7 @@ actor ObsidianExportWorker {
     /// the worker's active security-scoped handle when already open so status polling never
     /// blocks `@MainActor` or races `stopAccessingSecurityScopedResource()`.
     func isVaultAccessible(for destination: ObsidianDestinationRecord) async -> Bool {
-        if let cache = vaultCache,
-           cache.destinationID == destination.id,
+        if let cache = vaultCaches[destination.id],
            cache.configRevision == destination.configRevision,
            cache.started {
             var isDirectory: ObjCBool = false
@@ -198,29 +209,28 @@ actor ObsidianExportWorker {
     }
 
     private func resolveVault(_ destination: ObsidianDestinationRecord, now: Date = Date(), interactiveProbe: Bool = false) async -> URL? {
-        if let cache = vaultCache, cache.destinationID == destination.id,
+        if let cache = vaultCaches[destination.id],
            cache.configRevision == destination.configRevision, cache.started {
             var isDirectory: ObjCBool = false
             if FileManager.default.fileExists(atPath: cache.url.path, isDirectory: &isDirectory), isDirectory.boolValue {
-                vaultBackoff = nil
+                vaultBackoffs[destination.id] = nil
                 return cache.url
             }
         }
-        stopVaultAccess()
+        stopVaultAccess(for: destination.id)
         func recordFailure(_ event: String, reason: String, message: String? = nil, fields: [String: Any] = [:]) {
             guard !interactiveProbe else { return }
-            let sameFailure = vaultBackoff?.destinationID == destination.id &&
-                vaultBackoff?.configRevision == destination.configRevision &&
-                vaultBackoff?.reason == reason &&
-                vaultBackoff?.message == message
+            let existing = vaultBackoffs[destination.id]
+            let sameFailure = existing?.configRevision == destination.configRevision &&
+                existing?.reason == reason &&
+                existing?.message == message
             if !sameFailure {
                 onLog(event, fields)
             }
-            let priorFailures = (vaultBackoff?.destinationID == destination.id &&
-                vaultBackoff?.configRevision == destination.configRevision) ? (vaultBackoff?.failures ?? 0) : 0
+            let priorFailures = existing?.configRevision == destination.configRevision ? (existing?.failures ?? 0) : 0
             let failures = priorFailures + 1
             let delay = min(300.0, 15.0 * pow(2.0, Double(min(failures - 1, 5))))
-            vaultBackoff = VaultAccessBackoff(
+            vaultBackoffs[destination.id] = VaultAccessBackoff(
                 destinationID: destination.id,
                 configRevision: destination.configRevision,
                 reason: reason,
@@ -236,7 +246,7 @@ actor ObsidianExportWorker {
         let resolved = vaultResolver(bookmark)
         switch resolved.resolution {
         case .granted(let url):
-            vaultBackoff = nil
+            vaultBackoffs[destination.id] = nil
             if let refreshed = resolved.refreshedBookmark {
                 try? await store.refreshDestinationVaultBookmark(
                     id: destination.id,
@@ -245,7 +255,7 @@ actor ObsidianExportWorker {
                 )
                 onLog("obsidian-export-refreshed-stale-bookmark", ["destination": destination.id.uuidString])
             }
-            vaultCache = (destination.id, destination.configRevision, url, true)
+            vaultCaches[destination.id] = (destination.configRevision, url, true)
             return url
         case .stale:
             recordFailure("obsidian-export-stale-bookmark", reason: "stale", fields: ["destination": destination.id.uuidString])
@@ -259,9 +269,71 @@ actor ObsidianExportWorker {
         }
     }
 
-    private func stopVaultAccess() {
-        vaultCache?.url.stopAccessingSecurityScopedResource()
-        vaultCache = nil
+    private func stopVaultAccess(for destinationID: UUID? = nil) {
+        if let destinationID {
+            vaultCaches.removeValue(forKey: destinationID)?.url.stopAccessingSecurityScopedResource()
+        } else {
+            for cache in vaultCaches.values {
+                cache.url.stopAccessingSecurityScopedResource()
+            }
+            vaultCaches.removeAll()
+        }
+    }
+
+    private func retract(row: ObsidianOutboxRecord, destination: ObsidianDestinationRecord,
+                         vault: URL, now: Date) async {
+        let bindings = (try? await store.bindings(destinationID: destination.id, sessionID: row.sessionID)) ?? []
+        var activeComponent = ObsidianExportComponent.meeting
+        do {
+            for binding in bindings where binding.state == .exported {
+                activeComponent = binding.component
+                guard case .success(let target) = ObsidianVaultAccess.validate(relativePath: binding.relativePath, in: vault),
+                      case .success(let fileTarget) = ObsidianVaultAccess.validateFileTarget(target) else {
+                    throw ObsidianExportError.pathEscapesVault(binding.relativePath)
+                }
+                guard let identity = try ObsidianFileWriter.FileIdentity.fingerprint(fileTarget) else {
+                    try? await store.markBindingRetracted(destinationID: destination.id, sessionID: row.sessionID, component: binding.component)
+                    continue
+                }
+                switch binding.component {
+                case .meeting, .transcript:
+                    if let expectedFileHash = binding.lastFileSHA256, identity.sha256 != expectedFileHash {
+                        throw ObsidianExportError.managedBlockConflict
+                    }
+                    try await writer.delete(target: fileTarget, expectedIdentity: identity, vaultRoot: vault, relativePath: binding.relativePath)
+                    try await store.markBindingRetracted(destinationID: destination.id, sessionID: row.sessionID, component: binding.component)
+                case .worklog, .index:
+                    let existingText = try String(contentsOf: fileTarget, encoding: .utf8)
+                    guard let nonce = binding.markerID else {
+                        throw ObsidianExportError.markerDamage("The managed binding has no marker identity.")
+                    }
+                    let stripped = try MarkdownFilePatcher.removeManagedBlock(
+                        existing: existingText,
+                        sessionID: row.sessionID,
+                        nonce: nonce,
+                        component: binding.component,
+                        expectedBlockSHA256: binding.lastBlockSHA256
+                    )
+                    if stripped != existingText {
+                        _ = try await writer.write(target: fileTarget, content: stripped, expectedIdentity: identity, vaultRoot: vault, relativePath: binding.relativePath)
+                    }
+                    try await store.markBindingRetracted(destinationID: destination.id, sessionID: row.sessionID, component: binding.component)
+                }
+            }
+            try await store.completeRetractOutbox(destinationID: destination.id, sessionID: row.sessionID, configRevision: row.desiredConfigRevision)
+            onLog("obsidian-retracted", ["session": row.sessionID.uuidString, "destination": destination.id.uuidString])
+        } catch {
+            let failure = error as? ObsidianExportError
+            let code = failure.map { String(describing: $0) } ?? "retractFailed"
+            if (try? await store.isAuthorizedForWrite(row)) == true {
+                try? await store.failOutbox(destinationID: destination.id, sessionID: row.sessionID,
+                    errorCode: code, transient: failure?.isTransient ?? true, now: now,
+                    expectedRevision: row.desiredRevision, configRevision: row.desiredConfigRevision)
+                try? await markBinding(destinationID: destination.id, sessionID: row.sessionID, component: activeComponent,
+                    state: failure?.isTransient == false ? .conflict : .failed, errorCode: code)
+            }
+            onLog("obsidian-retract-failed", ["session": row.sessionID.uuidString, "destination": destination.id.uuidString, "error": code])
+        }
     }
 
     private func export(row: ObsidianOutboxRecord, destination: ObsidianDestinationRecord,
@@ -482,15 +554,17 @@ actor ObsidianExportWorker {
     }
 
     func conflicts() async throws -> [ObsidianConflict] {
-        guard let destination = try await store.destination() else { return [] }
-        let rows = try await store.outboxRows(destinationID: destination.id).filter(\.paused)
+        let destinations = try await store.destinations()
         var conflicts: [ObsidianConflict] = []
-        for row in rows {
-            let components = destination.mode == .worklog ? [.transcript, .worklog] : destination.mode.requiredComponents
-            for component in components {
-                if let binding = try await store.binding(destinationID: destination.id, sessionID: row.sessionID, component: component),
-                   binding.state == .conflict {
-                    conflicts.append(ObsidianConflict(row: row, binding: binding))
+        for destination in destinations {
+            let rows = try await store.outboxRows(destinationID: destination.id).filter(\.paused)
+            for row in rows {
+                let components = destination.mode == .worklog ? [.transcript, .worklog] : destination.mode.requiredComponents
+                for component in components {
+                    if let binding = try await store.binding(destinationID: destination.id, sessionID: row.sessionID, component: component),
+                       binding.state == .conflict {
+                        conflicts.append(ObsidianConflict(row: row, binding: binding))
+                    }
                 }
             }
         }
@@ -499,7 +573,7 @@ actor ObsidianExportWorker {
 
     func compare(_ conflict: ObsidianConflict) async throws -> ObsidianConflictComparison {
         let row = conflict.row, binding = conflict.binding
-        guard let rawDestination = try await store.destination(), rawDestination.id == row.destinationID,
+        guard let rawDestination = try await store.destination(id: row.destinationID),
               let snapshot = row.snapshot else { throw ObsidianExportError.destinationChanged }
         let overrides = (try? await store.autoExportOverrides(for: snapshot.session)) ?? .init()
         let destination = rawDestination.effective(for: overrides)
@@ -508,7 +582,9 @@ actor ObsidianExportWorker {
             ? await snapshotStore.snapshots(for: await snapshotSessionIDsProvider(snapshot.session.id)) : []
         let copy = MeetingMarkdownTemplate.managedContent(session: snapshot.session, note: snapshot.note,
             outcome: snapshot.outcome, outcomeState: snapshot.outcomeState, sections: destination.layout.sections,
-            snapshots: visualSnapshots, useWikiLinksForSnapshots: true)
+            snapshots: visualSnapshots, useWikiLinksForSnapshots: true,
+            expertBlocks: snapshot.expertBlocks, dominantRole: snapshot.dominantRole ?? snapshot.session.dominantRole,
+            coreOutcomePolicy: snapshot.coreOutcomePolicy)
             + ObsidianComponentRenderer.transcriptSection(component: .meeting, layout: destination.layout,
                 path: binding.relativePath, body: transcript, transcriptPath: nil)
         guard let vault = await resolveVault(destination) else {

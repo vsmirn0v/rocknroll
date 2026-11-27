@@ -1,7 +1,7 @@
 import Foundation
 
 enum MeetingLibrarySchema {
-    static let currentVersion = 6
+    static let currentVersion = 7
 
     static let ddl: [String] = [
         """
@@ -26,6 +26,25 @@ enum MeetingLibrarySchema {
             export_revision INTEGER NOT NULL DEFAULT 0,
             created_at INTEGER NOT NULL,
             updated_at INTEGER NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS meeting_expert_blocks (
+            block_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL REFERENCES meeting_sessions(session_id) ON DELETE CASCADE,
+            skill_id TEXT NOT NULL,
+            preset_id TEXT,
+            is_deleted INTEGER NOT NULL DEFAULT 0,
+            updated_at INTEGER NOT NULL,
+            payload_json BLOB NOT NULL
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_meeting_expert_blocks_session ON meeting_expert_blocks(session_id, updated_at)",
+        """
+        CREATE TABLE IF NOT EXISTS meeting_role_observations (
+            session_id TEXT PRIMARY KEY REFERENCES meeting_sessions(session_id) ON DELETE CASCADE,
+            updated_at INTEGER NOT NULL,
+            payload_json BLOB NOT NULL
         )
         """,
         "CREATE INDEX IF NOT EXISTS idx_meeting_sessions_started ON meeting_sessions(started_at, session_id)",

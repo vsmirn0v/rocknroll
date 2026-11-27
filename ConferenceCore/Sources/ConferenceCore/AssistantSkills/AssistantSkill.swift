@@ -49,8 +49,121 @@ public enum AssistantSkillToolGroup: String, Codable, CaseIterable, Hashable, Se
     }
 }
 
+/// How an assistant role engages during a meeting.
+public enum AssistantEngagementMode: String, Codable, CaseIterable, Hashable, Sendable, Identifiable {
+    case off
+    case mentions
+    case follow
+    case observe
+    case advise
+    case participate
+    case facilitate
+
+    public var id: String { rawValue }
+
+    public var isSilentToRoom: Bool {
+        switch self {
+        case .off, .mentions, .follow, .observe, .advise:
+            return true
+        case .participate, .facilitate:
+            return false
+        }
+    }
+
+    public var requiresLiveTranscript: Bool {
+        self != .off
+    }
+
+    public var supportsOutboundVoiceOrChat: Bool {
+        self == .participate || self == .facilitate
+    }
+
+    public var isAdvisorFamily: Bool {
+        self == .observe || self == .advise
+    }
+
+    public var title: String {
+        switch self {
+        case .off: return L("Off")
+        case .mentions: return L("Mentions")
+        case .follow: return L("Follow")
+        case .observe: return L("Observe")
+        case .advise: return L("Advise")
+        case .participate: return L("Participate")
+        case .facilitate: return L("Facilitate")
+        }
+    }
+
+    public var subtitle: String {
+        switch self {
+        case .off: return L("No live alerts or assistant commentary.")
+        case .mentions: return L("Alerts you only when you are named or urgently needed.")
+        case .follow: return L("Follows the conversation and alerts you when your input matters.")
+        case .observe: return L("Silently takes structured role notes with zero interruptions.")
+        case .advise: return L("Silently coaches you live with probes, contradictions, and pacing.")
+        case .participate: return L("Drafts or sends chat and voice replies on your behalf.")
+        case .facilitate: return L("Autonomously speaks and acts as Rock Assistant in the call.")
+        }
+    }
+
+    public var symbol: String {
+        switch self {
+        case .off: return "bell.slash"
+        case .mentions: return "at"
+        case .follow: return "eye"
+        case .observe: return "note.text"
+        case .advise: return "lightbulb"
+        case .participate: return "bubble.left"
+        case .facilitate: return "waveform"
+        }
+    }
+}
+
+/// Controls whether the neutral core `MeetingOutcome` (Summary, Decisions, Tasks, Open Questions)
+/// is generated alongside a specialized role's Expert Block.
+public enum CoreOutcomePolicy: String, Codable, CaseIterable, Hashable, Sendable, Identifiable {
+    case full
+    case summaryOnly = "summary_only"
+    case expertOnly = "expert_only"
+
+    public var id: String { rawValue }
+
+    public var title: String {
+        switch self {
+        case .full: return L("Full outcome & tasks")
+        case .summaryOnly: return L("Summary only (no tasks)")
+        case .expertOnly: return L("Role opinion only (suppress core outcome)")
+        }
+    }
+
+    public var generatesCoreSummary: Bool {
+        self == .full || self == .summaryOnly
+    }
+
+    public var extractsDecisionsAndTasks: Bool {
+        self == .full
+    }
+}
+
+/// Visibility classification for a role-generated Expert Summary Block.
+public enum ExpertSummaryVisibility: String, Codable, CaseIterable, Hashable, Sendable, Identifiable {
+    case privateOwnerOnly = "private"
+    case shared
+
+    public var id: String { rawValue }
+
+    public var title: String {
+        switch self {
+        case .privateOwnerOnly: return L("Private (owner only)")
+        case .shared: return L("Shareable with team")
+        }
+    }
+}
+
 /// An extendable assistant skill stored as Markdown + YAML frontmatter in Obsidian (or local fallback).
 public struct AssistantSkill: Identifiable, Codable, Equatable, Sendable {
+    public static let personalAssistantID = "personal-assistant"
+
     public var id: String
     public var name: String
     public var role: String
@@ -61,10 +174,18 @@ public struct AssistantSkill: Identifiable, Codable, Equatable, Sendable {
     public var approvedSpeakersOnly: Bool
     public var realtimePreferred: Bool
     public var autoGreet: Bool
+    public var defaultMode: AssistantEngagementMode
+    public var coreOutcomePolicy: CoreOutcomePolicy
+    public var summaryBlockTitle: String
+    public var summaryVisibility: ExpertSummaryVisibility
+    public var exportDestinationSlug: String?
+    public var routeEntireMeeting: Bool
     public var instructions: String
     public var sourceRelativePath: String?
     public var updatedAt: Date?
     public var extraFrontmatter: [String: String]
+    /// Transient runtime identifier of the vault destination that owns this skill file (`nil` = primary/local).
+    public var owningDestinationID: UUID?
 
     public init(
         id: String,
@@ -77,10 +198,17 @@ public struct AssistantSkill: Identifiable, Codable, Equatable, Sendable {
         approvedSpeakersOnly: Bool = true,
         realtimePreferred: Bool = false,
         autoGreet: Bool = false,
+        defaultMode: AssistantEngagementMode = .facilitate,
+        coreOutcomePolicy: CoreOutcomePolicy = .full,
+        summaryBlockTitle: String = "",
+        summaryVisibility: ExpertSummaryVisibility = .shared,
+        exportDestinationSlug: String? = nil,
+        routeEntireMeeting: Bool = false,
         instructions: String,
         sourceRelativePath: String? = nil,
         updatedAt: Date? = nil,
-        extraFrontmatter: [String: String] = [:]
+        extraFrontmatter: [String: String] = [:],
+        owningDestinationID: UUID? = nil
     ) {
         let slug = Self.sanitizedSlug(from: id.isEmpty ? name : id)
         self.id = slug.isEmpty ? "custom-skill" : slug
@@ -93,10 +221,63 @@ public struct AssistantSkill: Identifiable, Codable, Equatable, Sendable {
         self.approvedSpeakersOnly = approvedSpeakersOnly
         self.realtimePreferred = realtimePreferred
         self.autoGreet = autoGreet
+        self.defaultMode = defaultMode
+        self.coreOutcomePolicy = coreOutcomePolicy
+        self.summaryBlockTitle = summaryBlockTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.summaryVisibility = summaryVisibility
+        let cleanSlug = exportDestinationSlug?.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.exportDestinationSlug = (cleanSlug?.isEmpty == false) ? cleanSlug : nil
+        self.routeEntireMeeting = routeEntireMeeting
         self.instructions = instructions.trimmingCharacters(in: .newlines)
         self.sourceRelativePath = sourceRelativePath ?? "Skills/\(self.id).md"
         self.updatedAt = updatedAt
         self.extraFrontmatter = extraFrontmatter
+        self.owningDestinationID = owningDestinationID
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, name, role, enabled, voiceActivation, triggers, tools
+        case approvedSpeakersOnly, realtimePreferred, autoGreet
+        case defaultMode, coreOutcomePolicy, summaryBlockTitle, summaryVisibility
+        case exportDestinationSlug, routeEntireMeeting
+        case instructions, sourceRelativePath, updatedAt, extraFrontmatter, owningDestinationID
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let rawID = try c.decode(String.self, forKey: .id)
+        let rawName = try c.decode(String.self, forKey: .name)
+        self.init(
+            id: rawID,
+            name: rawName,
+            role: try c.decodeIfPresent(String.self, forKey: .role) ?? "",
+            enabled: try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? true,
+            voiceActivation: try c.decodeIfPresent(Bool.self, forKey: .voiceActivation) ?? true,
+            triggers: try c.decodeIfPresent([String].self, forKey: .triggers) ?? [],
+            tools: try c.decodeIfPresent([AssistantSkillToolGroup].self, forKey: .tools) ?? AssistantSkillToolGroup.allCases,
+            approvedSpeakersOnly: try c.decodeIfPresent(Bool.self, forKey: .approvedSpeakersOnly) ?? true,
+            realtimePreferred: try c.decodeIfPresent(Bool.self, forKey: .realtimePreferred) ?? false,
+            autoGreet: try c.decodeIfPresent(Bool.self, forKey: .autoGreet) ?? false,
+            defaultMode: try c.decodeIfPresent(AssistantEngagementMode.self, forKey: .defaultMode) ?? .facilitate,
+            coreOutcomePolicy: try c.decodeIfPresent(CoreOutcomePolicy.self, forKey: .coreOutcomePolicy) ?? .full,
+            summaryBlockTitle: try c.decodeIfPresent(String.self, forKey: .summaryBlockTitle) ?? "",
+            summaryVisibility: try c.decodeIfPresent(ExpertSummaryVisibility.self, forKey: .summaryVisibility) ?? .shared,
+            exportDestinationSlug: try c.decodeIfPresent(String.self, forKey: .exportDestinationSlug),
+            routeEntireMeeting: try c.decodeIfPresent(Bool.self, forKey: .routeEntireMeeting) ?? false,
+            instructions: try c.decodeIfPresent(String.self, forKey: .instructions) ?? "",
+            sourceRelativePath: try c.decodeIfPresent(String.self, forKey: .sourceRelativePath),
+            updatedAt: try c.decodeIfPresent(Date.self, forKey: .updatedAt),
+            extraFrontmatter: try c.decodeIfPresent([String: String].self, forKey: .extraFrontmatter) ?? [:],
+            owningDestinationID: try c.decodeIfPresent(UUID.self, forKey: .owningDestinationID)
+        )
+    }
+
+    public var isPersonalAssistant: Bool {
+        id == Self.personalAssistantID
+    }
+
+    public var resolvedSummaryBlockTitle: String {
+        summaryBlockTitle.isEmpty ? name : summaryBlockTitle
     }
 
     public static func sanitizedSlug(from raw: String) -> String {
@@ -173,21 +354,32 @@ public enum AssistantSkillMarkdownCodec {
         updatedAt: Date? = nil
     ) -> AssistantSkill {
         let normalized = markdown.replacingOccurrences(of: "\r\n", with: "\n")
-        let (frontmatter, extra, body) = splitFrontmatter(normalized)
+        let (frontmatter, extra, body) = parseFrontmatter(normalized, knownKeys: [
+            "id", "name", "role", "enabled", "voice_activation",
+            "approved_speakers_only", "realtime_preferred", "auto_greet", "triggers", "tools",
+            "default_mode", "core_outcome_policy", "summary_block_title", "summary_visibility",
+            "export_destination_slug", "route_entire_meeting"
+        ])
 
         let slugSource = frontmatter["id"]?.scalar ?? fallbackSlug
         let cleanSlug = AssistantSkill.sanitizedSlug(from: slugSource).isEmpty
             ? AssistantSkill.sanitizedSlug(from: fallbackSlug)
             : AssistantSkill.sanitizedSlug(from: slugSource)
         let name = frontmatter["name"]?.scalar?.trimmedNonEmpty
-            ?? headingTitle(in: body)
+            ?? extractHeadingTitle(in: body)
             ?? cleanSlug
         let role = frontmatter["role"]?.scalar ?? ""
-        let enabled = parseBool(frontmatter["enabled"]?.scalar, default: true)
-        let voiceActivation = parseBool(frontmatter["voice_activation"]?.scalar, default: true)
-        let approvedOnly = parseBool(frontmatter["approved_speakers_only"]?.scalar, default: true)
-        let realtimePreferred = parseBool(frontmatter["realtime_preferred"]?.scalar, default: false)
-        let autoGreet = parseBool(frontmatter["auto_greet"]?.scalar, default: false)
+        let enabled = parseBoolScalar(frontmatter["enabled"]?.scalar, default: true)
+        let voiceActivation = parseBoolScalar(frontmatter["voice_activation"]?.scalar, default: true)
+        let approvedOnly = parseBoolScalar(frontmatter["approved_speakers_only"]?.scalar, default: true)
+        let realtimePreferred = parseBoolScalar(frontmatter["realtime_preferred"]?.scalar, default: false)
+        let autoGreet = parseBoolScalar(frontmatter["auto_greet"]?.scalar, default: false)
+        let defaultMode = frontmatter["default_mode"]?.scalar.flatMap(AssistantEngagementMode.init(rawValue:)) ?? .facilitate
+        let coreOutcomePolicy = frontmatter["core_outcome_policy"]?.scalar.flatMap(CoreOutcomePolicy.init(rawValue:)) ?? .full
+        let summaryBlockTitle = frontmatter["summary_block_title"]?.scalar ?? ""
+        let summaryVisibility = frontmatter["summary_visibility"]?.scalar.flatMap(ExpertSummaryVisibility.init(rawValue:)) ?? .shared
+        let exportDestinationSlug = frontmatter["export_destination_slug"]?.scalar
+        let routeEntireMeeting = parseBoolScalar(frontmatter["route_entire_meeting"]?.scalar, default: false)
         let triggers = frontmatter["triggers"]?.list ?? []
         let tools = (frontmatter["tools"]?.list ?? []).compactMap(AssistantSkillToolGroup.init(rawValue:))
 
@@ -202,6 +394,12 @@ public enum AssistantSkillMarkdownCodec {
             approvedSpeakersOnly: approvedOnly,
             realtimePreferred: realtimePreferred,
             autoGreet: autoGreet,
+            defaultMode: defaultMode,
+            coreOutcomePolicy: coreOutcomePolicy,
+            summaryBlockTitle: summaryBlockTitle,
+            summaryVisibility: summaryVisibility,
+            exportDestinationSlug: exportDestinationSlug,
+            routeEntireMeeting: routeEntireMeeting,
             instructions: body,
             sourceRelativePath: relativePath ?? "Skills/\(cleanSlug).md",
             updatedAt: updatedAt,
@@ -221,6 +419,24 @@ public enum AssistantSkillMarkdownCodec {
         lines.append("approved_speakers_only: \(skill.approvedSpeakersOnly ? "true" : "false")")
         lines.append("realtime_preferred: \(skill.realtimePreferred ? "true" : "false")")
         lines.append("auto_greet: \(skill.autoGreet ? "true" : "false")")
+        if skill.defaultMode != .facilitate {
+            lines.append("default_mode: \(yamlScalar(skill.defaultMode.rawValue))")
+        }
+        if skill.coreOutcomePolicy != .full {
+            lines.append("core_outcome_policy: \(yamlScalar(skill.coreOutcomePolicy.rawValue))")
+        }
+        if !skill.summaryBlockTitle.isEmpty {
+            lines.append("summary_block_title: \(yamlScalar(skill.summaryBlockTitle))")
+        }
+        if skill.summaryVisibility != .shared {
+            lines.append("summary_visibility: \(yamlScalar(skill.summaryVisibility.rawValue))")
+        }
+        if let destSlug = skill.exportDestinationSlug, !destSlug.isEmpty {
+            lines.append("export_destination_slug: \(yamlScalar(destSlug))")
+        }
+        if skill.routeEntireMeeting {
+            lines.append("route_entire_meeting: true")
+        }
         lines.append("triggers: [\(skill.triggers.map(yamlScalar).joined(separator: ", "))]")
         lines.append("tools: [\(skill.tools.map { yamlScalar($0.rawValue) }.joined(separator: ", "))]")
         for key in skill.extraFrontmatter.keys.sorted() {
@@ -236,7 +452,7 @@ public enum AssistantSkillMarkdownCodec {
         return lines.joined(separator: "\n") + "\n\n" + trimmedBody + "\n"
     }
 
-    private enum YAMLValue {
+    enum YAMLValue {
         case scalarValue(String)
         case listValue([String])
 
@@ -253,7 +469,7 @@ public enum AssistantSkillMarkdownCodec {
         }
     }
 
-    private static func splitFrontmatter(_ text: String) -> ([String: YAMLValue], [String: String], String) {
+    static func parseFrontmatter(_ text: String, knownKeys: Set<String>) -> ([String: YAMLValue], [String: String], String) {
         let lines = text.components(separatedBy: "\n")
         guard lines.first?.trimmingCharacters(in: .whitespaces) == "---" else {
             return ([:], [:], text)
@@ -265,10 +481,6 @@ public enum AssistantSkillMarkdownCodec {
         let bodyLines = Array(lines[(endIndex + 1)...])
         let body = bodyLines.joined(separator: "\n").replacingOccurrences(of: #"^\n+"#, with: "", options: .regularExpression)
 
-        let knownKeys: Set<String> = [
-            "id", "name", "role", "enabled", "voice_activation",
-            "approved_speakers_only", "realtime_preferred", "auto_greet", "triggers", "tools"
-        ]
         var values: [String: YAMLValue] = [:]
         var extra: [String: String] = [:]
         var activeListKey: String?
@@ -342,7 +554,7 @@ public enum AssistantSkillMarkdownCodec {
             .replacingOccurrences(of: "\\\\", with: "\\")
     }
 
-    private static func yamlScalar(_ value: String) -> String {
+    static func yamlScalar(_ value: String) -> String {
         let needsQuotes = value.isEmpty ||
             value.contains(":") || value.contains("#") || value.contains("[") ||
             value.contains("]") || value.contains(",") || value.contains("\"") ||
@@ -354,7 +566,7 @@ public enum AssistantSkillMarkdownCodec {
         return "\"\(escaped)\""
     }
 
-    private static func parseBool(_ value: String?, default fallback: Bool) -> Bool {
+    static func parseBoolScalar(_ value: String?, default fallback: Bool) -> Bool {
         guard let lowered = value?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
               !lowered.isEmpty else { return fallback }
         switch lowered {
@@ -364,7 +576,7 @@ public enum AssistantSkillMarkdownCodec {
         }
     }
 
-    private static func headingTitle(in markdown: String) -> String? {
+    static func extractHeadingTitle(in markdown: String) -> String? {
         for line in markdown.components(separatedBy: "\n") {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
             if trimmed.hasPrefix("# ") {
@@ -387,8 +599,37 @@ private extension String {
 public enum DefaultAssistantSkills {
     public static let defaultIDs: Set<String> = Set(all.map(\.id))
 
+    /// Universal personal assistant role underlying default `Mentions`, `Follow`, `Observe`, `Advise`, and `Participate` modes.
+    public static let personalAssistant = AssistantSkill(
+        id: AssistantSkill.personalAssistantID,
+        name: "Personal Assistant",
+        role: "Tracks meetings for you, alerts on mentions, takes quiet notes, advises privately, or participates on your behalf.",
+        enabled: true,
+        voiceActivation: false,
+        triggers: [],
+        tools: [.obsidianSearch, .meetingSearch, .tasks, .meetingSummary],
+        approvedSpeakersOnly: true,
+        realtimePreferred: false,
+        autoGreet: false,
+        defaultMode: .follow,
+        coreOutcomePolicy: .full,
+        summaryBlockTitle: "Personal Assistant Notes",
+        summaryVisibility: .privateOwnerOnly,
+        instructions: """
+        # Personal Assistant
+
+        You act as the user's private meeting assistant across live calls and post-meeting synthesis.
+        - In **Observe** mode, record concise factual highlights, decisions, risks, and action-item candidates without interrupting.
+        - In **Advise** mode, surface sharp follow-up questions, missed context from notes/history, and concise decision framing.
+        - Always ground observations in `[L#]` transcript references and distinguish what the user said from what others proposed.
+        """
+    )
+
     public static func skill(id: String) -> AssistantSkill? {
-        all.first { $0.id == id }
+        if id == AssistantSkill.personalAssistantID {
+            return personalAssistant
+        }
+        return all.first { $0.id == id }
     }
 
     public static let all: [AssistantSkill] = [
@@ -470,6 +711,47 @@ public enum DefaultAssistantSkills {
             - **Sprint Planning**: Review open carryover tasks (`rocknroll_list_tasks`), clarify acceptance criteria, assign owners using `People.md`, and create/update sprint tasks (`rocknroll_create_task` / `rocknroll_update_task`).
             - Record all agreed sprint goals, decisions, open questions, and action items with `rocknroll_update_meeting_artifacts`.
             - Schedule follow-up check-ins or the next retrospective on the calendar when requested (`rocknroll_schedule_meeting`).
+            """
+        ),
+        AssistantSkill(
+            id: "hiring-interviewer",
+            name: "Hiring Interviewer",
+            role: "Silently coaches live interviews with probes and rubric pacing, then produces an evidence-cited Hiring Evaluation.",
+            enabled: true,
+            voiceActivation: false,
+            triggers: ["interview", "candidate", "hiring", "собеседование", "кандидат", "интервью", "найм"],
+            tools: [.obsidianSearch, .meetingSearch, .meetingSummary],
+            approvedSpeakersOnly: true,
+            realtimePreferred: false,
+            autoGreet: false,
+            defaultMode: .advise,
+            coreOutcomePolicy: .expertOnly,
+            summaryBlockTitle: "Hiring Evaluation",
+            summaryVisibility: .privateOwnerOnly,
+            routeEntireMeeting: true,
+            instructions: """
+            # Hiring Interviewer
+
+            You act as a structured, evidence-driven hiring interview co-pilot and evaluator.
+
+            ## Live Coaching Rules (`Observe` / `Advise`)
+            - Stay **completely silent to the room** unless explicitly launched in `Facilitate` mode.
+            - Distinguish `[Interviewer / Team]` statements from `[Candidate]` answers: never credit interviewer explanations to the candidate.
+            - In **Observe** mode: silently log verified candidate claims, concrete examples, and potential concerns mapped to the position rubric.
+            - In **Advise** mode:
+              - Surface sharp **follow-up probes** when the candidate stays high-level ("we built" without personal ownership, missing failure modes, unverified scale/latency claims).
+              - Flag **contradictions** with earlier statements, resume/notes context, or stated trade-offs.
+              - Track **rubric pacing** so critical dimensions aren't left unassessed near the end of the slot.
+
+            ## Post-Meeting Evaluation (`Hiring Evaluation`)
+            - Ground every rating in verbatim or closely paraphrased `[L#]` transcript citations.
+            - Strictly distinguish **Weak Signal** (asked and answered poorly or vaguely) from **Not Assessed** (not covered in this interview).
+            - Never penalize ASR transcription glitches, accents, or bilingual technical code-switching.
+            - Structure the evaluation with:
+              1. **Verdict & Level Calibration** (`Strong Hire` / `Hire` / `Leaning Hire` / `Leaning No Hire` / `No Hire` + calibrated level)
+              2. **Rubric Scorecard** (rating + `[L#]` evidence per dimension, or `Not Assessed`)
+              3. **Key Strengths & Red Flags / Risks**
+              4. **Suggested Probes for Next Round**
             """
         ),
     ]

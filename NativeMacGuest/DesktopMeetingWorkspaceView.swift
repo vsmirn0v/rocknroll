@@ -8,14 +8,13 @@ func workspaceDate(_ date: Date, style: Date.FormatStyle.DateStyle = .omitted) -
 
 @MainActor
 final class MeetingWorkspaceViewState: ObservableObject {
-    enum Pause: Equatable {
-        case participation(UUID)
-        case following(UUID)
-        case both(participation: UUID, following: UUID)
-        case facilitator(String)
-        case participationAndFacilitator(UUID, facilitator: String)
-        case followingAndFacilitator(UUID, facilitator: String)
-        case all(participation: UUID, following: UUID, facilitator: String)
+    struct Pause: Equatable {
+        var participation: UUID? = nil
+        var following: UUID? = nil
+        var facilitator: String? = nil
+        var advisorSkill: String? = nil
+        var advisorPreset: String? = nil
+        var advisorMode: AssistantEngagementMode? = nil
     }
 
     @Published var parallel = false
@@ -40,57 +39,47 @@ final class MeetingWorkspaceViewState: ObservableObject {
         if activeFacilitatorSkill != nil {
             attention.facilitator?.disable(for: model.sessionID)
         }
+        let activeAdvisor = attention.advisorCoordinator?.activeSessions[model.sessionID]
+        if activeAdvisor != nil {
+            attention.advisorCoordinator?.disable(for: model.sessionID)
+        }
+        var result = Pause(
+            facilitator: activeFacilitatorSkill,
+            advisorSkill: activeAdvisor?.skillID,
+            advisorPreset: activeAdvisor?.presetID,
+            advisorMode: activeAdvisor?.mode
+        )
         let participation = model.participation
         if participation.status == .observing {
             participation.pause()
-            guard let token = participation.workspacePauseID else {
-                return activeFacilitatorSkill.map(Pause.facilitator)
-            }
-            if let following = attention.pauseWorkspaceFollowing(model) {
-                return activeFacilitatorSkill.map { Pause.all(participation: token, following: following, facilitator: $0) }
-                    ?? .both(participation: token, following: following)
-            }
-            return activeFacilitatorSkill.map { Pause.participationAndFacilitator(token, facilitator: $0) }
-                ?? .participation(token)
+            result.participation = participation.workspacePauseID
+            result.following = attention.pauseWorkspaceFollowing(model)
+            return result
         }
         if attention.store.enabled, attention.resolvedMode(model).mode != .off,
            let token = attention.pauseWorkspaceFollowing(model) {
-            return activeFacilitatorSkill.map { Pause.followingAndFacilitator(token, facilitator: $0) }
-                ?? .following(token)
+            result.following = token
+            return result
         }
-        return activeFacilitatorSkill.map(Pause.facilitator)
+        if result.facilitator != nil || result.advisorMode != nil {
+            return result
+        }
+        return nil
     }
 
     func resume(_ model: NativeDesktopMeetingModel, pause: Pause, attention: AttentionCoordinator) {
         let participation = model.participation
-        switch pause {
-        case .participation(let token):
-            if participation.workspacePauseID == token { participation.resume() }
-        case .following(let token):
-            attention.resumeWorkspaceFollowing(model, pause: token)
-        case .both(let token, let following):
-            if participation.workspacePauseID == token { participation.resume() }
+        if let token = pause.participation, participation.workspacePauseID == token {
+            participation.resume()
+        }
+        if let following = pause.following {
             attention.resumeWorkspaceFollowing(model, pause: following)
-        case .facilitator(let skillID):
-            if attention.facilitator?.activeSessionSkills[model.sessionID] == nil {
-                attention.facilitator?.enable(for: model, skillID: skillID, suppressAutoGreet: true)
-            }
-        case .participationAndFacilitator(let token, let skillID):
-            if participation.workspacePauseID == token { participation.resume() }
-            if attention.facilitator?.activeSessionSkills[model.sessionID] == nil {
-                attention.facilitator?.enable(for: model, skillID: skillID, suppressAutoGreet: true)
-            }
-        case .followingAndFacilitator(let token, let skillID):
-            attention.resumeWorkspaceFollowing(model, pause: token)
-            if attention.facilitator?.activeSessionSkills[model.sessionID] == nil {
-                attention.facilitator?.enable(for: model, skillID: skillID, suppressAutoGreet: true)
-            }
-        case .all(let token, let following, let skillID):
-            if participation.workspacePauseID == token { participation.resume() }
-            attention.resumeWorkspaceFollowing(model, pause: following)
-            if attention.facilitator?.activeSessionSkills[model.sessionID] == nil {
-                attention.facilitator?.enable(for: model, skillID: skillID, suppressAutoGreet: true)
-            }
+        }
+        if let skillID = pause.facilitator, attention.facilitator?.activeSessionSkills[model.sessionID] == nil {
+            attention.facilitator?.enable(for: model, skillID: skillID, suppressAutoGreet: true)
+        }
+        if let advisorSkill = pause.advisorSkill, let advisorMode = pause.advisorMode {
+            attention.setMeetingRoleAndMode(model: model, skillID: advisorSkill, presetID: pause.advisorPreset, mode: advisorMode)
         }
     }
 
@@ -169,7 +158,7 @@ struct NativeDesktopMeetingWorkspaceView: View {
                     Label(state.restorePauses.isEmpty ? L("Pause all assistants") : L("Restore previous modes"),
                           systemImage: state.restorePauses.isEmpty ? "pause.fill" : "play.fill")
                 }
-                .disabled(state.restorePauses.isEmpty && !store.enabled && (attention.facilitator?.activeSessionSkills.isEmpty ?? true))
+                .disabled(state.restorePauses.isEmpty && !store.enabled && (attention.facilitator?.activeSessionSkills.isEmpty ?? true) && (attention.advisorCoordinator?.activeSessions.isEmpty ?? true))
                 .accessibilityIdentifier("meetingWorkspace.pauseAll")
             }
         }

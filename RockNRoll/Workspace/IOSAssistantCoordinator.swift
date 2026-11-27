@@ -12,6 +12,8 @@ enum IOSMeetingAssistantMode: String, Codable, CaseIterable, Sendable, Identifia
     case off
     case mentions
     case follow
+    case observe
+    case advise
     case participating
 
     var id: String { rawValue }
@@ -21,6 +23,8 @@ enum IOSMeetingAssistantMode: String, Codable, CaseIterable, Sendable, Identifia
         case .off: return L("Off")
         case .mentions: return L("Mentions")
         case .follow: return L("Follow")
+        case .observe: return L("Observe")
+        case .advise: return L("Advise")
         case .participating: return L("Participate")
         }
     }
@@ -30,6 +34,8 @@ enum IOSMeetingAssistantMode: String, Codable, CaseIterable, Sendable, Identifia
         case .off: return L("assistant.compact.off")
         case .mentions: return L("assistant.compact.mentions")
         case .follow: return L("assistant.compact.follow")
+        case .observe: return L("Observe")
+        case .advise: return L("Advise")
         case .participating: return L("assistant.compact.participating")
         }
     }
@@ -42,6 +48,10 @@ enum IOSMeetingAssistantMode: String, Codable, CaseIterable, Sendable, Identifia
             return L("Alerts you when your name or alias is mentioned or you are directly addressed.")
         case .follow:
             return L("Follows the conversation and alerts you when your input or decision is needed.")
+        case .observe:
+            return L("Listens silently and builds structured Role Notes without speaking or messaging.")
+        case .advise:
+            return L("Monitors silently, coaches you privately, and supports Whisper Q&A.")
         case .participating:
             return L("Tracks the meeting and drafts or delivers chat and voice replies on your behalf.")
         }
@@ -52,8 +62,14 @@ enum IOSMeetingAssistantMode: String, Codable, CaseIterable, Sendable, Identifia
         case .off: return "bell.slash"
         case .mentions: return "at.badge.plus"
         case .follow: return "eye"
+        case .observe: return "note.text"
+        case .advise: return "lightbulb.max"
         case .participating: return "waveform.and.person.filled"
         }
+    }
+
+    var isSilentToRoom: Bool {
+        self == .observe || self == .advise
     }
 
     /// Compatible string value for `SyncedMeetingContextSettings.attentionMode`.
@@ -62,6 +78,8 @@ enum IOSMeetingAssistantMode: String, Codable, CaseIterable, Sendable, Identifia
         case .off: return "off"
         case .mentions: return "mentions"
         case .follow: return "watch"
+        case .observe: return "observe"
+        case .advise: return "advise"
         case .participating: return nil
         }
     }
@@ -73,6 +91,8 @@ enum IOSMeetingAssistantMode: String, Codable, CaseIterable, Sendable, Identifia
         case "off": self = .off
         case "mentions": self = .mentions
         case "watch", "follow": self = .follow
+        case "observe": self = .observe
+        case "advise": self = .advise
         case "participating": self = .participating
         default: return nil
         }
@@ -352,6 +372,10 @@ struct IOSAssistantLLMService: IOSAssistantEvaluating {
             modeRule = "Only trigger needs_user=true when the user (aliases: \(req.userAliases.joined(separator: ", "))) is mentioned by name, role, or asked an urgent direct question."
         case .follow:
             modeRule = "Trigger needs_user=true whenever the conversation needs the user's attention, opinion, decision, action item, or mentions their area."
+        case .observe:
+            modeRule = "Silently observe and summarize key points without interrupting the meeting."
+        case .advise:
+            modeRule = "Privately advise the user with concise coaching points without interrupting the meeting."
         case .participating:
             modeRule = "Actively participate on the user's behalf: determine when a concise first-person response is helpful or expected, and write suggested_reply in first person matching the meeting language (\(langLabel)). Goal: \(req.participationGoal.isEmpty ? "Help answer direct questions and confirm ownership concisely." : req.participationGoal). Style: \(req.replyStyle)."
         }
@@ -481,6 +505,14 @@ final class IOSAssistantCoordinator: ObservableObject {
     @Published private(set) var activityLog: [IOSAssistantActivityItem] = []
     @Published private(set) var lastStatusNoteBySession: [UUID: String] = [:]
     @Published private(set) var evaluationErrors: [UUID: String] = [:]
+    @Published private(set) var sessionRoleIDs: [UUID: String] = [:]
+    @Published private(set) var sessionPresetIDs: [UUID: String] = [:]
+    @Published private(set) var observationsBySession: [UUID: [RoleObservationItem]] = [:]
+    @Published private(set) var whisperInFlight: Set<UUID> = []
+
+    private var fullEventBuffers: [UUID: [SyncedTranscriptEvent]] = [:]
+    private var backfilledSessions: Set<UUID> = []
+    private var roleSegmentsByController: [UUID: [SessionRoleSegment]] = [:]
 
     private weak var workspace: IOSWorkspaceCoordinator?
     private let preferences: UserDefaults
@@ -592,6 +624,7 @@ final class IOSAssistantCoordinator: ObservableObject {
             }
             self.roomModeOverrides = loaded
         }
+        workspace?.assistantCoordinator = self
     }
 
     // MARK: - Mode Resolution & Configuration
@@ -643,6 +676,95 @@ final class IOSAssistantCoordinator: ObservableObject {
     func hasModelConfigured() -> Bool {
         modelAvailableOverride?()
             ?? (workspace?.hasPermittedOutcomeWriter ?? PortableOutcomeConfiguration.isAppleOnDeviceAvailable)
+    }
+
+    func resolvedRoleID(for controllerID: UUID) -> String {
+        if let explicit = sessionRoleIDs[controllerID] { return explicit }
+        if let bridge = resolveBridge(controllerID), let workspace {
+            let seriesIDs = [bridge.calendarSeriesKey, bridge.localCalendarSeriesKey].compactMap { $0 }
+            let roomKeys = [bridge.roomKey].filter { !$0.isEmpty }
+            if let cfgSkill = workspace.autoFacilitatorSkillID(seriesIDs: seriesIDs, roomKeys: roomKeys) {
+                return cfgSkill
+            }
+        }
+        return AssistantSkill.personalAssistantID
+    }
+
+    func resolvedPresetID(for controllerID: UUID) -> String? {
+        if let explicit = sessionPresetIDs[controllerID] { return explicit }
+        if let bridge = resolveBridge(controllerID), let workspace {
+            let seriesIDs = [bridge.calendarSeriesKey, bridge.localCalendarSeriesKey].compactMap { $0 }
+            let roomKeys = [bridge.roomKey].filter { !$0.isEmpty }
+            return workspace.autoFacilitatorConfiguration(seriesIDs: seriesIDs, roomKeys: roomKeys).presetID
+        }
+        return nil
+    }
+
+    func isOutboundMuted(for controllerID: UUID) -> Bool {
+        resolvedMode(for: controllerID).isSilentToRoom
+    }
+
+    func setRoleAndMode(
+        skillID: String,
+        presetID: String? = nil,
+        mode: IOSMeetingAssistantMode,
+        for controllerID: UUID,
+        rememberForRoom: Bool = false
+    ) {
+        let canonical = AssistantSkill.sanitizedSlug(from: skillID)
+        let nextRole = canonical.isEmpty ? AssistantSkill.personalAssistantID : canonical
+        let prevRole = sessionRoleIDs[controllerID]
+        let prevPreset = sessionPresetIDs[controllerID]
+        let roleChanged = prevRole != nextRole || prevPreset != presetID
+
+        sessionRoleIDs[controllerID] = nextRole
+        sessionPresetIDs[controllerID] = presetID
+        if roleChanged {
+            backfilledSessions.remove(controllerID)
+        }
+        setMode(mode, for: controllerID, rememberForRoom: rememberForRoom)
+
+        let engagement: AssistantEngagementMode = switch mode {
+        case .off: .off
+        case .mentions: .mentions
+        case .follow: .follow
+        case .observe: .observe
+        case .advise: .advise
+        case .participating: .participate
+        }
+        if let sid = workspace?.workspaceSessionID(forControllerID: controllerID), let workspace {
+            let skill = workspace.skillsController?.skills.first(where: { $0.id == nextRole }) ?? DefaultAssistantSkills.skill(id: nextRole)
+            let preset = presetID.flatMap { pid in workspace.skillsController?.presets.first(where: { $0.id == pid && $0.skillID == nextRole }) }
+            let policy = preset?.coreOutcomePolicy ?? skill?.coreOutcomePolicy ?? .full
+            let destSlug = preset?.exportDestinationSlug ?? skill?.exportDestinationSlug
+            let destID = destSlug.flatMap { slug in
+                workspace.skillsController?.syncedVaultDestinations.first(where: { $0.slug == slug })?.id
+            }
+            let routeEntire = preset?.routeEntireMeeting ?? skill?.routeEntireMeeting ?? true
+            let existingDom = workspace.sessions.first(where: { $0.id == sid })?.dominantRole
+            let existingSegs = roleSegmentsByController[controllerID]
+                ?? workspace.sessions.first(where: { $0.id == sid })?.roleSegments
+                ?? []
+            let resolved = DominantRoleResolver.resolveLiveSwitch(
+                existingSegments: existingSegs,
+                previousDominant: existingDom,
+                newSkillID: nextRole,
+                newPresetID: presetID,
+                newMode: engagement,
+                coreOutcomePolicy: policy,
+                exportDestinationID: destID,
+                routeEntireMeeting: routeEntire,
+                at: nowProvider()
+            )
+            roleSegmentsByController[controllerID] = resolved.segments
+            Task { @MainActor [weak workspace] in
+                await workspace?.setSessionRoleState(sessionID: sid, dominantRole: resolved.dominantRole, roleSegments: resolved.segments)
+            }
+        }
+        if mode.isSilentToRoom && !backfilledSessions.contains(controllerID) {
+            backfilledSessions.insert(controllerID)
+            queueEvaluation(for: controllerID, mention: nil, immediate: true)
+        }
     }
 
     func setMode(_ mode: IOSMeetingAssistantMode, for controllerID: UUID, rememberForRoom: Bool = false) {
@@ -745,6 +867,13 @@ final class IOSAssistantCoordinator: ObservableObject {
         lastEvaluatedAt.removeValue(forKey: controllerID)
         lastMentionTriggerAt.removeValue(forKey: controllerID)
         sessionModeOverrides.removeValue(forKey: controllerID)
+        sessionRoleIDs.removeValue(forKey: controllerID)
+        sessionPresetIDs.removeValue(forKey: controllerID)
+        observationsBySession.removeValue(forKey: controllerID)
+        whisperInFlight.remove(controllerID)
+        fullEventBuffers.removeValue(forKey: controllerID)
+        backfilledSessions.remove(controllerID)
+        roleSegmentsByController.removeValue(forKey: controllerID)
         sessionParticipationOutputs.removeValue(forKey: controllerID)
         sessionParticipationGoals.removeValue(forKey: controllerID)
         sessionAskBeforeSending.removeValue(forKey: controllerID)
@@ -770,6 +899,10 @@ final class IOSAssistantCoordinator: ObservableObject {
             guard !clean.isEmpty, ev.kind == "transcript" || ev.kind == "chat" else { continue }
             seen.insert(ev.id)
             buffer.append(ev)
+            var full = fullEventBuffers[controllerID] ?? []
+            full.append(ev)
+            if full.count > 600 { full.removeFirst(full.count - 600) }
+            fullEventBuffers[controllerID] = full
             freshAllEvents.append(ev)
             if !ev.isOwn {
                 freshEvents.append(ev)
@@ -851,9 +984,16 @@ final class IOSAssistantCoordinator: ObservableObject {
     private func startPendingEvaluation(for controllerID: UUID) {
         guard evaluationTasks[controllerID] == nil, let pending = pendingEvaluations[controllerID] else { return }
         let isMention = pending.mention != nil
+        let mode = resolvedMode(for: controllerID)
         let last = isMention ? lastMentionTriggerAt[controllerID] : lastEvaluatedAt[controllerID]
         let cooldown = isMention ? mentionCooldown : evaluationCooldown
-        let delay = pending.immediate ? 0 : last.map { cooldown - nowProvider().timeIntervalSince($0) } ?? 0
+        var delay = pending.immediate ? 0 : last.map { cooldown - nowProvider().timeIntervalSince($0) } ?? 0
+        // Concurrent meeting priority: P0 mentions/whispers run immediately; P1 advise/participate yields only to P0;
+        // P2 observe/follow yields briefly when higher-priority sessions are currently evaluating.
+        if !isMention && !pending.immediate && !evaluatingSessions.isEmpty {
+            let isP2 = (mode == .observe || mode == .follow)
+            if isP2 { delay = max(delay, 2.0) }
+        }
         evaluationTasks[controllerID] = Task { @MainActor [weak self] in
             if delay > 0 { try? await Task.sleep(for: .seconds(delay)) }
             guard !Task.isCancelled, let self, let batch = pendingEvaluations.removeValue(forKey: controllerID) else { return }
@@ -880,6 +1020,18 @@ final class IOSAssistantCoordinator: ObservableObject {
         lastEvaluatedAt[controllerID] = nowProvider()
         evaluatingSessions.insert(controllerID)
         defer { if !Task.isCancelled { evaluatingSessions.remove(controllerID) } }
+
+        if mode == .observe || mode == .advise {
+            let liveEvents = fullEventBuffers[controllerID] ?? recentEvents
+            _ = await evaluateLiveAdvisor(
+                controllerID: controllerID,
+                mode: mode,
+                bridge: bridge,
+                events: liveEvents,
+                whisperQuestion: nil
+            )
+            return
+        }
 
         var verdict: IOSAssistantVerdict?
         AppDiagnostics.log("assistant-evaluation", ["mode": mode.rawValue, "eventCount": recentEvents.count, "nameMatched": localMention != nil])
@@ -981,7 +1133,7 @@ final class IOSAssistantCoordinator: ObservableObject {
         let askFirst = effectiveAskBeforeSending(for: controllerID)
         var sentChannels: [String] = []
         var failures: [String] = []
-        if mode == .participating, !askFirst, !replyText.isEmpty, let bridge,
+        if mode == .participating, !mode.isSilentToRoom, !askFirst, !replyText.isEmpty, let bridge,
            bridge.canDeliverAutomaticReplies, !bridge.isMicUnmuted {
             if output != .voice {
                 do {
@@ -1067,6 +1219,9 @@ final class IOSAssistantCoordinator: ObservableObject {
     }
 
     func sendManualChat(controllerID: UUID, text: String) async throws {
+        guard !resolvedMode(for: controllerID).isSilentToRoom else {
+            throw MeetingSessionError.unavailable(L("Outbound audio and chat are disabled in Observe/Advise mode."))
+        }
         let clean = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !clean.isEmpty else { return }
         guard let bridge = resolveBridge(controllerID) else { throw MeetingSessionError.notConnected }
@@ -1078,6 +1233,9 @@ final class IOSAssistantCoordinator: ObservableObject {
     func sendCardToChat(_ cardID: UUID) async throws {
         guard let idx = alertCards.firstIndex(where: { $0.id == cardID }) else { return }
         let card = alertCards[idx]
+        guard !resolvedMode(for: card.controllerID).isSilentToRoom else {
+            throw MeetingSessionError.unavailable(L("Outbound audio and chat are disabled in Observe/Advise mode."))
+        }
         let text = card.suggestedReply.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
         guard let bridge = resolveBridge(card.controllerID) else { throw MeetingSessionError.notConnected }
@@ -1093,6 +1251,9 @@ final class IOSAssistantCoordinator: ObservableObject {
     func speakCardReply(_ cardID: UUID) async throws {
         guard let idx = alertCards.firstIndex(where: { $0.id == cardID }) else { return }
         let card = alertCards[idx]
+        guard !resolvedMode(for: card.controllerID).isSilentToRoom else {
+            throw MeetingSessionError.unavailable(L("Outbound audio and chat are disabled in Observe/Advise mode."))
+        }
         let text = card.suggestedReply.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
         guard let bridge = resolveBridge(card.controllerID) else { throw MeetingSessionError.notConnected }
@@ -1102,6 +1263,204 @@ final class IOSAssistantCoordinator: ObservableObject {
             alertCards[current].deliveryNote = L("Spoken in call")
         }
         recordActivity(controllerID: card.controllerID, title: card.meetingTitle, mode: card.mode, summary: text, channel: L("Voice"))
+    }
+
+    // MARK: - Live Advisor (Observe / Advise / Whisper)
+
+    @discardableResult
+    func whisper(_ question: String, for controllerID: UUID) async -> [RoleObservationItem] {
+        let clean = question.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty else { return [] }
+        let currentMode = resolvedMode(for: controllerID)
+        if !currentMode.isSilentToRoom {
+            setRoleAndMode(skillID: resolvedRoleID(for: controllerID), presetID: resolvedPresetID(for: controllerID), mode: .advise, for: controllerID)
+        }
+        whisperInFlight.insert(controllerID)
+        defer { whisperInFlight.remove(controllerID) }
+        let events = fullEventBuffers[controllerID] ?? eventBuffers[controllerID] ?? []
+        return await evaluateLiveAdvisor(
+            controllerID: controllerID,
+            mode: .advise,
+            bridge: resolveBridge(controllerID),
+            events: events,
+            whisperQuestion: clean
+        )
+    }
+
+    func toggleObservationPin(observationID: UUID, for controllerID: UUID) {
+        guard var list = observationsBySession[controllerID],
+              let idx = list.firstIndex(where: { $0.id == observationID }) else { return }
+        list[idx].isPinned.toggle()
+        list[idx].updatedAt = nowProvider()
+        observationsBySession[controllerID] = list
+        persistObservations(list, controllerID: controllerID)
+    }
+
+    func dismissObservation(observationID: UUID, for controllerID: UUID) {
+        guard var list = observationsBySession[controllerID],
+              let idx = list.firstIndex(where: { $0.id == observationID }) else { return }
+        list[idx].isDismissed = true
+        list[idx].updatedAt = nowProvider()
+        observationsBySession[controllerID] = list
+        persistObservations(list, controllerID: controllerID)
+    }
+
+    func insertObservationIntoNotes(observationID: UUID, for controllerID: UUID) {
+        guard let workspace,
+              let sid = workspace.workspaceSessionID(forControllerID: controllerID),
+              var list = observationsBySession[controllerID],
+              let idx = list.firstIndex(where: { $0.id == observationID }) else { return }
+        var item = list[idx]
+        item.copiedToNotesAt = nowProvider()
+        item.updatedAt = item.copiedToNotesAt ?? nowProvider()
+        list[idx] = item
+        observationsBySession[controllerID] = list
+        persistObservations(list, controllerID: controllerID)
+
+        let existing = workspace.noteDraft(for: sid)
+        let prefix = item.isPinned ? "★ " : ""
+        let title = item.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let body = item.body.trimmingCharacters(in: .whitespacesAndNewlines)
+        let refs = item.evidenceRefs.isEmpty ? "" : " " + item.evidenceRefs.map { "[\($0)]" }.joined()
+        let line = title.isEmpty ? "- \(prefix)\(body)\(refs)" : "- \(prefix)**\(title)**: \(body)\(refs)"
+        let trimmed = existing.trimmingCharacters(in: .whitespacesAndNewlines)
+        let next = trimmed.isEmpty ? line : trimmed + "\n" + line
+        workspace.updateNoteDraft(next, for: sid)
+    }
+
+    @discardableResult
+    private func evaluateLiveAdvisor(
+        controllerID: UUID,
+        mode: IOSMeetingAssistantMode,
+        bridge: IOSAssistantSessionBridge?,
+        events: [SyncedTranscriptEvent],
+        whisperQuestion: String?
+    ) async -> [RoleObservationItem] {
+        guard let workspace else { return [] }
+        let sid = workspace.workspaceSessionID(forControllerID: controllerID) ?? controllerID
+        if observationsBySession[controllerID] == nil,
+           let saved = workspace.roleObservationsBySession[sid]?.items {
+            observationsBySession[controllerID] = saved.filter { !$0.isDismissed }
+        }
+        guard hasModelConfigured(), let config = try? workspace.permittedAIConfiguration() else {
+            lastStatusNoteBySession[controllerID] = L("Configure Apple Intelligence or an AI API key to generate live Role Notes.")
+            return []
+        }
+        let skillID = resolvedRoleID(for: controllerID)
+        let presetID = resolvedPresetID(for: controllerID)
+        let skill = workspace.skillsController?.skills.first(where: { $0.id == skillID })
+            ?? DefaultAssistantSkills.skill(id: skillID)
+            ?? DefaultAssistantSkills.personalAssistant
+        let preset = presetID.flatMap { pid in
+            workspace.skillsController?.presets.first(where: { $0.id == pid && $0.skillID == skill.id })
+        }
+        let notes = workspace.noteDraft(for: sid)
+        let localNames = collectedAliases(for: bridge)
+        let teamNames = workspace.skillsController?.people.entries.map(\.displayName) ?? []
+        let focusSpeakers = skill.id == "hiring-interviewer"
+            ? Array(FullTranscriptEvaluationWindowBuilder.detectedExternalSpeakers(
+                events: events,
+                localNames: localNames,
+                teamMemberNames: teamNames
+            ).prefix(2))
+            : []
+        let window = FullTranscriptEvaluationWindowBuilder.build(
+            events: events,
+            notes: notes,
+            snapshotCaptions: [],
+            focusSpeakers: focusSpeakers,
+            focusSpeakerRole: preset?.focusSpeakerRole ?? "",
+            localNames: localNames,
+            teamMemberNames: teamNames,
+            contextTokens: config.contextTokens,
+            onDevice: config.providerKind == .appleOnDevice
+        )
+        let previous = observationsBySession[controllerID] ?? []
+        let service = PortableExpertEvaluationService(apiKeyProvider: { [keychain = workspace.keychain] kind in
+            keychain.read(kind: kind)
+        })
+        let engagement: AssistantEngagementMode = (whisperQuestion == nil && mode == .observe) ? .observe : .advise
+        let lang = MeetingLanguageResolver.resolve(
+            events: events,
+            notes: notes,
+            title: bridge?.title ?? L("Meeting"),
+            appLanguage: Localization.preferredAppLanguageCode()
+        )
+        do {
+            let response = try await service.evaluateLiveAdvisor(
+                meetingTitle: bridge?.title ?? L("Meeting"),
+                mode: engagement,
+                skill: skill,
+                preset: preset,
+                adHocContext: "",
+                focusSpeakers: focusSpeakers,
+                window: window,
+                previousObservations: previous,
+                notes: notes,
+                whisperQuestion: whisperQuestion,
+                language: lang,
+                configuration: config
+            )
+            guard !Task.isCancelled else { return [] }
+            let now = nowProvider()
+            var created: [RoleObservationItem] = []
+            for entry in response.entries {
+                let cleanBody = entry.body.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !cleanBody.isEmpty else { continue }
+                let dup = previous.contains {
+                    !$0.isDismissed
+                        && $0.title.caseInsensitiveCompare(entry.title) == .orderedSame
+                        && $0.body.caseInsensitiveCompare(cleanBody) == .orderedSame
+                }
+                guard !dup else { continue }
+                let evidenceIDs = entry.evidenceRefs.compactMap { window.refToEventID[$0] }
+                let item = RoleObservationItem(
+                    sessionID: sid,
+                    skillID: skill.id,
+                    presetID: preset?.id,
+                    mode: engagement,
+                    kind: entry.kind,
+                    title: entry.title,
+                    body: cleanBody,
+                    evidenceLineIDs: evidenceIDs,
+                    evidenceRefs: entry.evidenceRefs,
+                    createdAt: now,
+                    updatedAt: now
+                )
+                created.append(item)
+            }
+            if !created.isEmpty {
+                var updated = previous
+                if whisperQuestion != nil {
+                    updated.insert(contentsOf: created, at: 0)
+                } else {
+                    updated.append(contentsOf: created)
+                }
+                observationsBySession[controllerID] = updated
+                persistObservations(updated, controllerID: controllerID)
+            }
+            evaluationErrors.removeValue(forKey: controllerID)
+            return created
+        } catch {
+            evaluationErrors[controllerID] = error.localizedDescription
+            return []
+        }
+    }
+
+    private func persistObservations(_ items: [RoleObservationItem], controllerID: UUID) {
+        guard let workspace,
+              let sid = workspace.workspaceSessionID(forControllerID: controllerID) else { return }
+        let deviceID = workspace.deviceID
+        let nextCounter = (workspace.roleObservationsBySession[sid]?.version.counter ?? 0) + 1
+        let log = SyncedRoleObservationLog(
+            sessionID: sid,
+            items: items,
+            version: SyncVersion(counter: nextCounter, device: deviceID),
+            updatedAt: nowProvider()
+        )
+        Task { @MainActor [weak workspace] in
+            await workspace?.upsertRoleObservations(log)
+        }
     }
 
     // MARK: - Mention Detection & Helpers

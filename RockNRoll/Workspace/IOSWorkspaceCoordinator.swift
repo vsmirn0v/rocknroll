@@ -54,7 +54,13 @@ final class IOSWorkspaceCoordinator: ObservableObject {
     @Published private(set) var taskProfile = IOSTaskProfile()
     @Published private(set) var taskArchiveDates: [UUID: Date] = [:]
     @Published private(set) var contextSettings: [String: SyncedMeetingContextSettings] = [:]
+    @Published private(set) var expertBlocksBySession: [UUID: [SyncedMeetingExpertBlock]] = [:]
+    @Published private(set) var roleObservationsBySession: [UUID: SyncedRoleObservationLog] = [:]
+    @Published private(set) var generatingExpertSessionIDs: Set<UUID> = []
+    @Published private(set) var expertSummaryErrors: [UUID: String] = [:]
     private(set) lazy var taskSync: WorkspaceTaskSyncController = makeTaskSyncController()
+    weak var skillsController: IOSAssistantSkillsController?
+    weak var assistantCoordinator: IOSAssistantCoordinator?
     @Published var outcomeConfig: PortableOutcomeConfiguration {
         didSet {
             if oldValue.consentIdentifier != outcomeConfig.consentIdentifier { setRemoteAIConsent(false) }
@@ -407,6 +413,8 @@ final class IOSWorkspaceCoordinator: ObservableObject {
             if tasks != snapshot.tasks { tasks = snapshot.tasks }
             if taskProfile != snapshot.taskProfile { taskProfile = snapshot.taskProfile }
             if taskArchiveDates != snapshot.taskArchiveDates { taskArchiveDates = snapshot.taskArchiveDates }
+            if expertBlocksBySession != snapshot.expertBlocksBySession { expertBlocksBySession = snapshot.expertBlocksBySession }
+            if roleObservationsBySession != snapshot.roleObservationsBySession { roleObservationsBySession = snapshot.roleObservationsBySession }
             if contextSettings != snapshot.contextSettings {
                 contextSettings = snapshot.contextSettings
                 calendar?.refreshAutoJoinSchedule()
@@ -478,6 +486,11 @@ final class IOSWorkspaceCoordinator: ObservableObject {
 
     func workspaceSessionID(forControllerID controllerID: UUID) -> UUID? {
         controllerToSessionID[controllerID]
+    }
+
+    func controllerID(forSessionID sessionID: UUID) -> UUID? {
+        let canonical = replica.workspaceDoc.resolveCanonicalSessionID(for: sessionID)
+        return controllerToSessionID.first(where: { $0.value == sessionID || $0.value == canonical })?.key
     }
 
     @discardableResult
@@ -738,8 +751,11 @@ final class IOSWorkspaceCoordinator: ObservableObject {
     private func coordinateOutcomeAfterLeave(sessionID: UUID) async {
         let sid = replica.workspaceDoc.resolveCanonicalSessionID(for: sessionID)
         let overrides = resolvedAutoExportOverrides(for: sid)
-        guard overrides.autoGenerateSummary ?? outcomeConfig.autoGenerateOnLeave else { return }
-        if outcomesBySession[sid]?.state == "ready" { return }
+        let corePolicy = effectiveCoreOutcomePolicy(for: sid)
+        let wantsCore = (overrides.autoGenerateSummary ?? outcomeConfig.autoGenerateOnLeave) && corePolicy != .expertOnly
+        let wantsExpert = hasSpecialOrAdvisorRoleForAutoCapture(sessionID: sid)
+        guard wantsCore || wantsExpert else { return }
+        if !wantsExpert && outcomesBySession[sid]?.state == "ready" { return }
         if hasActiveMeeting() {
             enqueueDeferredOutcome(sid)
             return
@@ -769,26 +785,29 @@ final class IOSWorkspaceCoordinator: ObservableObject {
         }
 
         let resolvedSID = replica.workspaceDoc.resolveCanonicalSessionID(for: sid)
-        if outcomesBySession[resolvedSID]?.state == "ready" ||
-            replica.workspaceDoc.sessions[resolvedSID]?.outcomeClaim?.value?.state == "ready" {
-            return
+        let needsCore = wantsCore
+            && outcomesBySession[resolvedSID]?.state != "ready"
+            && replica.workspaceDoc.sessions[resolvedSID]?.outcomeClaim?.value?.state != "ready"
+        if needsCore {
+            if hasActiveMeeting() {
+                enqueueDeferredOutcome(resolvedSID)
+                return
+            }
+            guard hasPermittedOutcomeWriter else {
+                var fields = outcomeDiagnosticConfiguration(outcomeConfig)
+                fields["reason"] = "writerUnavailable"
+                AppDiagnostics.log("meeting-summary-skipped", fields)
+                return
+            }
+            if let currentSynced = replica.workspaceDoc.sessions[resolvedSID],
+               !OutcomeCoordinatorPolicy.canClaimGeneration(session: currentSynced, localDeviceID: deviceID) {
+                return
+            }
+            await generateOutcomeNow(sessionID: resolvedSID, automatic: true)
         }
-        if hasActiveMeeting() {
-            enqueueDeferredOutcome(resolvedSID)
-            return
+        if wantsExpert {
+            await autoCaptureExpertBlockIfNeeded(sessionID: resolvedSID)
         }
-
-        guard hasPermittedOutcomeWriter else {
-            var fields = outcomeDiagnosticConfiguration(outcomeConfig)
-            fields["reason"] = "writerUnavailable"
-            AppDiagnostics.log("meeting-summary-skipped", fields)
-            return
-        }
-        if let currentSynced = replica.workspaceDoc.sessions[resolvedSID],
-           !OutcomeCoordinatorPolicy.canClaimGeneration(session: currentSynced, localDeviceID: deviceID) {
-            return
-        }
-        await generateOutcomeNow(sessionID: resolvedSID, automatic: true)
     }
 
     func canonicalSessionID(for sessionID: UUID) -> UUID {
@@ -813,6 +832,9 @@ final class IOSWorkspaceCoordinator: ObservableObject {
 
     func generateOutcomeNow(sessionID: UUID, automatic: Bool = false) async {
         let sid = replica.workspaceDoc.resolveCanonicalSessionID(for: sessionID)
+        if automatic && effectiveCoreOutcomePolicy(for: sid) == .expertOnly {
+            return
+        }
         if automatic && hasActiveMeeting() {
             enqueueDeferredOutcome(sid)
             return
@@ -1055,28 +1077,37 @@ final class IOSWorkspaceCoordinator: ObservableObject {
                     candidates.append(add.snapshot)
                 }
             }
+            let corePolicy = effectiveCoreOutcomePolicy(for: sid)
+            let suppressDetails = corePolicy == .summaryOnly
             let summaryEdited = manualRegenerate || (prior?.summaryEdited ?? false)
             let decisionsEdited = manualRegenerate || (prior?.decisionsEdited ?? false)
             let questionsEdited = manualRegenerate || (prior?.questionsEdited ?? false)
+            let resolvedDecisions = suppressDetails ? [] : ((!automatic || prior?.decisionsEdited != true) ? result.decisions : (prior?.decisions ?? []))
+            let resolvedQuestions = suppressDetails ? [] : ((!automatic || prior?.questionsEdited != true) ? result.openQuestions : (prior?.openQuestions ?? []))
+            let resolvedTasks = suppressDetails ? [] : mappedTasks
+            let resolvedCandidates = suppressDetails ? [] : candidates
+            let resolvedCanonicalUpdates = suppressDetails ? [] : reconciliation.canonicalUpdates
+            let resolvedLinks = suppressDetails ? [] : reconciliation.links
+
             let newOutcome = IOSMeetingOutcomeItem(
                 outcomeID: outcomeID,
                 sessionID: sid,
                 state: "ready",
                 summary: (!automatic || prior?.summaryEdited != true) ? result.summary : (prior?.summary ?? ""),
-                decisions: (!automatic || prior?.decisionsEdited != true) ? result.decisions : (prior?.decisions ?? []),
-                openQuestions: (!automatic || prior?.questionsEdited != true) ? result.openQuestions : (prior?.openQuestions ?? []),
+                decisions: resolvedDecisions,
+                openQuestions: resolvedQuestions,
                 summaryEdited: summaryEdited,
                 decisionsEdited: decisionsEdited,
                 questionsEdited: questionsEdited,
                 coverageSeconds: duration,
                 writerTier: 1,
                 versions: Array(versions.suffix(8)),
-                reviewCandidates: candidates,
+                reviewCandidates: resolvedCandidates,
                 updatedAt: now
             )
 
             try await store.saveOutcome(newOutcome)
-            if !reviewingExisting { try await store.replaceTasks(for: sid, tasks: mappedTasks) }
+            if !reviewingExisting && !suppressDetails { try await store.replaceTasks(for: sid, tasks: resolvedTasks) }
 
             let syncedOutcome = SyncedMeetingOutcome(
                 outcomeID: outcomeID,
@@ -1096,12 +1127,12 @@ final class IOSWorkspaceCoordinator: ObservableObject {
                 isDeleted: SyncValue(false, version: v)
             )
             replica.workspaceDoc.upsertOutcome(syncedOutcome)
-            for t in reviewingExisting ? [] : mappedTasks {
+            for t in reviewingExisting ? [] : resolvedTasks {
                 let syncedTask = toSyncedTask(t, version: v)
                 replica.workspaceDoc.upsertTask(syncedTask)
             }
 
-            for update in reconciliation.canonicalUpdates {
+            for update in resolvedCanonicalUpdates {
                 if var existingTask = tasks.first(where: { $0.id == update.existingTaskID }) {
                     if let newStatus = update.newStatus {
                         existingTask.extended.workflowStatus = newStatus
@@ -1133,9 +1164,9 @@ final class IOSWorkspaceCoordinator: ObservableObject {
                     updateTaskInDocument(existingTask)
                 }
             }
-            if !reconciliation.links.isEmpty {
-                try? await store.saveTaskLinks(reconciliation.links)
-                for link in reconciliation.links {
+            if !resolvedLinks.isEmpty {
+                try? await store.saveTaskLinks(resolvedLinks)
+                for link in resolvedLinks {
                     replica.workspaceDoc.upsertTaskLink(link)
                 }
             }
@@ -1629,27 +1660,84 @@ final class IOSWorkspaceCoordinator: ObservableObject {
         return nil
     }
 
+    struct ResolvedAutoFacilitatorConfiguration: Equatable {
+        var skillID: String? = nil
+        var presetID: String? = nil
+        var engagementMode: AssistantEngagementMode? = nil
+        var coreOutcomePolicy: CoreOutcomePolicy? = nil
+        var exportDestinationID: UUID? = nil
+        var routeEntireMeeting: Bool? = nil
+    }
+
     func autoFacilitatorSkillID(seriesIDs: [String], roomKeys: [String]) -> String? {
+        autoFacilitatorConfiguration(seriesIDs: seriesIDs, roomKeys: roomKeys).skillID
+    }
+
+    func autoFacilitatorConfiguration(seriesIDs: [String], roomKeys: [String]) -> ResolvedAutoFacilitatorConfiguration {
         func sanitized(_ raw: String?) -> String? {
             guard let raw else { return nil }
             let slug = AssistantSkill.sanitizedSlug(from: raw)
             return slug.isEmpty ? nil : slug
         }
+        var result = ResolvedAutoFacilitatorConfiguration()
+        var scopes: [SyncedMeetingContextSettings] = []
         for sid in seriesIDs {
             let trimmed = sid.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmed.isEmpty else { continue }
-            if let slug = sanitized(settings(for: "series:" + trimmed)?.autoFacilitatorSkillID?.value) {
-                return slug
+            if !trimmed.isEmpty, let entry = settings(for: "series:" + trimmed) {
+                scopes.append(entry)
             }
         }
         for key in roomKeys {
             let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmed.isEmpty else { continue }
-            if let slug = sanitized(settings(for: "room:" + trimmed)?.autoFacilitatorSkillID?.value) {
-                return slug
+            if !trimmed.isEmpty, let entry = settings(for: "room:" + trimmed) {
+                scopes.append(entry)
             }
         }
-        return nil
+        if let allEntry = settings(for: "all") {
+            scopes.append(allEntry)
+        }
+        for entry in scopes {
+            if result.skillID == nil { result.skillID = sanitized(entry.autoFacilitatorSkillID?.value) }
+            if result.presetID == nil { result.presetID = sanitized(entry.autoFacilitatorPresetID?.value) }
+            if result.engagementMode == nil,
+               let raw = entry.autoEngagementMode?.value?.trimmingCharacters(in: .whitespacesAndNewlines),
+               let parsed = AssistantEngagementMode(rawValue: raw) {
+                result.engagementMode = parsed
+            }
+            if result.coreOutcomePolicy == nil,
+               let raw = entry.coreOutcomePolicy?.value?.trimmingCharacters(in: .whitespacesAndNewlines),
+               let parsed = CoreOutcomePolicy(rawValue: raw) {
+                result.coreOutcomePolicy = parsed
+            }
+            if result.exportDestinationID == nil,
+               let raw = entry.exportDestinationID?.value?.trimmingCharacters(in: .whitespacesAndNewlines),
+               let uuid = UUID(uuidString: raw) {
+                result.exportDestinationID = uuid
+            }
+            if result.routeEntireMeeting == nil {
+                result.routeEntireMeeting = entry.routeEntireMeeting?.value
+            }
+        }
+        return result
+    }
+
+    func effectiveCoreOutcomePolicy(for sessionID: UUID) -> CoreOutcomePolicy {
+        let canonical = replica.workspaceDoc.resolveCanonicalSessionID(for: sessionID)
+        let session = sessions.first(where: { $0.id == canonical || $0.id == sessionID })
+        let seriesIDs = [session?.externalSeriesID, session?.calendarSeriesID].compactMap { $0 }
+        let roomKeys = [session?.invitation?.absoluteString, session?.roomIdentity].compactMap { $0 }
+        let autoConfig = autoFacilitatorConfiguration(seriesIDs: seriesIDs, roomKeys: roomKeys)
+        let exportOverride = resolvedAutoExportOverrides(for: canonical).coreOutcomePolicy
+        let skillID = session?.dominantRole?.skillID ?? autoConfig.skillID
+        let presetID = session?.dominantRole?.presetID ?? autoConfig.presetID
+        let skill = skillID.flatMap { id in skillsController?.skills.first(where: { $0.id == id }) ?? DefaultAssistantSkills.skill(id: id) }
+        let preset = presetID.flatMap { pid in skillsController?.presets.first(where: { $0.id == pid && (skillID == nil || $0.skillID == skillID) }) }
+        return DominantRoleResolver.effectiveCoreOutcomePolicy(
+            dominantRole: session?.dominantRole,
+            skill: skill,
+            preset: preset,
+            perMeetingOverride: autoConfig.coreOutcomePolicy ?? exportOverride
+        )
     }
 
     func resolvedAutoExportOverrides(seriesIDs: [String], roomKeys: [String]) -> MeetingAutoExportOverrides {
@@ -1853,6 +1941,16 @@ final class IOSWorkspaceCoordinator: ObservableObject {
         updateAutoJoin: Bool = false,
         autoFacilitatorSkillID: String? = nil,
         updateAutoFacilitatorSkillID: Bool = false,
+        autoFacilitatorPresetID: String? = nil,
+        updateAutoFacilitatorPresetID: Bool = false,
+        autoEngagementMode: String? = nil,
+        updateAutoEngagementMode: Bool = false,
+        coreOutcomePolicy: String? = nil,
+        updateCoreOutcomePolicy: Bool = false,
+        exportDestinationID: String? = nil,
+        updateExportDestinationID: Bool = false,
+        routeEntireMeeting: Bool? = nil,
+        updateRouteEntireMeeting: Bool = false,
         jiraBoardURL: String? = nil,
         updateJiraBoardURL: Bool = false,
         jiraProjectKeys: [String]? = nil,
@@ -1888,6 +1986,28 @@ final class IOSWorkspaceCoordinator: ObservableObject {
         let nextAutoSkill = updateAutoFacilitatorSkillID
             ? nullableScalar(sanitizedSkill, existing?.autoFacilitatorSkillID)
             : existing?.autoFacilitatorSkillID
+        let sanitizedPreset = autoFacilitatorPresetID.flatMap { raw -> String? in
+            let slug = AssistantSkill.sanitizedSlug(from: raw)
+            return slug.isEmpty ? nil : slug
+        }
+        let nextAutoPreset = updateAutoFacilitatorPresetID
+            ? nullableScalar(sanitizedPreset, existing?.autoFacilitatorPresetID)
+            : existing?.autoFacilitatorPresetID
+        let trimmedAutoMode = autoEngagementMode?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let nextAutoMode = updateAutoEngagementMode
+            ? nullableScalar(trimmedAutoMode.flatMap { $0.isEmpty ? nil : $0 }, existing?.autoEngagementMode)
+            : existing?.autoEngagementMode
+        let trimmedPolicy = coreOutcomePolicy?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let nextPolicy = updateCoreOutcomePolicy
+            ? nullableScalar(trimmedPolicy.flatMap { $0.isEmpty ? nil : $0 }, existing?.coreOutcomePolicy)
+            : existing?.coreOutcomePolicy
+        let trimmedDestID = exportDestinationID?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let nextDestID = updateExportDestinationID
+            ? nullableScalar(trimmedDestID.flatMap { $0.isEmpty ? nil : $0 }, existing?.exportDestinationID)
+            : existing?.exportDestinationID
+        let nextRouteEntire = updateRouteEntireMeeting
+            ? nullableScalar(routeEntireMeeting, existing?.routeEntireMeeting)
+            : existing?.routeEntireMeeting
 
         let cleanedBoard = jiraBoardURL?.trimmingCharacters(in: .whitespacesAndNewlines)
         let normalizedBoard = cleanedBoard.flatMap { SyncedMeetingContextSettings.normalizedBoardURLString(from: $0) }
@@ -1940,6 +2060,11 @@ final class IOSWorkspaceCoordinator: ObservableObject {
             defaultReminderOverride: existing?.defaultReminderOverride,
             autoJoin: nextAutoJoin,
             autoFacilitatorSkillID: nextAutoSkill,
+            autoFacilitatorPresetID: nextAutoPreset,
+            autoEngagementMode: nextAutoMode,
+            coreOutcomePolicy: nextPolicy,
+            exportDestinationID: nextDestID,
+            routeEntireMeeting: nextRouteEntire,
             jiraBoardURL: nextBoardURL,
             jiraProjectKeys: nextProjectKeys,
             autoExportSettings: nextAutoExport,
@@ -1980,6 +2105,11 @@ final class IOSWorkspaceCoordinator: ObservableObject {
             defaultReminderOverride: existing?.defaultReminderOverride,
             autoJoin: existing?.autoJoin,
             autoFacilitatorSkillID: existing?.autoFacilitatorSkillID,
+            autoFacilitatorPresetID: existing?.autoFacilitatorPresetID,
+            autoEngagementMode: existing?.autoEngagementMode,
+            coreOutcomePolicy: existing?.coreOutcomePolicy,
+            exportDestinationID: existing?.exportDestinationID,
+            routeEntireMeeting: existing?.routeEntireMeeting,
             jiraBoardURL: existing?.jiraBoardURL,
             jiraProjectKeys: existing?.jiraProjectKeys,
             autoExportSettings: existing?.autoExportSettings,
@@ -2059,6 +2189,7 @@ final class IOSWorkspaceCoordinator: ObservableObject {
                 let hasSnapshots = relatedSnapshotSessionIDs(for: src.id, includeHistoryGroup: false).contains {
                     snapshotSessionIDs.contains($0)
                 }
+                let hasExperts = !(expertBlocksBySession[src.id]?.filter { !$0.isDeleted.value }.isEmpty ?? true)
                 return MeetingContentMeaningfulness.isMeaningful(
                     MeetingMeaningfulnessInput(
                         hasNotes: note?.isEmpty == false,
@@ -2070,6 +2201,7 @@ final class IOSWorkspaceCoordinator: ObservableObject {
                         isGeneratingOutcome: generatingSessionIDs.contains(src.id) || outcome?.state == "pending",
                         hasFailedOutcomeWithInput: hasFailedWithInput,
                         hasSnapshots: hasSnapshots,
+                        hasExpertBlocks: hasExperts,
                         transcriptTexts: texts
                     )
                 )
@@ -2678,6 +2810,12 @@ final class IOSWorkspaceCoordinator: ObservableObject {
                     links: Array(sessionLinks)
                 )
             }
+            for block in replica.workspaceDoc.expertBlocks(for: sid, includeDeleted: true) {
+                try? await store.upsertExpertBlock(block)
+            }
+            if let roleObs = replica.workspaceDoc.roleObservations[sid] {
+                try? await store.upsertRoleObservations(roleObs)
+            }
         }
         replica.lastExportedNoteMarkdown = exportedNotes
 
@@ -2714,6 +2852,12 @@ final class IOSWorkspaceCoordinator: ObservableObject {
                 if let claim = session.outcomeClaim {
                     existing.outcomeClaim = SyncValue(claim, version: replica.workspaceDoc.nextVersion())
                 }
+                if existing.dominantRole?.value != session.dominantRole {
+                    existing.dominantRole = SyncValue(session.dominantRole, version: replica.workspaceDoc.nextVersion())
+                }
+                if existing.roleSegments?.value != session.roleSegments {
+                    existing.roleSegments = SyncValue(session.roleSegments, version: replica.workspaceDoc.nextVersion())
+                }
             case .title:
                 existing.title = SyncValue(session.title, version: replica.workspaceDoc.nextVersion())
                 existing.hasTitleOverride = SyncValue(session.hasTitleOverride, version: replica.workspaceDoc.nextVersion())
@@ -2747,11 +2891,339 @@ final class IOSWorkspaceCoordinator: ObservableObject {
                 outcomeClaim: session.outcomeClaim.map { SyncValue($0, version: v) },
                 obsidianReceipt: session.obsidianReceipt.map { SyncValue($0, version: v) },
                 manualObsidianSaveAt: session.manualObsidianSaveAt.map { SyncValue($0, version: v) },
+                dominantRole: session.dominantRole.map { SyncValue($0, version: v) },
+                roleSegments: session.roleSegments.isEmpty ? nil : SyncValue(session.roleSegments, version: v),
                 isDeleted: SyncValue(false, version: v),
                 createdAt: session.createdAt,
                 updatedAt: session.updatedAt
             )
             replica.workspaceDoc.upsertSession(synced)
+        }
+    }
+
+    // MARK: - Role State, Observations & Expert Summaries
+
+    func setSessionRoleState(
+        sessionID: UUID,
+        dominantRole: DominantRoleBinding?,
+        roleSegments: [SessionRoleSegment]
+    ) async {
+        await loadReplicaFromDiskIfNeeded()
+        let sid = replica.workspaceDoc.resolveCanonicalSessionID(for: sessionID)
+        try? await store.setSessionRoleState(sid, dominantRole: dominantRole, roleSegments: roleSegments)
+        if var existing = replica.workspaceDoc.sessions[sid] {
+            existing.dominantRole = SyncValue(dominantRole, version: replica.workspaceDoc.nextVersion())
+            existing.roleSegments = SyncValue(roleSegments, version: replica.workspaceDoc.nextVersion())
+            existing.updatedAt = Date()
+            replica.workspaceDoc.upsertSession(existing)
+        }
+        try? await persistReplicaCheckpoint()
+        await reloadFromStore()
+        scheduleSync(delayMilliseconds: 250)
+    }
+
+    func upsertRoleObservations(_ log: SyncedRoleObservationLog) async {
+        await loadReplicaFromDiskIfNeeded()
+        let sid = replica.workspaceDoc.resolveCanonicalSessionID(for: log.sessionID)
+        var scoped = log
+        scoped.sessionID = sid
+        try? await store.upsertRoleObservations(scoped)
+        replica.workspaceDoc.upsertRoleObservations(scoped)
+        try? await persistReplicaCheckpoint()
+        await reloadFromStore()
+        scheduleSync(delayMilliseconds: 300)
+    }
+
+    func hasSpecialOrAdvisorRoleForAutoCapture(sessionID: UUID) -> Bool {
+        let sid = replica.workspaceDoc.resolveCanonicalSessionID(for: sessionID)
+        guard let session = sessions.first(where: { $0.id == sid || $0.id == sessionID }) else {
+            return false
+        }
+        if let dom = session.dominantRole {
+            if dom.skillID != AssistantSkill.personalAssistantID { return true }
+            if dom.mode == .observe || dom.mode == .advise || dom.mode == .facilitate { return true }
+        }
+        let seriesIDs = [session.externalSeriesID, session.calendarSeriesID].compactMap { $0 }
+        let roomKeys = [session.invitation?.absoluteString, session.roomIdentity].compactMap { $0 }
+        let cfg = autoFacilitatorConfiguration(seriesIDs: seriesIDs, roomKeys: roomKeys)
+        if let configured = cfg.skillID, configured != AssistantSkill.personalAssistantID {
+            return true
+        }
+        if let mode = cfg.engagementMode, mode == .observe || mode == .advise || mode == .facilitate {
+            return true
+        }
+        return false
+    }
+
+    func autoCaptureExpertBlockIfNeeded(sessionID: UUID) async {
+        let sid = replica.workspaceDoc.resolveCanonicalSessionID(for: sessionID)
+        guard let session = sessions.first(where: { $0.id == sid || $0.id == sessionID }) else { return }
+        let seriesIDs = [session.externalSeriesID, session.calendarSeriesID].compactMap { $0 }
+        let roomKeys = [session.invitation?.absoluteString, session.roomIdentity].compactMap { $0 }
+        let cfg = autoFacilitatorConfiguration(seriesIDs: seriesIDs, roomKeys: roomKeys)
+        let activeSkillID = session.dominantRole?.skillID ?? cfg.skillID ?? AssistantSkill.personalAssistantID
+        let activePresetID = session.dominantRole?.presetID ?? cfg.presetID
+        let activeMode = session.dominantRole?.mode ?? cfg.engagementMode ?? .off
+        let isSpecialRole = activeSkillID != AssistantSkill.personalAssistantID || activeMode == .observe || activeMode == .advise || activeMode == .facilitate
+        guard isSpecialRole else { return }
+        let existing = expertBlocksBySession[sid]?.filter { !$0.isDeleted.value } ?? []
+        if existing.contains(where: { $0.skillID == activeSkillID && $0.presetID == activePresetID }) {
+            return
+        }
+        guard let skill = skillsController?.skills.first(where: { $0.id == activeSkillID })
+            ?? DefaultAssistantSkills.skill(id: activeSkillID) else { return }
+        let preset = activePresetID.flatMap { pid in
+            skillsController?.presets.first(where: { $0.id == pid && $0.skillID == activeSkillID })
+        }
+        guard hasPermittedOutcomeWriter else { return }
+        _ = try? await generateExpertSummary(
+            sessionID: sid,
+            skill: skill,
+            preset: preset,
+            focusSpeakers: [],
+            adHocContext: "",
+            makePrimary: true,
+            exportDestinationID: cfg.exportDestinationID,
+            routeEntireMeeting: cfg.routeEntireMeeting,
+            existingBlock: nil
+        )
+    }
+
+    @discardableResult
+    func generateExpertSummary(
+        sessionID: UUID,
+        skill: AssistantSkill,
+        preset: AssistantRolePreset? = nil,
+        focusSpeakers: [String] = [],
+        adHocContext: String = "",
+        makePrimary: Bool = true,
+        exportDestinationID: UUID? = nil,
+        routeEntireMeeting: Bool? = nil,
+        existingBlock: SyncedMeetingExpertBlock? = nil
+    ) async throws -> SyncedMeetingExpertBlock {
+        await loadReplicaFromDiskIfNeeded()
+        let sid = replica.workspaceDoc.resolveCanonicalSessionID(for: sessionID)
+        let config = try permittedAIConfiguration()
+        generatingExpertSessionIDs.insert(sid)
+        expertSummaryErrors[sid] = nil
+        defer { generatingExpertSessionIDs.remove(sid) }
+
+        do {
+            guard let session = sessions.first(where: { $0.id == sid || $0.id == sessionID }) else {
+                throw PortableOutcomeError.noMeetingContent
+            }
+            let (events, _) = await transcriptForDisplay(sessionID: sid)
+            let notes = noteDraft(for: sid)
+            let obsItems = roleObservationsBySession[sid]?.items ?? []
+            let pinnedObs = obsItems.filter { $0.skillID == skill.id && $0.isPinned && !$0.isDismissed }
+            let dismissedObs = obsItems.filter { $0.skillID == skill.id && $0.isDismissed }
+            let resolvedFocus = !focusSpeakers.isEmpty
+                ? focusSpeakers
+                : (existingBlock?.contextSnapshot.value.focusSpeakers ?? [])
+            let resolvedContext = !adHocContext.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                ? adHocContext.trimmingCharacters(in: .whitespacesAndNewlines)
+                : (existingBlock?.contextSnapshot.value.adHocContext ?? "")
+            let finalFocus = !resolvedFocus.isEmpty
+                ? resolvedFocus
+                : (skill.id == "hiring-interviewer"
+                    ? Array(FullTranscriptEvaluationWindowBuilder.detectedExternalSpeakers(
+                        events: events,
+                        localNames: taskProfile.aliases,
+                        teamMemberNames: skillsController?.people.entries.map(\.displayName) ?? []
+                    ).prefix(2))
+                    : [])
+
+            let window = FullTranscriptEvaluationWindowBuilder.build(
+                events: events,
+                notes: notes,
+                snapshotCaptions: [],
+                focusSpeakers: finalFocus,
+                focusSpeakerRole: preset?.focusSpeakerRole ?? "",
+                localNames: taskProfile.aliases,
+                teamMemberNames: skillsController?.people.entries.map(\.displayName) ?? [],
+                contextTokens: config.contextTokens,
+                onDevice: config.providerKind == .appleOnDevice
+            )
+            let language = MeetingLanguageResolver.resolve(
+                events: events,
+                notes: notes,
+                title: session.title,
+                appLanguage: Localization.preferredAppLanguageCode()
+            )
+            let service = PortableExpertEvaluationService(apiKeyProvider: { [keychain] kind in
+                keychain.read(kind: kind)
+            })
+            let result = try await service.generateExpertBlock(
+                meetingTitle: session.title,
+                endedAt: session.endedAt ?? Date(),
+                skill: skill,
+                preset: preset,
+                adHocContext: resolvedContext,
+                focusSpeakers: finalFocus,
+                window: window,
+                notes: notes,
+                pinnedObservations: pinnedObs,
+                dismissedObservations: dismissedObs,
+                snapshotCaptions: [],
+                language: language,
+                configuration: config
+            )
+
+            var resolvedCitations: [String: [String]] = [:]
+            for (heading, refs) in result.citations {
+                resolvedCitations[heading] = refs.compactMap { window.refToEventID[$0] ?? $0 }
+            }
+            let presetSlug = preset?.exportDestinationSlug.flatMap { $0.isEmpty ? nil : $0 }
+            let skillSlug = skill.exportDestinationSlug.flatMap { $0.isEmpty ? nil : $0 }
+            let destSlug = presetSlug ?? skillSlug
+            let matchedDestID = destSlug.flatMap { slug in
+                skillsController?.syncedVaultDestinations.first(where: { $0.slug == slug })?.id
+            }
+            let resolvedDestID = exportDestinationID ?? existingBlock?.exportDestinationID.value ?? matchedDestID
+            let resolvedRouteEntire = routeEntireMeeting
+                ?? existingBlock?.routeEntireMeeting.value
+                ?? preset?.routeEntireMeeting
+                ?? skill.routeEntireMeeting
+
+            let targetBlockID = existingBlock?.id
+                ?? expertBlocksBySession[sid]?.first(where: { !$0.isDeleted.value && $0.skillID == skill.id && $0.presetID == preset?.id })?.id
+                ?? UUID()
+            let now = Date()
+            var updatedVersions = existingBlock?.versions ?? []
+            if let prev = existingBlock, !prev.markdownBody.value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                updatedVersions.insert(
+                    ExpertBlockVersionSnapshot(
+                        revision: updatedVersions.count + 1,
+                        headlineVerdict: prev.headlineVerdict.value,
+                        markdownBody: prev.markdownBody.value,
+                        savedAt: prev.updatedAt,
+                        deviceID: deviceID
+                    ),
+                    at: 0
+                )
+                if updatedVersions.count > 5 { updatedVersions = Array(updatedVersions.prefix(5)) }
+            }
+            let v = replica.workspaceDoc.nextVersion()
+            let baseTitle = preset.map { "\(skill.resolvedSummaryBlockTitle) — \($0.name)" } ?? skill.resolvedSummaryBlockTitle
+            let snapshot = RoleContextSnapshot(
+                skillID: skill.id,
+                skillName: skill.name,
+                presetID: preset?.id,
+                presetName: preset?.name,
+                focusSpeakers: finalFocus,
+                adHocContext: resolvedContext,
+                rubricDimensions: preset?.rubricDimensions ?? [],
+                instructionsDigest: AssistantCloudSync.skillDigest(skill),
+                capturedInstructions: [skill.instructions, preset?.instructions ?? ""]
+                    .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+                    .joined(separator: "\n\n")
+            )
+            let block = SyncedMeetingExpertBlock(
+                id: targetBlockID,
+                sessionID: sid,
+                skillID: skill.id,
+                presetID: preset?.id,
+                title: SyncValue(baseTitle, version: v),
+                visibility: SyncValue(skill.summaryVisibility, version: v),
+                headlineVerdict: SyncValue(result.headlineVerdict, version: v),
+                markdownBody: SyncValue(result.markdownBody, version: v),
+                isEdited: false,
+                contextSnapshot: SyncValue(snapshot, version: v),
+                citations: SyncValue(resolvedCitations, version: v),
+                exportDestinationID: SyncValue(resolvedDestID, version: v),
+                routeEntireMeeting: SyncValue(resolvedRouteEntire, version: v),
+                sourceCoverageLabel: window.sourceCoverageLabel,
+                transcriptFingerprint: window.fingerprint,
+                versions: updatedVersions,
+                isDeleted: SyncValue(false, version: v),
+                createdAt: existingBlock?.createdAt ?? now,
+                updatedAt: now
+            )
+            let nextDominant = DominantRoleResolver.resolveRetroactiveAdd(
+                existingDominant: session.dominantRole,
+                newBlock: block,
+                coreOutcomePolicy: preset?.coreOutcomePolicy ?? skill.coreOutcomePolicy,
+                makePrimary: makePrimary,
+                at: now
+            )
+            try? await store.upsertExpertBlock(block)
+            replica.workspaceDoc.upsertExpertBlock(block)
+            await setSessionRoleState(sessionID: sid, dominantRole: nextDominant, roleSegments: session.roleSegments)
+            return block
+        } catch {
+            expertSummaryErrors[sid] = error.localizedDescription
+            throw error
+        }
+    }
+
+    func setPrimaryExpertBlock(sessionID: UUID, blockID: UUID) async throws {
+        await loadReplicaFromDiskIfNeeded()
+        let sid = replica.workspaceDoc.resolveCanonicalSessionID(for: sessionID)
+        guard let session = sessions.first(where: { $0.id == sid || $0.id == sessionID }),
+              let block = expertBlocksBySession[sid]?.first(where: { $0.id == blockID && !$0.isDeleted.value }) else {
+            return
+        }
+        let skill = skillsController?.skills.first(where: { $0.id == block.skillID }) ?? DefaultAssistantSkills.skill(id: block.skillID)
+        let preset = block.presetID.flatMap { pid in skillsController?.presets.first(where: { $0.id == pid && $0.skillID == block.skillID }) }
+        let policy = preset?.coreOutcomePolicy ?? skill?.coreOutcomePolicy ?? .full
+        let nextDom = DominantRoleResolver.setPrimary(
+            block: block,
+            coreOutcomePolicy: policy,
+            existingMode: session.dominantRole?.mode ?? .off
+        )
+        await setSessionRoleState(sessionID: sid, dominantRole: nextDom, roleSegments: session.roleSegments)
+    }
+
+    func updateExpertBlockMarkdown(sessionID: UUID, blockID: UUID, headlineVerdict: String?, markdownBody: String) async throws {
+        await loadReplicaFromDiskIfNeeded()
+        let sid = replica.workspaceDoc.resolveCanonicalSessionID(for: sessionID)
+        guard var block = expertBlocksBySession[sid]?.first(where: { $0.id == blockID }) else { return }
+        let now = Date()
+        var versions = block.versions
+        if !block.markdownBody.value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            versions.insert(
+                ExpertBlockVersionSnapshot(
+                    revision: versions.count + 1,
+                    headlineVerdict: block.headlineVerdict.value,
+                    markdownBody: block.markdownBody.value,
+                    savedAt: block.updatedAt,
+                    deviceID: deviceID
+                ),
+                at: 0
+            )
+            if versions.count > 5 { versions = Array(versions.prefix(5)) }
+        }
+        let v = replica.workspaceDoc.nextVersion()
+        block.headlineVerdict = SyncValue(headlineVerdict, version: v)
+        block.markdownBody = SyncValue(markdownBody, version: v)
+        block.isEdited = true
+        block.versions = versions
+        block.updatedAt = now
+        try? await store.upsertExpertBlock(block)
+        replica.workspaceDoc.upsertExpertBlock(block)
+        try? await persistReplicaCheckpoint()
+        await reloadFromStore()
+        scheduleSync(delayMilliseconds: 250)
+    }
+
+    func deleteExpertBlock(sessionID: UUID, blockID: UUID) async throws {
+        await loadReplicaFromDiskIfNeeded()
+        let sid = replica.workspaceDoc.resolveCanonicalSessionID(for: sessionID)
+        guard var block = expertBlocksBySession[sid]?.first(where: { $0.id == blockID }) else { return }
+        let v = replica.workspaceDoc.nextVersion()
+        block.isDeleted = SyncValue(true, version: v)
+        block.updatedAt = Date()
+        try? await store.upsertExpertBlock(block)
+        replica.workspaceDoc.upsertExpertBlock(block)
+        if let session = sessions.first(where: { $0.id == sid || $0.id == sessionID }),
+           session.dominantRole?.expertBlockID == blockID {
+            var nextDom = session.dominantRole
+            nextDom?.expertBlockID = nil
+            await setSessionRoleState(sessionID: sid, dominantRole: nextDom, roleSegments: session.roleSegments)
+        } else {
+            try? await persistReplicaCheckpoint()
+            await reloadFromStore()
+            scheduleSync(delayMilliseconds: 250)
         }
     }
 

@@ -261,6 +261,11 @@ final class MacWorkspaceSyncCoordinator: ObservableObject {
         var people: [String]?
         var autoJoin: Bool?
         var autoFacilitatorSkillID: String?
+        var autoFacilitatorPresetID: String? = nil
+        var autoEngagementMode: String? = nil
+        var coreOutcomePolicyOverride: String? = nil
+        var exportDestinationIDOverride: String? = nil
+        var routeEntireMeetingOverride: Bool? = nil
         var jiraBoardURL: String?
         var jiraProjectKeys: [String]?
         var autoExportOverrides: MeetingAutoExportOverrides = .init()
@@ -1424,6 +1429,14 @@ final class MacWorkspaceSyncCoordinator: ObservableObject {
                     existing.obsidianReceipt = SyncValue(receipt, version: replica.workspaceDoc.nextVersion())
                     changed = true
                 }
+                if let dom = session.dominantRole, existing.dominantRole?.value != dom {
+                    existing.dominantRole = SyncValue(dom, version: replica.workspaceDoc.nextVersion())
+                    changed = true
+                }
+                if !session.roleSegments.isEmpty, existing.roleSegments?.value != session.roleSegments {
+                    existing.roleSegments = SyncValue(session.roleSegments, version: replica.workspaceDoc.nextVersion())
+                    changed = true
+                }
                 if changed {
                     existing.updatedAt = max(existing.updatedAt, session.updatedAt)
                     replica.workspaceDoc.upsertSession(existing)
@@ -1453,6 +1466,8 @@ final class MacWorkspaceSyncCoordinator: ObservableObject {
                     startProvenance: session.startProvenance?.rawValue,
                     legs: legs,
                     obsidianReceipt: receipt.map { SyncValue($0, version: v) },
+                    dominantRole: session.dominantRole.map { SyncValue($0, version: v) },
+                    roleSegments: session.roleSegments.isEmpty ? nil : SyncValue(session.roleSegments, version: v),
                     isDeleted: SyncValue(false, version: v),
                     createdAt: session.createdAt,
                     updatedAt: session.updatedAt
@@ -1497,6 +1512,19 @@ final class MacWorkspaceSyncCoordinator: ObservableObject {
 
         if !snapshot.taskLinks.isEmpty {
             _ = replica.workspaceDoc.mergeLibraryRecords(snapshot.taskLinks.map { .taskLink($0) })
+        }
+
+        for block in snapshot.expertBlocks {
+            let canonicalID = replica.workspaceDoc.resolveCanonicalSessionID(for: block.sessionID)
+            var normalized = block
+            normalized.sessionID = canonicalID
+            replica.workspaceDoc.upsertExpertBlock(normalized)
+        }
+        for obs in snapshot.roleObservations {
+            let canonicalID = replica.workspaceDoc.resolveCanonicalSessionID(for: obs.sessionID)
+            var normalized = obs
+            normalized.sessionID = canonicalID
+            replica.workspaceDoc.upsertRoleObservations(normalized)
         }
     }
 
@@ -1709,6 +1737,11 @@ final class MacWorkspaceSyncCoordinator: ObservableObject {
                     people: preset?.people,
                     autoJoin: preset?.autoJoin,
                     autoFacilitatorSkillID: preset?.autoFacilitatorSkillID,
+                    autoFacilitatorPresetID: preset?.autoFacilitatorPresetID,
+                    autoEngagementMode: preset?.autoEngagementMode?.rawValue,
+                    coreOutcomePolicyOverride: preset?.coreOutcomePolicyOverride?.rawValue ?? preset?.autoExportOverrides.coreOutcomePolicy?.rawValue,
+                    exportDestinationIDOverride: preset?.exportDestinationIDOverride?.uuidString,
+                    routeEntireMeetingOverride: preset?.routeEntireMeetingOverride,
                     jiraBoardURL: preset?.jiraBoardURL,
                     jiraProjectKeys: preset?.jiraProjectKeys,
                     autoExportOverrides: preset?.autoExportOverrides ?? .init(),
@@ -1730,6 +1763,11 @@ final class MacWorkspaceSyncCoordinator: ObservableObject {
                     people: preset?.people,
                     autoJoin: preset?.autoJoin,
                     autoFacilitatorSkillID: preset?.autoFacilitatorSkillID,
+                    autoFacilitatorPresetID: preset?.autoFacilitatorPresetID,
+                    autoEngagementMode: preset?.autoEngagementMode?.rawValue,
+                    coreOutcomePolicyOverride: preset?.coreOutcomePolicyOverride?.rawValue ?? preset?.autoExportOverrides.coreOutcomePolicy?.rawValue,
+                    exportDestinationIDOverride: preset?.exportDestinationIDOverride?.uuidString,
+                    routeEntireMeetingOverride: preset?.routeEntireMeetingOverride,
                     jiraBoardURL: preset?.jiraBoardURL,
                     jiraProjectKeys: preset?.jiraProjectKeys,
                     autoExportOverrides: preset?.autoExportOverrides ?? .init(),
@@ -1816,6 +1854,11 @@ final class MacWorkspaceSyncCoordinator: ObservableObject {
                 defaultReminderOverride: existing?.defaultReminderOverride,
                 autoJoin: syncNullable(fp.autoJoin, old: existing?.autoJoin),
                 autoFacilitatorSkillID: syncNullable(fp.autoFacilitatorSkillID, old: existing?.autoFacilitatorSkillID),
+                autoFacilitatorPresetID: syncNullable(fp.autoFacilitatorPresetID, old: existing?.autoFacilitatorPresetID),
+                autoEngagementMode: syncNullable(fp.autoEngagementMode, old: existing?.autoEngagementMode),
+                coreOutcomePolicy: syncNullable(fp.coreOutcomePolicyOverride, old: existing?.coreOutcomePolicy),
+                exportDestinationID: syncNullable(fp.exportDestinationIDOverride, old: existing?.exportDestinationID),
+                routeEntireMeeting: syncNullable(fp.routeEntireMeetingOverride, old: existing?.routeEntireMeeting),
                 jiraBoardURL: syncNullable(normalizedBoardURL, old: existing?.jiraBoardURL),
                 jiraProjectKeys: syncNullable(normalizedProjectKeys, old: existing?.jiraProjectKeys),
                 autoExportSettings: syncedAutoExport,
@@ -1895,6 +1938,8 @@ final class MacWorkspaceSyncCoordinator: ObservableObject {
             let sessionLinks = replica.workspaceDoc.taskLinks.values.filter {
                 replica.workspaceDoc.resolveCanonicalSessionID(for: $0.sessionID) == sessionID
             }
+            let sessionExpertBlocks = replica.workspaceDoc.expertBlocks(for: sessionID, includeDeleted: true)
+            let sessionRoleObs = replica.workspaceDoc.roleObservations[sessionID]
 
             let bundleResult = try await store.applyRemoteSessionBundle(
                 sessionID: sessionID,
@@ -1903,6 +1948,8 @@ final class MacWorkspaceSyncCoordinator: ObservableObject {
                 outcome: sessionOutcome,
                 tasks: Array(sessionTasks),
                 links: Array(sessionLinks),
+                expertBlocks: sessionExpertBlocks,
+                roleObservations: sessionRoleObs,
                 localDeviceID: deviceID,
                 alreadyMergedFromLocalMarkdown: preMergeLocalNoteMarkdown[sessionID],
                 syncBaseMarkdown: replica.workspaceDoc.noteBases[sessionID]?.markdown
@@ -2135,6 +2182,11 @@ final class MacWorkspaceSyncCoordinator: ObservableObject {
             settings.suggestReplies?.value != nil ||
             settings.autoJoin?.value != nil ||
             (settings.autoFacilitatorSkillID?.value.map { !$0.isEmpty } ?? false) ||
+            (settings.autoFacilitatorPresetID?.value.map { !$0.isEmpty } ?? false) ||
+            (settings.autoEngagementMode?.value.map { !$0.isEmpty } ?? false) ||
+            (settings.coreOutcomePolicy?.value.map { !$0.isEmpty } ?? false) ||
+            (settings.exportDestinationID?.value.map { !$0.isEmpty } ?? false) ||
+            settings.routeEntireMeeting?.value != nil ||
             (settings.jiraBoardURL?.value.map { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty } ?? false) ||
             (settings.jiraProjectKeys?.value.map { !$0.isEmpty } ?? false) ||
             (settings.autoExportSettings?.hasAnyExplicitOverride ?? false)
@@ -2161,6 +2213,23 @@ final class MacWorkspaceSyncCoordinator: ObservableObject {
         if let skillBox = settings.autoFacilitatorSkillID {
             let trimmed = skillBox.value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             preset.autoFacilitatorSkillID = trimmed.isEmpty ? nil : trimmed
+        }
+        if let presetBox = settings.autoFacilitatorPresetID {
+            let trimmed = presetBox.value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            preset.autoFacilitatorPresetID = trimmed.isEmpty ? nil : trimmed
+        }
+        if let modeBox = settings.autoEngagementMode {
+            preset.autoEngagementMode = modeBox.value.flatMap(AssistantEngagementMode.init(rawValue:))
+        }
+        if let policyBox = settings.coreOutcomePolicy {
+            preset.coreOutcomePolicyOverride = policyBox.value.flatMap(CoreOutcomePolicy.init(rawValue:))
+            preset.autoExportOverrides.coreOutcomePolicy = preset.coreOutcomePolicyOverride
+        }
+        if let destBox = settings.exportDestinationID {
+            preset.exportDestinationIDOverride = destBox.value.flatMap(UUID.init(uuidString:))
+        }
+        if let routeBox = settings.routeEntireMeeting {
+            preset.routeEntireMeetingOverride = routeBox.value
         }
         if let boardBox = settings.jiraBoardURL {
             let trimmed = boardBox.value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""

@@ -4,6 +4,8 @@ struct ObsidianSettingsView: View {
     @ObservedObject var coordinator: ObsidianExportCoordinator
     @State private var confirmHeld = false
     @State private var configureLayout = false
+    @State private var secondaryLayoutTarget: ObsidianDestinationRecord?
+    @State private var newSecondaryName = ""
     @State private var confirmDisconnectVault = false
 
     var body: some View {
@@ -85,9 +87,79 @@ struct ObsidianSettingsView: View {
                 Text(L("The main switch pauses all automatic exports. Manual Markdown export works without Obsidian."))
                     .font(.caption)
             }
+
+            Section {
+                ForEach(coordinator.secondaryDestinations) { dest in
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack {
+                            TextField(L("Vault name"), text: Binding(
+                                get: { dest.name },
+                                set: { newName in
+                                    var updated = dest
+                                    updated.name = newName
+                                    coordinator.updateSecondaryDestination(updated)
+                                }
+                            ))
+                            Button(L("Remove"), role: .destructive) {
+                                coordinator.removeSecondaryDestination(id: dest.id)
+                            }
+                        }
+                        Toggle(L("Enabled"), isOn: Binding(
+                            get: { dest.enabled },
+                            set: { enabled in
+                                var updated = dest
+                                updated.enabled = enabled
+                                coordinator.updateSecondaryDestination(updated)
+                            }
+                        ))
+                        Toggle(L("Save to vault after the meeting"), isOn: Binding(
+                            get: { dest.saveAfterMeeting },
+                            set: { value in
+                                var updated = dest
+                                updated.saveAfterMeeting = value
+                                coordinator.updateSecondaryDestination(updated)
+                            }
+                        ))
+                        Toggle(L("Load skills & role presets from this vault"), isOn: Binding(
+                            get: { dest.loadsSkills },
+                            set: { value in
+                                var updated = dest
+                                updated.loadsSkills = value
+                                coordinator.updateSecondaryDestination(updated)
+                            }
+                        ))
+                        HStack {
+                            if let url = dest.vaultBookmark.flatMap(ObsidianVaultAccess.bookmarkedURL) {
+                                Text(url.lastPathComponent).font(.caption).foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Button(L("Choose Folder…")) {
+                                coordinator.chooseVault(forSecondaryID: dest.id)
+                            }
+                            Button(L("Format…")) {
+                                secondaryLayoutTarget = dest
+                            }
+                        }
+                    }
+                    .padding(.vertical, 4)
+                }
+                HStack {
+                    TextField(L("New secondary repo or vault name"), text: $newSecondaryName)
+                    Button(L("Add Vault…")) {
+                        coordinator.addSecondaryVault(name: newSecondaryName)
+                        newSecondaryName = ""
+                    }
+                }
+            } header: {
+                Text(L("Secondary & Role Vaults"))
+            } footer: {
+                Text(L("Dedicated Git repos or secondary Obsidian vaults can receive role-routed meetings and supply extra Skills & Role Presets."))
+                    .font(.caption)
+            }
         }
         .formStyle(.grouped).nativeSettingsReveal()
         .sheet(isPresented: $configureLayout) { ObsidianLayoutSettingsView(coordinator: coordinator) }
+        .sheet(item: $secondaryLayoutTarget) { target in ObsidianLayoutSettingsView(coordinator: coordinator, targetDestination: target) }
         .sheet(isPresented: $confirmHeld) { ObsidianHeldExportsView(coordinator: coordinator) }
         .onAppear { coordinator.load(); coordinator.startStatusLoop() }
         .onDisappear { coordinator.stopStatusLoop() }

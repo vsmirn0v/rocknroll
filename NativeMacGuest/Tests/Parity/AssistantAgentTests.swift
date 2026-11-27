@@ -674,6 +674,9 @@ final class AssistantAgentTests: XCTestCase {
         func controlBoard(_: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON { [:] }
         func joinMeetings(_: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON { [:] }
         func jiraAction(_: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON { [:] }
+        func listRolePresets(_: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON { ["items": []] }
+        func listExpertOpinions(_: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON { ["items": []] }
+        func generateExpertOpinion(_: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON { [:] }
     }
 
     /// Read-only tools only, `run_assistant` excluded, all namespaced `mcp__*`.
@@ -1063,6 +1066,8 @@ final class AssistantAgentTests: XCTestCase {
             XCTAssertTrue(readNames.contains("rocknroll_list_skills"))
             XCTAssertTrue(readNames.contains("rocknroll_get_skill"))
             XCTAssertTrue(readNames.contains("rocknroll_search_knowledge"))
+            XCTAssertTrue(readNames.contains("rocknroll_list_role_presets"))
+            XCTAssertTrue(readNames.contains("rocknroll_list_expert_opinions"))
             XCTAssertFalse(readNames.contains("rocknroll_create_task"))
             XCTAssertFalse(readNames.contains("rocknroll_control_board"))
             XCTAssertFalse(readNames.contains("rocknroll_join_meetings"))
@@ -1082,6 +1087,7 @@ final class AssistantAgentTests: XCTestCase {
             XCTAssertTrue(fullNames.contains("rocknroll_schedule_meeting"))
             XCTAssertTrue(fullNames.contains("rocknroll_update_meeting_artifacts"))
             XCTAssertTrue(fullNames.contains("rocknroll_upsert_skill"))
+            XCTAssertTrue(fullNames.contains("rocknroll_generate_expert_opinion"))
             XCTAssertTrue(fullNames.contains("rocknroll_manage_people"))
             XCTAssertTrue(fullNames.contains("rocknroll_control_board"))
             XCTAssertTrue(fullNames.contains("rocknroll_join_meetings"))

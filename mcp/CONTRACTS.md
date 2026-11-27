@@ -167,6 +167,11 @@ Read-only tools (scope `meetings:read`) exposing Obsidian-backed skills (`Skills
 - `rocknroll_join_meetings` (`meetings:control`): batch-joins one or more meetings by title/keyword queries and binds an Obsidian skill + voice facilitation.
 - `rocknroll_jira_action` (`tasks:write`): searches Jira issues via JQL/query (`operation: "search"`) or posts a comment on an issue (`operation: "comment"`).
 
+### rocknroll_list_role_presets / rocknroll_list_expert_opinions / rocknroll_generate_expert_opinion
+- `rocknroll_list_role_presets` (`meetings:read`): lists Markdown Role Presets under `Presets/<skill_id>/`; optional `skill_id`.
+- `rocknroll_list_expert_opinions` (`meetings:read`): lists Primary & Secondary Expert Opinion blocks and dominant role governance for `session_id`*.
+- `rocknroll_generate_expert_opinion` (`tasks:write`): generates or regenerates an Expert Opinion block (`action_id`*, `session_id`*, `skill_id`*, `preset_id?`, `focus_speakers?`, `extra_context?`, `make_primary?`).
+
 ### rocknroll_update_settings
 Shows a native approval dialog; denied calls are recorded as `rejected`.
 

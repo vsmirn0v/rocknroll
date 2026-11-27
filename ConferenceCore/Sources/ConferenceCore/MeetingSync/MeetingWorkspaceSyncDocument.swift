@@ -12,12 +12,38 @@ public struct MeetingWorkspaceSyncDocument: Codable, Equatable, Sendable {
     public private(set) var taskLinks: [String: SyncedTaskLink] = [:]
     public private(set) var taskProfiles: [String: SyncedTaskProfile] = [:]
     public private(set) var contextSettings: [String: SyncedMeetingContextSettings] = [:]
+    public private(set) var expertBlocks: [UUID: SyncedMeetingExpertBlock] = [:]
+    public private(set) var roleObservations: [UUID: SyncedRoleObservationLog] = [:]
     public private(set) var transcriptChunks: [String: SyncedTranscriptChunk] = [:]
     /// Maps CloudKit transcript record ID (`"transcript:<session>:<device>:<chunk>"`) to session start date for retention pruning.
     public private(set) var cloudTranscriptIndex: [String: Date] = [:]
 
     public init(device: String = UUID().uuidString) {
         self.device = device
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case device, counter, sessions, notes, noteBases, outcomes, tasks
+        case taskLinks, taskProfiles, contextSettings, expertBlocks, roleObservations
+        case transcriptChunks, cloudTranscriptIndex
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        device = try c.decode(String.self, forKey: .device)
+        counter = try c.decodeIfPresent(Int64.self, forKey: .counter) ?? 0
+        sessions = try c.decodeIfPresent([UUID: SyncedMeetingSession].self, forKey: .sessions) ?? [:]
+        notes = try c.decodeIfPresent([UUID: SyncedMeetingNote].self, forKey: .notes) ?? [:]
+        noteBases = try c.decodeIfPresent([UUID: NoteBaseSnapshot].self, forKey: .noteBases) ?? [:]
+        outcomes = try c.decodeIfPresent([UUID: SyncedMeetingOutcome].self, forKey: .outcomes) ?? [:]
+        tasks = try c.decodeIfPresent([UUID: SyncedMeetingTask].self, forKey: .tasks) ?? [:]
+        taskLinks = try c.decodeIfPresent([String: SyncedTaskLink].self, forKey: .taskLinks) ?? [:]
+        taskProfiles = try c.decodeIfPresent([String: SyncedTaskProfile].self, forKey: .taskProfiles) ?? [:]
+        contextSettings = try c.decodeIfPresent([String: SyncedMeetingContextSettings].self, forKey: .contextSettings) ?? [:]
+        expertBlocks = try c.decodeIfPresent([UUID: SyncedMeetingExpertBlock].self, forKey: .expertBlocks) ?? [:]
+        roleObservations = try c.decodeIfPresent([UUID: SyncedRoleObservationLog].self, forKey: .roleObservations) ?? [:]
+        transcriptChunks = try c.decodeIfPresent([String: SyncedTranscriptChunk].self, forKey: .transcriptChunks) ?? [:]
+        cloudTranscriptIndex = try c.decodeIfPresent([String: Date].self, forKey: .cloudTranscriptIndex) ?? [:]
     }
 
     public mutating func nextVersion() -> SyncVersion {
@@ -170,6 +196,34 @@ public struct MeetingWorkspaceSyncDocument: Codable, Equatable, Sendable {
         var adjusted = chunk
         adjusted.sessionID = sid
         transcriptChunks[adjusted.id] = transcriptChunks[adjusted.id]?.merging(adjusted) ?? adjusted
+    }
+
+    public mutating func upsertExpertBlock(_ block: SyncedMeetingExpertBlock) {
+        counter = max(counter, block.maximumCounter)
+        let sid = resolveCanonicalSessionID(for: block.sessionID)
+        var adjusted = block
+        adjusted.sessionID = sid
+        expertBlocks[adjusted.id] = expertBlocks[adjusted.id]?.merging(adjusted) ?? adjusted
+    }
+
+    public func expertBlocks(for sessionID: UUID, includeDeleted: Bool = false) -> [SyncedMeetingExpertBlock] {
+        let sid = resolveCanonicalSessionID(for: sessionID)
+        return expertBlocks.values
+            .filter { (includeDeleted || !$0.isDeleted.value) && resolveCanonicalSessionID(for: $0.sessionID) == sid }
+            .sorted { ($0.createdAt, $0.id.uuidString) < ($1.createdAt, $1.id.uuidString) }
+    }
+
+    public mutating func upsertRoleObservations(_ log: SyncedRoleObservationLog) {
+        counter = max(counter, log.maximumCounter)
+        let sid = resolveCanonicalSessionID(for: log.sessionID)
+        var adjusted = log
+        adjusted.sessionID = sid
+        adjusted.items = adjusted.items.map { item in
+            var copy = item
+            copy.sessionID = sid
+            return copy
+        }
+        roleObservations[sid] = roleObservations[sid]?.merging(adjusted) ?? adjusted
     }
 
     public mutating func markTranscriptUploaded(recordID: String, sessionStartedAt: Date) {
@@ -416,6 +470,21 @@ public struct MeetingWorkspaceSyncDocument: Codable, Equatable, Sendable {
             chunk.sessionID = winnerID
             transcriptChunks[chunk.id] = transcriptChunks[chunk.id]?.merging(chunk) ?? chunk
         }
+
+        for (blockID, var block) in expertBlocks where block.sessionID == loserID {
+            block.sessionID = winnerID
+            expertBlocks[blockID] = block
+        }
+
+        if var loserObs = roleObservations.removeValue(forKey: loserID) {
+            loserObs.sessionID = winnerID
+            loserObs.items = loserObs.items.map { item in
+                var copy = item
+                copy.sessionID = winnerID
+                return copy
+            }
+            roleObservations[winnerID] = roleObservations[winnerID]?.merging(loserObs) ?? loserObs
+        }
     }
 
     public struct LibraryMergeOutcome: Equatable, Sendable {
@@ -538,6 +607,31 @@ public struct MeetingWorkspaceSyncDocument: Codable, Equatable, Sendable {
                     contextSettings[incoming.scopeKey] = merged
                     report.changedSettingsKeys.insert(incoming.scopeKey)
                 }
+
+            case .expertBlock(let incoming):
+                let sid = resolveCanonicalSessionID(for: incoming.sessionID)
+                var normalized = incoming
+                normalized.sessionID = sid
+                let merged = expertBlocks[normalized.id]?.merging(normalized) ?? normalized
+                if expertBlocks[normalized.id] != merged {
+                    expertBlocks[normalized.id] = merged
+                    report.changedSessions.insert(sid)
+                }
+
+            case .roleObservations(let incoming):
+                let sid = resolveCanonicalSessionID(for: incoming.sessionID)
+                var normalized = incoming
+                normalized.sessionID = sid
+                normalized.items = normalized.items.map { item in
+                    var copy = item
+                    copy.sessionID = sid
+                    return copy
+                }
+                let merged = roleObservations[sid]?.merging(normalized) ?? normalized
+                if roleObservations[sid] != merged {
+                    roleObservations[sid] = merged
+                    report.changedSessions.insert(sid)
+                }
             }
         }
         // Redirects may arrive after a local edit or before their child records.
@@ -546,10 +640,13 @@ public struct MeetingWorkspaceSyncDocument: Codable, Equatable, Sendable {
         if !redirectedSessions.isEmpty {
             let sessionsWithTasks = Set(tasks.values.map(\.sessionID))
             let sessionsWithChunks = Set(transcriptChunks.values.map(\.sessionID))
+            let sessionsWithBlocks = Set(expertBlocks.values.map(\.sessionID))
             for session in redirectedSessions {
                 let target = resolveCanonicalSessionID(for: session.id)
                 guard target != session.id,
                       notes[session.id] != nil || outcomes[session.id] != nil ||
+                        roleObservations[session.id] != nil ||
+                        sessionsWithBlocks.contains(session.id) ||
                         sessionsWithTasks.contains(session.id) ||
                         sessionsWithChunks.contains(session.id) else { continue }
                 let version = nextVersion()
@@ -609,6 +706,8 @@ public struct MeetingWorkspaceSyncDocument: Codable, Equatable, Sendable {
         records.append(contentsOf: taskLinks.values.map { .taskLink($0) })
         records.append(contentsOf: taskProfiles.values.map { .taskProfile($0) })
         records.append(contentsOf: contextSettings.values.map { .contextSettings($0) })
+        records.append(contentsOf: expertBlocks.values.map { .expertBlock($0) })
+        records.append(contentsOf: roleObservations.values.map { .roleObservations($0) })
         return records
     }
 

@@ -73,6 +73,8 @@ struct IOSAssistantModePill: View {
         case .off: return Color.secondary.opacity(0.12)
         case .mentions: return Color.blue.opacity(0.14)
         case .follow: return Color.indigo.opacity(0.14)
+        case .observe: return Color.cyan.opacity(0.16)
+        case .advise: return Color.purple.opacity(0.16)
         case .participating: return Color.green.opacity(0.16)
         }
     }
@@ -84,6 +86,8 @@ struct IOSAssistantModePill: View {
         case .off: return .secondary
         case .mentions: return .blue
         case .follow: return .indigo
+        case .observe: return .cyan
+        case .advise: return .purple
         case .participating: return .green
         }
     }
@@ -293,11 +297,64 @@ struct IOSAssistantModeSheet: View {
 
     var body: some View {
         NavigationStack {
+            let activeRoleID = assistant.resolvedRoleID(for: controllerID)
+            let activePresetID = assistant.resolvedPresetID(for: controllerID)
+            let availableRoles = (skills?.skills ?? DefaultAssistantSkills.all).filter(\.enabled)
+            let availablePresets = skills?.presets.filter { $0.skillID == activeRoleID } ?? []
             List {
+                if !availableRoles.isEmpty {
+                    Section(L("Assistant Role")) {
+                        Picker(L("Role"), selection: Binding(
+                            get: { activeRoleID },
+                            set: { newRole in
+                                assistant.setRoleAndMode(
+                                    skillID: newRole,
+                                    presetID: nil,
+                                    mode: activeMode,
+                                    for: controllerID,
+                                    rememberForRoom: rememberForRoom
+                                )
+                            }
+                        )) {
+                            ForEach(availableRoles) { role in
+                                Text(role.name).tag(role.id)
+                            }
+                        }
+                        if !availablePresets.isEmpty {
+                            Picker(L("Preset"), selection: Binding(
+                                get: { activePresetID },
+                                set: { newPreset in
+                                    assistant.setRoleAndMode(
+                                        skillID: activeRoleID,
+                                        presetID: newPreset,
+                                        mode: activeMode,
+                                        for: controllerID,
+                                        rememberForRoom: rememberForRoom
+                                    )
+                                }
+                            )) {
+                                Text(L("Base Role")).tag(String?.none)
+                                ForEach(availablePresets) { preset in
+                                    Text(preset.name).tag(String?.some(preset.id))
+                                }
+                            }
+                        }
+                    }
+                }
+
                 Section {
                     ForEach(IOSMeetingAssistantMode.allCases) { mode in
                         Button {
-                            assistant.setMode(mode, for: controllerID, rememberForRoom: rememberForRoom)
+                            assistant.setRoleAndMode(
+                                skillID: activeRoleID,
+                                presetID: activePresetID,
+                                mode: mode,
+                                for: controllerID,
+                                rememberForRoom: rememberForRoom
+                            )
+                            if mode.isSilentToRoom {
+                                facilitator?.disable(controllerID: controllerID)
+                            }
                             if mode == .participating {
                                 maybeAutoStartGoalDictation()
                             } else {
@@ -331,6 +388,14 @@ struct IOSAssistantModeSheet: View {
                         .accessibilityAddTraits(activeMode == mode ? [.isSelected] : [])
                     }
 
+                    if activeMode.isSilentToRoom {
+                        Label(
+                            L("Silent to room — outbound microphone, chat, and Realtime voice are locked off."),
+                            systemImage: "lock.shield.fill"
+                        )
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    }
                     Toggle(L("Remember mode for this room"), isOn: $rememberForRoom)
                         .onChange(of: rememberForRoom) { _, newValue in
                             if newValue {

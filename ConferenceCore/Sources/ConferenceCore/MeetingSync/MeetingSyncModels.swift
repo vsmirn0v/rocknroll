@@ -227,6 +227,8 @@ public struct SyncedMeetingSession: Codable, Equatable, Identifiable, Sendable {
     public var obsidianReceipt: SyncValue<ObsidianSyncReceipt?>?
     public var manualObsidianSaveAt: SyncValue<Date?>?
     public var transcriptDeletedAt: SyncValue<Date?>?
+    public var dominantRole: SyncValue<DominantRoleBinding?>?
+    public var roleSegments: SyncValue<[SessionRoleSegment]>?
     public var isDeleted: SyncValue<Bool>
     public var createdAt: Date
     public var updatedAt: Date
@@ -253,6 +255,8 @@ public struct SyncedMeetingSession: Codable, Equatable, Identifiable, Sendable {
         obsidianReceipt: SyncValue<ObsidianSyncReceipt?>? = nil,
         manualObsidianSaveAt: SyncValue<Date?>? = nil,
         transcriptDeletedAt: SyncValue<Date?>? = nil,
+        dominantRole: SyncValue<DominantRoleBinding?>? = nil,
+        roleSegments: SyncValue<[SessionRoleSegment]>? = nil,
         isDeleted: SyncValue<Bool>,
         createdAt: Date,
         updatedAt: Date
@@ -278,6 +282,8 @@ public struct SyncedMeetingSession: Codable, Equatable, Identifiable, Sendable {
         self.obsidianReceipt = obsidianReceipt
         self.manualObsidianSaveAt = manualObsidianSaveAt
         self.transcriptDeletedAt = transcriptDeletedAt
+        self.dominantRole = dominantRole
+        self.roleSegments = roleSegments
         self.isDeleted = isDeleted
         self.createdAt = createdAt
         self.updatedAt = updatedAt
@@ -299,6 +305,8 @@ public struct SyncedMeetingSession: Codable, Equatable, Identifiable, Sendable {
         if let obsidianReceipt { versions.append(obsidianReceipt.version) }
         if let manualObsidianSaveAt { versions.append(manualObsidianSaveAt.version) }
         if let transcriptDeletedAt { versions.append(transcriptDeletedAt.version) }
+        if let dominantRole { versions.append(dominantRole.version) }
+        if let roleSegments { versions.append(roleSegments.version) }
         return versions.map(\.counter).max() ?? 0
     }
 
@@ -336,10 +344,42 @@ public struct SyncedMeetingSession: Codable, Equatable, Identifiable, Sendable {
         result.obsidianReceipt = Self.mergeOptional(obsidianReceipt, other.obsidianReceipt)
         result.manualObsidianSaveAt = Self.mergeOptional(manualObsidianSaveAt, other.manualObsidianSaveAt)
         result.transcriptDeletedAt = Self.mergeOptional(transcriptDeletedAt, other.transcriptDeletedAt)
+        result.dominantRole = Self.mergeOptional(dominantRole, other.dominantRole)
+        result.roleSegments = Self.mergeRoleSegments(roleSegments, other.roleSegments)
         result.isDeleted = isDeleted.merging(other.isDeleted)
         result.createdAt = min(createdAt, other.createdAt)
         result.updatedAt = max(updatedAt, other.updatedAt)
         return result
+    }
+
+    private static func mergeRoleSegments(
+        _ lhs: SyncValue<[SessionRoleSegment]>?,
+        _ rhs: SyncValue<[SessionRoleSegment]>?
+    ) -> SyncValue<[SessionRoleSegment]>? {
+        switch (lhs, rhs) {
+        case (.some(let a), .some(let b)):
+            var byID: [UUID: SessionRoleSegment] = [:]
+            for item in a.value + b.value {
+                if let existing = byID[item.id] {
+                    byID[item.id] = SessionRoleSegment(
+                        id: item.id,
+                        skillID: item.skillID,
+                        presetID: item.presetID ?? existing.presetID,
+                        mode: item.endedAt ?? item.startedAt >= existing.endedAt ?? existing.startedAt ? item.mode : existing.mode,
+                        startedAt: min(existing.startedAt, item.startedAt),
+                        endedAt: [existing.endedAt, item.endedAt].compactMap { $0 }.max(),
+                        pinnedObservationCount: max(existing.pinnedObservationCount, item.pinnedObservationCount)
+                    )
+                } else {
+                    byID[item.id] = item
+                }
+            }
+            let sorted = byID.values.sorted { ($0.startedAt, $0.id.uuidString) < ($1.startedAt, $1.id.uuidString) }
+            return SyncValue(sorted, version: max(a.version, b.version))
+        case (.some(let a), .none): return a
+        case (.none, .some(let b)): return b
+        case (.none, .none): return nil
+        }
     }
 
     private static func mergeOptional<V>(_ lhs: SyncValue<V>?, _ rhs: SyncValue<V>?) -> SyncValue<V>? {
@@ -1157,6 +1197,7 @@ public struct MeetingAutoExportOverrides: Codable, Equatable, Sendable {
     public var includeQuestions: Bool?
     public var autoGenerateSummary: Bool?
     public var autoSyncTasks: Bool?
+    public var coreOutcomePolicy: CoreOutcomePolicy?
 
     public init(
         autoExport: Bool? = nil,
@@ -1167,7 +1208,8 @@ public struct MeetingAutoExportOverrides: Codable, Equatable, Sendable {
         includeDecisions: Bool? = nil,
         includeQuestions: Bool? = nil,
         autoGenerateSummary: Bool? = nil,
-        autoSyncTasks: Bool? = nil
+        autoSyncTasks: Bool? = nil,
+        coreOutcomePolicy: CoreOutcomePolicy? = nil
     ) {
         self.autoExport = autoExport
         self.includeTranscript = includeTranscript
@@ -1178,6 +1220,7 @@ public struct MeetingAutoExportOverrides: Codable, Equatable, Sendable {
         self.includeQuestions = includeQuestions
         self.autoGenerateSummary = autoGenerateSummary
         self.autoSyncTasks = autoSyncTasks
+        self.coreOutcomePolicy = coreOutcomePolicy
     }
 
     public var isEmpty: Bool {
@@ -1189,7 +1232,8 @@ public struct MeetingAutoExportOverrides: Codable, Equatable, Sendable {
             includeDecisions == nil &&
             includeQuestions == nil &&
             autoGenerateSummary == nil &&
-            autoSyncTasks == nil
+            autoSyncTasks == nil &&
+            coreOutcomePolicy == nil
     }
 
     public func mergingFallback(_ fallback: Self) -> Self {
@@ -1202,7 +1246,8 @@ public struct MeetingAutoExportOverrides: Codable, Equatable, Sendable {
             includeDecisions: includeDecisions ?? fallback.includeDecisions,
             includeQuestions: includeQuestions ?? fallback.includeQuestions,
             autoGenerateSummary: autoGenerateSummary ?? fallback.autoGenerateSummary,
-            autoSyncTasks: autoSyncTasks ?? fallback.autoSyncTasks
+            autoSyncTasks: autoSyncTasks ?? fallback.autoSyncTasks,
+            coreOutcomePolicy: coreOutcomePolicy ?? fallback.coreOutcomePolicy
         )
     }
 }
@@ -1326,6 +1371,11 @@ public struct SyncedMeetingContextSettings: Codable, Equatable, Identifiable, Se
     public var defaultReminderOverride: SyncValue<ReminderOverride?>?
     public var autoJoin: SyncValue<Bool?>?
     public var autoFacilitatorSkillID: SyncValue<String?>?
+    public var autoFacilitatorPresetID: SyncValue<String?>?
+    public var autoEngagementMode: SyncValue<String?>?
+    public var coreOutcomePolicy: SyncValue<String?>?
+    public var exportDestinationID: SyncValue<String?>?
+    public var routeEntireMeeting: SyncValue<Bool?>?
     public var jiraBoardURL: SyncValue<String?>?
     public var jiraProjectKeys: SyncValue<[String]?>?
     public var autoExportSettings: SyncedMeetingAutoExportSettings?
@@ -1346,6 +1396,11 @@ public struct SyncedMeetingContextSettings: Codable, Equatable, Identifiable, Se
         defaultReminderOverride: SyncValue<ReminderOverride?>? = nil,
         autoJoin: SyncValue<Bool?>? = nil,
         autoFacilitatorSkillID: SyncValue<String?>? = nil,
+        autoFacilitatorPresetID: SyncValue<String?>? = nil,
+        autoEngagementMode: SyncValue<String?>? = nil,
+        coreOutcomePolicy: SyncValue<String?>? = nil,
+        exportDestinationID: SyncValue<String?>? = nil,
+        routeEntireMeeting: SyncValue<Bool?>? = nil,
         jiraBoardURL: SyncValue<String?>? = nil,
         jiraProjectKeys: SyncValue<[String]?>? = nil,
         autoExportSettings: SyncedMeetingAutoExportSettings? = nil,
@@ -1365,6 +1420,11 @@ public struct SyncedMeetingContextSettings: Codable, Equatable, Identifiable, Se
         self.defaultReminderOverride = defaultReminderOverride
         self.autoJoin = autoJoin
         self.autoFacilitatorSkillID = autoFacilitatorSkillID
+        self.autoFacilitatorPresetID = autoFacilitatorPresetID
+        self.autoEngagementMode = autoEngagementMode
+        self.coreOutcomePolicy = coreOutcomePolicy
+        self.exportDestinationID = exportDestinationID
+        self.routeEntireMeeting = routeEntireMeeting
         self.jiraBoardURL = jiraBoardURL
         self.jiraProjectKeys = jiraProjectKeys
         self.autoExportSettings = autoExportSettings
@@ -1471,6 +1531,11 @@ public struct SyncedMeetingContextSettings: Codable, Equatable, Identifiable, Se
             defaultReminderOverride?.version.counter,
             autoJoin?.version.counter,
             autoFacilitatorSkillID?.version.counter,
+            autoFacilitatorPresetID?.version.counter,
+            autoEngagementMode?.version.counter,
+            coreOutcomePolicy?.version.counter,
+            exportDestinationID?.version.counter,
+            routeEntireMeeting?.version.counter,
             jiraBoardURL?.version.counter,
             jiraProjectKeys?.version.counter,
             autoExportSettings?.maximumCounter
@@ -1496,6 +1561,11 @@ public struct SyncedMeetingContextSettings: Codable, Equatable, Identifiable, Se
         result.defaultReminderOverride = mergeOptional(defaultReminderOverride, other.defaultReminderOverride)
         result.autoJoin = mergeOptional(autoJoin, other.autoJoin)
         result.autoFacilitatorSkillID = mergeOptional(autoFacilitatorSkillID, other.autoFacilitatorSkillID)
+        result.autoFacilitatorPresetID = mergeOptional(autoFacilitatorPresetID, other.autoFacilitatorPresetID)
+        result.autoEngagementMode = mergeOptional(autoEngagementMode, other.autoEngagementMode)
+        result.coreOutcomePolicy = mergeOptional(coreOutcomePolicy, other.coreOutcomePolicy)
+        result.exportDestinationID = mergeOptional(exportDestinationID, other.exportDestinationID)
+        result.routeEntireMeeting = mergeOptional(routeEntireMeeting, other.routeEntireMeeting)
         result.jiraBoardURL = mergeOptional(jiraBoardURL, other.jiraBoardURL)
         result.jiraProjectKeys = mergeOptional(jiraProjectKeys, other.jiraProjectKeys)
         result.autoExportSettings = switch (autoExportSettings, other.autoExportSettings) {
@@ -1522,6 +1592,388 @@ public struct SyncedMeetingContextSettings: Codable, Equatable, Identifiable, Se
     }
 }
 
+public struct DominantRoleBinding: Codable, Equatable, Sendable {
+    public enum Source: String, Codable, Equatable, Sendable {
+        case automatic
+        case liveSwitch
+        case retroactiveUpgrade
+        case manualPrimary
+    }
+
+    public var skillID: String
+    public var presetID: String?
+    public var mode: AssistantEngagementMode
+    public var expertBlockID: UUID?
+    public var coreOutcomePolicy: CoreOutcomePolicy
+    public var exportDestinationID: UUID?
+    public var routeEntireMeeting: Bool
+    public var source: Source
+    public var updatedAt: Date
+
+    public init(
+        skillID: String,
+        presetID: String? = nil,
+        mode: AssistantEngagementMode,
+        expertBlockID: UUID? = nil,
+        coreOutcomePolicy: CoreOutcomePolicy = .full,
+        exportDestinationID: UUID? = nil,
+        routeEntireMeeting: Bool = false,
+        source: Source = .automatic,
+        updatedAt: Date = Date()
+    ) {
+        self.skillID = skillID
+        self.presetID = presetID
+        self.mode = mode
+        self.expertBlockID = expertBlockID
+        self.coreOutcomePolicy = coreOutcomePolicy
+        self.exportDestinationID = exportDestinationID
+        self.routeEntireMeeting = routeEntireMeeting
+        self.source = source
+        self.updatedAt = updatedAt
+    }
+}
+
+public struct SessionRoleSegment: Codable, Equatable, Identifiable, Sendable {
+    public var id: UUID
+    public var skillID: String
+    public var presetID: String?
+    public var mode: AssistantEngagementMode
+    public var startedAt: Date
+    public var endedAt: Date?
+    public var pinnedObservationCount: Int
+
+    public init(
+        id: UUID = UUID(),
+        skillID: String,
+        presetID: String? = nil,
+        mode: AssistantEngagementMode,
+        startedAt: Date,
+        endedAt: Date? = nil,
+        pinnedObservationCount: Int = 0
+    ) {
+        self.id = id
+        self.skillID = skillID
+        self.presetID = presetID
+        self.mode = mode
+        self.startedAt = startedAt
+        self.endedAt = endedAt
+        self.pinnedObservationCount = pinnedObservationCount
+    }
+}
+
+public struct RoleContextSnapshot: Codable, Equatable, Sendable {
+    public var skillID: String
+    public var skillName: String
+    public var presetID: String?
+    public var presetName: String?
+    public var focusSpeakers: [String]
+    public var adHocContext: String
+    public var rubricDimensions: [String]
+    public var instructionsDigest: String
+    public var capturedInstructions: String
+
+    public init(
+        skillID: String,
+        skillName: String,
+        presetID: String? = nil,
+        presetName: String? = nil,
+        focusSpeakers: [String] = [],
+        adHocContext: String = "",
+        rubricDimensions: [String] = [],
+        instructionsDigest: String = "",
+        capturedInstructions: String = ""
+    ) {
+        self.skillID = skillID
+        self.skillName = skillName
+        self.presetID = presetID
+        self.presetName = presetName
+        self.focusSpeakers = focusSpeakers
+        self.adHocContext = adHocContext
+        self.rubricDimensions = rubricDimensions
+        self.instructionsDigest = instructionsDigest
+        self.capturedInstructions = capturedInstructions
+    }
+}
+
+public struct ExpertBlockVersionSnapshot: Codable, Equatable, Sendable {
+    public var revision: Int
+    public var headlineVerdict: String?
+    public var markdownBody: String
+    public var savedAt: Date
+    public var deviceID: String
+
+    public init(
+        revision: Int,
+        headlineVerdict: String? = nil,
+        markdownBody: String,
+        savedAt: Date = Date(),
+        deviceID: String = ""
+    ) {
+        self.revision = revision
+        self.headlineVerdict = headlineVerdict
+        self.markdownBody = markdownBody
+        self.savedAt = savedAt
+        self.deviceID = deviceID
+    }
+}
+
+public struct SyncedMeetingExpertBlock: Codable, Equatable, Identifiable, Sendable {
+    public var id: UUID
+    public var sessionID: UUID
+    public var skillID: String
+    public var presetID: String?
+    public var title: SyncValue<String>
+    public var visibility: SyncValue<ExpertSummaryVisibility>
+    public var headlineVerdict: SyncValue<String?>
+    public var markdownBody: SyncValue<String>
+    public var isEdited: Bool
+    public var contextSnapshot: SyncValue<RoleContextSnapshot>
+    public var citations: SyncValue<[String: [String]]>
+    public var exportDestinationID: SyncValue<UUID?>
+    public var routeEntireMeeting: SyncValue<Bool>
+    public var sourceCoverageLabel: String
+    public var transcriptFingerprint: String?
+    public var versions: [ExpertBlockVersionSnapshot]
+    public var isDeleted: SyncValue<Bool>
+    public var createdAt: Date
+    public var updatedAt: Date
+
+    public init(
+        id: UUID = UUID(),
+        sessionID: UUID,
+        skillID: String,
+        presetID: String? = nil,
+        title: SyncValue<String>,
+        visibility: SyncValue<ExpertSummaryVisibility>,
+        headlineVerdict: SyncValue<String?>,
+        markdownBody: SyncValue<String>,
+        isEdited: Bool = false,
+        contextSnapshot: SyncValue<RoleContextSnapshot>,
+        citations: SyncValue<[String: [String]]>,
+        exportDestinationID: SyncValue<UUID?>,
+        routeEntireMeeting: SyncValue<Bool>,
+        sourceCoverageLabel: String = "",
+        transcriptFingerprint: String? = nil,
+        versions: [ExpertBlockVersionSnapshot] = [],
+        isDeleted: SyncValue<Bool>,
+        createdAt: Date = Date(),
+        updatedAt: Date = Date()
+    ) {
+        self.id = id
+        self.sessionID = sessionID
+        self.skillID = skillID
+        self.presetID = presetID
+        self.title = title
+        self.visibility = visibility
+        self.headlineVerdict = headlineVerdict
+        self.markdownBody = markdownBody
+        self.isEdited = isEdited
+        self.contextSnapshot = contextSnapshot
+        self.citations = citations
+        self.exportDestinationID = exportDestinationID
+        self.routeEntireMeeting = routeEntireMeeting
+        self.sourceCoverageLabel = sourceCoverageLabel
+        self.transcriptFingerprint = transcriptFingerprint
+        self.versions = versions
+        self.isDeleted = isDeleted
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+    }
+
+    public var maximumCounter: Int64 {
+        [
+            title.version.counter,
+            visibility.version.counter,
+            headlineVerdict.version.counter,
+            markdownBody.version.counter,
+            contextSnapshot.version.counter,
+            citations.version.counter,
+            exportDestinationID.version.counter,
+            routeEntireMeeting.version.counter,
+            isDeleted.version.counter
+        ].max() ?? 0
+    }
+
+    public func merging(_ other: Self) -> Self {
+        guard id == other.id, sessionID == other.sessionID else { return self }
+        var result = self
+        result.title = title.merging(other.title)
+        result.visibility = visibility.merging(other.visibility)
+        if isEdited != other.isEdited {
+            let edited = isEdited ? self : other
+            result.markdownBody = edited.markdownBody
+            result.headlineVerdict = edited.headlineVerdict
+            result.isEdited = true
+        } else {
+            result.markdownBody = markdownBody.merging(other.markdownBody)
+            result.headlineVerdict = headlineVerdict.merging(other.headlineVerdict)
+            result.isEdited = isEdited || other.isEdited
+        }
+        result.contextSnapshot = contextSnapshot.merging(other.contextSnapshot)
+        result.citations = citations.merging(other.citations)
+        result.exportDestinationID = exportDestinationID.merging(other.exportDestinationID)
+        result.routeEntireMeeting = routeEntireMeeting.merging(other.routeEntireMeeting)
+        if other.markdownBody.version > markdownBody.version && !other.sourceCoverageLabel.isEmpty {
+            result.sourceCoverageLabel = other.sourceCoverageLabel
+            result.transcriptFingerprint = other.transcriptFingerprint
+        }
+        var mergedVersions = versions + other.versions
+        if !markdownBody.value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+           markdownBody.value != result.markdownBody.value {
+            mergedVersions.append(ExpertBlockVersionSnapshot(
+                revision: Int(max(1, markdownBody.version.counter)),
+                headlineVerdict: headlineVerdict.value,
+                markdownBody: markdownBody.value,
+                savedAt: updatedAt,
+                deviceID: markdownBody.version.device
+            ))
+        }
+        if !other.markdownBody.value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+           other.markdownBody.value != result.markdownBody.value {
+            mergedVersions.append(ExpertBlockVersionSnapshot(
+                revision: Int(max(1, other.markdownBody.version.counter)),
+                headlineVerdict: other.headlineVerdict.value,
+                markdownBody: other.markdownBody.value,
+                savedAt: other.updatedAt,
+                deviceID: other.markdownBody.version.device
+            ))
+        }
+        var seen: Set<String> = []
+        result.versions = mergedVersions
+            .sorted { ($0.savedAt, $0.revision, $0.deviceID) > ($1.savedAt, $1.revision, $1.deviceID) }
+            .filter {
+                $0.markdownBody != result.markdownBody.value &&
+                    seen.insert("\($0.revision)|\($0.deviceID)|\($0.markdownBody)").inserted
+            }
+            .prefix(5)
+            .map { $0 }
+        result.isDeleted = isDeleted.merging(other.isDeleted)
+        result.createdAt = min(createdAt, other.createdAt)
+        result.updatedAt = max(updatedAt, other.updatedAt)
+        return result
+    }
+}
+
+public enum RoleObservationKind: String, Codable, CaseIterable, Sendable {
+    case observation
+    case probe
+    case contradiction
+    case pacing
+    case whisperReply = "whisper_reply"
+
+    public var title: String {
+        switch self {
+        case .observation: return L("Observation")
+        case .probe: return L("Suggested Probe")
+        case .contradiction: return L("Watch / Contradiction")
+        case .pacing: return L("Rubric Pacing")
+        case .whisperReply: return L("Advisor Answer")
+        }
+    }
+
+    public var symbol: String {
+        switch self {
+        case .observation: return "note.text"
+        case .probe: return "questionmark.bubble"
+        case .contradiction: return "exclamationmark.triangle"
+        case .pacing: return "gauge.with.needle"
+        case .whisperReply: return "sparkles"
+        }
+    }
+}
+
+public struct RoleObservationItem: Codable, Equatable, Identifiable, Sendable {
+    public var id: UUID
+    public var sessionID: UUID
+    public var skillID: String
+    public var presetID: String?
+    public var mode: AssistantEngagementMode
+    public var kind: RoleObservationKind
+    public var title: String
+    public var body: String
+    public var evidenceLineIDs: [String]
+    public var evidenceRefs: [String]
+    public var isPinned: Bool
+    public var isDismissed: Bool
+    public var copiedToNotesAt: Date?
+    public var createdAt: Date
+    public var updatedAt: Date
+
+    public init(
+        id: UUID = UUID(),
+        sessionID: UUID,
+        skillID: String,
+        presetID: String? = nil,
+        mode: AssistantEngagementMode,
+        kind: RoleObservationKind,
+        title: String,
+        body: String,
+        evidenceLineIDs: [String] = [],
+        evidenceRefs: [String] = [],
+        isPinned: Bool = false,
+        isDismissed: Bool = false,
+        copiedToNotesAt: Date? = nil,
+        createdAt: Date = Date(),
+        updatedAt: Date = Date()
+    ) {
+        self.id = id
+        self.sessionID = sessionID
+        self.skillID = skillID
+        self.presetID = presetID
+        self.mode = mode
+        self.kind = kind
+        self.title = title
+        self.body = body
+        self.evidenceLineIDs = evidenceLineIDs
+        self.evidenceRefs = evidenceRefs
+        self.isPinned = isPinned
+        self.isDismissed = isDismissed
+        self.copiedToNotesAt = copiedToNotesAt
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+    }
+}
+
+public struct SyncedRoleObservationLog: Codable, Equatable, Sendable {
+    public var sessionID: UUID
+    public var items: [RoleObservationItem]
+    public var version: SyncVersion
+    public var updatedAt: Date
+
+    public init(
+        sessionID: UUID,
+        items: [RoleObservationItem] = [],
+        version: SyncVersion,
+        updatedAt: Date = Date()
+    ) {
+        self.sessionID = sessionID
+        self.items = items
+        self.version = version
+        self.updatedAt = updatedAt
+    }
+
+    public var maximumCounter: Int64 { version.counter }
+
+    public func merging(_ other: Self) -> Self {
+        guard sessionID == other.sessionID else { return self }
+        var byID: [UUID: RoleObservationItem] = [:]
+        for item in items + other.items {
+            if let existing = byID[item.id] {
+                byID[item.id] = item.updatedAt >= existing.updatedAt ? item : existing
+            } else {
+                byID[item.id] = item
+            }
+        }
+        let sorted = byID.values.sorted { ($0.createdAt, $0.id.uuidString) < ($1.createdAt, $1.id.uuidString) }
+        return SyncedRoleObservationLog(
+            sessionID: sessionID,
+            items: Array(sorted.suffix(200)),
+            version: max(version, other.version),
+            updatedAt: max(updatedAt, other.updatedAt)
+        )
+    }
+}
+
 public enum MeetingLibrarySyncRecord: SyncZoneRecord {
     case session(SyncedMeetingSession)
     case note(SyncedMeetingNote)
@@ -1530,6 +1982,8 @@ public enum MeetingLibrarySyncRecord: SyncZoneRecord {
     case taskLink(SyncedTaskLink)
     case taskProfile(SyncedTaskProfile)
     case contextSettings(SyncedMeetingContextSettings)
+    case expertBlock(SyncedMeetingExpertBlock)
+    case roleObservations(SyncedRoleObservationLog)
 
     public var syncRecordID: String {
         switch self {
@@ -1540,6 +1994,8 @@ public enum MeetingLibrarySyncRecord: SyncZoneRecord {
         case .taskLink(let value): return "tasklink:" + value.syncID
         case .taskProfile(let value): return "taskprofile:" + value.profileID
         case .contextSettings(let value): return "settings:" + value.scopeKey
+        case .expertBlock(let value): return "expert:" + value.id.uuidString
+        case .roleObservations(let value): return "roleobs:" + value.sessionID.uuidString
         }
     }
 
@@ -1552,6 +2008,8 @@ public enum MeetingLibrarySyncRecord: SyncZoneRecord {
         case .taskLink: return 0
         case .taskProfile(let value): return value.maximumCounter
         case .contextSettings(let value): return value.maximumCounter
+        case .expertBlock(let value): return value.maximumCounter
+        case .roleObservations(let value): return value.maximumCounter
         }
     }
 
@@ -1568,6 +2026,8 @@ public enum MeetingLibrarySyncRecord: SyncZoneRecord {
             return a.updatedAt >= b.updatedAt ? .taskLink(a) : .taskLink(b)
         case (.taskProfile(let a), .taskProfile(let b)): return .taskProfile(a.merging(b))
         case (.contextSettings(let a), .contextSettings(let b)): return .contextSettings(a.merging(b))
+        case (.expertBlock(let a), .expertBlock(let b)): return .expertBlock(a.merging(b))
+        case (.roleObservations(let a), .roleObservations(let b)): return .roleObservations(a.merging(b))
         default: return self
         }
     }

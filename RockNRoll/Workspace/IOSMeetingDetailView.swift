@@ -57,6 +57,14 @@ struct IOSMeetingDetailView: View {
     @State private var useSeriesScope = false
     @State private var autoJoinChoice: Bool?
     @State private var autoFacilitatorSkillID: String?
+    @State private var autoFacilitatorPresetID: String?
+    @State private var autoEngagementMode: AssistantEngagementMode?
+    @State private var coreOutcomePolicyOverride: CoreOutcomePolicy?
+    @State private var exportDestinationIDOverride: String?
+    @State private var routeEntireMeetingOverride: Bool?
+    @State private var showingAddExpertSummary = false
+    @State private var editingExpertBlock: SyncedMeetingExpertBlock?
+    @State private var expertVersionsBlock: SyncedMeetingExpertBlock?
     @State private var availableSkills: [AssistantSkill] = []
     @State private var aboutDraft = ""
     @State private var mattersDraft = ""
@@ -252,6 +260,38 @@ struct IOSMeetingDetailView: View {
             Task { await workspace.flushNotesNow() }
         }
         .sheet(item: $editingTask) { task in IOSMeetingTaskEditor(workspace: workspace, task: task) }
+        .sheet(isPresented: $showingAddExpertSummary) {
+            IOSAddExpertSummarySheet(
+                sessionID: resolvedSessionID,
+                workspace: workspace,
+                skillsController: skills,
+                transcriptEvents: transcriptEvents
+            )
+        }
+        .sheet(item: $editingExpertBlock) { block in
+            IOSEditExpertBlockSheet(block: block) { verdict, body in
+                Task {
+                    try? await workspace.updateExpertBlockMarkdown(
+                        sessionID: resolvedSessionID,
+                        blockID: block.id,
+                        headlineVerdict: verdict,
+                        markdownBody: body
+                    )
+                }
+            }
+        }
+        .sheet(item: $expertVersionsBlock) { block in
+            IOSExpertBlockVersionsSheet(block: block) { version in
+                Task {
+                    try? await workspace.updateExpertBlockMarkdown(
+                        sessionID: resolvedSessionID,
+                        blockID: block.id,
+                        headlineVerdict: version.headlineVerdict,
+                        markdownBody: version.markdownBody
+                    )
+                }
+            }
+        }
         .sheet(isPresented: $showingAddTask) {
             NavigationStack {
                 Form {
@@ -386,8 +426,27 @@ struct IOSMeetingDetailView: View {
                             .font(.caption)
                             .foregroundStyle(.red)
                     }
+                    if let expertError = workspace.expertSummaryErrors[resolvedSessionID] {
+                        Text(expertError)
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                    }
                 }
             }
+
+            let activePolicy = workspace.effectiveCoreOutcomePolicy(for: resolvedSessionID)
+            if activePolicy == .expertOnly && outcome == nil {
+                Section {
+                    Label(
+                        L("Core meeting summary suppressed by role policy. Expert lenses are shown below."),
+                        systemImage: "sparkles.rectangle.stack"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
+            }
+
+            expertEvaluationsSection
 
             if !visibleMeetingSnapshots.isEmpty {
                 IOSMeetingSnapshotsSection(snapshots: visibleMeetingSnapshots) { snap in
@@ -830,6 +889,63 @@ struct IOSMeetingDetailView: View {
                     guard !isLoadingContext else { return }
                     saveCurrentContextSettings()
                 }
+                if let activeSkillID = autoFacilitatorSkillID, !activeSkillID.isEmpty {
+                    let rolePresets = skills?.presets.filter { $0.skillID == activeSkillID } ?? []
+                    if !rolePresets.isEmpty {
+                        Picker(L("Role Preset"), selection: $autoFacilitatorPresetID) {
+                            Text(L("Base Role")).tag(String?.none)
+                            ForEach(rolePresets) { preset in
+                                Text(preset.name).tag(String?.some(preset.id))
+                            }
+                        }
+                        .onChange(of: autoFacilitatorPresetID) { _, _ in
+                            guard !isLoadingContext else { return }
+                            saveCurrentContextSettings()
+                        }
+                    }
+                    Picker(L("Engagement mode"), selection: $autoEngagementMode) {
+                        Text(L("Role Default")).tag(AssistantEngagementMode?.none)
+                        ForEach(AssistantEngagementMode.allCases, id: \.self) { m in
+                            Text(m.title).tag(AssistantEngagementMode?.some(m))
+                        }
+                    }
+                    .onChange(of: autoEngagementMode) { _, _ in
+                        guard !isLoadingContext else { return }
+                        saveCurrentContextSettings()
+                    }
+                }
+                Picker(L("Core Summary Policy"), selection: $coreOutcomePolicyOverride) {
+                    Text(L("Role Default")).tag(CoreOutcomePolicy?.none)
+                    ForEach(CoreOutcomePolicy.allCases, id: \.self) { policy in
+                        Text(policy.title).tag(CoreOutcomePolicy?.some(policy))
+                    }
+                }
+                .onChange(of: coreOutcomePolicyOverride) { _, _ in
+                    guard !isLoadingContext else { return }
+                    saveCurrentContextSettings()
+                }
+                if let vaults = skills?.syncedVaultDestinations, !vaults.isEmpty {
+                    Picker(L("Vault Destination"), selection: $exportDestinationIDOverride) {
+                        Text(L("Default Routing")).tag(String?.none)
+                        ForEach(vaults) { dest in
+                            Text(dest.name).tag(String?.some(dest.id.uuidString))
+                        }
+                    }
+                    .onChange(of: exportDestinationIDOverride) { _, _ in
+                        guard !isLoadingContext else { return }
+                        saveCurrentContextSettings()
+                    }
+                    if exportDestinationIDOverride != nil {
+                        Toggle(L("Route entire meeting note"), isOn: Binding(
+                            get: { routeEntireMeetingOverride ?? true },
+                            set: { newValue in
+                                routeEntireMeetingOverride = newValue
+                                guard !isLoadingContext else { return }
+                                saveCurrentContextSettings()
+                            }
+                        ))
+                    }
+                }
             } header: {
                 Text(L("Joining & Role Assistant"))
             } footer: {
@@ -1021,6 +1137,11 @@ struct IOSMeetingDetailView: View {
         let neverSnapshot = neverDraft
         let autoJoinSnapshot = autoJoinChoice
         let autoSkillSnapshot = autoFacilitatorSkillID
+        let autoPresetSnapshot = autoFacilitatorPresetID
+        let autoModeSnapshot = autoEngagementMode?.rawValue
+        let policySnapshot = coreOutcomePolicyOverride?.rawValue
+        let destSnapshot = exportDestinationIDOverride
+        let routeEntireSnapshot = routeEntireMeetingOverride
         let rawBoard = jiraBoardURLDraft.trimmingCharacters(in: .whitespacesAndNewlines)
         let normalizedBoardSnapshot = SyncedMeetingContextSettings.normalizedBoardURLString(from: rawBoard)
         let hasInvalidBoardInput = !rawBoard.isEmpty && normalizedBoardSnapshot == nil
@@ -1068,6 +1189,16 @@ struct IOSMeetingDetailView: View {
                 updateAutoJoin: true,
                 autoFacilitatorSkillID: autoSkillSnapshot,
                 updateAutoFacilitatorSkillID: true,
+                autoFacilitatorPresetID: autoPresetSnapshot,
+                updateAutoFacilitatorPresetID: true,
+                autoEngagementMode: autoModeSnapshot,
+                updateAutoEngagementMode: true,
+                coreOutcomePolicy: policySnapshot,
+                updateCoreOutcomePolicy: true,
+                exportDestinationID: destSnapshot,
+                updateExportDestinationID: true,
+                routeEntireMeeting: routeEntireSnapshot,
+                updateRouteEntireMeeting: true,
                 jiraBoardURL: normalizedBoardSnapshot ?? "",
                 updateJiraBoardURL: shouldUpdateBoardURL,
                 jiraProjectKeys: projectKeys,
@@ -1108,6 +1239,12 @@ struct IOSMeetingDetailView: View {
         autoJoinChoice = settings?.autoJoin?.value
         let rawSkill = settings?.autoFacilitatorSkillID?.value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         autoFacilitatorSkillID = rawSkill.isEmpty ? nil : rawSkill
+        let rawPreset = settings?.autoFacilitatorPresetID?.value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        autoFacilitatorPresetID = rawPreset.isEmpty ? nil : rawPreset
+        autoEngagementMode = settings?.autoEngagementMode?.value.flatMap(AssistantEngagementMode.init(rawValue:))
+        coreOutcomePolicyOverride = settings?.coreOutcomePolicy?.value.flatMap(CoreOutcomePolicy.init(rawValue:))
+        exportDestinationIDOverride = settings?.exportDestinationID?.value
+        routeEntireMeetingOverride = settings?.routeEntireMeeting?.value
         transitionChoice = settings?.sameRoomTransition?.value.flatMap(IOSSameRoomTransitionMode.init(rawValue:))
         aboutDraft = settings?.about?.value ?? ""
         mattersDraft = settings?.matters?.value ?? ""
@@ -1223,5 +1360,407 @@ struct IOSMeetingDetailView: View {
     private struct IdentifiableVersion: Identifiable {
         var id: String { "\(snapshot.revision)-\(snapshot.deviceID)" }
         let snapshot: SyncedOutcomeVersionSnapshot
+    }
+
+    @ViewBuilder
+    private var expertEvaluationsSection: some View {
+        let expertBlocks = (workspace.expertBlocksBySession[resolvedSessionID] ?? []).filter { !$0.isDeleted.value }
+        Section {
+            if expertBlocks.isEmpty {
+                Text(L("No expert opinions generated yet."))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(expertBlocks) { block in
+                    let isPrimary = session?.dominantRole?.expertBlockID == block.id
+                        || (session?.dominantRole?.skillID == block.skillID && session?.dominantRole?.presetID == block.presetID && expertBlocks.count == 1)
+                    IOSExpertBlockCardView(
+                        block: block,
+                        isPrimary: isPrimary,
+                        transcriptEvents: transcriptEvents,
+                        isGenerating: workspace.generatingExpertSessionIDs.contains(resolvedSessionID),
+                        onSetPrimary: {
+                            Task { try? await workspace.setPrimaryExpertBlock(sessionID: resolvedSessionID, blockID: block.id) }
+                        },
+                        onEdit: { editingExpertBlock = block },
+                        onRegenerate: {
+                            regenerateExpertBlock(block, makePrimary: isPrimary)
+                        },
+                        onShowVersions: { expertVersionsBlock = block },
+                        onDelete: {
+                            Task { try? await workspace.deleteExpertBlock(sessionID: resolvedSessionID, blockID: block.id) }
+                        },
+                        onJumpToTranscriptSnippet: { snippet in
+                            transcriptSearch = snippet
+                            tab = .transcript
+                        }
+                    )
+                }
+            }
+        } header: {
+            HStack {
+                Text(L("Expert Opinions & Lenses"))
+                Spacer()
+                Button {
+                    showingAddExpertSummary = true
+                } label: {
+                    Label(L("Add Opinion"), systemImage: "plus.circle")
+                        .font(.caption)
+                }
+            }
+        }
+    }
+
+    private func regenerateExpertBlock(_ block: SyncedMeetingExpertBlock, makePrimary: Bool) {
+        let skill = availableSkills.first(where: { $0.id == block.skillID })
+            ?? DefaultAssistantSkills.skill(id: block.skillID)
+            ?? DefaultAssistantSkills.personalAssistant
+        let preset = block.presetID.flatMap { pid in
+            skills?.presets.first(where: { $0.id == pid && $0.skillID == skill.id })
+        }
+        Task {
+            _ = try? await workspace.generateExpertSummary(
+                sessionID: resolvedSessionID,
+                skill: skill,
+                preset: preset,
+                focusSpeakers: block.contextSnapshot.value.focusSpeakers,
+                adHocContext: block.contextSnapshot.value.adHocContext,
+                makePrimary: makePrimary,
+                exportDestinationID: block.exportDestinationID.value,
+                routeEntireMeeting: block.routeEntireMeeting.value,
+                existingBlock: block
+            )
+        }
+    }
+}
+
+private struct IOSExpertBlockCardView: View {
+    let block: SyncedMeetingExpertBlock
+    let isPrimary: Bool
+    let transcriptEvents: [SyncedTranscriptEvent]
+    let isGenerating: Bool
+    let onSetPrimary: () -> Void
+    let onEdit: () -> Void
+    let onRegenerate: () -> Void
+    let onShowVersions: () -> Void
+    let onDelete: () -> Void
+    let onJumpToTranscriptSnippet: (String) -> Void
+
+    private var citationEntries: [(label: String, snippet: String)] {
+        let sortedIDs = Array(Set(block.citations.value.values.flatMap { $0 })).sorted()
+        var result: [(String, String)] = []
+        for (idx, eventID) in sortedIDs.enumerated() {
+            if let ev = transcriptEvents.first(where: { $0.id == eventID }) {
+                let quote = String(ev.text.trimmingCharacters(in: .whitespacesAndNewlines).prefix(32))
+                result.append(("L\(idx + 1)", quote))
+            }
+        }
+        return result
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Label(
+                    isPrimary ? L("Primary Role") : L("Secondary Lens"),
+                    systemImage: isPrimary ? "star.fill" : "sparkles"
+                )
+                .font(.caption2.weight(.semibold))
+                .padding(.horizontal, 7)
+                .padding(.vertical, 3)
+                .background((isPrimary ? Color.purple : Color.secondary).opacity(0.16), in: Capsule())
+                .foregroundStyle(isPrimary ? Color.purple : .secondary)
+
+                Text(block.title.value)
+                    .font(.subheadline.weight(.semibold))
+                Spacer()
+                Menu {
+                    if !isPrimary {
+                        Button(L("Set as Primary Role"), systemImage: "star.fill", action: onSetPrimary)
+                    }
+                    Button(L("Edit"), systemImage: "pencil", action: onEdit)
+                    Button(L("Regenerate"), systemImage: "arrow.clockwise", action: onRegenerate)
+                        .disabled(isGenerating)
+                    if !block.versions.isEmpty {
+                        Button(L("Version History (%ld)", block.versions.count), systemImage: "clock.arrow.circlepath", action: onShowVersions)
+                    }
+                    Divider()
+                    Button(L("Delete"), systemImage: "trash", role: .destructive, action: onDelete)
+                } label: {
+                    Image(systemName: "ellipsis.circle")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .frame(minWidth: 36, minHeight: 36)
+                        .contentShape(Rectangle())
+                }
+            }
+
+            if let verdict = block.headlineVerdict.value?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !verdict.isEmpty {
+                Text(verdict)
+                    .font(.subheadline.weight(.medium))
+                    .foregroundStyle(.primary)
+            }
+
+            if !block.markdownBody.value.isEmpty {
+                if let attr = try? AttributedString(markdown: block.markdownBody.value) {
+                    Text(attr)
+                        .font(.footnote)
+                } else {
+                    Text(block.markdownBody.value)
+                        .font(.footnote)
+                }
+            }
+
+            if !citationEntries.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        ForEach(citationEntries, id: \.label) { entry in
+                            Button {
+                                onJumpToTranscriptSnippet(entry.snippet)
+                            } label: {
+                                Text("[\(entry.label)] \(entry.snippet)…")
+                                    .font(.caption2.monospaced())
+                                    .lineLimit(1)
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 3)
+                                    .background(Color.accentColor.opacity(0.12), in: Capsule())
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+            }
+        }
+        .padding(.vertical, 4)
+    }
+}
+
+private struct IOSAddExpertSummarySheet: View {
+    let sessionID: UUID
+    @ObservedObject var workspace: IOSWorkspaceCoordinator
+    var skillsController: IOSAssistantSkillsController?
+    let transcriptEvents: [SyncedTranscriptEvent]
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var selectedSkillID: String = "hiring-interviewer"
+    @State private var selectedPresetID: String? = nil
+    @State private var selectedSpeakers: Set<String> = []
+    @State private var extraContext = ""
+    @State private var selectedDestinationID: UUID? = nil
+    @State private var makePrimary = true
+    @State private var isGenerating = false
+    @State private var errorMessage: String?
+
+    private var availableSkills: [AssistantSkill] {
+        (skillsController?.skills ?? DefaultAssistantSkills.all).filter(\.enabled)
+    }
+
+    private var presetsForSkill: [AssistantRolePreset] {
+        skillsController?.presets.filter { $0.skillID == selectedSkillID } ?? []
+    }
+
+    private var detectedSpeakers: [String] {
+        FullTranscriptEvaluationWindowBuilder.detectedExternalSpeakers(
+            events: transcriptEvents,
+            localNames: workspace.taskProfile.aliases,
+            teamMemberNames: skillsController?.people.entries.map(\.displayName) ?? []
+        )
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section(L("Role & Preset")) {
+                    Picker(L("Role"), selection: $selectedSkillID) {
+                        ForEach(availableSkills) { skill in
+                            Text(skill.name).tag(skill.id)
+                        }
+                    }
+                    .onChange(of: selectedSkillID) { _, _ in
+                        selectedPresetID = nil
+                    }
+                    if !presetsForSkill.isEmpty {
+                        Picker(L("Preset"), selection: $selectedPresetID) {
+                            Text(L("Base Role")).tag(String?.none)
+                            ForEach(presetsForSkill) { preset in
+                                Text(preset.name).tag(String?.some(preset.id))
+                            }
+                        }
+                    }
+                }
+
+                if !detectedSpeakers.isEmpty {
+                    Section(L("Focus Speakers (e.g. Candidate)")) {
+                        ForEach(detectedSpeakers, id: \.self) { speaker in
+                            Toggle(speaker, isOn: Binding(
+                                get: { selectedSpeakers.contains(speaker) },
+                                set: { on in
+                                    if on { selectedSpeakers.insert(speaker) }
+                                    else { selectedSpeakers.remove(speaker) }
+                                }
+                            ))
+                        }
+                    }
+                }
+
+                Section(L("Additional Evaluation Context")) {
+                    TextField(L("Job description, rubric focus, or extra instructions…"), text: $extraContext, axis: .vertical)
+                        .lineLimit(2...5)
+                }
+
+                Section(L("Governance & Destination")) {
+                    Toggle(L("Set as Primary Role"), isOn: $makePrimary)
+                    if let vaults = skillsController?.syncedVaultDestinations, !vaults.isEmpty {
+                        Picker(L("Vault Destination"), selection: $selectedDestinationID) {
+                            Text(L("Role Default")).tag(UUID?.none)
+                            ForEach(vaults) { dest in
+                                Text(dest.name).tag(UUID?.some(dest.id))
+                            }
+                        }
+                    }
+                }
+
+                if let errorMessage {
+                    Section {
+                        Text(errorMessage)
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                    }
+                }
+            }
+            .navigationTitle(L("Add Expert Opinion"))
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button(L("Cancel")) { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button {
+                        runGeneration()
+                    } label: {
+                        if isGenerating {
+                            ProgressView()
+                        } else {
+                            Text(L("Generate"))
+                        }
+                    }
+                    .disabled(isGenerating)
+                }
+            }
+            .onAppear {
+                if !availableSkills.contains(where: { $0.id == selectedSkillID }),
+                   let first = availableSkills.first {
+                    selectedSkillID = first.id
+                }
+            }
+        }
+    }
+
+    private func runGeneration() {
+        guard let skill = availableSkills.first(where: { $0.id == selectedSkillID })
+                ?? DefaultAssistantSkills.skill(id: selectedSkillID) else { return }
+        let preset = selectedPresetID.flatMap { pid in
+            presetsForSkill.first(where: { $0.id == pid })
+        }
+        isGenerating = true
+        errorMessage = nil
+        Task {
+            do {
+                _ = try await workspace.generateExpertSummary(
+                    sessionID: sessionID,
+                    skill: skill,
+                    preset: preset,
+                    focusSpeakers: Array(selectedSpeakers),
+                    adHocContext: extraContext,
+                    makePrimary: makePrimary,
+                    exportDestinationID: selectedDestinationID,
+                    routeEntireMeeting: nil,
+                    existingBlock: nil
+                )
+                dismiss()
+            } catch {
+                errorMessage = error.localizedDescription
+                isGenerating = false
+            }
+        }
+    }
+}
+
+private struct IOSEditExpertBlockSheet: View {
+    let block: SyncedMeetingExpertBlock
+    let onSave: (String?, String) -> Void
+    @State private var verdictDraft: String
+    @State private var bodyDraft: String
+    @Environment(\.dismiss) private var dismiss
+
+    init(block: SyncedMeetingExpertBlock, onSave: @escaping (String?, String) -> Void) {
+        self.block = block
+        self.onSave = onSave
+        _verdictDraft = State(initialValue: block.headlineVerdict.value ?? "")
+        _bodyDraft = State(initialValue: block.markdownBody.value)
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section(L("Headline Verdict")) {
+                    TextField(L("Verdict (e.g. Strong Hire)"), text: $verdictDraft)
+                }
+                Section(L("Evaluation Markdown")) {
+                    TextEditor(text: $bodyDraft)
+                        .frame(minHeight: 220)
+                }
+            }
+            .navigationTitle(block.title.value)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button(L("Cancel")) { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button(L("Save")) {
+                        let cleanVerdict = verdictDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+                        onSave(cleanVerdict.isEmpty ? nil : cleanVerdict, bodyDraft)
+                        dismiss()
+                    }
+                }
+            }
+        }
+    }
+}
+
+private struct IOSExpertBlockVersionsSheet: View {
+    let block: SyncedMeetingExpertBlock
+    let onRestore: (ExpertBlockVersionSnapshot) -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            List {
+                ForEach(block.versions, id: \.revision) { version in
+                    Section {
+                        if let v = version.headlineVerdict, !v.isEmpty {
+                            Text(v).font(.subheadline.weight(.semibold))
+                        }
+                        Text(version.markdownBody)
+                            .font(.footnote)
+                        Button(L("Restore This Version")) {
+                            onRestore(version)
+                            dismiss()
+                        }
+                    } header: {
+                        Text(L("Revision #%ld", version.revision))
+                    }
+                }
+            }
+            .navigationTitle(block.title.value)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button(L("Done")) { dismiss() }
+                }
+            }
+        }
     }
 }

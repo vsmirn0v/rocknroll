@@ -375,7 +375,8 @@ private final class HistoryViewCache: ObservableObject {
                 openQuestionsCount: outcome?.openQuestions.count ?? 0,
                 isGeneratingOutcome: source.outcomeState == .pending || outcomeStatusKeys.contains(source.sessionID),
                 hasFailedOutcomeWithInput: source.outcomeState == .failed && source.hasOutcomeInput,
-                hasSnapshots: hasSnapshots
+                hasSnapshots: hasSnapshots,
+                hasExpertBlocks: source.expertBlocksCount > 0
             )
             return MeetingContentMeaningfulness.isMeaningful(input) {
                 let session = sync?.historyConversation(for: source.sessionID, in: journal) ?? journal.session(id: source.sessionID)
@@ -465,6 +466,9 @@ struct MeetingHistoryView: View {
     @State private var exportRequest: ExportRequest?
     @State private var obsidianMessage: String?
     @State private var editingOutcomeTask: OutcomeTaskSheetTarget?
+    @State private var showingAddExpertSummary = false
+    @State private var expertBlocks: [SyncedMeetingExpertBlock] = []
+    @State private var loadedExpertBlocksSessionID: UUID?
     @Environment(\.locale) private var locale
 
     private struct OutcomeTaskSheetTarget: Identifiable {
@@ -1088,6 +1092,23 @@ struct MeetingHistoryView: View {
             .task(id: navigation.taskID) {
                 if let id = navigation.taskID { scroll.scrollTo(id, anchor: .center) }
             }
+            .task(id: card.sessionID) {
+                await reloadExpertBlocks(for: card.sessionID)
+            }
+            .sheet(isPresented: $showingAddExpertSummary) {
+                let rawSourceIDs = base.groupedCards(for: card.sessionID).map(\.sessionID)
+                let sourceIDs = Array(Set(([card.sessionID] + rawSourceIDs).flatMap {
+                    workspace?.workspaceSync.relatedSnapshotSessionIDs(for: $0, includeHistoryGroup: true) ?? [$0]
+                }))
+                let events = combinedExpertEvents(for: card, sourceIDs: sourceIDs)
+                ExpertSummaryGeneratorSheet(
+                    attention: attention,
+                    card: card,
+                    sessionEvents: events
+                ) {
+                    Task { await reloadExpertBlocks(for: card.sessionID) }
+                }
+            }
             .task(id: navigation.tab) {
                 if navigation.tab == .tasks, navigation.taskID == nil { scroll.scrollTo("tasks", anchor: .top) }
                 if navigation.tab == .notes { scroll.scrollTo("notes", anchor: .top) }
@@ -1130,7 +1151,56 @@ struct MeetingHistoryView: View {
         _ card: MeetingLibraryCard,
         base: HistoryViewCache.BaseSnapshot
     ) -> some View {
-        VStack(alignment: .leading, spacing: 0) {
+        let activeExpertBlocks = loadedExpertBlocksSessionID == card.sessionID ? expertBlocks.filter { !$0.isDeleted.value } : []
+        let primaryBlock: SyncedMeetingExpertBlock? = {
+            guard let dom = card.dominantRole else { return activeExpertBlocks.first }
+            if let bid = dom.expertBlockID, let exact = activeExpertBlocks.first(where: { $0.id == bid }) {
+                return exact
+            }
+            return activeExpertBlocks.first(where: { $0.skillID == dom.skillID && $0.presetID == dom.presetID })
+                ?? activeExpertBlocks.first
+        }()
+        let secondaryBlocks = activeExpertBlocks.filter { $0.id != primaryBlock?.id }
+        let suppressCoreOutcome = card.dominantRole?.coreOutcomePolicy == .expertOnly && !activeExpertBlocks.isEmpty
+
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                if let dom = card.dominantRole, dom.skillID != AssistantSkill.personalAssistantID {
+                    Label(dom.skillID, systemImage: "star.fill")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(Color.accentColor)
+                        .padding(.horizontal, 8).padding(.vertical, 3)
+                        .background(Color.accentColor.opacity(0.14), in: Capsule())
+                }
+                Spacer()
+                Button {
+                    showingAddExpertSummary = true
+                } label: {
+                    Label(L("Add Expert Summary"), systemImage: "plus.bubble")
+                }
+                .controlSize(.small)
+                .accessibilityIdentifier("assistant.add-expert-summary")
+            }
+            .padding([.top, .horizontal], 20)
+
+            let rawSourceIDs = base.groupedCards(for: card.sessionID).map(\.sessionID)
+            let sourceIDs = Array(Set(([card.sessionID] + rawSourceIDs).flatMap {
+                workspace?.workspaceSync.relatedSnapshotSessionIDs(for: $0, includeHistoryGroup: true) ?? [$0]
+            }))
+            let events = combinedExpertEvents(for: card, sourceIDs: sourceIDs)
+
+            if let primaryBlock {
+                ExpertBlockCardView(
+                    attention: attention,
+                    block: primaryBlock,
+                    isPrimary: true,
+                    sessionEvents: events
+                ) {
+                    Task { await reloadExpertBlocks(for: card.sessionID) }
+                }
+                .padding(.horizontal, 20)
+            }
+
             historyOutcomeActions(card, base: base)
             if let id = card.outcomeID, let error = data.outcomeWriteErrors[id] {
                 VStack(alignment: .leading, spacing: 8) {
@@ -1143,29 +1213,69 @@ struct MeetingHistoryView: View {
                     }
                 }.padding(16)
             }
-            if card.outcomeState == .failed || card.outcomeState == .pending {
-                generationDetail(card, base: base)
-            } else if let outcome = card.outcomeID.flatMap({ base.outcomesByID[$0] }) {
-                detail(outcome, card: card, base: base)
-            } else if card.state == .active || card.state == .reconnecting {
-                Text(L("Meeting in progress"))
-                    .foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading).padding(20)
-            } else {
+            if !suppressCoreOutcome {
+                if card.outcomeState == .failed || card.outcomeState == .pending {
+                    generationDetail(card, base: base)
+                } else if let outcome = card.outcomeID.flatMap({ base.outcomesByID[$0] }) {
+                    detail(outcome, card: card, base: base)
+                } else if card.state == .active || card.state == .reconnecting {
+                    Text(L("Meeting in progress"))
+                        .foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading).padding(20)
+                } else {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text(L("Outcome unavailable")).foregroundStyle(.secondary)
+                        if let error = attention.outcomeError[card.sessionID] {
+                            Text(error).font(.caption).foregroundStyle(.red)
+                        }
+                        Button {
+                            triggerRegenerate(card, base: base)
+                        } label: {
+                            Label(L("Generate summary"), systemImage: "sparkles")
+                        }
+                        .disabled(attention.outcomeStatus[card.sessionID] != nil)
+                        .accessibilityIdentifier("assistant.generate-outcome")
+                    }.frame(maxWidth: .infinity, alignment: .leading).padding(20)
+                }
+            }
+
+            if !secondaryBlocks.isEmpty {
                 VStack(alignment: .leading, spacing: 10) {
-                    Text(L("Outcome unavailable")).foregroundStyle(.secondary)
-                    if let error = attention.outcomeError[card.sessionID] {
-                        Text(error).font(.caption).foregroundStyle(.red)
+                    ForEach(secondaryBlocks) { block in
+                        ExpertBlockCardView(
+                            attention: attention,
+                            block: block,
+                            isPrimary: false,
+                            sessionEvents: events
+                        ) {
+                            Task { await reloadExpertBlocks(for: card.sessionID) }
+                        }
                     }
-                    Button {
-                        triggerRegenerate(card, base: base)
-                    } label: {
-                        Label(L("Generate summary"), systemImage: "sparkles")
-                    }
-                    .disabled(attention.outcomeStatus[card.sessionID] != nil)
-                    .accessibilityIdentifier("assistant.generate-outcome")
-                }.frame(maxWidth: .infinity, alignment: .leading).padding(20)
+                }
+                .padding(.horizontal, 20)
             }
         }
+    }
+
+    private func reloadExpertBlocks(for sessionID: UUID) async {
+        let blocks = (try? await library.store.expertBlocks(for: sessionID)) ?? []
+        expertBlocks = blocks
+        loadedExpertBlocksSessionID = sessionID
+    }
+
+    private func combinedExpertEvents(for card: MeetingLibraryCard, sourceIDs: [UUID]) -> [SyncedTranscriptEvent] {
+        var byID: [String: SyncedTranscriptEvent] = [:]
+        for event in MeetingWorkspaceJournal.syncedTranscriptEvents(from: conversation(card.sessionID)?.events ?? []) {
+            byID[event.id] = event
+        }
+        for event in (workspace?.workspaceSync.syncedTranscriptEvents(for: sourceIDs) ?? []) {
+            byID[event.id] = event
+        }
+        if loadedArchiveID == card.sessionID {
+            for event in archivedEvents {
+                byID[event.id] = event
+            }
+        }
+        return byID.values.sorted { ($0.occurredAt, $0.id) < ($1.occurredAt, $1.id) }
     }
 
     @ViewBuilder private func historyOutcomeActions(
@@ -1217,6 +1327,10 @@ struct MeetingHistoryView: View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 4) {
                 Text(card.title).fontWeight(.semibold).lineLimit(1)
+                if let dom = card.dominantRole, dom.skillID != AssistantSkill.personalAssistantID {
+                    Image(systemName: "star.fill").font(.caption2).foregroundStyle(Color.accentColor)
+                        .help(dom.skillID)
+                }
                 if card.hasNotes {
                     Image(systemName: "note.text").font(.caption).foregroundStyle(.secondary)
                         .help(L("Has notes"))
@@ -1247,6 +1361,9 @@ struct MeetingHistoryView: View {
                 if let outcome {
                     Text("·").foregroundStyle(.secondary)
                     Text(MeetingOutcomePrompt.displayText(outcome.summary)).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                } else if let verdict = card.expertVerdictPreview, !verdict.isEmpty {
+                    Text("·").foregroundStyle(.secondary)
+                    Text(verdict).font(.caption).foregroundStyle(.secondary).lineLimit(1)
                 } else if let status = attention.outcomeStatus[card.sessionID] {
                     Text("·").foregroundStyle(.secondary)
                     Text(status).font(.caption).foregroundStyle(.secondary).lineLimit(1)

@@ -201,6 +201,9 @@ final class AutonomousMeetingFacilitator: ObservableObject {
         suppressAutoGreet: Bool = false,
         trigger: String = "manual"
     ) {
+        if attention?.advisorCoordinator?.isOutboundMuted(sessionID: model.sessionID) == true {
+            attention?.advisorCoordinator?.disable(for: model.sessionID)
+        }
         manuallyDisabledSessions.remove(model.sessionID)
         var chosen = resolveSkillID(explicitSkillID: skillID, meetingTitle: model.title)
         activeSessionSkills[model.sessionID] = chosen
@@ -466,16 +469,23 @@ final class AutonomousMeetingFacilitator: ObservableObject {
         // 1. Attach queued skills (voice/MCP join), then per-meeting/series setting,
         // then optional global voice-activation fallback (default off).
         for model in models where !model.isClosed && model.connected && activeSessionSkills[model.sessionID] == nil {
+            if attention?.advisorCoordinator?.isOutboundMuted(sessionID: model.sessionID) == true {
+                continue
+            }
             if let queued = pendingSkillByTitleOrURL.removeValue(forKey: model.invitation.absoluteString.lowercased())
                 ?? pendingSkillByTitleOrURL.removeValue(forKey: model.title.trimmed.lowercased()) {
                 enable(for: model, skillID: queued, trigger: "pending")
             } else if !manuallyDisabledSessions.contains(model.sessionID) {
                 let seriesIDs = [model.participationCalendar?.externalSeriesID, model.calendarSeriesID]
                     .compactMap { $0 }
-                if let configuredSkillID = attention?.store.autoFacilitatorSkillID(room: model.invitation, seriesIDs: seriesIDs),
+                let presetConfig = attention?.store.autoFacilitatorConfiguration(room: model.invitation, seriesIDs: seriesIDs)
+                let wantsFacilitate = (presetConfig?.mode == nil || presetConfig?.mode == .facilitate)
+                if wantsFacilitate,
+                   let configuredSkillID = presetConfig?.skillID,
                    let configuredSkill = cachedSkills.first(where: { $0.id == configuredSkillID && $0.enabled }) {
                     enable(for: model, skillID: configuredSkill.id, trigger: "meeting-setting")
-                } else if attention?.store.autonomousMeetingVoiceEnabled == true,
+                } else if presetConfig?.mode == nil,
+                          attention?.store.autonomousMeetingVoiceEnabled == true,
                           let matched = cachedSkills.first(where: {
                               $0.enabled && $0.voiceActivation && $0.matches(meetingTitle: model.title, commandText: "")
                           }) {
@@ -1098,6 +1108,10 @@ final class AutonomousMeetingFacilitator: ObservableObject {
 
     private func maybeConnectRealtime(for model: NativeDesktopMeetingModel, skill: AssistantSkill?, skillID: String) async {
         guard let attention else { return }
+        guard attention.advisorCoordinator?.isOutboundMuted(sessionID: model.sessionID) != true else {
+            syncRealtimeActiveFlag()
+            return
+        }
         let kind = attention.store.realtimeProvider
         guard kind != .disabled,
               let apiKey = attention.store.realtimeAPIKey(for: kind),
@@ -1371,6 +1385,7 @@ final class AutonomousMeetingFacilitator: ObservableObject {
     func speakIntoMeeting(_ text: String, model: NativeDesktopMeetingModel) async {
         let sid = model.sessionID
         guard let attention,
+              attention.advisorCoordinator?.isOutboundMuted(sessionID: sid) != true,
               !model.isClosed,
               model.connected,
               activeSessionSkills[sid] != nil,
@@ -1538,6 +1553,7 @@ final class AutonomousMeetingFacilitator: ObservableObject {
     private func deliverSpokenBuffer(_ buffer: AVAudioPCMBuffer, fallbackText: String, model: NativeDesktopMeetingModel) async {
         let sid = model.sessionID
         guard let attention,
+              attention.advisorCoordinator?.isOutboundMuted(sessionID: sid) != true,
               !model.isClosed,
               model.connected,
               activeSessionSkills[sid] != nil,

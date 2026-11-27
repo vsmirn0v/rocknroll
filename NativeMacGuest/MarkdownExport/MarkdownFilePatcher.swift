@@ -83,6 +83,47 @@ enum MarkdownFilePatcher {
         return PatchResult(text: text, blockSHA256: sha256(managedContent), fileSHA256: sha256(text))
     }
 
+    static func removeManagedBlock(existing: String, sessionID: UUID, nonce: String,
+                                   component: ObsidianExportComponent,
+                                   expectedBlockSHA256: String?) throws -> String {
+        let structure = MarkdownStructureScanner.scan(existing)
+        if let ambiguity = structure.markerAmbiguity {
+            throw ObsidianExportError.markerDamage(ambiguity)
+        }
+        let matches = structure.managedBlocks.filter {
+            $0.markers.sessionID == sessionID && $0.markers.component == component
+        }
+        guard !matches.isEmpty else { return existing }
+        guard matches.count == 1, let owned = matches.first, owned.markers.nonce == nonce else {
+            throw ObsidianExportError.markerDamage("The managed block has an unexpected identity.")
+        }
+        let innerStart = structure.lines[owned.beginLine].byteEnd + 1
+        let innerEnd = structure.lines[owned.endLine].byteStart
+        guard innerStart <= innerEnd, let inner = substring(of: existing, bytes: innerStart..<innerEnd) else {
+            throw ObsidianExportError.markerDamage("block byte range is invalid")
+        }
+        let canonicalInner = normalizeManagedInner(inner)
+        if let expectedBlockSHA256, sha256(canonicalInner) != expectedBlockSHA256 {
+            throw ObsidianExportError.managedBlockConflict
+        }
+        let bytes = Data(existing.utf8)
+        let blockStart = structure.lines[owned.beginLine].byteStart
+        let afterEnd = structure.lines[owned.endLine].byteEnd
+        var suffixStart = afterEnd
+        if suffixStart < bytes.count, bytes[suffixStart] == UInt8(ascii: "\n") {
+            suffixStart += 1
+        }
+        var prefixData = bytes.prefix(blockStart)
+        let suffixData = bytes.suffix(from: suffixStart)
+        while prefixData.last == UInt8(ascii: "\n"), prefixData.dropLast().last == UInt8(ascii: "\n"), suffixData.isEmpty || suffixData.first == UInt8(ascii: "\n") {
+            prefixData = prefixData.dropLast()
+        }
+        guard let result = String(data: prefixData + suffixData, encoding: .utf8) else {
+            throw ObsidianExportError.markerDamage("retracted file is not valid UTF-8")
+        }
+        return result
+    }
+
     static func managedBlockHash(in text: String, sessionID: UUID, nonce: String,
                                  component: ObsidianExportComponent) -> String? {
         managedBlockContent(in: text, sessionID: sessionID, nonce: nonce, component: component).map(sha256)

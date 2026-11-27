@@ -210,6 +210,9 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
         trigger: String = "manual",
         suppressAutoGreet: Bool = false
     ) {
+        if workspace?.assistantCoordinator?.isOutboundMuted(for: controllerID) == true {
+            return
+        }
         manuallyDisabledSessions.remove(controllerID)
         let chosen = resolveSkillID(explicitSkillID: skillID, meetingTitle: title)
         activeSessionSkills[controllerID] = chosen
@@ -719,13 +722,25 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
             ?? (!titleKey.isEmpty ? pendingSkillByTitleOrURL.removeValue(forKey: titleKey) : nil) {
             enable(controllerID: controllerID, title: title, skillID: queued, trigger: "pending")
         } else if !manuallyDisabledSessions.contains(controllerID) {
-            let bridge = resolveBridge(controllerID)
-            let seriesIDs = [bridge?.calendarSeriesKey, bridge?.localCalendarSeriesKey].compactMap { $0 }
-            let roomKeys = [roomURLString, bridge?.roomKey].compactMap { $0 }.filter { !$0.isEmpty }
-            if let configuredSkillID = workspace?.autoFacilitatorSkillID(seriesIDs: seriesIDs, roomKeys: roomKeys),
-               let configuredSkill = skills?.skills.first(where: { $0.id == configuredSkillID && $0.enabled }) {
-                enable(controllerID: controllerID, title: title, skillID: configuredSkill.id, trigger: "meeting-setting")
-            } else if skills?.autonomousMeetingVoiceEnabled == true,
+        let bridge = resolveBridge(controllerID)
+        let seriesIDs = [bridge?.calendarSeriesKey, bridge?.localCalendarSeriesKey].compactMap { $0 }
+        let roomKeys = [roomURLString, bridge?.roomKey].compactMap { $0 }.filter { !$0.isEmpty }
+        if let cfg = workspace?.autoFacilitatorConfiguration(seriesIDs: seriesIDs, roomKeys: roomKeys),
+           let cfgMode = cfg.engagementMode, cfgMode == .observe || cfgMode == .advise {
+            let skillID = cfg.skillID ?? AssistantSkill.personalAssistantID
+            let assistantMode: IOSMeetingAssistantMode = cfgMode == .observe ? .observe : .advise
+            workspace?.assistantCoordinator?.setRoleAndMode(
+                skillID: skillID,
+                presetID: cfg.presetID,
+                mode: assistantMode,
+                for: controllerID
+            )
+            return
+        }
+        if let configuredSkillID = workspace?.autoFacilitatorSkillID(seriesIDs: seriesIDs, roomKeys: roomKeys),
+           let configuredSkill = skills?.skills.first(where: { $0.id == configuredSkillID && $0.enabled }) {
+            enable(controllerID: controllerID, title: title, skillID: configuredSkill.id, trigger: "meeting-setting")
+        } else if skills?.autonomousMeetingVoiceEnabled == true,
                       let matched = skills?.skills.first(where: {
                           $0.enabled && $0.voiceActivation && $0.matches(meetingTitle: title, commandText: "")
                       }) {
@@ -1046,6 +1061,10 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
         skill: AssistantSkill?,
         skillID: String
     ) async {
+        guard workspace?.assistantCoordinator?.isOutboundMuted(for: controllerID) != true else {
+            await teardownRealtimeSession(controllerID: controllerID)
+            return
+        }
         guard let skills else { return }
         let kind = skills.realtimeProvider
         guard kind != .disabled,
@@ -1982,7 +2001,8 @@ final class IOSAutonomousMeetingFacilitator: ObservableObject {
     }
 
     func speakIntoMeeting(_ text: String, controllerID: UUID) async {
-        guard activeSessionSkills[controllerID] != nil,
+        guard workspace?.assistantCoordinator?.isOutboundMuted(for: controllerID) != true,
+              activeSessionSkills[controllerID] != nil,
               !manuallyDisabledSessions.contains(controllerID),
               let initialBridge = resolveBridge(controllerID),
               initialBridge.isConnected() else {

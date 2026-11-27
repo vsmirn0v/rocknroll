@@ -8,6 +8,8 @@ import SwiftUI
 @MainActor
 final class IOSAssistantSkillsController: ObservableObject {
     @Published private(set) var skills: [AssistantSkill] = []
+    @Published private(set) var presets: [AssistantRolePreset] = []
+    @Published private(set) var syncedVaultDestinations: [SyncedVaultDestinationDescriptor] = []
     @Published private(set) var prompts: [AssistantPromptDocument] = []
     @Published private(set) var people = AssistantPeopleDirectory()
     @Published private(set) var teamContext = AssistantTeamContextDocument()
@@ -136,6 +138,7 @@ final class IOSAssistantSkillsController: ObservableObject {
         refreshRealtimeKeyIndicators()
         refresh()
         startWatcher()
+        workspace?.skillsController = self
         credentialObserver = NotificationCenter.default.addObserver(
             forName: YandexRealtimePreferences.credentialsChangedNotification,
             object: nil,
@@ -242,6 +245,7 @@ final class IOSAssistantSkillsController: ObservableObject {
     func refresh() {
         withRepository { repo, vaultURL in
             self.skills = repo.listSkills()
+            self.presets = repo.listPresets()
             self.prompts = repo.listPrompts()
             self.people = repo.loadPeople()
             self.teamContext = repo.loadTeamContext()
@@ -249,6 +253,24 @@ final class IOSAssistantSkillsController: ObservableObject {
             self.folderPath = repo.rootURL.path
             self.hasLoadedOnce = true
         }
+    }
+
+    @discardableResult
+    func savePreset(_ preset: AssistantRolePreset) throws -> AssistantRolePreset {
+        let saved = try withRepository { repo, _ in
+            try repo.savePreset(preset)
+        }
+        refresh()
+        notifyLocalCloudSyncableChange()
+        return saved
+    }
+
+    func deletePreset(skillID: String, id: String) throws {
+        try withRepository { repo, _ in
+            try repo.deletePreset(skillID: skillID, id: id)
+        }
+        refresh()
+        notifyLocalCloudSyncableChange()
     }
 
     func startWatcher() {
@@ -438,6 +460,7 @@ final class IOSAssistantSkillsController: ObservableObject {
             people: people,
             teamContext: teamContext,
             skills: skills,
+            presets: presets,
             prompts: prompts,
             preferences: LocalAssistantPortablePreferences(
                 selectedSkillIDs: selectedSkillIDs,
@@ -449,7 +472,8 @@ final class IOSAssistantSkillsController: ObservableObject {
                 realtimeFolderID: realtimeFolderID,
                 realtimeVoiceRole: realtimeVoiceRole,
                 lastBoardURL: lastBoardURL
-            )
+            ),
+            vaultDestinations: syncedVaultDestinations
         )
     }
 
@@ -464,6 +488,9 @@ final class IOSAssistantSkillsController: ObservableObject {
             previousBaseline: previousBaseline
         ) else {
             return previousBaseline
+        }
+        if let updated = plan.updatedVaultDestinations, !updated.isEmpty, syncedVaultDestinations != updated {
+            syncedVaultDestinations = updated
         }
         guard plan.hasAnyChange else {
             return plan.updatedBaseline

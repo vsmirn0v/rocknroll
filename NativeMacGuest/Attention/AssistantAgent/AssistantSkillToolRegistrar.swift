@@ -351,6 +351,70 @@ enum AssistantSkillToolRegistrar {
                 summary: L("Found %ld knowledge matches for “%@”.", items.count, query)
             )
         })
+
+        registry.register(AgentSkillClosureTool(
+            descriptor: .init(
+                name: "rocknroll_list_role_presets",
+                description: "List specialized Markdown Role Presets under Rock Assistant/Presets/<skill_id>/.",
+                arguments: [
+                    .init(name: "skill_id", type: .string, required: false, description: "Optional parent Role skill slug."),
+                ]
+            )
+        ) { call, args in
+            let skillID = args["skill_id"]?.stringValue?.trimmed
+            let presets = await attention.withCompositeSkillRepository { repo, _ in
+                repo.listPresets(skillID: skillID?.isEmpty == true ? nil : skillID)
+            }
+            let items: [AssistantJSON] = presets.map { preset in
+                .object(
+                    ("id", .string(preset.id)),
+                    ("skill_id", .string(preset.skillID)),
+                    ("name", .string(preset.name)),
+                    ("focus_speaker_role", .string(preset.focusSpeakerRole)),
+                    ("enabled", .bool(preset.enabled))
+                )
+            }
+            return .init(
+                callID: call.id,
+                toolName: call.name,
+                json: .object(["items": .array(items)]),
+                summary: L("Found %ld role presets.", items.count)
+            )
+        })
+
+        registry.register(AgentSkillClosureTool(
+            descriptor: .init(
+                name: "rocknroll_list_expert_opinions",
+                description: "List persisted Primary and Secondary Expert Opinion blocks for a meeting session.",
+                arguments: [
+                    .init(name: "session_id", type: .string, required: true, description: "Session UUID or session: identifier."),
+                ]
+            )
+        ) { call, args in
+            guard let raw = args["session_id"]?.stringValue?.trimmed,
+                  let token = raw.split(separator: ":").last.map(String.init),
+                  let sessionID = UUID(uuidString: token) else {
+                throw AssistantAgentError.missingArgument(call.name, "session_id")
+            }
+            await attention.store.waitForMeetingLibrary()
+            let blocks = (try? await attention.store.meetingLibrary.store.expertBlocks(for: sessionID)) ?? []
+            let items: [AssistantJSON] = blocks.map { block in
+                .object(
+                    ("block_id", .string(block.id.uuidString)),
+                    ("skill_id", .string(block.skillID)),
+                    ("preset_id", .string(block.presetID ?? "")),
+                    ("title", .string(block.title.value)),
+                    ("headline_verdict", .string(block.headlineVerdict.value ?? "")),
+                    ("markdown_body", .string(block.markdownBody.value))
+                )
+            }
+            return .init(
+                callID: call.id,
+                toolName: call.name,
+                json: .object(["items": .array(items)]),
+                summary: L("Found %ld expert opinions.", items.count)
+            )
+        })
     }
 
     private static func registerJiraActionTool(
@@ -1200,6 +1264,53 @@ enum AssistantSkillToolRegistrar {
                 toolName: call.name,
                 json: .object(["id": .string(saved.id), "path": .string(saved.sourceRelativePath ?? "")]),
                 summary: L("Saved Obsidian skill “%@”.", saved.name)
+            )
+        })
+        }
+
+        if allows(.meetingSummary) || allows(.tasks) {
+        registry.register(AgentSkillClosureTool(
+            descriptor: .init(
+                name: "rocknroll_generate_expert_opinion",
+                description: "Generate or regenerate an Expert Opinion block on a meeting using full-transcript evaluation.",
+                arguments: [
+                    .init(name: "session_id", type: .string, required: true),
+                    .init(name: "skill_id", type: .string, required: true),
+                    .init(name: "preset_id", type: .string, required: false),
+                    .init(name: "focus_speakers", type: .array, required: false),
+                    .init(name: "extra_context", type: .string, required: false),
+                    .init(name: "make_primary", type: .boolean, required: false),
+                ],
+                allowsArbitraryArguments: true
+            )
+        ) { call, args in
+            guard let rawSID = args["session_id"]?.stringValue?.trimmed,
+                  let token = rawSID.split(separator: ":").last.map(String.init),
+                  let sessionID = UUID(uuidString: token),
+                  let skillID = args["skill_id"]?.stringValue?.trimmed, !skillID.isEmpty else {
+                throw AssistantAgentError.missingArgument(call.name, "session_id, skill_id")
+            }
+            let presetID = args["preset_id"]?.stringValue?.trimmed
+            let focusSpeakers = args["focus_speakers"]?.arrayValue?.compactMap(\.stringValue)
+            let extraContext = args["extra_context"]?.stringValue ?? ""
+            let makePrimary = args["make_primary"]?.boolValue
+            let block = try await attention.generateExpertSummary(
+                sessionID: sessionID,
+                skillID: skillID,
+                presetID: presetID?.isEmpty == true ? nil : presetID,
+                focusSpeakers: focusSpeakers,
+                adHocContext: extraContext,
+                makePrimary: makePrimary
+            )
+            return .init(
+                callID: call.id,
+                toolName: call.name,
+                json: .object(
+                    ("block_id", .string(block.id.uuidString)),
+                    ("title", .string(block.title.value)),
+                    ("headline_verdict", .string(block.headlineVerdict.value ?? ""))
+                ),
+                summary: block.title.value
             )
         })
         }

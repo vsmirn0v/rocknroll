@@ -26,6 +26,8 @@ struct WorkspaceLiveMeeting: View {
     @State private var editText = ""
     @State private var feedback: String?
     @State private var copiedTranscript = false
+    @State private var whisperQuestion = ""
+    @State private var askingWhisper = false
 
     init(workspace: NativeDesktopWorkspace, state: MeetingWorkspaceViewState,
          model: NativeDesktopMeetingModel, session: MeetingWorkspaceSession?, selected: Bool, style: Style) {
@@ -76,6 +78,9 @@ struct WorkspaceLiveMeeting: View {
         if followingPause != nil && participation.status != .observing { return L("Assistant paused") }
         if !store.enabled { return L("Assistant off") }
         if participation.status != .inactive { return participation.status.title }
+        if let advisorMode = attention.advisorCoordinator?.activeMode(for: sessionID) {
+            return advisorMode == .observe ? L("Observing silently") : L("Advising privately")
+        }
         return switch attention.resolvedMode(model).mode {
         case .off: L("Assistant off")
         case .mentions: L("Following mentions")
@@ -534,6 +539,11 @@ struct WorkspaceLiveMeeting: View {
             }
         } else {
             VStack(alignment: .leading, spacing: 11) {
+                if let advisor = attention.advisorCoordinator,
+                   let advisorSession = advisor.activeSessions[sessionID] {
+                    advisorPanel(advisor: advisor, session: advisorSession)
+                    Divider()
+                }
                 Text(L("Working context")).font(.headline)
                 if let reason = participation.reason?.message ?? followingWaiting {
                     Text(reason).font(.caption).foregroundStyle(.secondary)
@@ -581,6 +591,128 @@ struct WorkspaceLiveMeeting: View {
                     Label(L("Meeting chat"), systemImage: "bubble.left").font(.callout)
                 }
             }.frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    @ViewBuilder
+    private func advisorPanel(
+        advisor: AdvisorSessionCoordinator,
+        session: AdvisorSessionCoordinator.ActiveSession
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Label(
+                    session.mode == .observe ? L("Observer Notes") : L("Private Advisor"),
+                    systemImage: session.mode.symbol
+                )
+                .font(.headline)
+                .foregroundStyle(session.mode.tint)
+                Spacer()
+                Text(L("Silent"))
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.orange)
+                    .padding(.horizontal, 6).padding(.vertical, 2)
+                    .background(Color.orange.opacity(0.14), in: Capsule())
+            }
+
+            Picker(L("Mode"), selection: Binding(
+                get: { session.mode },
+                set: { nextMode in
+                    attention.setMeetingRoleAndMode(
+                        model: model,
+                        skillID: session.skillID,
+                        presetID: session.presetID,
+                        mode: nextMode
+                    )
+                }
+            )) {
+                Text(L("Observe")).tag(AssistantEngagementMode.observe)
+                Text(L("Advise")).tag(AssistantEngagementMode.advise)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+
+            if advisor.isEvaluatingSession.contains(sessionID) {
+                ProgressView().controlSize(.small)
+            }
+
+            let items = (advisor.observationsBySession[sessionID] ?? []).filter { !$0.isDismissed }
+            if items.isEmpty {
+                Text(session.mode == .observe
+                     ? L("Listening silently to take structured role notes.")
+                     : L("Listening silently for coaching hints and suggested probes."))
+                    .font(.caption).foregroundStyle(.secondary)
+            } else {
+                ForEach(items) { item in
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack(spacing: 4) {
+                            Image(systemName: item.kind.symbol).font(.caption)
+                            Text(item.title).font(.caption.weight(.semibold)).lineLimit(2)
+                            Spacer()
+                            Button {
+                                advisor.togglePin(observationID: item.id, sessionID: sessionID)
+                            } label: {
+                                Image(systemName: item.isPinned ? "star.fill" : "star")
+                                    .foregroundStyle(item.isPinned ? .orange : .secondary)
+                            }
+                            .buttonStyle(.borderless)
+                            Button {
+                                advisor.insertIntoNotes(
+                                    observationID: item.id,
+                                    sessionID: sessionID,
+                                    noteSessionID: model.activeNoteSessionID
+                                )
+                            } label: {
+                                Image(systemName: item.copiedToNotesAt != nil ? "checkmark.circle" : "note.text.badge.plus")
+                            }
+                            .buttonStyle(.borderless)
+                            Button {
+                                advisor.dismiss(observationID: item.id, sessionID: sessionID)
+                            } label: {
+                                Image(systemName: "xmark")
+                            }
+                            .buttonStyle(.borderless)
+                        }
+                        Text(item.body).font(.caption).textSelection(.enabled)
+                        if !item.evidenceRefs.isEmpty {
+                            Text(item.evidenceRefs.map { "[\($0)]" }.joined(separator: " "))
+                                .font(.caption2).foregroundStyle(.secondary)
+                        }
+                    }
+                    .padding(7)
+                    .background(Color.secondary.opacity(0.09), in: RoundedRectangle(cornerRadius: 6))
+                }
+            }
+
+            if session.mode == .advise {
+                HStack(spacing: 6) {
+                    TextField(L("Ask advisor privately…"), text: $whisperQuestion)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.caption)
+                        .onSubmit { submitWhisper() }
+                    Button {
+                        submitWhisper()
+                    } label: {
+                        if askingWhisper {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Image(systemName: "paperplane")
+                        }
+                    }
+                    .disabled(whisperQuestion.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || askingWhisper)
+                }
+            }
+        }
+    }
+
+    private func submitWhisper() {
+        let q = whisperQuestion.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !q.isEmpty, let advisor = attention.advisorCoordinator else { return }
+        whisperQuestion = ""
+        askingWhisper = true
+        Task { @MainActor in
+            defer { askingWhisper = false }
+            _ = try? await advisor.whisper(q, in: model)
         }
     }
 

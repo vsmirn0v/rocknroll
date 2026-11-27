@@ -104,16 +104,22 @@ public struct AssistantKnowledgeSearchHit: Identifiable, Codable, Equatable, Sen
     }
 }
 
-/// Manages Obsidian-backed (or local AppSupport fallback) skills, `People.md`, and `TeamContext.md`.
+/// Manages Obsidian-backed (or local AppSupport fallback) skills, presets, `People.md`, and `TeamContext.md`.
 public struct AssistantSkillRepository: Sendable {
     public let rootURL: URL
+    public let owningDestinationID: UUID?
 
-    public init(rootURL: URL) {
+    public init(rootURL: URL, owningDestinationID: UUID? = nil) {
         self.rootURL = rootURL
+        self.owningDestinationID = owningDestinationID
     }
 
     public var skillsDirectoryURL: URL {
         rootURL.appendingPathComponent("Skills", isDirectory: true)
+    }
+
+    public var presetsDirectoryURL: URL {
+        rootURL.appendingPathComponent("Presets", isDirectory: true)
     }
 
     public var knowledgeDirectoryURL: URL {
@@ -160,6 +166,7 @@ public struct AssistantSkillRepository: Sendable {
         let lock = NSLock()
         var verifiedRoots: Set<String> = []
         var skillsByPath: [String: (stamp: FileStamp, skill: AssistantSkill)] = [:]
+        var presetsByPath: [String: (stamp: FileStamp, preset: AssistantRolePreset)] = [:]
         var peopleByPath: [String: (stamp: FileStamp, directory: AssistantPeopleDirectory)] = [:]
         var teamContextByPath: [String: (stamp: FileStamp, doc: AssistantTeamContextDocument)] = [:]
         var promptsByPath: [String: (stamp: FileStamp, doc: AssistantPromptDocument)] = [:]
@@ -213,6 +220,7 @@ public struct AssistantSkillRepository: Sendable {
         let cache = RepositoryCache.shared
         cache.lock.lock()
         cache.skillsByPath.removeValue(forKey: key)
+        cache.presetsByPath.removeValue(forKey: key)
         cache.peopleByPath.removeValue(forKey: key)
         cache.teamContextByPath.removeValue(forKey: key)
         cache.promptsByPath.removeValue(forKey: key)
@@ -366,12 +374,14 @@ public struct AssistantSkillRepository: Sendable {
                 relativePath: "Skills/\(file.lastPathComponent)",
                 updatedAt: values.contentModificationDate
             )
+            var taggedSkill = skill
+            taggedSkill.owningDestinationID = owningDestinationID
             if let stamp {
                 cache.lock.lock()
-                cache.skillsByPath[key] = (stamp, skill)
+                cache.skillsByPath[key] = (stamp, taggedSkill)
                 cache.lock.unlock()
             }
-            loaded.append(skill)
+            loaded.append(taggedSkill)
         }
         return loaded.sorted {
             $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
@@ -381,6 +391,12 @@ public struct AssistantSkillRepository: Sendable {
     public func skill(id: String) -> AssistantSkill? {
         let slug = AssistantSkill.sanitizedSlug(from: id)
         guard !slug.isEmpty else { return nil }
+        if slug == AssistantSkill.personalAssistantID {
+            let file = skillURL(id: slug)
+            if !FileManager.default.fileExists(atPath: file.path) {
+                return DefaultAssistantSkills.personalAssistant
+            }
+        }
         let file = skillURL(id: slug)
         let key = cacheKey(for: file)
         let cache = RepositoryCache.shared
@@ -389,16 +405,19 @@ public struct AssistantSkillRepository: Sendable {
             let hit = cache.skillsByPath[key]
             cache.lock.unlock()
             if let hit, hit.stamp == stamp {
-                return hit.skill
+                var cached = hit.skill
+                cached.owningDestinationID = owningDestinationID
+                return cached
             }
             if let text = try? String(contentsOf: file, encoding: .utf8) {
                 let modified = (try? file.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
-                let skill = AssistantSkillMarkdownCodec.decode(
+                var skill = AssistantSkillMarkdownCodec.decode(
                     text,
                     fallbackSlug: slug,
                     relativePath: "Skills/\(file.lastPathComponent)",
                     updatedAt: modified
                 )
+                skill.owningDestinationID = owningDestinationID
                 cache.lock.lock()
                 cache.skillsByPath[key] = (stamp, skill)
                 cache.lock.unlock()
@@ -406,12 +425,14 @@ public struct AssistantSkillRepository: Sendable {
             }
         } else if let text = try? String(contentsOf: file, encoding: .utf8) {
             let modified = (try? file.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
-            return AssistantSkillMarkdownCodec.decode(
+            var skill = AssistantSkillMarkdownCodec.decode(
                 text,
                 fallbackSlug: slug,
                 relativePath: "Skills/\(file.lastPathComponent)",
                 updatedAt: modified
             )
+            skill.owningDestinationID = owningDestinationID
+            return skill
         }
         return listSkills().first { $0.id == slug }
     }
@@ -422,6 +443,7 @@ public struct AssistantSkillRepository: Sendable {
         var clean = skill
         clean.sourceRelativePath = "Skills/\(clean.id).md"
         clean.updatedAt = Date()
+        clean.owningDestinationID = owningDestinationID
         let destination = skillURL(id: clean.id)
         try writeAtomic(AssistantSkillMarkdownCodec.encode(clean), to: destination)
         invalidateFileCache(at: destination)
@@ -441,6 +463,133 @@ public struct AssistantSkillRepository: Sendable {
         if seeded.insert(slug).inserted {
             try? saveSeededIDs(seeded)
         }
+    }
+
+    // MARK: - Role Presets (`Presets/<skill-id>/<preset-slug>.md`)
+
+    public func presetDirectoryURL(skillID: String) -> URL {
+        presetsDirectoryURL.appendingPathComponent(AssistantSkill.sanitizedSlug(from: skillID), isDirectory: true)
+    }
+
+    public func presetURL(skillID: String, id: String) -> URL {
+        presetDirectoryURL(skillID: skillID)
+            .appendingPathComponent("\(AssistantSkill.sanitizedSlug(from: id)).md", isDirectory: false)
+    }
+
+    public func listPresets(skillID: String? = nil) -> [AssistantRolePreset] {
+        let fm = FileManager.default
+        let base = presetsDirectoryURL
+        guard fm.fileExists(atPath: base.path) else { return [] }
+
+        let targetSkillDirs: [URL]
+        if let skillID {
+            let clean = AssistantSkill.sanitizedSlug(from: skillID)
+            let dir = presetDirectoryURL(skillID: clean)
+            targetSkillDirs = fm.fileExists(atPath: dir.path) ? [dir] : []
+        } else {
+            let subdirs = (try? fm.contentsOfDirectory(
+                at: base,
+                includingPropertiesForKeys: [.isDirectoryKey],
+                options: [.skipsHiddenFiles]
+            )) ?? []
+            targetSkillDirs = subdirs.filter {
+                (try? $0.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
+            }
+        }
+
+        let cache = RepositoryCache.shared
+        var loaded: [AssistantRolePreset] = []
+        for dir in targetSkillDirs {
+            let fallbackSkillID = dir.lastPathComponent
+            guard let files = try? fm.contentsOfDirectory(
+                at: dir,
+                includingPropertiesForKeys: [.isRegularFileKey, .contentModificationDateKey],
+                options: [.skipsHiddenFiles]
+            ) else { continue }
+            for file in files where file.pathExtension.caseInsensitiveCompare("md") == .orderedSame {
+                guard let values = try? file.resourceValues(forKeys: [.isRegularFileKey, .contentModificationDateKey]),
+                      values.isRegularFile == true else { continue }
+                let key = cacheKey(for: file)
+                let stamp = Self.fileStamp(for: file)
+                if let stamp {
+                    cache.lock.lock()
+                    let hit = cache.presetsByPath[key]
+                    cache.lock.unlock()
+                    if let hit, hit.stamp == stamp {
+                        var cached = hit.preset
+                        cached.owningDestinationID = owningDestinationID
+                        loaded.append(cached)
+                        continue
+                    }
+                }
+                guard let text = try? String(contentsOf: file, encoding: .utf8) else { continue }
+                let slug = file.deletingPathExtension().lastPathComponent
+                var preset = AssistantRolePresetMarkdownCodec.decode(
+                    text,
+                    fallbackSkillID: fallbackSkillID,
+                    fallbackSlug: slug,
+                    relativePath: "Presets/\(fallbackSkillID)/\(file.lastPathComponent)",
+                    updatedAt: values.contentModificationDate
+                )
+                preset.owningDestinationID = owningDestinationID
+                if let stamp {
+                    cache.lock.lock()
+                    cache.presetsByPath[key] = (stamp, preset)
+                    cache.lock.unlock()
+                }
+                loaded.append(preset)
+            }
+        }
+        return loaded.sorted {
+            if $0.skillID != $1.skillID { return $0.skillID < $1.skillID }
+            return $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+        }
+    }
+
+    public func preset(skillID: String, id: String) -> AssistantRolePreset? {
+        let cleanSkill = AssistantSkill.sanitizedSlug(from: skillID)
+        let cleanID = AssistantSkill.sanitizedSlug(from: id)
+        guard !cleanSkill.isEmpty, !cleanID.isEmpty else { return nil }
+        let file = presetURL(skillID: cleanSkill, id: cleanID)
+        guard FileManager.default.fileExists(atPath: file.path),
+              let text = try? String(contentsOf: file, encoding: .utf8) else {
+            return listPresets(skillID: cleanSkill).first { $0.id == cleanID }
+        }
+        let modified = (try? file.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+        var preset = AssistantRolePresetMarkdownCodec.decode(
+            text,
+            fallbackSkillID: cleanSkill,
+            fallbackSlug: cleanID,
+            relativePath: "Presets/\(cleanSkill)/\(cleanID).md",
+            updatedAt: modified
+        )
+        preset.owningDestinationID = owningDestinationID
+        return preset
+    }
+
+    @discardableResult
+    public func savePreset(_ preset: AssistantRolePreset) throws -> AssistantRolePreset {
+        let dir = presetDirectoryURL(skillID: preset.skillID)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        var clean = preset
+        clean.sourceRelativePath = "Presets/\(clean.skillID)/\(clean.id).md"
+        clean.updatedAt = Date()
+        clean.owningDestinationID = owningDestinationID
+        let destination = presetURL(skillID: clean.skillID, id: clean.id)
+        try writeAtomic(AssistantRolePresetMarkdownCodec.encode(clean), to: destination)
+        invalidateFileCache(at: destination)
+        return clean
+    }
+
+    public func deletePreset(skillID: String, id: String) throws {
+        let cleanSkill = AssistantSkill.sanitizedSlug(from: skillID)
+        let cleanID = AssistantSkill.sanitizedSlug(from: id)
+        guard !cleanSkill.isEmpty, !cleanID.isEmpty else { return }
+        let file = presetURL(skillID: cleanSkill, id: cleanID)
+        if FileManager.default.fileExists(atPath: file.path) {
+            try FileManager.default.removeItem(at: file)
+        }
+        invalidateFileCache(at: file)
     }
 
     public func searchSkills(query: String, enabledOnly: Bool = false) -> [AssistantSkill] {
@@ -842,5 +991,90 @@ public struct AssistantSkillRepository: Sendable {
     private func saveSeededIDs(_ ids: Set<String>) throws {
         let data = try JSONEncoder().encode(ids.sorted())
         try data.write(to: seededMarkerURL, options: [.atomic])
+    }
+}
+
+/// Merges `AssistantSkill` and `AssistantRolePreset` catalogs across a primary repository
+/// and 0..N secondary vault repositories (e.g., a private Hiring Git repository), while routing
+/// edits back to the owning repository.
+public struct CompositeAssistantSkillRepository: Sendable {
+    public let primary: AssistantSkillRepository
+    public let secondary: [AssistantSkillRepository]
+
+    public init(primary: AssistantSkillRepository, secondary: [AssistantSkillRepository] = []) {
+        self.primary = primary
+        self.secondary = secondary
+    }
+
+    public var allRepositories: [AssistantSkillRepository] {
+        [primary] + secondary
+    }
+
+    public func listSkills() -> [AssistantSkill] {
+        var byID: [String: AssistantSkill] = [:]
+        // Primary seeds defaults; secondary vaults override/augment with specialized skills if customized or non-default.
+        for skill in primary.listSkills() {
+            byID[skill.id] = skill
+        }
+        for repo in secondary {
+            for skill in repo.listSkills() {
+                if let existing = byID[skill.id],
+                   let def = DefaultAssistantSkills.skill(id: skill.id),
+                   AssistantCloudSync.skillDigest(skill) == AssistantCloudSync.skillDigest(def),
+                   AssistantCloudSync.skillDigest(existing) != AssistantCloudSync.skillDigest(def) {
+                    continue
+                }
+                if byID[skill.id] == nil || !DefaultAssistantSkills.defaultIDs.contains(skill.id)
+                    || (skill.exportDestinationSlug != nil) {
+                    byID[skill.id] = skill
+                }
+            }
+        }
+        return byID.values.sorted {
+            $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+        }
+    }
+
+    public func listPresets(skillID: String? = nil) -> [AssistantRolePreset] {
+        var byKey: [String: AssistantRolePreset] = [:]
+        for repo in allRepositories {
+            for preset in repo.listPresets(skillID: skillID) {
+                byKey[preset.compositeKey] = preset
+            }
+        }
+        return byKey.values.sorted {
+            if $0.skillID != $1.skillID { return $0.skillID < $1.skillID }
+            return $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+        }
+    }
+
+    public func preset(skillID: String, id: String) -> AssistantRolePreset? {
+        for repo in secondary.reversed() {
+            if let found = repo.preset(skillID: skillID, id: id) {
+                return found
+            }
+        }
+        return primary.preset(skillID: skillID, id: id)
+    }
+
+    public func repository(forOwningDestinationID destinationID: UUID?) -> AssistantSkillRepository {
+        guard let destinationID else { return primary }
+        return allRepositories.first { $0.owningDestinationID == destinationID } ?? primary
+    }
+
+    @discardableResult
+    public func savePreset(_ preset: AssistantRolePreset, preferredDestinationID: UUID? = nil) throws -> AssistantRolePreset {
+        let targetRepo = repository(forOwningDestinationID: preferredDestinationID ?? preset.owningDestinationID)
+        return try targetRepo.savePreset(preset)
+    }
+
+    public func deletePreset(skillID: String, id: String, owningDestinationID: UUID? = nil) throws {
+        if let owningDestinationID {
+            try repository(forOwningDestinationID: owningDestinationID).deletePreset(skillID: skillID, id: id)
+        } else {
+            for repo in allRepositories {
+                try repo.deletePreset(skillID: skillID, id: id)
+            }
+        }
     }
 }

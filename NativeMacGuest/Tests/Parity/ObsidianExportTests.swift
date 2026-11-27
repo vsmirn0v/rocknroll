@@ -763,6 +763,161 @@ final class ObsidianExportTests: XCTestCase {
         XCTAssertTrue(registry.allEntries.isEmpty)
     }
 
+    func testExpertBlockAndCoreOutcomePolicySuppressionAndMultiVaultWriteThenRetract() async throws {
+        let vaultB = temp.appendingPathComponent("VaultB", isDirectory: true)
+        try FileManager.default.createDirectory(at: vaultB, withIntermediateDirectories: true)
+
+        let store = MeetingLibraryStore(root: temp.appendingPathComponent("MultiVaultLibrary", isDirectory: true))
+        stores.append(store)
+        try await store.prepare()
+
+        let destPrimary = ObsidianDestinationRecord(
+            enabled: true, saveAfterMeeting: true, syncChanges: true,
+            configRevision: 1, vaultBookmark: Data([1]),
+            name: "Primary", slug: "primary", isPrimary: true, loadsSkills: false
+        )
+        let destHiring = ObsidianDestinationRecord(
+            enabled: true, saveAfterMeeting: true, syncChanges: true,
+            configRevision: 1, vaultBookmark: Data([2]),
+            name: "Hiring", slug: "hiring", isPrimary: false, loadsSkills: true
+        )
+        try await store.saveDestination(destPrimary)
+        try await store.saveDestination(destHiring)
+
+        var session = MeetingSessionRecord(title: "Candidate Loop", startedAt: Date())
+        try await store.upsertSession(session)
+        _ = try await store.saveNote(sessionID: session.id, markdown: "Interviewer raw notes")
+        _ = try await store.saveOutcome(.init(
+            id: UUID(), meetingTitle: "Candidate Loop", endedAt: Date(),
+            summary: "Core summary text", decisions: ["Core decision"], tasks: [], openQuestions: []
+        ), state: .ready)
+        try await store.saveInObsidian(session.id)
+
+        let worker = ObsidianExportWorker(
+            store: store,
+            backupRoot: backups,
+            vaultResolver: { bookmark in bookmark == Data([2]) ? .granted(vaultB) : .granted(self.vault) }
+        )
+        await worker.runOnce()
+
+        let fileName = MeetingMarkdownTemplate.meetingFileName(title: session.title, sessionID: session.id)
+        let fileA = vault.appendingPathComponent("Meetings/\(fileName)")
+        let fileB = vaultB.appendingPathComponent("Meetings/\(fileName)")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fileA.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fileB.path))
+
+        // Add Dominant Hiring Expert Block routed exclusively to Vault B with coreOutcomePolicy = .expertOnly
+        let v = SyncVersion(counter: 1, device: "mac-test")
+        let block = SyncedMeetingExpertBlock(
+            id: UUID(),
+            sessionID: session.id,
+            skillID: "hiring-interviewer",
+            presetID: "ios-staff",
+            title: SyncValue("Hiring Evaluation — Senior iOS", version: v),
+            visibility: SyncValue(.privateOwnerOnly, version: v),
+            headlineVerdict: SyncValue("Strong Hire (9/10)", version: v),
+            markdownBody: SyncValue("Strong Swift concurrency depth.", version: v),
+            isEdited: false,
+            contextSnapshot: SyncValue(RoleContextSnapshot(skillID: "hiring-interviewer", skillName: "Hiring Interviewer"), version: v),
+            citations: SyncValue([:], version: v),
+            exportDestinationID: SyncValue(destHiring.id, version: v),
+            routeEntireMeeting: SyncValue(true, version: v),
+            sourceCoverageLabel: "Full transcript",
+            transcriptFingerprint: "fp1",
+            versions: [],
+            isDeleted: SyncValue(false, version: v),
+            createdAt: Date(),
+            updatedAt: Date()
+        )
+        let dom = DominantRoleBinding(
+            skillID: "hiring-interviewer",
+            presetID: "ios-staff",
+            mode: .advise,
+            expertBlockID: block.id,
+            coreOutcomePolicy: .expertOnly,
+            exportDestinationID: destHiring.id,
+            routeEntireMeeting: true
+        )
+        try await store.setSessionRoleState(session.id, dominantRole: dom, roleSegments: [], bumpExportRevision: false)
+        try await store.upsertExpertBlock(block, bumpExportRevision: true)
+
+        await worker.runOnce()
+        // Retract was queued for Primary on completion; run worker once more so retraction finishes.
+        await worker.runOnce()
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fileB.path), "Routed meeting must appear in Vault B")
+        let contentB = try String(contentsOf: fileB, encoding: .utf8)
+        XCTAssertTrue(contentB.contains("Strong Hire (9/10)"))
+        XCTAssertFalse(contentB.contains("Core summary text"), "expertOnly suppresses core summary")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fileA.path), "Auto Write-Then-Retract removes superseded export in Vault A")
+        let bindingA = try await store.binding(destinationID: destPrimary.id, sessionID: session.id, component: .meeting)
+        XCTAssertEqual(bindingA?.state, .retracted)
+    }
+
+    func testRetractPausesInConflictWhenSupersededFileWasHandEdited() async throws {
+        let vaultB = temp.appendingPathComponent("VaultBConflict", isDirectory: true)
+        try FileManager.default.createDirectory(at: vaultB, withIntermediateDirectories: true)
+
+        let store = MeetingLibraryStore(root: temp.appendingPathComponent("ConflictLibrary", isDirectory: true))
+        stores.append(store)
+        try await store.prepare()
+
+        let destA = ObsidianDestinationRecord(
+            enabled: true, saveAfterMeeting: true, syncChanges: true,
+            configRevision: 1, vaultBookmark: Data([1]),
+            name: "Primary", slug: "primary", isPrimary: true
+        )
+        let destB = ObsidianDestinationRecord(
+            enabled: true, saveAfterMeeting: true, syncChanges: true,
+            configRevision: 1, vaultBookmark: Data([2]),
+            name: "Hiring", slug: "hiring", isPrimary: false
+        )
+        try await store.saveDestination(destA)
+        try await store.saveDestination(destB)
+
+        let session = MeetingSessionRecord(title: "Conflict Retract", startedAt: Date())
+        try await store.upsertSession(session)
+        _ = try await store.saveNote(sessionID: session.id, markdown: "initial body")
+        try await store.saveInObsidian(session.id)
+
+        let worker = ObsidianExportWorker(
+            store: store,
+            backupRoot: backups,
+            vaultResolver: { bookmark in bookmark == Data([2]) ? .granted(vaultB) : .granted(self.vault) }
+        )
+        await worker.runOnce()
+
+        let fileName = MeetingMarkdownTemplate.meetingFileName(title: session.title, sessionID: session.id)
+        let fileA = vault.appendingPathComponent("Meetings/\(fileName)")
+        let editedA = try String(contentsOf: fileA, encoding: .utf8).replacingOccurrences(of: "initial body", with: "hand edited in A")
+        try editedA.write(to: fileA, atomically: true, encoding: .utf8)
+
+        let v = SyncVersion(counter: 1, device: "mac-test")
+        let block = SyncedMeetingExpertBlock(
+            id: UUID(), sessionID: session.id, skillID: "hiring-interviewer",
+            title: SyncValue("Hiring", version: v), visibility: SyncValue(.privateOwnerOnly, version: v),
+            headlineVerdict: SyncValue("No Hire", version: v), markdownBody: SyncValue("Body", version: v),
+            contextSnapshot: SyncValue(RoleContextSnapshot(skillID: "hiring-interviewer", skillName: "Hiring"), version: v),
+            citations: SyncValue([:], version: v),
+            exportDestinationID: SyncValue(destB.id, version: v), routeEntireMeeting: SyncValue(true, version: v),
+            isDeleted: SyncValue(false, version: v), createdAt: Date(), updatedAt: Date()
+        )
+        let dom = DominantRoleBinding(
+            skillID: "hiring-interviewer", mode: .observe, expertBlockID: block.id, coreOutcomePolicy: .full,
+            exportDestinationID: destB.id, routeEntireMeeting: true
+        )
+        try await store.setSessionRoleState(session.id, dominantRole: dom, roleSegments: [], bumpExportRevision: false)
+        try await store.upsertExpertBlock(block, bumpExportRevision: true)
+
+        await worker.runOnce()
+        await worker.runOnce()
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fileA.path), "Hand-edited superseded file must NOT be deleted")
+        XCTAssertTrue(try String(contentsOf: fileA, encoding: .utf8).contains("hand edited in A"))
+        let bindingA = try await store.binding(destinationID: destA.id, sessionID: session.id, component: .meeting)
+        XCTAssertEqual(bindingA?.state, .conflict)
+    }
+
     private func makeSolidTestImage(width: Int = 48, height: Int = 36, red: UInt8, green: UInt8, blue: UInt8) -> CGImage {
         let colorSpace = CGColorSpaceCreateDeviceRGB()
         let bytesPerRow = width * 4

@@ -21,6 +21,8 @@ struct IOSMeetingSessionItem: Codable, Equatable, Identifiable, Sendable {
     var outcomeClaim: OutcomeGenerationClaim?
     var obsidianReceipt: ObsidianSyncReceipt?
     var manualObsidianSaveAt: Date?
+    var dominantRole: DominantRoleBinding? = nil
+    var roleSegments: [SessionRoleSegment] = []
     var createdAt: Date
     var updatedAt: Date
 }
@@ -156,6 +158,8 @@ actor IOSWorkspaceStore {
         var taskProfile: IOSTaskProfile
         var taskArchiveDates: [UUID: Date]
         var contextSettings: [String: SyncedMeetingContextSettings]
+        var expertBlocksBySession: [UUID: [SyncedMeetingExpertBlock]]
+        var roleObservationsBySession: [UUID: SyncedRoleObservationLog]
     }
 
     let root: URL
@@ -309,8 +313,36 @@ actor IOSWorkspaceStore {
                 scope_key TEXT PRIMARY KEY,
                 payload_json BLOB NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS expert_blocks (
+                block_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+                is_deleted INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL,
+                payload_json BLOB NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_expert_blocks_session ON expert_blocks(session_id, updated_at);
+
+            CREATE TABLE IF NOT EXISTS role_observations (
+                session_id TEXT PRIMARY KEY REFERENCES sessions(session_id) ON DELETE CASCADE,
+                updated_at INTEGER NOT NULL,
+                payload_json BLOB NOT NULL
+            );
             """)
         try ensureTasksExtendedColumn()
+        try ensureSessionRoleColumns()
+    }
+
+    private func ensureSessionRoleColumns() throws {
+        let columns = try query("PRAGMA table_info(sessions)") { stmt in
+            colText(stmt, 1)
+        }
+        if !columns.contains("dominant_role_json") {
+            try exec("ALTER TABLE sessions ADD COLUMN dominant_role_json BLOB;")
+        }
+        if !columns.contains("role_segments_json") {
+            try exec("ALTER TABLE sessions ADD COLUMN role_segments_json BLOB;")
+        }
     }
 
     private func ensureTasksExtendedColumn() throws {
@@ -333,6 +365,8 @@ actor IOSWorkspaceStore {
         let profile = try taskProfile()
         let archiveDates = try taskArchiveDates(profileID: profile.profileID)
         let settings = try allContextSettings()
+        let expertBlocks = try allExpertBlocksBySession(includeDeleted: true)
+        let roleObs = try allRoleObservationsBySession()
         return LocalSnapshot(
             sessions: sessions,
             notesBySession: notes,
@@ -340,20 +374,22 @@ actor IOSWorkspaceStore {
             tasks: tasks,
             taskProfile: profile,
             taskArchiveDates: archiveDates,
-            contextSettings: settings
+            contextSettings: settings,
+            expertBlocksBySession: expertBlocks,
+            roleObservationsBySession: roleObs
         )
     }
 
     func allSessions() throws -> [IOSMeetingSessionItem] {
         try prepare()
-        return try query("SELECT session_id,occurrence_key,title,has_title_override,invitation,room_identity,calendar_series_id,external_series_id,started_at,ended_at,time_zone_id,state,legs_json,outcome_claim_json,obsidian_receipt_json,manual_obsidian_save_at,created_at,updated_at FROM sessions ORDER BY started_at DESC") { stmt in
+        return try query("SELECT session_id,occurrence_key,title,has_title_override,invitation,room_identity,calendar_series_id,external_series_id,started_at,ended_at,time_zone_id,state,legs_json,outcome_claim_json,obsidian_receipt_json,manual_obsidian_save_at,created_at,updated_at,dominant_role_json,role_segments_json FROM sessions ORDER BY started_at DESC") { stmt in
             decodeSessionRow(stmt)
         }
     }
 
     func session(_ id: UUID) throws -> IOSMeetingSessionItem? {
         try prepare()
-        return try query("SELECT session_id,occurrence_key,title,has_title_override,invitation,room_identity,calendar_series_id,external_series_id,started_at,ended_at,time_zone_id,state,legs_json,outcome_claim_json,obsidian_receipt_json,manual_obsidian_save_at,created_at,updated_at FROM sessions WHERE session_id=?", bind: {
+        return try query("SELECT session_id,occurrence_key,title,has_title_override,invitation,room_identity,calendar_series_id,external_series_id,started_at,ended_at,time_zone_id,state,legs_json,outcome_claim_json,obsidian_receipt_json,manual_obsidian_save_at,created_at,updated_at,dominant_role_json,role_segments_json FROM sessions WHERE session_id=?", bind: {
             bindText($0, id.uuidString, at: 1)
         }) { stmt in
             decodeSessionRow(stmt)
@@ -365,12 +401,15 @@ actor IOSWorkspaceStore {
         let legsData = try encoder.encode(session.legs)
         let claimData = try session.outcomeClaim.map { try encoder.encode($0) }
         let receiptData = try session.obsidianReceipt.map { try encoder.encode($0) }
+        let dominantData = try session.dominantRole.map { try encoder.encode($0) }
+        let segmentsData = session.roleSegments.isEmpty ? nil : try encoder.encode(session.roleSegments)
         try run("""
             INSERT INTO sessions(
                 session_id,occurrence_key,title,title_folded,has_title_override,invitation,room_identity,
                 calendar_series_id,external_series_id,started_at,ended_at,time_zone_id,state,legs_json,
-                outcome_claim_json,obsidian_receipt_json,manual_obsidian_save_at,created_at,updated_at
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                outcome_claim_json,obsidian_receipt_json,manual_obsidian_save_at,created_at,updated_at,
+                dominant_role_json,role_segments_json
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(session_id) DO UPDATE SET
                 occurrence_key=excluded.occurrence_key,
                 title=excluded.title,
@@ -388,7 +427,9 @@ actor IOSWorkspaceStore {
                 outcome_claim_json=excluded.outcome_claim_json,
                 obsidian_receipt_json=excluded.obsidian_receipt_json,
                 manual_obsidian_save_at=excluded.manual_obsidian_save_at,
-                updated_at=excluded.updated_at
+                updated_at=excluded.updated_at,
+                dominant_role_json=COALESCE(excluded.dominant_role_json, sessions.dominant_role_json),
+                role_segments_json=COALESCE(excluded.role_segments_json, sessions.role_segments_json)
             """) { stmt in
             bindText(stmt, session.id.uuidString, at: 1)
             bindText(stmt, session.occurrenceKey, at: 2)
@@ -409,7 +450,87 @@ actor IOSWorkspaceStore {
             bindOptionalInt(stmt, session.manualObsidianSaveAt?.syncMilliseconds, at: 17)
             bindInt(stmt, session.createdAt.syncMilliseconds, at: 18)
             bindInt(stmt, session.updatedAt.syncMilliseconds, at: 19)
+            bindBlob(stmt, dominantData, at: 20)
+            bindBlob(stmt, segmentsData, at: 21)
         }
+    }
+
+    func setSessionRoleState(
+        _ sessionID: UUID,
+        dominantRole: DominantRoleBinding?,
+        roleSegments: [SessionRoleSegment]
+    ) throws {
+        try prepare()
+        try ensureSessionExists(sessionID)
+        let dominantData = try dominantRole.map { try encoder.encode($0) }
+        let segmentsData = roleSegments.isEmpty ? nil : try encoder.encode(roleSegments)
+        try run("""
+            UPDATE sessions SET dominant_role_json=?, role_segments_json=?, updated_at=?
+            WHERE session_id=?
+            """) { stmt in
+            bindBlob(stmt, dominantData, at: 1)
+            bindBlob(stmt, segmentsData, at: 2)
+            bindInt(stmt, Date().syncMilliseconds, at: 3)
+            bindText(stmt, sessionID.uuidString, at: 4)
+        }
+    }
+
+    func upsertExpertBlock(_ block: SyncedMeetingExpertBlock) throws {
+        try prepare()
+        try ensureSessionExists(block.sessionID)
+        let payload = try encoder.encode(block)
+        try run("""
+            INSERT INTO expert_blocks(block_id, session_id, is_deleted, updated_at, payload_json)
+            VALUES(?,?,?,?,?)
+            ON CONFLICT(block_id) DO UPDATE SET
+                is_deleted=excluded.is_deleted,
+                updated_at=excluded.updated_at,
+                payload_json=excluded.payload_json
+            """) { stmt in
+            bindText(stmt, block.id.uuidString, at: 1)
+            bindText(stmt, block.sessionID.uuidString, at: 2)
+            bindInt(stmt, block.isDeleted.value ? 1 : 0, at: 3)
+            bindInt(stmt, block.updatedAt.syncMilliseconds, at: 4)
+            bindBlob(stmt, payload, at: 5)
+        }
+    }
+
+    func allExpertBlocksBySession(includeDeleted: Bool = false) throws -> [UUID: [SyncedMeetingExpertBlock]] {
+        try prepare()
+        let sql = includeDeleted
+            ? "SELECT payload_json FROM expert_blocks ORDER BY updated_at ASC"
+            : "SELECT payload_json FROM expert_blocks WHERE is_deleted=0 ORDER BY updated_at ASC"
+        let blocks = try query(sql) { stmt -> SyncedMeetingExpertBlock? in
+            guard let data = colBlob(stmt, 0) else { return nil }
+            return try? decoder.decode(SyncedMeetingExpertBlock.self, from: data)
+        }
+        return Dictionary(grouping: blocks, by: \.sessionID)
+    }
+
+    func upsertRoleObservations(_ log: SyncedRoleObservationLog) throws {
+        try prepare()
+        try ensureSessionExists(log.sessionID)
+        let payload = try encoder.encode(log)
+        try run("""
+            INSERT INTO role_observations(session_id, updated_at, payload_json)
+            VALUES(?,?,?)
+            ON CONFLICT(session_id) DO UPDATE SET
+                updated_at=excluded.updated_at,
+                payload_json=excluded.payload_json
+            """) { stmt in
+            bindText(stmt, log.sessionID.uuidString, at: 1)
+            bindInt(stmt, log.updatedAt.syncMilliseconds, at: 2)
+            bindBlob(stmt, payload, at: 3)
+        }
+    }
+
+    func allRoleObservationsBySession() throws -> [UUID: SyncedRoleObservationLog] {
+        try prepare()
+        let logs = try query("SELECT payload_json FROM role_observations") { stmt -> SyncedRoleObservationLog? in
+            guard let data = colBlob(stmt, 0) else { return nil }
+            return try? decoder.decode(SyncedRoleObservationLog.self, from: data)
+        }
+        return Dictionary(uniqueKeysWithValues: logs.map { ($0.sessionID, $0) })
     }
 
     func deleteSession(_ id: UUID) throws {
@@ -445,6 +566,8 @@ actor IOSWorkspaceStore {
             outcomeClaim: remote.outcomeClaim?.value ?? existing?.outcomeClaim,
             obsidianReceipt: remote.obsidianReceipt?.value ?? existing?.obsidianReceipt,
             manualObsidianSaveAt: remote.manualObsidianSaveAt?.value ?? existing?.manualObsidianSaveAt,
+            dominantRole: remote.dominantRole?.value ?? existing?.dominantRole,
+            roleSegments: remote.roleSegments?.value ?? existing?.roleSegments ?? [],
             createdAt: min(existing?.createdAt ?? remote.createdAt, remote.createdAt),
             updatedAt: max(existing?.updatedAt ?? remote.updatedAt, remote.updatedAt)
         )
@@ -1043,6 +1166,8 @@ actor IOSWorkspaceStore {
         let legs = colBlob(stmt, 12).flatMap { try? decoder.decode([String: DeviceParticipationLeg].self, from: $0) } ?? [:]
         let claim = colBlob(stmt, 13).flatMap { try? decoder.decode(OutcomeGenerationClaim.self, from: $0) }
         let receipt = colBlob(stmt, 14).flatMap { try? decoder.decode(ObsidianSyncReceipt.self, from: $0) }
+        let dominantRole = colBlob(stmt, 18).flatMap { try? decoder.decode(DominantRoleBinding.self, from: $0) }
+        let roleSegments = colBlob(stmt, 19).flatMap { try? decoder.decode([SessionRoleSegment].self, from: $0) } ?? []
         return IOSMeetingSessionItem(
             id: sid,
             occurrenceKey: occKey,
@@ -1060,6 +1185,8 @@ actor IOSWorkspaceStore {
             outcomeClaim: claim,
             obsidianReceipt: receipt,
             manualObsidianSaveAt: colInt(stmt, 15).map(Date.fromSyncMilliseconds),
+            dominantRole: dominantRole,
+            roleSegments: roleSegments,
             createdAt: Date.fromSyncMilliseconds(createdMs),
             updatedAt: Date.fromSyncMilliseconds(updatedMs)
         )

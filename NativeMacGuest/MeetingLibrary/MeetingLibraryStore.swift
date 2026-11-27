@@ -396,6 +396,15 @@ actor MeetingLibraryStore: @unchecked Sendable {
                 if version < 6 {
                     try Self.migrateOutcomeVersions(db: opened)
                 }
+                if version < 7 {
+                    let columns = Set(try opened.rows("PRAGMA table_info(meeting_sessions)").compactMap { $0.text(1) })
+                    if !columns.contains("dominant_role_json") {
+                        try opened.execute("ALTER TABLE meeting_sessions ADD COLUMN dominant_role_json BLOB")
+                    }
+                    if !columns.contains("role_segments_json") {
+                        try opened.execute("ALTER TABLE meeting_sessions ADD COLUMN role_segments_json BLOB")
+                    }
+                }
                 if version < MeetingLibrarySchema.currentVersion {
                     try opened.run("INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)") {
                         try MeetingSQLiteConnection.bindInt($0, Int64(MeetingLibrarySchema.currentVersion), at: 1)
@@ -448,16 +457,20 @@ actor MeetingLibraryStore: @unchecked Sendable {
 
     func upsertSession(_ session: MeetingSessionRecord) async throws {
         let db = try db()
+        let dominantData: Data? = try session.dominantRole.map { try JSONEncoder.attention.encode($0) }
+        let segmentsData: Data? = session.roleSegments.isEmpty ? nil : try JSONEncoder.attention.encode(session.roleSegments)
         try db.run("""
-        INSERT INTO meeting_sessions(session_id,title,title_folded,invitation,room_identity,calendar_series_id,continuation_id,started_at,ended_at,time_zone_id,state,export_revision,created_at,updated_at,start_provenance,outcome_end_fallback)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        INSERT INTO meeting_sessions(session_id,title,title_folded,invitation,room_identity,calendar_series_id,continuation_id,started_at,ended_at,time_zone_id,state,export_revision,created_at,updated_at,start_provenance,outcome_end_fallback,dominant_role_json,role_segments_json)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(session_id) DO UPDATE SET
         title=CASE WHEN EXISTS(SELECT 1 FROM meeting_title_overrides WHERE session_id=excluded.session_id) THEN meeting_sessions.title ELSE excluded.title END,
         title_folded=CASE WHEN EXISTS(SELECT 1 FROM meeting_title_overrides WHERE session_id=excluded.session_id) THEN meeting_sessions.title_folded ELSE excluded.title_folded END,invitation=excluded.invitation,
         room_identity=excluded.room_identity,calendar_series_id=excluded.calendar_series_id,
         continuation_id=excluded.continuation_id,started_at=excluded.started_at,ended_at=excluded.ended_at,
         time_zone_id=excluded.time_zone_id,state=excluded.state,export_revision=MAX(meeting_sessions.export_revision,excluded.export_revision),
-        updated_at=excluded.updated_at,start_provenance=excluded.start_provenance,outcome_end_fallback=excluded.outcome_end_fallback
+        updated_at=excluded.updated_at,start_provenance=excluded.start_provenance,outcome_end_fallback=excluded.outcome_end_fallback,
+        dominant_role_json=COALESCE(excluded.dominant_role_json, meeting_sessions.dominant_role_json),
+        role_segments_json=COALESCE(excluded.role_segments_json, meeting_sessions.role_segments_json)
         """) {
             try Self.bindText($0, session.id.uuidString, at: 1)
             try Self.bindText($0, session.title, at: 2)
@@ -475,6 +488,39 @@ actor MeetingLibraryStore: @unchecked Sendable {
             try Self.bindInt($0, session.updatedAt.ms, at: 14)
             try Self.bindText($0, (session.startProvenance ?? .unknown).rawValue, at: 15)
             try Self.bindOptionalInt($0, session.outcomeEndFallback?.ms, at: 16)
+            try Self.bindBlob($0, dominantData, at: 17)
+            try Self.bindBlob($0, segmentsData, at: 18)
+        }
+    }
+
+    func setSessionRoleState(
+        _ sessionID: UUID,
+        dominantRole: DominantRoleBinding?,
+        roleSegments: [SessionRoleSegment],
+        bumpExportRevision: Bool = true
+    ) throws {
+        let db = try db()
+        let dominantData: Data? = try dominantRole.map { try JSONEncoder.attention.encode($0) }
+        let segmentsData: Data? = roleSegments.isEmpty ? nil : try JSONEncoder.attention.encode(roleSegments)
+        try db.transaction {
+            guard let row = try db.one("SELECT export_revision FROM meeting_sessions WHERE session_id=?", bind: {
+                try Self.bindText($0, sessionID.uuidString, at: 1)
+            }) else { throw MeetingLibraryError.invalidSession }
+            let revision = Int(row.integer(0) ?? 0) + (bumpExportRevision ? 1 : 0)
+            try db.run("""
+            UPDATE meeting_sessions
+            SET dominant_role_json=?, role_segments_json=?, export_revision=?, updated_at=?
+            WHERE session_id=?
+            """) {
+                try Self.bindBlob($0, dominantData, at: 1)
+                try Self.bindBlob($0, segmentsData, at: 2)
+                try Self.bindInt($0, Int64(revision), at: 3)
+                try Self.bindInt($0, Date().ms, at: 4)
+                try Self.bindText($0, sessionID.uuidString, at: 5)
+            }
+            if bumpExportRevision {
+                _ = try Self.queueOutbox(db: db, sessionID: sessionID, desiredRevision: revision)
+            }
         }
     }
 
@@ -1095,7 +1141,7 @@ actor MeetingLibraryStore: @unchecked Sendable {
         participationNoteChanges.willChange(sessionID)
         let db = try db()
         try db.transaction {
-            for table in ["export_outbox", "export_bindings", "note_chunks", "note_sync_bases", "meeting_sessions"] {
+            for table in ["export_outbox", "export_bindings", "note_chunks", "note_sync_bases", "meeting_expert_blocks", "meeting_role_observations", "meeting_sessions"] {
                 try db.run("DELETE FROM \(table) WHERE session_id=?") {
                     try Self.bindText($0, sessionID.uuidString, at: 1)
                 }
@@ -1107,7 +1153,7 @@ actor MeetingLibraryStore: @unchecked Sendable {
         participationNoteChanges.willChange()
         let db = try db()
         try db.transaction {
-            for table in ["export_outbox", "export_bindings", "export_destinations", "note_chunks", "note_sync_bases", "task_reminder_cancellations", "meeting_notes", "meeting_outcomes", "meeting_sessions"] {
+            for table in ["export_outbox", "export_bindings", "export_destinations", "note_chunks", "note_sync_bases", "task_reminder_cancellations", "meeting_expert_blocks", "meeting_role_observations", "meeting_notes", "meeting_outcomes", "meeting_sessions"] {
                 try db.execute("DELETE FROM \(table)")
             }
         }
@@ -1119,39 +1165,51 @@ actor MeetingLibraryStore: @unchecked Sendable {
     static func queueOutbox(db: MeetingSQLiteConnection, sessionID: UUID, desiredRevision: Int,
                             outcomeReady: Bool = false, finalEnd: Bool = false,
                             awaitingOutcome: Bool = false) throws -> Int {
-        guard let destination = try activeDestination(db) else { return 0 }
         guard var snapshot = try exportSnapshot(db, sessionID: sessionID),
               snapshot.session.exportRevision == desiredRevision else { return 0 }
+        let (targets, _) = try targetDestinations(db: db, snapshot: snapshot)
+        guard !targets.isEmpty else { return 0 }
         let overrides = db.autoExportOverrides(for: snapshot.session)
-        let linked = try isObsidianLinked(db: db, destination: destination, sessionID: sessionID)
-        let stage = try db.one("SELECT stage FROM export_initial_state WHERE destination_id=? AND session_id=?",
-            bind: { try bindExportKey($0, destination: destination.id, session: sessionID) })?.text(0)
-        let after = overrides.autoExport ?? (destination.enabled && destination.saveAfterMeeting)
-        let sync = overrides.autoExport ?? (destination.enabled && destination.syncChanges)
-        let intent: ObsidianExportIntent
-        let held: Bool
-        var forcedState: MeetingOutcomePersistenceState?
-        if finalEnd, after, stage == nil {
-            let existingState = try db.one("SELECT state FROM meeting_outcomes WHERE session_id=?",
-                bind: { try bindText($0, sessionID.uuidString, at: 1) })?.text(0)
-            let wait = existingState != MeetingOutcomePersistenceState.ready.rawValue && awaitingOutcome
-            try setInitialStage(wait ? "waiting" : "complete", db: db, destination: destination.id, session: sessionID)
-            forcedState = wait && existingState == nil ? .pending : nil
-            intent = .initialEnd
-            held = false
-        } else if outcomeReady, stage == "waiting" || stage == "held" {
-            try setInitialStage("complete", db: db, destination: destination.id, session: sessionID)
-            intent = after && stage == "waiting" || !sync || !linked ? .initialFirstReady : .linkedUpdate
-            held = intent == .initialFirstReady && (!after || stage == "held")
-        } else if sync, linked {
-            intent = .linkedUpdate
-            held = false
-        } else {
-            return 0
+        var queuedCount = 0
+        for destination in targets {
+            let linked = try isObsidianLinked(db: db, destination: destination, sessionID: sessionID)
+            let stage = try db.one("SELECT stage FROM export_initial_state WHERE destination_id=? AND session_id=?",
+                bind: { try bindExportKey($0, destination: destination.id, session: sessionID) })?.text(0)
+            let after = overrides.autoExport ?? (destination.enabled && destination.saveAfterMeeting)
+            let sync = overrides.autoExport ?? (destination.enabled && destination.syncChanges)
+            let intent: ObsidianExportIntent
+            let held: Bool
+            var forcedState: MeetingOutcomePersistenceState?
+            if finalEnd, after, stage == nil {
+                let existingState = try db.one("SELECT state FROM meeting_outcomes WHERE session_id=?",
+                    bind: { try bindText($0, sessionID.uuidString, at: 1) })?.text(0)
+                let wait = existingState != MeetingOutcomePersistenceState.ready.rawValue && awaitingOutcome
+                try setInitialStage(wait ? "waiting" : "complete", db: db, destination: destination.id, session: sessionID)
+                forcedState = wait && existingState == nil ? .pending : nil
+                intent = .initialEnd
+                held = false
+            } else if outcomeReady, stage == "waiting" || stage == "held" {
+                try setInitialStage("complete", db: db, destination: destination.id, session: sessionID)
+                intent = after && stage == "waiting" || !sync || !linked ? .initialFirstReady : .linkedUpdate
+                held = intent == .initialFirstReady && (!after || stage == "held")
+            } else if sync, linked {
+                intent = .linkedUpdate
+                held = false
+            } else if let dominant = snapshot.dominantRole,
+                      dominant.exportDestinationID == destination.id,
+                      after || sync {
+                // First delivery into a role-routed secondary vault
+                intent = .linkedUpdate
+                held = false
+            } else {
+                continue
+            }
+            var targetSnapshot = snapshot
+            if let forcedState { targetSnapshot.outcomeState = forcedState }
+            try putExport(db: db, destination: destination, snapshot: targetSnapshot, intent: intent, held: held)
+            queuedCount += 1
         }
-        if let forcedState { snapshot.outcomeState = forcedState }
-        try putExport(db: db, destination: destination, snapshot: snapshot, intent: intent, held: held)
-        return 1
+        return queuedCount
     }
 
     private static func isObsidianLinked(db: MeetingSQLiteConnection, destination: ObsidianDestinationRecord,
@@ -1191,8 +1249,65 @@ actor MeetingLibraryStore: @unchecked Sendable {
         let outcomeRow = try db.one("SELECT outcome_id,state FROM meeting_outcomes WHERE session_id=?",
             bind: { try bindText($0, sessionID.uuidString, at: 1) })
         let outcome = try outcomeRow?.text(0).flatMap(UUID.init(uuidString:)).flatMap { try storedOutcome(db: db, id: $0) }
-        return ObsidianExportSnapshot(session: session(from: row), note: try noteRow.map(note(from:)),
-            outcome: outcome, outcomeState: outcomeRow?.text(1).flatMap(MeetingOutcomePersistenceState.init(rawValue:)) ?? .notStarted)
+        let session = session(from: row)
+        let expertBlocks = try storedExpertBlocks(db: db, sessionID: sessionID, includeDeleted: false)
+        let overrides = db.autoExportOverrides(for: session)
+        let policy = DominantRoleResolver.effectiveCoreOutcomePolicy(
+            dominantRole: session.dominantRole,
+            skill: nil,
+            preset: nil,
+            perMeetingOverride: overrides.coreOutcomePolicy
+        )
+        return ObsidianExportSnapshot(
+            session: session,
+            note: try noteRow.map(note(from:)),
+            outcome: outcome,
+            outcomeState: outcomeRow?.text(1).flatMap(MeetingOutcomePersistenceState.init(rawValue:)) ?? .notStarted,
+            expertBlocks: expertBlocks,
+            dominantRole: session.dominantRole,
+            coreOutcomePolicy: policy
+        )
+    }
+
+    static func storedExpertBlocks(
+        db: MeetingSQLiteConnection,
+        sessionID: UUID,
+        includeDeleted: Bool = false
+    ) throws -> [SyncedMeetingExpertBlock] {
+        let sql = includeDeleted
+            ? "SELECT payload_json FROM meeting_expert_blocks WHERE session_id=? ORDER BY updated_at ASC"
+            : "SELECT payload_json FROM meeting_expert_blocks WHERE session_id=? AND is_deleted=0 ORDER BY updated_at ASC"
+        return try db.rows(sql) {
+            try bindText($0, sessionID.uuidString, at: 1)
+        }.compactMap { row in
+            guard case .blob(let data)? = row[0] else { return nil }
+            return try? JSONDecoder.attention.decode(SyncedMeetingExpertBlock.self, from: data)
+        }
+    }
+
+    static func targetDestinations(
+        db: MeetingSQLiteConnection,
+        snapshot: ObsidianExportSnapshot
+    ) throws -> (destinations: [ObsidianDestinationRecord], exclusiveTargetID: UUID?) {
+        let all = try allDestinations(db)
+        let primary = try activeDestination(db)
+        let explicitTargetID = snapshot.dominantRole?.exportDestinationID
+            ?? snapshot.expertBlocks.first(where: { !$0.isDeleted.value && $0.exportDestinationID.value != nil })?.exportDestinationID.value
+        let routeEntire = snapshot.dominantRole?.routeEntireMeeting
+            ?? snapshot.expertBlocks.first(where: { !$0.isDeleted.value && $0.exportDestinationID.value != nil })?.routeEntireMeeting.value
+            ?? false
+        if let explicitTargetID, let target = all.first(where: { $0.id == explicitTargetID }) {
+            if routeEntire {
+                return ([target], target.id)
+            }
+            var combined: [ObsidianDestinationRecord] = []
+            if let primary { combined.append(primary) }
+            if !combined.contains(where: { $0.id == target.id }) {
+                combined.append(target)
+            }
+            return (combined, nil)
+        }
+        return (primary.map { [$0] } ?? [], nil)
     }
 
     func manualExportSnapshots(sessionIDs: [UUID]) throws -> [ObsidianExportSnapshot] {
@@ -1323,7 +1438,15 @@ actor MeetingLibraryStore: @unchecked Sendable {
     }
 
     static func session(from row: MeetingSQLiteRow) -> MeetingSessionRecord {
-        MeetingSessionRecord(
+        let dominantRole: DominantRoleBinding? = {
+            guard case .blob(let data)? = row[16] else { return nil }
+            return try? JSONDecoder.attention.decode(DominantRoleBinding.self, from: data)
+        }()
+        let roleSegments: [SessionRoleSegment] = {
+            guard case .blob(let data)? = row[17] else { return [] }
+            return (try? JSONDecoder.attention.decode([SessionRoleSegment].self, from: data)) ?? []
+        }()
+        return MeetingSessionRecord(
             id: UUID(uuidString: row.text(0) ?? UUID().uuidString) ?? UUID(),
             title: row.text(1) ?? "",
             invitation: row.text(3).flatMap(URL.init(string:)),
@@ -1338,7 +1461,9 @@ actor MeetingLibraryStore: @unchecked Sendable {
             createdAt: Self.date(row.integer(12)) ?? .distantPast,
             updatedAt: Self.date(row.integer(13)) ?? .distantPast,
             startProvenance: row.text(14).flatMap(MeetingStartProvenance.init(rawValue:)),
-            outcomeEndFallback: Self.date(row.integer(15))
+            outcomeEndFallback: Self.date(row.integer(15)),
+            dominantRole: dominantRole,
+            roleSegments: roleSegments
         )
     }
 
@@ -2014,11 +2139,111 @@ extension MeetingLibraryStore {
     }
 }
 
+// MARK: - Expert Blocks & Role Observations
+
+extension MeetingLibraryStore {
+    func upsertExpertBlock(
+        _ block: SyncedMeetingExpertBlock,
+        bumpExportRevision: Bool = true
+    ) throws {
+        let db = try db()
+        let payload = try JSONEncoder.attention.encode(block)
+        try db.transaction {
+            try db.run("""
+            INSERT INTO meeting_expert_blocks(block_id, session_id, skill_id, preset_id, is_deleted, updated_at, payload_json)
+            VALUES(?,?,?,?,?,?,?)
+            ON CONFLICT(block_id) DO UPDATE SET
+                skill_id=excluded.skill_id,
+                preset_id=excluded.preset_id,
+                is_deleted=excluded.is_deleted,
+                updated_at=excluded.updated_at,
+                payload_json=excluded.payload_json
+            """) {
+                try Self.bindText($0, block.id.uuidString, at: 1)
+                try Self.bindText($0, block.sessionID.uuidString, at: 2)
+                try Self.bindText($0, block.skillID, at: 3)
+                try Self.bindText($0, block.presetID, at: 4)
+                try Self.bindInt($0, block.isDeleted.value ? 1 : 0, at: 5)
+                try Self.bindInt($0, block.updatedAt.ms, at: 6)
+                try Self.bindBlob($0, payload, at: 7)
+            }
+            if bumpExportRevision,
+               let row = try db.one("SELECT export_revision FROM meeting_sessions WHERE session_id=?", bind: {
+                   try Self.bindText($0, block.sessionID.uuidString, at: 1)
+               }) {
+                let revision = Int(row.integer(0) ?? 0) + 1
+                try db.run("UPDATE meeting_sessions SET export_revision=?, updated_at=? WHERE session_id=?") {
+                    try Self.bindInt($0, Int64(revision), at: 1)
+                    try Self.bindInt($0, Date().ms, at: 2)
+                    try Self.bindText($0, block.sessionID.uuidString, at: 3)
+                }
+                _ = try Self.queueOutbox(db: db, sessionID: block.sessionID, desiredRevision: revision)
+            }
+        }
+    }
+
+    func expertBlocks(for sessionID: UUID, includeDeleted: Bool = false) throws -> [SyncedMeetingExpertBlock] {
+        try Self.storedExpertBlocks(db: db(), sessionID: sessionID, includeDeleted: includeDeleted)
+    }
+
+    func allExpertBlocks(includeDeleted: Bool = true) throws -> [SyncedMeetingExpertBlock] {
+        let sql = includeDeleted
+            ? "SELECT payload_json FROM meeting_expert_blocks ORDER BY updated_at ASC"
+            : "SELECT payload_json FROM meeting_expert_blocks WHERE is_deleted=0 ORDER BY updated_at ASC"
+        return try db().rows(sql).compactMap { row in
+            guard case .blob(let data)? = row[0] else { return nil }
+            return try? JSONDecoder.attention.decode(SyncedMeetingExpertBlock.self, from: data)
+        }
+    }
+
+    func deleteExpertBlock(id: UUID, sessionID: UUID, updatedBy deviceID: String) throws {
+        var existing = try expertBlocks(for: sessionID, includeDeleted: true)
+        guard let index = existing.firstIndex(where: { $0.id == id }) else { return }
+        let block = existing[index]
+        let now = Date()
+        var mutable = block
+        mutable.isDeleted = SyncValue(true, version: SyncVersion(counter: block.isDeleted.version.counter + 1, device: deviceID))
+        mutable.updatedAt = now
+        existing[index] = mutable
+        try upsertExpertBlock(mutable, bumpExportRevision: true)
+    }
+
+    func upsertRoleObservations(_ log: SyncedRoleObservationLog) throws {
+        let db = try db()
+        let payload = try JSONEncoder.attention.encode(log)
+        try db.run("""
+        INSERT INTO meeting_role_observations(session_id, updated_at, payload_json)
+        VALUES(?,?,?)
+        ON CONFLICT(session_id) DO UPDATE SET
+            updated_at=excluded.updated_at,
+            payload_json=excluded.payload_json
+        """) {
+            try Self.bindText($0, log.sessionID.uuidString, at: 1)
+            try Self.bindInt($0, log.updatedAt.ms, at: 2)
+            try Self.bindBlob($0, payload, at: 3)
+        }
+    }
+
+    func roleObservations(for sessionID: UUID) throws -> SyncedRoleObservationLog? {
+        guard let row = try db().one("SELECT payload_json FROM meeting_role_observations WHERE session_id=?", bind: {
+            try Self.bindText($0, sessionID.uuidString, at: 1)
+        }), case .blob(let data)? = row[0] else { return nil }
+        return try? JSONDecoder.attention.decode(SyncedRoleObservationLog.self, from: data)
+    }
+
+    func allRoleObservations() throws -> [SyncedRoleObservationLog] {
+        try db().rows("SELECT payload_json FROM meeting_role_observations ORDER BY updated_at ASC").compactMap { row in
+            guard case .blob(let data)? = row[0] else { return nil }
+            return try? JSONDecoder.attention.decode(SyncedRoleObservationLog.self, from: data)
+        }
+    }
+}
+
 // MARK: - Cards
 
 extension MeetingLibraryStore {
     /// One row per attended session, including meetings that have no captured material.
-    /// Incomplete joins appear only when they contain a note or outcome.
+    /// Incomplete joins appear only when they contain a note, outcome, or expert evaluation.
     func cards() async throws -> [MeetingLibraryCard] {
         let db = try db()
         let rows = try db.rows("""
@@ -2026,7 +2251,9 @@ extension MeetingLibraryStore {
                n.note_id, n.revision, substr(n.markdown, 1, 240),
                o.outcome_id, o.state, o.error_code,
                EXISTS(SELECT 1 FROM meeting_outcome_inputs i WHERE i.outcome_id=o.outcome_id),
-               s.start_provenance, s.outcome_end_fallback
+               s.start_provenance, s.outcome_end_fallback, s.dominant_role_json,
+               (SELECT COUNT(*) FROM meeting_expert_blocks e WHERE e.session_id = s.session_id AND e.is_deleted = 0),
+               (SELECT e.payload_json FROM meeting_expert_blocks e WHERE e.session_id = s.session_id AND e.is_deleted = 0 ORDER BY e.updated_at DESC LIMIT 1)
         FROM meeting_sessions s
         LEFT JOIN meeting_notes n ON n.session_id = s.session_id
         LEFT JOIN meeting_outcomes o ON o.session_id = s.session_id
@@ -2035,8 +2262,21 @@ extension MeetingLibraryStore {
         return rows.compactMap { row in
             let hasNote = row.text(6) != nil
             let hasOutcome = row.text(9) != nil
+            let expertCount = Int(row.integer(16) ?? 0)
+            let hasExpert = expertCount > 0
             let state = MeetingSessionRecord.State(rawValue: row.text(4) ?? "") ?? .active
-            guard hasNote || hasOutcome || state == .active || state == .reconnecting || state == .ended else { return nil }
+            guard hasNote || hasOutcome || hasExpert || state == .active || state == .reconnecting || state == .ended else { return nil }
+            let dominantRole: DominantRoleBinding? = {
+                guard case .blob(let data)? = row[15] else { return nil }
+                return try? JSONDecoder.attention.decode(DominantRoleBinding.self, from: data)
+            }()
+            let latestExpertVerdict: String? = {
+                guard case .blob(let data)? = row[17],
+                      let block = try? JSONDecoder.attention.decode(SyncedMeetingExpertBlock.self, from: data) else {
+                    return nil
+                }
+                return block.headlineVerdict.value
+            }()
             return MeetingLibraryCard(
                 sessionID: UUID(uuidString: row.text(0) ?? "") ?? UUID(),
                 title: row.text(1) ?? "",
@@ -2053,7 +2293,10 @@ extension MeetingLibraryStore {
                 hasOutcomeInput: row.bool(12),
                 updatedAt: Self.date(row.integer(5)) ?? .distantPast,
                 startProvenance: row.text(13).flatMap(MeetingStartProvenance.init(rawValue:)),
-                outcomeEndFallback: Self.date(row.integer(14)))
+                outcomeEndFallback: Self.date(row.integer(14)),
+                dominantRole: dominantRole,
+                expertBlocksCount: expertCount,
+                expertVerdictPreview: latestExpertVerdict)
         }
     }
 
@@ -2136,7 +2379,7 @@ extension MeetingLibraryStore {
         var destination = destination
         destination.updatedAt = Date()
         try db.transaction {
-            let previous = try Self.activeDestination(db)
+            let previous = try Self.destination(db, id: destination.id)
             try db.run("""
             INSERT INTO export_destinations(destination_id,enabled,mode,config_json,config_revision,vault_bookmark,created_at,updated_at)
             VALUES(?,?,?,?,?,?,?,?)
@@ -2147,8 +2390,16 @@ extension MeetingLibraryStore {
                 try Self.bindText($0, destination.id.uuidString, at: 1)
                 try Self.bindInt($0, destination.enabled ? 1 : 0, at: 2)
                 try Self.bindText($0, destination.mode.rawValue, at: 3)
-                let config = try JSONEncoder.attention.encode(ExportConfiguration(meetingFolder: destination.meetingFolder,
-                    saveAfterMeeting: destination.saveAfterMeeting, syncChanges: destination.syncChanges, layout: destination.layout))
+                let config = try JSONEncoder.attention.encode(ExportConfiguration(
+                    meetingFolder: destination.meetingFolder,
+                    saveAfterMeeting: destination.saveAfterMeeting,
+                    syncChanges: destination.syncChanges,
+                    layout: destination.layout,
+                    name: destination.name,
+                    slug: destination.slug,
+                    isPrimary: destination.isPrimary,
+                    loadsSkills: destination.loadsSkills
+                ))
                 try Self.bindBlob($0, config, at: 4)
                 try Self.bindInt($0, Int64(destination.configRevision), at: 5)
                 try Self.bindBlob($0, destination.vaultBookmark, at: 6)
@@ -2268,36 +2519,89 @@ extension MeetingLibraryStore {
         let saveAfterMeeting: Bool?
         let syncChanges: Bool?
         let layout: ObsidianExportLayout?
+        var name: String? = nil
+        var slug: String? = nil
+        var isPrimary: Bool? = nil
+        var loadsSkills: Bool? = nil
     }
 
-    static func activeDestination(_ db: MeetingSQLiteConnection) throws -> ObsidianDestinationRecord? {
-        guard let row = try db.one("SELECT * FROM export_destinations ORDER BY updated_at DESC, rowid DESC LIMIT 1"),
-              let id = UUID(uuidString: row.text(0) ?? "") else { return nil }
+    private static func destination(from row: MeetingSQLiteRow) -> ObsidianDestinationRecord? {
+        guard let id = UUID(uuidString: row.text(0) ?? "") else { return nil }
         var config: ExportConfiguration?
         if case .blob(let data)? = row[3] ?? nil {
             config = try? JSONDecoder.attention.decode(ExportConfiguration.self, from: data)
         }
         return ObsidianDestinationRecord(
-            id: id, enabled: row.bool(1), saveAfterMeeting: config?.saveAfterMeeting ?? false,
+            id: id,
+            enabled: row.bool(1),
+            saveAfterMeeting: config?.saveAfterMeeting ?? false,
             syncChanges: config?.syncChanges ?? false,
             mode: ObsidianExportMode(rawValue: row.text(2) ?? "") ?? .separateFiles,
-            meetingFolder: config?.meetingFolder ?? "Meetings", layout: config?.layout ?? .init(),
+            meetingFolder: config?.meetingFolder ?? "Meetings",
+            layout: config?.layout ?? .init(),
             configRevision: Int(row.integer(4) ?? 0),
             vaultBookmark: { if case .blob(let data)? = row[5] ?? nil { return data }; return nil }(),
+            name: config?.name ?? "",
+            slug: config?.slug ?? "",
+            isPrimary: config?.isPrimary ?? true,
+            loadsSkills: config?.loadsSkills ?? false,
             createdAt: Self.date(row.integer(6)) ?? .distantPast,
-            updatedAt: Self.date(row.integer(7)) ?? .distantPast)
+            updatedAt: Self.date(row.integer(7)) ?? .distantPast
+        )
+    }
+
+    static func allDestinations(_ db: MeetingSQLiteConnection) throws -> [ObsidianDestinationRecord] {
+        try db.rows("SELECT * FROM export_destinations ORDER BY updated_at DESC, rowid DESC")
+            .compactMap(Self.destination(from:))
+            .sorted { left, right in
+                if left.isPrimary != right.isPrimary { return left.isPrimary }
+                return left.updatedAt > right.updatedAt
+            }
+    }
+
+    static func destination(_ db: MeetingSQLiteConnection, id: UUID) throws -> ObsidianDestinationRecord? {
+        guard let row = try db.one("SELECT * FROM export_destinations WHERE destination_id=?", bind: {
+            try bindText($0, id.uuidString, at: 1)
+        }) else { return nil }
+        return Self.destination(from: row)
+    }
+
+    static func activeDestination(_ db: MeetingSQLiteConnection) throws -> ObsidianDestinationRecord? {
+        let all = try allDestinations(db)
+        return all.first(where: \.isPrimary) ?? all.first
     }
 
     func destination() async throws -> ObsidianDestinationRecord? { try Self.activeDestination(db()) }
 
-    func saveInObsidian(_ id: UUID) throws {
+    func destinations() async throws -> [ObsidianDestinationRecord] { try Self.allDestinations(db()) }
+
+    func destination(id: UUID) async throws -> ObsidianDestinationRecord? { try Self.destination(db(), id: id) }
+
+    func deleteDestination(id: UUID) async throws {
         let db = try db()
         try db.transaction {
-            guard let destination = try Self.activeDestination(db), destination.vaultBookmark != nil else {
+            try db.run("DELETE FROM export_outbox WHERE destination_id=?") { try Self.bindText($0, id.uuidString, at: 1) }
+            try db.run("DELETE FROM export_destinations WHERE destination_id=?") { try Self.bindText($0, id.uuidString, at: 1) }
+        }
+    }
+
+    func saveInObsidian(_ id: UUID, destinationID: UUID? = nil) throws {
+        let db = try db()
+        try db.transaction {
+            guard let snapshot = try Self.exportSnapshot(db, sessionID: id) else { throw MeetingLibraryError.invalidSession }
+            let targets: [ObsidianDestinationRecord]
+            if let destinationID, let explicit = try Self.destination(db, id: destinationID) {
+                targets = [explicit]
+            } else {
+                targets = try Self.targetDestinations(db: db, snapshot: snapshot).destinations
+            }
+            let valid = targets.filter { $0.vaultBookmark != nil }
+            guard !valid.isEmpty else {
                 throw ObsidianExportError.vaultUnavailable(L("Select an Obsidian vault in Settings."))
             }
-            guard let snapshot = try Self.exportSnapshot(db, sessionID: id) else { throw MeetingLibraryError.invalidSession }
-            try Self.putExport(db: db, destination: destination, snapshot: snapshot, intent: .manualSave, held: false)
+            for destination in valid {
+                try Self.putExport(db: db, destination: destination, snapshot: snapshot, intent: .manualSave, held: false)
+            }
         }
     }
 
@@ -2417,7 +2721,7 @@ extension MeetingLibraryStore {
                                             proposedBlockHash: String?) throws {
         let db = try db()
         try db.transaction {
-            guard let destination = try Self.activeDestination(db), destination.id == row.destinationID,
+            guard let destination = try Self.destination(db, id: row.destinationID),
                   destination.configRevision == row.desiredConfigRevision,
                   let current = try outboxRows(destinationID: row.destinationID).first(where: { $0.sessionID == row.sessionID }),
                   current.paused, current.desiredRevision == row.desiredRevision,
@@ -2499,7 +2803,7 @@ extension MeetingLibraryStore {
 
     func dueOutbox(now: Date = Date()) async throws -> [ObsidianOutboxRecord] {
         let db = try db()
-        let destination = try Self.activeDestination(db)
+        let destinationsByID = Dictionary(uniqueKeysWithValues: try Self.allDestinations(db).map { ($0.id, $0) })
         let rows = try db.rows("""
         SELECT o.*, d.enabled FROM export_outbox o
         JOIN export_destinations d ON d.destination_id = o.destination_id
@@ -2507,11 +2811,9 @@ extension MeetingLibraryStore {
         ORDER BY o.next_attempt_at
         """) { try Self.bindInt($0, now.ms, at: 1) }
         let records = rows.compactMap(Self.outboxRecord(from:))
-        guard let destination else { return records }
         return records.filter { record in
-            guard record.destinationID == destination.id else {
-                return record.intent == .manualSave
-            }
+            guard let destination = destinationsByID[record.destinationID] else { return false }
+            if record.intent == .retract { return true }
             let overrides = record.snapshot.map { db.autoExportOverrides(for: $0.session) } ?? .init()
             return record.intent.permitted(by: destination, overrides: overrides)
         }
@@ -2520,9 +2822,9 @@ extension MeetingLibraryStore {
     func isAuthorizedForWrite(_ row: ObsidianOutboxRecord) throws -> Bool {
         let db = try db()
         let overrides = row.snapshot.map { db.autoExportOverrides(for: $0.session) } ?? .init()
-        guard let destination = try Self.activeDestination(db), destination.id == row.destinationID,
+        guard let destination = try Self.destination(db, id: row.destinationID),
               destination.configRevision == row.desiredConfigRevision,
-              row.intent.permitted(by: destination, overrides: overrides) else { return false }
+              row.intent == .retract || row.intent.permitted(by: destination, overrides: overrides) else { return false }
         return try db.one("""
             SELECT 1 FROM export_outbox WHERE destination_id=? AND session_id=? AND desired_revision=?
               AND desired_config_revision=? AND intent=? AND paused=0 AND policy_held=0
@@ -2614,7 +2916,8 @@ extension MeetingLibraryStore {
                               expectedSnapshots: [UUID: [ObsidianExportSnapshot]]? = nil) throws {
         let db = try db()
         try db.transaction {
-            guard let destination = try Self.activeDestination(db), destination.vaultBookmark != nil else {
+            let resolved = try expectedDestination.flatMap { try Self.destination(db, id: $0) } ?? Self.activeDestination(db)
+            guard let destination = resolved, destination.vaultBookmark != nil else {
                 throw ObsidianExportError.vaultUnavailable(L("Select an Obsidian vault in Settings."))
             }
             guard (expectedDestination == nil || destination.id == expectedDestination),
@@ -2694,9 +2997,84 @@ extension MeetingLibraryStore {
                 try Self.bindOptionalInt($0, configRevision.map(Int64.init), at: 5)
                 try Self.bindOptionalInt($0, configRevision.map(Int64.init), at: 6)
             }
-            if let destination = try Self.activeDestination(db), destination.id == destinationID {
+            if let destination = try Self.destination(db, id: destinationID) {
                 try Self.promoteDeferred(db: db, destination: destination, sessionID: sessionID, through: throughRevision)
             }
+            guard let throughRevision else { return }
+            let snapshot = try Self.exportSnapshot(db, sessionID: sessionID)
+            guard let snapshot,
+                  try Self.targetDestinations(db: db, snapshot: snapshot).exclusiveTargetID == destinationID else {
+                return
+            }
+                let superseded = try db.rows("""
+                    SELECT DISTINCT destination_id FROM export_bindings
+                    WHERE session_id=? AND destination_id!=? AND state='exported'
+                    """) {
+                    try Self.bindText($0, sessionID.uuidString, at: 1)
+                    try Self.bindText($0, destinationID.uuidString, at: 2)
+                }
+                for row in superseded {
+                    guard let otherID = row.text(0).flatMap(UUID.init(uuidString:)),
+                          let otherDest = try Self.destination(db, id: otherID) else { continue }
+                    try db.run("DELETE FROM export_deferred WHERE destination_id=? AND session_id=?") {
+                        try Self.bindExportKey($0, destination: otherID, session: sessionID)
+                    }
+                    try db.run("""
+                    INSERT INTO export_outbox(destination_id,session_id,desired_revision,desired_config_revision,attempt_count,
+                        next_attempt_at,paused,last_error_code,updated_at,intent,snapshot_json,policy_held)
+                    VALUES(?,?,?,?,0,0,0,NULL,?,?,?,0)
+                    ON CONFLICT(destination_id,session_id) DO UPDATE SET
+                        desired_revision=MAX(desired_revision,excluded.desired_revision),
+                        desired_config_revision=excluded.desired_config_revision,
+                        attempt_count=0,next_attempt_at=0,paused=0,last_error_code=NULL,
+                        updated_at=excluded.updated_at,intent='retract',snapshot_json=excluded.snapshot_json,policy_held=0
+                    """) {
+                        try Self.bindExportKey($0, destination: otherID, session: sessionID)
+                        try Self.bindInt($0, Int64(max(throughRevision, snapshot.session.exportRevision)), at: 3)
+                        try Self.bindInt($0, Int64(otherDest.configRevision), at: 4)
+                        try Self.bindInt($0, Date().ms, at: 5)
+                        try Self.bindText($0, ObsidianExportIntent.retract.rawValue, at: 6)
+                        try Self.bindBlob($0, JSONEncoder.attention.encode(snapshot), at: 7)
+                    }
+                    db.notifyOutboxQueued()
+                }
+            }
+        }
+
+    func completeRetractOutbox(destinationID: UUID, sessionID: UUID, configRevision: Int? = nil) async throws {
+        let db = try db()
+        try db.transaction {
+            try db.run("DELETE FROM export_completed_deliveries WHERE destination_id=? AND session_id=?") {
+                try Self.bindExportKey($0, destination: destinationID, session: sessionID)
+            }
+            try db.run("DELETE FROM export_initial_state WHERE destination_id=? AND session_id=?") {
+                try Self.bindExportKey($0, destination: destinationID, session: sessionID)
+            }
+            try db.run("DELETE FROM export_outbox WHERE destination_id=? AND session_id=? AND intent='retract' AND (? IS NULL OR desired_config_revision=?)") {
+                try Self.bindText($0, destinationID.uuidString, at: 1)
+                try Self.bindText($0, sessionID.uuidString, at: 2)
+                try Self.bindOptionalInt($0, configRevision.map(Int64.init), at: 3)
+                try Self.bindOptionalInt($0, configRevision.map(Int64.init), at: 4)
+            }
+        }
+    }
+
+    func bindings(destinationID: UUID, sessionID: UUID) async throws -> [ObsidianExportBindingRecord] {
+        try db().rows("SELECT * FROM export_bindings WHERE destination_id=? AND session_id=?", bind: {
+            try Self.bindExportKey($0, destination: destinationID, session: sessionID)
+        }).compactMap { Self.binding(from: $0, destinationID: destinationID) }
+    }
+
+    func markBindingRetracted(destinationID: UUID, sessionID: UUID, component: ObsidianExportComponent) throws {
+        let db = try db()
+        try db.run("""
+        UPDATE export_bindings SET state='retracted', last_exported_revision=0, error_code=NULL, updated_at=?
+        WHERE destination_id=? AND session_id=? AND component=?
+        """) {
+            try Self.bindInt($0, Date().ms, at: 1)
+            try Self.bindText($0, destinationID.uuidString, at: 2)
+            try Self.bindText($0, sessionID.uuidString, at: 3)
+            try Self.bindText($0, component.rawValue, at: 4)
         }
     }
 

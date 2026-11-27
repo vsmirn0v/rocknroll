@@ -38,21 +38,52 @@ struct MeetingSessionRecord: Codable, Equatable, Identifiable, Sendable {
     var updatedAt: Date
     var startProvenance: MeetingStartProvenance?
     var outcomeEndFallback: Date?
+    var dominantRole: DominantRoleBinding? = nil
+    var roleSegments: [SessionRoleSegment] = []
 
     var recordedStart: Date? { startProvenance == .recorded && startedAt != .distantPast ? startedAt : nil }
     var knownEnd: Date? { [endedAt, outcomeEndFallback].compactMap { $0 }.first { $0 != .distantPast } }
     var effectiveDate: MeetingEffectiveDate? { .resolve(start: recordedStart, end: knownEnd) }
 
+    enum CodingKeys: String, CodingKey {
+        case id, title, invitation, roomIdentity, calendarSeriesID, continuationID
+        case startedAt, endedAt, timeZoneID, state, exportRevision, createdAt, updatedAt
+        case startProvenance, outcomeEndFallback, dominantRole, roleSegments
+    }
+
     init(id: UUID = UUID(), title: String, invitation: URL? = nil, roomIdentity: String = "",
          calendarSeriesID: String? = nil, continuationID: String? = nil, startedAt: Date,
          endedAt: Date? = nil, timeZoneID: String = TimeZone.current.identifier, state: State = .active,
          exportRevision: Int = 0, createdAt: Date = Date(), updatedAt: Date = Date(),
-         startProvenance: MeetingStartProvenance? = .recorded, outcomeEndFallback: Date? = nil) {
+         startProvenance: MeetingStartProvenance? = .recorded, outcomeEndFallback: Date? = nil,
+         dominantRole: DominantRoleBinding? = nil, roleSegments: [SessionRoleSegment] = []) {
         self.id = id; self.title = title; self.invitation = invitation; self.roomIdentity = roomIdentity
         self.calendarSeriesID = calendarSeriesID; self.continuationID = continuationID
         self.startedAt = startedAt; self.endedAt = endedAt; self.timeZoneID = timeZoneID
         self.state = state; self.exportRevision = exportRevision; self.createdAt = createdAt; self.updatedAt = updatedAt
         self.startProvenance = startProvenance; self.outcomeEndFallback = outcomeEndFallback
+        self.dominantRole = dominantRole; self.roleSegments = roleSegments
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        title = try c.decode(String.self, forKey: .title)
+        invitation = try c.decodeIfPresent(URL.self, forKey: .invitation)
+        roomIdentity = try c.decodeIfPresent(String.self, forKey: .roomIdentity) ?? ""
+        calendarSeriesID = try c.decodeIfPresent(String.self, forKey: .calendarSeriesID)
+        continuationID = try c.decodeIfPresent(String.self, forKey: .continuationID)
+        startedAt = try c.decode(Date.self, forKey: .startedAt)
+        endedAt = try c.decodeIfPresent(Date.self, forKey: .endedAt)
+        timeZoneID = try c.decodeIfPresent(String.self, forKey: .timeZoneID) ?? TimeZone.current.identifier
+        state = try c.decode(State.self, forKey: .state)
+        exportRevision = try c.decodeIfPresent(Int.self, forKey: .exportRevision) ?? 0
+        createdAt = try c.decode(Date.self, forKey: .createdAt)
+        updatedAt = try c.decode(Date.self, forKey: .updatedAt)
+        startProvenance = try c.decodeIfPresent(MeetingStartProvenance.self, forKey: .startProvenance)
+        outcomeEndFallback = try c.decodeIfPresent(Date.self, forKey: .outcomeEndFallback)
+        dominantRole = try c.decodeIfPresent(DominantRoleBinding.self, forKey: .dominantRole)
+        roleSegments = try c.decodeIfPresent([SessionRoleSegment].self, forKey: .roleSegments) ?? []
     }
 }
 
@@ -126,6 +157,9 @@ struct MeetingLibraryCard: Codable, Equatable, Identifiable, Sendable {
     var updatedAt: Date
     var startProvenance: MeetingStartProvenance?
     var outcomeEndFallback: Date?
+    var dominantRole: DominantRoleBinding? = nil
+    var expertBlocksCount: Int = 0
+    var expertVerdictPreview: String? = nil
 
     var effectiveDate: MeetingEffectiveDate? {
         .resolve(start: startProvenance == .recorded ? startedAt : nil, end: endedAt ?? outcomeEndFallback)
@@ -199,11 +233,12 @@ struct ObsidianExportLayout: Codable, Equatable, Sendable {
     var startAfter: String?
     var endBefore: String?
     private var snapshotsOptionMigrated = true
+    private var expertOpinionsOptionMigrated = true
 
     enum CodingKeys: String, CodingKey {
         case documentPath, monthly, sections, groupByDay, newestDaysFirst, insertAtBeginning
         case withinDayAtBeginning, timeZoneID, runtimeStyle, legacyRuntimeYears, startAfter, endBefore
-        case snapshotsOptionMigrated
+        case snapshotsOptionMigrated, expertOpinionsOptionMigrated
     }
 
     init(
@@ -233,6 +268,7 @@ struct ObsidianExportLayout: Codable, Equatable, Sendable {
         self.startAfter = startAfter
         self.endBefore = endBefore
         self.snapshotsOptionMigrated = true
+        self.expertOpinionsOptionMigrated = true
     }
 
     init(from decoder: Decoder) throws {
@@ -253,8 +289,13 @@ struct ObsidianExportLayout: Codable, Equatable, Sendable {
         if migrated != true {
             decodedSections.insert(.snapshots)
         }
+        let expertMigrated = try c.decodeIfPresent(Bool.self, forKey: .expertOpinionsOptionMigrated)
+        if expertMigrated != true {
+            decodedSections.insert(.expertOpinions)
+        }
         sections = decodedSections
         snapshotsOptionMigrated = true
+        expertOpinionsOptionMigrated = true
     }
 
     func encode(to encoder: Encoder) throws {
@@ -272,6 +313,7 @@ struct ObsidianExportLayout: Codable, Equatable, Sendable {
         try c.encodeIfPresent(startAfter, forKey: .startAfter)
         try c.encodeIfPresent(endBefore, forKey: .endBefore)
         try c.encode(true, forKey: .snapshotsOptionMigrated)
+        try c.encode(true, forKey: .expertOpinionsOptionMigrated)
     }
 
     mutating func applyRuntimePreset() {
@@ -295,24 +337,80 @@ struct ObsidianDestinationRecord: Codable, Equatable, Identifiable, Sendable {
     var configRevision: Int
     /// Security-scoped bookmark data for the vault root.
     var vaultBookmark: Data?
+    var name: String = ""
+    var slug: String = ""
+    var isPrimary: Bool = true
+    var loadsSkills: Bool = false
     var createdAt: Date
     var updatedAt: Date
+
+    enum CodingKeys: String, CodingKey {
+        case id, enabled, saveAfterMeeting, syncChanges, mode, meetingFolder, layout
+        case configRevision, vaultBookmark, name, slug, isPrimary, loadsSkills, createdAt, updatedAt
+    }
 
     init(id: UUID = UUID(), enabled: Bool = false, saveAfterMeeting: Bool = false,
          syncChanges: Bool = false, mode: ObsidianExportMode = .separateFiles,
          meetingFolder: String = "Meetings", layout: ObsidianExportLayout = .init(),
          configRevision: Int = 0, vaultBookmark: Data? = nil,
+         name: String = "", slug: String = "", isPrimary: Bool = true, loadsSkills: Bool = false,
          createdAt: Date = Date(), updatedAt: Date = Date()) {
         self.id = id; self.enabled = enabled; self.saveAfterMeeting = saveAfterMeeting; self.syncChanges = syncChanges
         self.mode = mode; self.meetingFolder = meetingFolder; self.layout = layout
         self.configRevision = configRevision; self.vaultBookmark = vaultBookmark
+        self.name = name; self.slug = slug; self.isPrimary = isPrimary; self.loadsSkills = loadsSkills
         self.createdAt = createdAt; self.updatedAt = updatedAt
     }
 
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? false
+        saveAfterMeeting = try c.decodeIfPresent(Bool.self, forKey: .saveAfterMeeting) ?? false
+        syncChanges = try c.decodeIfPresent(Bool.self, forKey: .syncChanges) ?? false
+        mode = try c.decodeIfPresent(ObsidianExportMode.self, forKey: .mode) ?? .separateFiles
+        meetingFolder = try c.decodeIfPresent(String.self, forKey: .meetingFolder) ?? "Meetings"
+        layout = try c.decodeIfPresent(ObsidianExportLayout.self, forKey: .layout) ?? .init()
+        configRevision = try c.decodeIfPresent(Int.self, forKey: .configRevision) ?? 0
+        vaultBookmark = try c.decodeIfPresent(Data.self, forKey: .vaultBookmark)
+        name = try c.decodeIfPresent(String.self, forKey: .name) ?? ""
+        slug = try c.decodeIfPresent(String.self, forKey: .slug) ?? ""
+        isPrimary = try c.decodeIfPresent(Bool.self, forKey: .isPrimary) ?? true
+        loadsSkills = try c.decodeIfPresent(Bool.self, forKey: .loadsSkills) ?? false
+        createdAt = try c.decode(Date.self, forKey: .createdAt)
+        updatedAt = try c.decode(Date.self, forKey: .updatedAt)
+    }
+
+    var displayName: String {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty { return trimmed }
+        if isPrimary { return L("Primary Obsidian Vault") }
+        return meetingFolder.isEmpty ? L("Secondary Vault") : meetingFolder
+    }
+
+    var resolvedSlug: String {
+        let raw = slug.trimmingCharacters(in: .whitespacesAndNewlines)
+        let candidate = raw.isEmpty ? displayName : raw
+        let cleaned = AssistantSkill.sanitizedSlug(from: candidate)
+        return cleaned.isEmpty ? String(id.uuidString.prefix(8)).lowercased() : cleaned
+    }
+
     func effective(for overrides: MeetingAutoExportOverrides) -> Self {
-        guard !overrides.isEmpty else { return self }
         var copy = self
-        copy.layout.sections = layout.sections.applying(overrides)
+        if !overrides.isEmpty {
+            copy.layout.sections = layout.sections.applying(overrides)
+        }
+        if let policy = overrides.coreOutcomePolicy {
+            switch policy {
+            case .full:
+                break
+            case .summaryOnly:
+                copy.layout.sections.remove([.decisions, .tasks, .questions])
+            case .expertOnly:
+                copy.layout.sections.remove([.summary, .decisions, .tasks, .questions])
+                copy.layout.sections.insert(.expertOpinions)
+            }
+        }
         return copy
     }
 }
@@ -322,7 +420,7 @@ enum ObsidianExportComponent: String, Codable, Sendable {
 }
 
 enum ObsidianBindingState: String, Codable, Sendable {
-    case idle, exporting, exported, conflict, failed, paused
+    case idle, exporting, exported, conflict, failed, paused, retracted
 }
 
 struct ObsidianExportBindingRecord: Codable, Equatable, Sendable {
@@ -346,12 +444,12 @@ struct ObsidianExportBindingRecord: Codable, Equatable, Sendable {
 }
 
 enum ObsidianExportIntent: String, Codable, Sendable {
-    case initialEnd, initialFirstReady, linkedUpdate, manualSave, legacy
+    case initialEnd, initialFirstReady, linkedUpdate, manualSave, retract, legacy
 
     func permitted(by destination: ObsidianDestinationRecord,
                    overrides: MeetingAutoExportOverrides = .init()) -> Bool {
         switch self {
-        case .manualSave: return true
+        case .manualSave, .retract: return true
         case .initialEnd, .initialFirstReady:
             if let explicit = overrides.autoExport { return explicit }
             return destination.enabled && destination.saveAfterMeeting
@@ -368,6 +466,42 @@ struct ObsidianExportSnapshot: Codable, Equatable, Sendable {
     var note: MeetingNoteRecord?
     var outcome: MeetingOutcome?
     var outcomeState: MeetingOutcomePersistenceState
+    var expertBlocks: [SyncedMeetingExpertBlock] = []
+    var dominantRole: DominantRoleBinding? = nil
+    var coreOutcomePolicy: CoreOutcomePolicy = .full
+
+    enum CodingKeys: String, CodingKey {
+        case session, note, outcome, outcomeState, expertBlocks, dominantRole, coreOutcomePolicy
+    }
+
+    init(
+        session: MeetingSessionRecord,
+        note: MeetingNoteRecord?,
+        outcome: MeetingOutcome?,
+        outcomeState: MeetingOutcomePersistenceState,
+        expertBlocks: [SyncedMeetingExpertBlock] = [],
+        dominantRole: DominantRoleBinding? = nil,
+        coreOutcomePolicy: CoreOutcomePolicy = .full
+    ) {
+        self.session = session
+        self.note = note
+        self.outcome = outcome
+        self.outcomeState = outcomeState
+        self.expertBlocks = expertBlocks
+        self.dominantRole = dominantRole
+        self.coreOutcomePolicy = coreOutcomePolicy
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        session = try c.decode(MeetingSessionRecord.self, forKey: .session)
+        note = try c.decodeIfPresent(MeetingNoteRecord.self, forKey: .note)
+        outcome = try c.decodeIfPresent(MeetingOutcome.self, forKey: .outcome)
+        outcomeState = try c.decode(MeetingOutcomePersistenceState.self, forKey: .outcomeState)
+        expertBlocks = try c.decodeIfPresent([SyncedMeetingExpertBlock].self, forKey: .expertBlocks) ?? []
+        dominantRole = try c.decodeIfPresent(DominantRoleBinding.self, forKey: .dominantRole)
+        coreOutcomePolicy = try c.decodeIfPresent(CoreOutcomePolicy.self, forKey: .coreOutcomePolicy) ?? .full
+    }
 }
 
 struct ObsidianOutboxRecord: Codable, Equatable, Identifiable, Sendable {

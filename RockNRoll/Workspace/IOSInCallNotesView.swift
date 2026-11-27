@@ -41,6 +41,16 @@ struct IOSInCallNotesView: View {
                     }
                     .padding(.horizontal)
 
+                    if let assistant = workspace.assistantCoordinator {
+                        IOSInCallAdvisorPanel(
+                            workspace: workspace,
+                            assistant: assistant,
+                            sessionID: sessionID,
+                            controllerID: workspace.controllerID(forSessionID: sessionID)
+                        )
+                        .padding(.horizontal)
+                    }
+
                     if let scopeKey = roomScopeKey {
                         VStack(alignment: .leading, spacing: 8) {
                             Text(L("Private Assistant Guidance"))
@@ -118,6 +128,146 @@ struct IOSInCallNotesView: View {
             }
             .onDisappear {
                 Task { await workspace.flushNotesNow() }
+            }
+        }
+    }
+}
+
+private struct IOSInCallAdvisorPanel: View {
+    @ObservedObject var workspace: IOSWorkspaceCoordinator
+    @ObservedObject var assistant: IOSAssistantCoordinator
+    let sessionID: UUID
+    let controllerID: UUID?
+
+    @State private var whisperInput = ""
+
+    private var activeControllerID: UUID { controllerID ?? sessionID }
+
+    private var currentMode: IOSMeetingAssistantMode {
+        assistant.resolvedMode(for: activeControllerID)
+    }
+
+    private var activeObservations: [RoleObservationItem] {
+        let live = assistant.observationsBySession[activeControllerID]
+            ?? workspace.roleObservationsBySession[sessionID]?.items
+            ?? []
+        return live.filter { !$0.isDismissed }
+    }
+
+    var body: some View {
+        let shouldShow = currentMode.isSilentToRoom || !activeObservations.isEmpty
+        if shouldShow {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(spacing: 8) {
+                    Label(L("Advisor & Role Notes"), systemImage: currentMode == .advise ? "lightbulb.max.fill" : "note.text")
+                        .font(.caption.weight(.semibold))
+                    Spacer()
+                    if currentMode.isSilentToRoom {
+                        Label(L("Silent"), systemImage: "lock.fill")
+                            .font(.caption2.weight(.semibold))
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 3)
+                            .background(Color.cyan.opacity(0.18), in: Capsule())
+                            .foregroundStyle(.cyan)
+                    }
+                    Menu {
+                        Button(L("Observe")) {
+                            assistant.setRoleAndMode(
+                                skillID: assistant.resolvedRoleID(for: activeControllerID),
+                                presetID: assistant.resolvedPresetID(for: activeControllerID),
+                                mode: .observe,
+                                for: activeControllerID
+                            )
+                        }
+                        Button(L("Advise")) {
+                            assistant.setRoleAndMode(
+                                skillID: assistant.resolvedRoleID(for: activeControllerID),
+                                presetID: assistant.resolvedPresetID(for: activeControllerID),
+                                mode: .advise,
+                                for: activeControllerID
+                            )
+                        }
+                    } label: {
+                        Text(currentMode.title)
+                            .font(.caption2.weight(.semibold))
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .background(.secondary.opacity(0.15), in: Capsule())
+                    }
+                }
+
+                if activeObservations.isEmpty {
+                    Text(L("Listening silently for structured observations and coaching notes…"))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(activeObservations) { item in
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack(alignment: .top, spacing: 6) {
+                                Text(item.kind.rawValue.capitalized)
+                                    .font(.caption2.weight(.semibold))
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 2)
+                                    .background(Color.accentColor.opacity(0.15), in: Capsule())
+                                    .foregroundStyle(Color.accentColor)
+                                Text(item.title)
+                                    .font(.footnote.weight(.semibold))
+                                Spacer()
+                                if item.isPinned {
+                                    Image(systemName: "star.fill")
+                                        .font(.caption2)
+                                        .foregroundStyle(.yellow)
+                                }
+                            }
+                            Text(item.body)
+                                .font(.footnote)
+                                .fixedSize(horizontal: false, vertical: true)
+                            if !item.evidenceRefs.isEmpty {
+                                Text(item.evidenceRefs.map { "[\($0)]" }.joined(separator: " "))
+                                    .font(.caption2.monospaced())
+                                    .foregroundStyle(.secondary)
+                            }
+                            HStack(spacing: 8) {
+                                Button(item.isPinned ? L("Unpin") : L("Pin")) {
+                                    assistant.toggleObservationPin(observationID: item.id, for: activeControllerID)
+                                }
+                                .buttonStyle(.bordered)
+                                .controlSize(.mini)
+                                Button(L("+ To Notes")) {
+                                    assistant.insertObservationIntoNotes(observationID: item.id, for: activeControllerID)
+                                }
+                                .buttonStyle(.bordered)
+                                .controlSize(.mini)
+                                Button(L("Dismiss")) {
+                                    assistant.dismissObservation(observationID: item.id, for: activeControllerID)
+                                }
+                                .buttonStyle(.borderless)
+                                .controlSize(.mini)
+                                .foregroundStyle(.secondary)
+                            }
+                        }
+                        .padding(10)
+                        .background(Color.secondary.opacity(0.1), in: RoundedRectangle(cornerRadius: 10))
+                    }
+                }
+
+                HStack(spacing: 8) {
+                    TextField(L("Whisper a private question…"), text: $whisperInput)
+                        .textFieldStyle(.roundedBorder)
+                    if assistant.whisperInFlight.contains(activeControllerID) {
+                        ProgressView()
+                    } else {
+                        Button {
+                            let q = whisperInput
+                            whisperInput = ""
+                            Task { await assistant.whisper(q, for: activeControllerID) }
+                        } label: {
+                            Image(systemName: "arrow.up.circle.fill")
+                                .font(.title3)
+                        }
+                        .disabled(whisperInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    }
+                }
             }
         }
     }

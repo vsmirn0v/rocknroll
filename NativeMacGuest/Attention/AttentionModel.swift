@@ -102,8 +102,18 @@ struct MeetingPreset: Codable, Identifiable, Equatable, Sendable {
     var sameRoomTransition: SameRoomMeetingTransitionMode? = nil
     /// Optional per-meeting/series override for automatic calendar joining (`nil` = inherit default).
     var autoJoin: Bool? = nil
-    /// Optional role assistant skill slug (e.g. `"scrum-master"`) to auto-engage on join (`nil` = Off).
+    /// Optional role assistant skill slug (e.g. `"scrum-master"`) to auto-engage on join (`nil` = Off / Personal Assistant).
     var autoFacilitatorSkillID: String? = nil
+    /// Optional specialized Role Preset ID under `autoFacilitatorSkillID`.
+    var autoFacilitatorPresetID: String? = nil
+    /// Optional explicit engagement mode on join (`off` | `mentions` | `follow` | `observe` | `advise` | `participate` | `facilitate`).
+    var autoEngagementMode: AssistantEngagementMode? = nil
+    /// Optional per-meeting override for core outcome generation (`full` | `summary_only` | `expert_only`).
+    var coreOutcomePolicyOverride: CoreOutcomePolicy? = nil
+    /// Optional target export vault destination ID override.
+    var exportDestinationIDOverride: UUID? = nil
+    /// Optional override whether the target vault receives the full meeting note (`true`) or only expert block.
+    var routeEntireMeetingOverride: Bool? = nil
     /// Optional custom Jira board URL for occurrences of this meeting or series (`nil` = inherit default).
     var jiraBoardURL: String? = nil
     /// Optional custom Jira project keys for JQL scoping (`nil` = inherit default).
@@ -136,6 +146,11 @@ struct MeetingPreset: Codable, Identifiable, Equatable, Sendable {
             people.allSatisfy { $0.trimmed.isEmpty } &&
             mode == nil && suggestReplies == nil && sameRoomTransition == nil &&
             autoJoin == nil && (autoFacilitatorSkillID?.trimmed.isEmpty ?? true) &&
+            (autoFacilitatorPresetID?.trimmed.isEmpty ?? true) &&
+            autoEngagementMode == nil &&
+            coreOutcomePolicyOverride == nil &&
+            exportDestinationIDOverride == nil &&
+            routeEntireMeetingOverride == nil &&
             (jiraBoardURL?.trimmed.isEmpty ?? true) &&
             (jiraProjectKeys?.allSatisfy { $0.trimmed.isEmpty } ?? true) &&
             autoExportOverrides.isEmpty
@@ -159,6 +174,8 @@ extension MeetingPreset {
         case id, title, bindings, about, matters, people, never, urgency, mode
         case thresholdAdjustment, examples, suggestReplies, replyEdits
         case sameRoomTransition, autoJoin, autoFacilitatorSkillID
+        case autoFacilitatorPresetID, autoEngagementMode, coreOutcomePolicyOverride
+        case exportDestinationIDOverride, routeEntireMeetingOverride
         case jiraBoardURL, jiraProjectKeys, autoExportOverrides
     }
 
@@ -180,6 +197,11 @@ extension MeetingPreset {
         sameRoomTransition = try c.decodeIfPresent(SameRoomMeetingTransitionMode.self, forKey: .sameRoomTransition)
         autoJoin = try c.decodeIfPresent(Bool.self, forKey: .autoJoin)
         autoFacilitatorSkillID = try c.decodeIfPresent(String.self, forKey: .autoFacilitatorSkillID)
+        autoFacilitatorPresetID = try c.decodeIfPresent(String.self, forKey: .autoFacilitatorPresetID)
+        autoEngagementMode = try c.decodeIfPresent(AssistantEngagementMode.self, forKey: .autoEngagementMode)
+        coreOutcomePolicyOverride = try c.decodeIfPresent(CoreOutcomePolicy.self, forKey: .coreOutcomePolicyOverride)
+        exportDestinationIDOverride = try c.decodeIfPresent(UUID.self, forKey: .exportDestinationIDOverride)
+        routeEntireMeetingOverride = try c.decodeIfPresent(Bool.self, forKey: .routeEntireMeetingOverride)
         jiraBoardURL = try c.decodeIfPresent(String.self, forKey: .jiraBoardURL)
         jiraProjectKeys = try c.decodeIfPresent([String].self, forKey: .jiraProjectKeys)
         autoExportOverrides = try c.decodeIfPresent(MeetingAutoExportOverrides.self, forKey: .autoExportOverrides) ?? .init()

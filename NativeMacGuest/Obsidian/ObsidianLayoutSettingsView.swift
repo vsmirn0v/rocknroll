@@ -12,6 +12,7 @@ extension ObsidianExportMode {
 
 struct ObsidianLayoutSettingsView: View {
     let coordinator: ObsidianExportCoordinator
+    let targetDestination: ObsidianDestinationRecord?
     @Environment(\.dismiss) private var dismiss
     @State private var mode: ObsidianExportMode
     @State private var folder: String
@@ -23,9 +24,10 @@ struct ObsidianLayoutSettingsView: View {
     @State private var issue: String?
     @State private var loading = false
 
-    init(coordinator: ObsidianExportCoordinator) {
+    init(coordinator: ObsidianExportCoordinator, targetDestination: ObsidianDestinationRecord? = nil) {
         self.coordinator = coordinator
-        let destination = coordinator.destination ?? ObsidianDestinationRecord()
+        self.targetDestination = targetDestination
+        let destination = targetDestination ?? coordinator.destination ?? ObsidianDestinationRecord()
         _mode = State(initialValue: destination.mode)
         _folder = State(initialValue: destination.meetingFolder)
         _layout = State(initialValue: destination.layout)
@@ -79,6 +81,7 @@ struct ObsidianLayoutSettingsView: View {
                     }
                     GridRow {
                         section(L("Visual snapshots"), .snapshots)
+                        section(L("Expert evaluations"), .expertOpinions)
                     }
                 }.toggleStyle(.checkbox)
             }.formStyle(.grouped).disabled(loading)
@@ -96,7 +99,11 @@ struct ObsidianLayoutSettingsView: View {
                 Spacer()
                 Button(L("Cancel"), role: .cancel) { dismiss() }.disabled(loading)
                 Button(L("Save")) {
-                    coordinator.setLayout(mode: mode, meetingFolder: folder, layout: confirmedLayout)
+                    if let targetDestination {
+                        coordinator.setSecondaryLayout(id: targetDestination.id, mode: mode, meetingFolder: folder, layout: confirmedLayout)
+                    } else {
+                        coordinator.setLayout(mode: mode, meetingFolder: folder, layout: confirmedLayout)
+                    }
                     dismiss()
                 }.keyboardShortcut(.defaultAction).disabled(preview == nil || loading)
             }.padding([.horizontal, .bottom], 16)

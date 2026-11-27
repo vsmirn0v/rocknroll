@@ -1017,4 +1017,154 @@ extension NativeDesktopMCPBackend {
         ]
         return actions.finish(id, client: client, type: "jira", target: finalJQL, status: "applied", result: result)
     }
+
+    // MARK: - Role Presets & Expert Opinions
+
+    func listRolePresets(_ args: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON {
+        let skillID = try MCPValue.optionalString(args["skill_id"], key: "skill_id")
+        guard let attention else { throw MCPToolFailure("APP_NOT_RUNNING", "The native workspace is unavailable.") }
+        let presets = await attention.withCompositeSkillRepository { repo, _ in
+            repo.listPresets(skillID: skillID)
+        }
+        let items: [MCPJSON] = presets.map { preset in
+            [
+                "id": preset.id,
+                "skill_id": preset.skillID,
+                "name": preset.name,
+                "enabled": preset.enabled,
+                "default_mode": preset.defaultMode?.rawValue ?? "",
+                "core_outcome_policy": preset.coreOutcomePolicy?.rawValue ?? "",
+                "focus_speaker_role": preset.focusSpeakerRole,
+                "rubric_dimensions": preset.rubricDimensions,
+                "export_destination_slug": preset.exportDestinationSlug ?? "",
+                "route_entire_meeting": preset.routeEntireMeeting,
+                "path": preset.sourceRelativePath ?? "",
+            ]
+        }
+        return [
+            "items": items,
+            "count": items.count,
+            "observed_at": mcpNow(),
+            "coverage": "complete",
+            "warnings": [],
+        ]
+    }
+
+    func listExpertOpinions(_ args: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON {
+        let rawSessionID = try MCPValue.string(args["session_id"], key: "session_id")
+        guard let attention else { throw MCPToolFailure("APP_NOT_RUNNING", "The native workspace is unavailable.") }
+        let sessionUUID = try parseSessionUUID(rawSessionID)
+        await attention.store.waitForMeetingLibrary()
+        let library = attention.store.meetingLibrary.store
+        guard let session = try await library.session(sessionUUID) else {
+            throw MCPToolFailure("MEETING_NOT_FOUND", "The requested session is unavailable.")
+        }
+        let blocks = try await library.expertBlocks(for: sessionUUID)
+        let skills = await attention.withCompositeSkillRepository { repo, _ in repo.listSkills() }
+        let presets = await attention.withCompositeSkillRepository { repo, _ in repo.listPresets() }
+        let skill = session.dominantRole.flatMap { dom in skills.first(where: { $0.id == dom.skillID }) }
+        let preset = session.dominantRole.flatMap { dom in
+            dom.presetID.flatMap { pid in presets.first(where: { $0.id == pid && $0.skillID == dom.skillID }) }
+        }
+        let effectivePolicy = DominantRoleResolver.effectiveCoreOutcomePolicy(
+            dominantRole: session.dominantRole,
+            skill: skill,
+            preset: preset,
+            perMeetingOverride: attention.store.autoFacilitatorConfiguration(
+                room: session.invitation,
+                seriesIDs: [session.calendarSeriesID].compactMap { $0 }
+            ).coreOutcomePolicy
+        )
+        let items: [MCPJSON] = blocks.map { block in
+            [
+                "block_id": block.id.uuidString,
+                "skill_id": block.skillID,
+                "preset_id": block.presetID ?? "",
+                "title": block.title.value,
+                "is_primary": session.dominantRole?.expertBlockID == block.id,
+                "headline_verdict": block.headlineVerdict.value ?? "",
+                "markdown_body": block.markdownBody.value,
+                "focus_speakers": block.contextSnapshot.value.focusSpeakers,
+                "ad_hoc_context": block.contextSnapshot.value.adHocContext,
+                "is_edited": block.isEdited,
+                "source_coverage": block.sourceCoverageLabel,
+                "version_count": block.versions.count,
+                "updated_at": mcpDate(block.updatedAt),
+            ]
+        }
+        var domJSON: MCPJSON = [:]
+        if let dom = session.dominantRole {
+            domJSON = [
+                "skill_id": dom.skillID,
+                "preset_id": dom.presetID ?? "",
+                "mode": dom.mode.rawValue,
+                "core_outcome_policy": dom.coreOutcomePolicy.rawValue,
+                "expert_block_id": dom.expertBlockID?.uuidString ?? "",
+            ]
+        }
+        return [
+            "session_id": sessionUUID.uuidString,
+            "dominant_role": domJSON,
+            "core_outcome_policy": effectivePolicy.rawValue,
+            "items": items,
+            "count": items.count,
+            "observed_at": mcpNow(),
+            "coverage": "complete",
+            "warnings": [],
+        ]
+    }
+
+    func generateExpertOpinion(_ args: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON {
+        _ = try validateActionID(args)
+        let rawSessionID = try MCPValue.string(args["session_id"], key: "session_id")
+        let skillID = try MCPValue.string(args["skill_id"], key: "skill_id")
+        let presetID = try MCPValue.optionalString(args["preset_id"], key: "preset_id")
+        let focusSpeakers = args["focus_speakers"] as? [String]
+        let extraContext = try MCPValue.optionalString(args["extra_context"], key: "extra_context") ?? ""
+        let makePrimary = try MCPValue.optionalBool(args["make_primary"], key: "make_primary")
+        guard let attention else { throw MCPToolFailure("APP_NOT_RUNNING", "The native workspace is unavailable.") }
+        let sessionUUID = try parseSessionUUID(rawSessionID)
+
+        let (id, replay) = try beginAction(args, client: client)
+        if let replay { return replay }
+
+        guard await actions.approval("Generate expert opinion", ["session_id": sessionUUID.uuidString, "skill_id": skillID, "preset_id": presetID ?? ""]) else {
+            return actions.finish(id, client: client, type: "expert_opinion", target: sessionUUID.uuidString, status: "rejected", failure: "APPROVAL_DENIED")
+        }
+
+        let block = try await attention.generateExpertSummary(
+            sessionID: sessionUUID,
+            skillID: skillID,
+            presetID: presetID,
+            focusSpeakers: focusSpeakers,
+            adHocContext: extraContext,
+            makePrimary: makePrimary
+        )
+        let result: MCPJSON = [
+            "action_id": id,
+            "status": "applied",
+            "observed_at": mcpNow(),
+            "entity_id": block.id.uuidString,
+            "block": [
+                "block_id": block.id.uuidString,
+                "session_id": block.sessionID.uuidString,
+                "skill_id": block.skillID,
+                "preset_id": block.presetID ?? "",
+                "title": block.title.value,
+                "headline_verdict": block.headlineVerdict.value ?? "",
+                "markdown_body": block.markdownBody.value,
+            ],
+            "warnings": [],
+        ]
+        return actions.finish(id, client: client, type: "expert_opinion", target: block.id.uuidString, status: "applied", result: result)
+    }
+
+    private func parseSessionUUID(_ raw: String) throws -> UUID {
+        let token = raw.split(separator: ":").last.map(String.init) ?? raw
+        guard let uuid = UUID(uuidString: token.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+            throw MCPToolFailure("INVALID_ARGUMENT", "session_id must be a UUID or session: identifier.",
+                                 details: ["field": "session_id", "reason": "format"])
+        }
+        return uuid
+    }
 }

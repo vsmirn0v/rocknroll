@@ -979,6 +979,10 @@
             "description" : "Jira Cloud accountId.",
             "type" : "string"
           },
+          "force_without_jira" : {
+            "description" : "Set true only to save aliases or voice permissions when the person genuinely has no Jira account.",
+            "type" : "boolean"
+          },
           "jira_username" : {
             "description" : "Jira Server\/DC username.",
             "type" : "string"
@@ -1017,7 +1021,7 @@
         "destructiveHint" : false,
         "readOnlyHint" : false
       },
-      "description" : "Control the sandbox-safe in-app Assistant Board WKWebView window and share it directly into an active meeting.",
+      "description" : "Control the sandbox-safe in-app Assistant Board WKWebView window, select person filters during standups, move Jira cards, and share it directly into an active meeting.",
       "inputSchema" : {
         "additionalProperties" : false,
         "properties" : {
@@ -1033,12 +1037,19 @@
               "stop_share",
               "scroll",
               "filter",
+              "select_person_filter",
+              "clear_filters",
               "click",
               "click_at",
               "highlight",
               "inspect",
-              "snapshot"
+              "snapshot",
+              "move_issue"
             ],
+            "type" : "string"
+          },
+          "comment" : {
+            "description" : "Optional Jira comment when moving an issue.",
             "type" : "string"
           },
           "delta_y" : {
@@ -1046,6 +1057,10 @@
             "maximum" : 4000,
             "minimum" : -4000,
             "type" : "integer"
+          },
+          "issue_key" : {
+            "description" : "Jira issue key for move_issue (e.g. PROJ-123).",
+            "type" : "string"
           },
           "meeting_id" : {
             "description" : "Active session identifier (session:native:...) for share_to_meeting.",
@@ -1056,11 +1071,15 @@
             "type" : "boolean"
           },
           "query" : {
-            "description" : "Search query for filter.",
+            "description" : "Search query for filter or person name\/alias for select_person_filter.",
             "type" : "string"
           },
           "selector" : {
             "description" : "CSS selector for click.",
+            "type" : "string"
+          },
+          "status" : {
+            "description" : "Target status\/column name for move_issue.",
             "type" : "string"
           },
           "text" : {
@@ -1134,7 +1153,7 @@
         "destructiveHint" : false,
         "readOnlyHint" : false
       },
-      "description" : "Search Jira issues with JQL, search Jira users to bind to People.md, or post a comment directly on a Jira issue.",
+      "description" : "Search Jira issues/board users, copy a user handle from an issue on the board, create/assign/transition issues, or post a comment.",
       "inputSchema" : {
         "additionalProperties" : false,
         "properties" : {
@@ -1142,18 +1161,49 @@
             "description" : "Client-generated UUID used as an idempotency key. Retrying with the same action_id and identical arguments replays the recorded result; reusing it with different arguments fails with ACTION_ID_REUSED.",
             "type" : "string"
           },
+          "aliases" : {
+            "description" : "Optional spoken/meeting aliases when save_to_people_name is provided.",
+            "items" : {
+              "description" : "Alias text.",
+              "minLength" : 1,
+              "type" : "string"
+            },
+            "type" : "array"
+          },
           "assignee" : {
             "description" : "Meeting/display name or Jira handle to resolve via People.md or Jira user search.",
             "type" : "string"
           },
           "comment" : {
-            "description" : "Comment body to add when operation is comment.",
+            "description" : "Comment body for comment or transition.",
             "minLength" : 1,
             "type" : "string"
           },
+          "description" : {
+            "description" : "Issue description when creating a Jira issue.",
+            "type" : "string"
+          },
           "issue_key" : {
-            "description" : "Jira issue key (e.g. PROJ-123) for comment.",
+            "description" : "Jira issue key (e.g. PROJ-123) for comment, transition, assign, or copy_user_from_issue.",
             "minLength" : 2,
+            "type" : "string"
+          },
+          "issue_kind" : {
+            "description" : "Issue type for create.",
+            "enum" : [
+              "task",
+              "story",
+              "bug",
+              "epic"
+            ],
+            "type" : "string"
+          },
+          "jira_account_id" : {
+            "description" : "Explicit Jira Cloud accountId for assign.",
+            "type" : "string"
+          },
+          "jira_username" : {
+            "description" : "Explicit Jira Server/DC username for assign.",
             "type" : "string"
           },
           "jql" : {
@@ -1172,12 +1222,55 @@
             "enum" : [
               "search",
               "search_users",
-              "comment"
+              "board_users",
+              "copy_user_from_issue",
+              "comment",
+              "transition",
+              "assign",
+              "create"
             ],
             "type" : "string"
           },
+          "parent_epic_key" : {
+            "description" : "Optional parent Epic key for create.",
+            "type" : "string"
+          },
+          "priority" : {
+            "description" : "Issue priority for create.",
+            "enum" : [
+              "critical",
+              "high",
+              "medium",
+              "low"
+            ],
+            "type" : "string"
+          },
+          "project_key" : {
+            "description" : "Target Jira project key when creating an issue.",
+            "type" : "string"
+          },
           "query" : {
-            "description" : "Plain text search query when jql is omitted, or name/login/email query for search_users.",
+            "description" : "Plain text search query when jql is omitted, or name/login/email query for search_users or copy_user_from_issue.",
+            "type" : "string"
+          },
+          "role" : {
+            "description" : "User role to copy from an issue: assignee (default) or reporter.",
+            "enum" : [
+              "assignee",
+              "reporter"
+            ],
+            "type" : "string"
+          },
+          "save_to_people_name" : {
+            "description" : "Optional People.md display name to immediately bind with the copied Jira user.",
+            "type" : "string"
+          },
+          "status" : {
+            "description" : "Target Jira status/column name for transition (e.g. In Progress, В работе, Done).",
+            "type" : "string"
+          },
+          "summary" : {
+            "description" : "Issue summary/title when creating a Jira issue.",
             "type" : "string"
           }
         },
@@ -1188,6 +1281,103 @@
         "type" : "object"
       },
       "name" : "rocknroll_jira_action"
+    },
+    {
+      "annotations" : {
+        "destructiveHint" : false,
+        "readOnlyHint" : true
+      },
+      "description" : "List specialized Markdown Role Presets under Rock Assistant\/Presets\/<skill_id>\/.",
+      "inputSchema" : {
+        "additionalProperties" : false,
+        "properties" : {
+          "skill_id" : {
+            "description" : "Optional parent Role skill slug to filter presets.",
+            "minLength" : 1,
+            "type" : "string"
+          }
+        },
+        "required" : [],
+        "type" : "object"
+      },
+      "name" : "rocknroll_list_role_presets"
+    },
+    {
+      "annotations" : {
+        "destructiveHint" : false,
+        "readOnlyHint" : true
+      },
+      "description" : "List persisted Primary and Secondary Expert Opinion blocks and dominant role governance for a meeting session.",
+      "inputSchema" : {
+        "additionalProperties" : false,
+        "properties" : {
+          "session_id" : {
+            "description" : "Session UUID or session: identifier.",
+            "minLength" : 1,
+            "type" : "string"
+          }
+        },
+        "required" : [
+          "session_id"
+        ],
+        "type" : "object"
+      },
+      "name" : "rocknroll_list_expert_opinions"
+    },
+    {
+      "annotations" : {
+        "destructiveHint" : false,
+        "readOnlyHint" : false
+      },
+      "description" : "Generate or regenerate an Expert Opinion block on a meeting using full-transcript evaluation and a Role\/Preset.",
+      "inputSchema" : {
+        "additionalProperties" : false,
+        "properties" : {
+          "action_id" : {
+            "description" : "Client-generated UUID used as an idempotency key. Retrying with the same action_id and identical arguments replays the recorded result; reusing it with different arguments fails with ACTION_ID_REUSED.",
+            "type" : "string"
+          },
+          "extra_context" : {
+            "description" : "Optional ad-hoc instructions, rubric, or job description.",
+            "type" : "string"
+          },
+          "focus_speakers" : {
+            "description" : "Optional speaker names to evaluate (e.g. Candidate names).",
+            "items" : {
+              "description" : "Speaker display name.",
+              "minLength" : 1,
+              "type" : "string"
+            },
+            "type" : "array"
+          },
+          "make_primary" : {
+            "description" : "Set this Role as the Dominant ★ Primary role for the meeting.",
+            "type" : "boolean"
+          },
+          "preset_id" : {
+            "description" : "Optional Role Preset slug under skill_id.",
+            "minLength" : 1,
+            "type" : "string"
+          },
+          "session_id" : {
+            "description" : "Session UUID or session: identifier.",
+            "minLength" : 1,
+            "type" : "string"
+          },
+          "skill_id" : {
+            "description" : "Target Role skill slug (e.g. hiring-interviewer).",
+            "minLength" : 1,
+            "type" : "string"
+          }
+        },
+        "required" : [
+          "action_id",
+          "session_id",
+          "skill_id"
+        ],
+        "type" : "object"
+      },
+      "name" : "rocknroll_generate_expert_opinion"
     }
   ]
 }

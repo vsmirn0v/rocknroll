@@ -153,9 +153,17 @@ final class AttentionMemoryPressure: @unchecked Sendable {
     let store: AttentionStore
     let boardController = AssistantBoardWindowController()
     private var facilitatorSubscription: AnyCancellable?
+    private var advisorSubscription: AnyCancellable?
+    @Published var activeMeetingRoles: [UUID: (skillID: String, presetID: String?, mode: AssistantEngagementMode)] = [:]
+    private var autoAppliedRoleSessions: Set<UUID> = []
     var facilitator: AutonomousMeetingFacilitator? {
         didSet {
             bindFacilitatorObserver()
+        }
+    }
+    var advisorCoordinator: AdvisorSessionCoordinator? {
+        didSet {
+            bindAdvisorObserver()
         }
     }
 
@@ -164,7 +172,14 @@ final class AttentionMemoryPressure: @unchecked Sendable {
             self?.objectWillChange.send()
         }
     }
+
+    private func bindAdvisorObserver() {
+        advisorSubscription = advisorCoordinator?.objectWillChange.sink { [weak self] _ in
+            self?.objectWillChange.send()
+        }
+    }
     var cachedPromptTexts: [AssistantPromptKind: String] = [:]
+    @Published var syncedVaultDestinations: [SyncedVaultDestinationDescriptor] = []
     var skillFolderWatcher: AssistantSkillFolderWatcher?
     var watchedSkillVaultURL: URL?
     var meetings: () -> [NativeDesktopMeetingModel] = { [] }
@@ -282,6 +297,10 @@ final class AttentionMemoryPressure: @unchecked Sendable {
     init(store: AttentionStore = .shared) {
         self.store = store
         ruleStore = AssistantRuleStore(root: store.root)
+        let advisor = AdvisorSessionCoordinator(attention: nil)
+        advisorCoordinator = advisor
+        advisor.attention = self
+        bindAdvisorObserver()
         facilitator = AutonomousMeetingFacilitator(attention: self)
         bindFacilitatorObserver()
         boardController.taskSync = taskSync
@@ -640,10 +659,33 @@ final class AttentionMemoryPressure: @unchecked Sendable {
         var previousTask: Task<Void, Never>?
         for segment in segments {
             let roomID = MeetingRoomIdentity(segment.invitation, engine: model.kind)?.displayDetails
+            let segSeriesIDs = seriesIDs(for: model, extraSeriesID: segment.seriesID)
+            let precomputedEvents = AdvisorSessionCoordinator.syncedEvents(from: model)
+            let resolvedConfig = store.autoFacilitatorConfiguration(
+                room: segment.invitation,
+                seriesIDs: segSeriesIDs
+            )
+            let activeRoleMode = activeMeetingRoles[model.sessionID]?.mode ?? effectiveRoleAndMode(for: model).mode
+            let activeSkillID = activeMeetingRoles[model.sessionID]?.skillID ?? effectiveRoleAndMode(for: model).skillID
+            let activePresetID = activeMeetingRoles[model.sessionID]?.presetID ?? effectiveRoleAndMode(for: model).presetID
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                await self.autoCaptureExpertBlockIfNeeded(
+                    forSessionID: segment.sessionID,
+                    title: segment.title,
+                    endedAt: segment.endedAt,
+                    invitation: segment.invitation,
+                    seriesID: segment.seriesID,
+                    events: precomputedEvents
+                )
+            }
+            if resolvedConfig.coreOutcomePolicy == .expertOnly {
+                continue
+            }
             guard store.shouldCaptureOutcome(
                 room: segment.invitation,
                 roomIdentity: roomID,
-                seriesIDs: seriesIDs(for: model, extraSeriesID: segment.seriesID)
+                seriesIDs: segSeriesIDs
             ) else { continue }
             if store.assistant.outcomes.contains(where: { $0.meetingID == segment.sessionID && !$0.summary.isEmpty }) {
                 continue
@@ -1074,14 +1116,29 @@ final class AttentionMemoryPressure: @unchecked Sendable {
                         seriesIDs: seriesIDs
                     )
                     let writer = makeOutcomeWriter(input.provider, store.apiKey(for: input.provider))
+                    let effectivePolicy = await effectiveCoreOutcomePolicy(
+                        forSessionID: sessionID,
+                        room: roomURL,
+                        seriesIDs: seriesIDs
+                    )
+                    if effectivePolicy == .expertOnly {
+                        return
+                    }
                     let content = try await writer.outcome(input.request)
                     try Task.checkCancellation()
                     outcome.summary = content.summary
-                    outcome.decisions = content.decisions
-                    outcome.tasks = content.tasks
-                    outcome.openQuestions = content.openQuestions
+                    if effectivePolicy == .summaryOnly {
+                        outcome.decisions = []
+                        outcome.tasks = []
+                        outcome.openQuestions = []
+                        outcome.decisionEvidence = [:]
+                    } else {
+                        outcome.decisions = content.decisions
+                        outcome.tasks = content.tasks
+                        outcome.openQuestions = content.openQuestions
+                        outcome.decisionEvidence = MeetingOutcomePrompt.verifiedEvidence(content, window: input.request.window)
+                    }
                     outcome.transcriptFingerprint = MeetingOutcomePrompt.fingerprint(input.request.window)
-                    outcome.decisionEvidence = MeetingOutcomePrompt.verifiedEvidence(content, window: input.request.window)
                 } catch {
                     failure = MeetingOutcomeFailure(writerError: error)
                     var fields: [String: Any] = [
@@ -1660,6 +1717,7 @@ final class AttentionMemoryPressure: @unchecked Sendable {
 
     @discardableResult func sendOutcome(_ outcome: MeetingOutcome, to meetingID: UUID) -> Bool {
         guard let model = meetings().first(where: { $0.sessionID == meetingID && !$0.isClosed && $0.chat.canSend }) else { return false }
+        guard advisorCoordinator?.isOutboundMuted(sessionID: model.sessionID) != true else { return false }
         let sameSession = outcome.meetingID == model.sessionID
         let soleLater = !sameSession && outcomeChatTarget(outcome)?.sessionID == model.sessionID
         guard sameSession || soleLater else { return false }
@@ -1700,11 +1758,38 @@ final class AttentionMemoryPressure: @unchecked Sendable {
             selectedCard?.speaking = false
         }
         for model in list { observeParticipants(model, now: current) }
+        // Auto-apply preset Role + Engagement Mode on newly joined meetings unless overridden.
+        for model in list where !model.isClosed && model.connected && !autoAppliedRoleSessions.contains(model.sessionID) {
+            autoAppliedRoleSessions.insert(model.sessionID)
+            let presetConfig = store.autoFacilitatorConfiguration(
+                room: model.invitation,
+                seriesIDs: [model.participationCalendar?.externalSeriesID, model.calendarSeriesID].compactMap { $0 }
+            )
+            if let presetMode = presetConfig.mode, presetMode == .observe || presetMode == .advise {
+                let skillID = presetConfig.skillID ?? AssistantSkill.personalAssistantID
+                setMeetingRoleAndMode(model: model, skillID: skillID, presetID: presetConfig.presetID, mode: presetMode, scope: .untilLeave)
+            }
+        }
+        autoAppliedRoleSessions = autoAppliedRoleSessions.intersection(ids)
+        activeMeetingRoles = activeMeetingRoles.filter { ids.contains($0.key) }
+        advisorCoordinator?.prune(liveSessionIDs: Set(list.filter { !$0.isClosed }.map(\.sessionID)))
+
+        // P0/P1/P2 scheduler ordering: P1 (.advise) ahead of P2 (.observe) for live advisor evaluations.
+        let prioritizedAdvisorIDs = list
+            .filter { !$0.isClosed && $0.connected && advisorCoordinator?.activeSessions[$0.sessionID] != nil }
+            .sorted { left, right in
+                let leftPriority = advisorCoordinator?.activeMode(for: left.sessionID) == .advise ? 1 : 2
+                let rightPriority = advisorCoordinator?.activeMode(for: right.sessionID) == .advise ? 1 : 2
+                if leftPriority != rightPriority { return leftPriority < rightPriority }
+                return (left.connectedSince ?? .distantPast) > (right.connectedSince ?? .distantPast)
+            }
+            .map(\.sessionID)
+        advisorCoordinator?.processTick(models: list, prioritizedSessionIDs: prioritizedAdvisorIDs)
         facilitator?.processTick(models: list)
         guard judging == nil else { return }
         calls.removeAll { current.timeIntervalSince($0) > 60 }
         guard calls.count < callsPerMinuteLimit else { return }
-        var best: (model: NativeDesktopMeetingModel, window: AttentionWindow, mode: AttentionMode, mentioned: Bool, trigger: Bool, last: Date)?
+        var best: (model: NativeDesktopMeetingModel, window: AttentionWindow, mode: AttentionMode, mentioned: Bool, priority: Int, trigger: Bool, last: Date)?
         for model in list where eligible(model) {
             let mode = resolvedMode(model).mode
             let state = states[model.sessionID] ?? .init()
@@ -1727,8 +1812,13 @@ final class AttentionMemoryPressure: @unchecked Sendable {
             }
             let last = state.judgedAt ?? .distantPast
             guard trigger || current.timeIntervalSince(last) >= cadence else { continue }
-            if let chosen = best, (chosen.trigger && !trigger) || (chosen.trigger == trigger && chosen.last <= last) { continue }
-            best = (model, window, mode, mentioned, trigger, last)
+            // Scheduler priority: P0 = explicit mention/question, P1 = active watch/participate, P2 = background watch
+            let priority: Int = mentioned ? 0 : (isOnScreen(model) || model.participation.status == .observing ? 1 : 2)
+            if let chosen = best {
+                if chosen.priority < priority { continue }
+                if chosen.priority == priority, (chosen.trigger && !trigger) || (chosen.trigger == trigger && chosen.last <= last) { continue }
+            }
+            best = (model, window, mode, mentioned, priority, trigger, last)
         }
         guard let best else { return }
         await judge(best.model, window: best.window, mode: best.mode, mentioned: best.mentioned, at: current)
@@ -2458,6 +2548,9 @@ final class AttentionMemoryPressure: @unchecked Sendable {
 
     func deliverVoiceStream(_ model: NativeDesktopMeetingModel,
                             _ chunks: AsyncThrowingStream<AVAudioPCMBuffer, Error>) async throws {
+        if advisorCoordinator?.isOutboundMuted(sessionID: model.sessionID) == true {
+            throw MeetingSessionError.unavailable(L("Outbound audio is disabled in silent Advisor/Observer mode."))
+        }
         try await model.speakStream(chunks)
     }
 

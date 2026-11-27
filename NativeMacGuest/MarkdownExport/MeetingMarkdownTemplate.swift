@@ -11,8 +11,9 @@ struct MeetingMarkdownSections: OptionSet, Codable, Sendable {
     static let questions = Self(rawValue: 1 << 4)
     static let transcript = Self(rawValue: 1 << 5)
     static let snapshots = Self(rawValue: 1 << 6)
+    static let expertOpinions = Self(rawValue: 1 << 7)
     // Transcripts are opt-in for both new and existing destinations.
-    static let all: Self = [.notes, .summary, .decisions, .tasks, .questions, .snapshots]
+    static let all: Self = [.notes, .summary, .decisions, .tasks, .questions, .snapshots, .expertOpinions]
 
     func applying(_ overrides: MeetingAutoExportOverrides) -> Self {
         var result = self
@@ -51,7 +52,9 @@ enum MeetingMarkdownTemplate {
 
     static func frontmatter(session: MeetingSessionRecord, note: MeetingNoteRecord?,
                             outcome: MeetingOutcome?, outcomeState: MeetingOutcomePersistenceState,
-                            exportRevision: Int) -> String {
+                            exportRevision: Int,
+                            dominantRole: DominantRoleBinding? = nil,
+                            expertBlocksCount: Int = 0) -> String {
         var lines = ["---",
             "schema_version: \(schemaVersion)",
             "meeting_id: \"\(session.id.uuidString)\"",
@@ -60,6 +63,16 @@ enum MeetingMarkdownTemplate {
             "export_revision: \(exportRevision)",
             "note_revision: \(note?.revision ?? 0)",
             "outcome_state: \(outcomeState.rawValue)"]
+        if let dominantRole {
+            lines.append("dominant_role: \(yamlValue(dominantRole.skillID))")
+            if let presetID = dominantRole.presetID, !presetID.isEmpty {
+                lines.append("dominant_preset: \(yamlValue(presetID))")
+            }
+            lines.append("core_outcome_policy: \(dominantRole.coreOutcomePolicy.rawValue)")
+        }
+        if expertBlocksCount > 0 {
+            lines.append("expert_opinions_count: \(expertBlocksCount)")
+        }
         if let start = session.recordedStart {
             lines.append("started_at: \(ISO8601DateFormatter().string(from: start))")
         }
@@ -77,7 +90,10 @@ enum MeetingMarkdownTemplate {
                                sections: MeetingMarkdownSections = .all, headingLevel: Int = 1,
                                boldTitle: Bool = false,
                                snapshots: [MeetingSnapshotRecord] = [],
-                               useWikiLinksForSnapshots: Bool = true) -> String {
+                               useWikiLinksForSnapshots: Bool = true,
+                               expertBlocks: [SyncedMeetingExpertBlock] = [],
+                               dominantRole: DominantRoleBinding? = nil,
+                               coreOutcomePolicy: CoreOutcomePolicy = .full) -> String {
         let heading = String(repeating: "#", count: headingLevel)
         var parts = [boldTitle ? "**" + session.title + "**" : heading + " " + session.title]
         if sections.contains(.snapshots), !snapshots.isEmpty {
@@ -96,7 +112,22 @@ enum MeetingMarkdownTemplate {
                 parts.append("_No notes for this meeting._")
             }
         }
-        if !sections.intersection([.summary, .decisions, .tasks, .questions]).isEmpty {
+        let visibleExpertBlocks = expertBlocks
+            .filter { !$0.isDeleted.value }
+            .sorted { left, right in
+                let leftPrimary = isPrimaryExpertBlock(left, dominantRole: dominantRole)
+                let rightPrimary = isPrimaryExpertBlock(right, dominantRole: dominantRole)
+                if leftPrimary != rightPrimary { return leftPrimary }
+                return left.createdAt < right.createdAt
+            }
+        let outcomeSectionMask: MeetingMarkdownSections = switch coreOutcomePolicy {
+        case .full: [.summary, .decisions, .tasks, .questions]
+        case .summaryOnly: [.summary]
+        case .expertOnly: []
+        }
+        let requestedOutcomeSections = sections.intersection(outcomeSectionMask)
+        let shouldSuppressEmptyOutcome = (coreOutcomePolicy == .expertOnly && !visibleExpertBlocks.isEmpty)
+        if !requestedOutcomeSections.isEmpty && !shouldSuppressEmptyOutcome {
             parts += ["", heading + "# Outcome"]
             switch outcomeState {
             case .notStarted:
@@ -107,20 +138,20 @@ enum MeetingMarkdownTemplate {
                 parts.append("_The meeting outcome could not be generated. Retry it in Rock’N’Roll for Mac._")
             case .draft, .ready:
                 if let outcome {
-                    if sections.contains(.summary) {
+                    if requestedOutcomeSections.contains(.summary) {
                         parts.append(outcome.summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                             ? "_No summary._" : MarkdownStructureScanner.closingTrailingFence(in: outcome.summary))
                     }
-                    if sections.contains(.decisions), !outcome.decisions.isEmpty {
+                    if requestedOutcomeSections.contains(.decisions), !outcome.decisions.isEmpty {
                         parts += ["", heading + "## Decisions", outcome.decisions.map { "- " + $0 }.joined(separator: "\n")]
                     }
-                    if sections.contains(.tasks), !outcome.tasks.isEmpty {
+                    if requestedOutcomeSections.contains(.tasks), !outcome.tasks.isEmpty {
                         parts += ["", heading + "## Tasks", outcome.tasks.map { task in
                             "- [" + (task.done ? "x" : " ") + "] " + task.text +
                                 (task.owner.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "" : " — " + task.owner)
                         }.joined(separator: "\n")]
                     }
-                    if sections.contains(.questions), !outcome.openQuestions.isEmpty {
+                    if requestedOutcomeSections.contains(.questions), !outcome.openQuestions.isEmpty {
                         parts += ["", heading + "## Open questions", outcome.openQuestions.map { "- " + $0 }.joined(separator: "\n")]
                     }
                 } else {
@@ -128,7 +159,42 @@ enum MeetingMarkdownTemplate {
                 }
             }
         }
+        if sections.contains(.expertOpinions), !visibleExpertBlocks.isEmpty {
+            for block in visibleExpertBlocks {
+                let isPrimary = isPrimaryExpertBlock(block, dominantRole: dominantRole)
+                let badge = isPrimary ? "★ " : ""
+                parts += ["", heading + "# " + badge + block.title.value]
+                var meta: [String] = []
+                meta.append("Role: \(block.skillID)")
+                if let presetName = block.contextSnapshot.value.presetName, !presetName.isEmpty {
+                    meta.append("Preset: \(presetName)")
+                } else if let presetID = block.presetID, !presetID.isEmpty {
+                    meta.append("Preset: \(presetID)")
+                }
+                let focusSpeakers = block.contextSnapshot.value.focusSpeakers
+                if !focusSpeakers.isEmpty {
+                    meta.append("Focus: \(focusSpeakers.joined(separator: ", "))")
+                }
+                if let verdict = block.headlineVerdict.value?.trimmingCharacters(in: .whitespacesAndNewlines), !verdict.isEmpty {
+                    meta.append("Verdict: \(verdict)")
+                }
+                if !meta.isEmpty {
+                    parts.append("> " + meta.joined(separator: " | "))
+                }
+                let body = block.markdownBody.value.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !body.isEmpty {
+                    parts.append("")
+                    parts.append(MarkdownStructureScanner.closingTrailingFence(in: body))
+                }
+            }
+        }
         return MarkdownStructureScanner.closingTrailingFence(in: parts.joined(separator: "\n"))
+    }
+
+    private static func isPrimaryExpertBlock(_ block: SyncedMeetingExpertBlock, dominantRole: DominantRoleBinding?) -> Bool {
+        guard let dominantRole else { return false }
+        if let blockID = dominantRole.expertBlockID { return blockID == block.id }
+        return dominantRole.skillID == block.skillID && dominantRole.presetID == block.presetID
     }
 
     static func transcriptBody(events: [SyncedTranscriptEvent], startedAt: Date?) -> String? {

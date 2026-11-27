@@ -31,6 +31,11 @@ struct AssistantSkillsView: View {
     @State private var selectedSkillID: String?
     @State private var draftSkill = AssistantSkill(id: "", name: "", instructions: "")
     @State private var draftTriggersText = ""
+    @State private var rolePresets: [AssistantRolePreset] = []
+    @State private var selectedPresetID: String?
+    @State private var draftPreset = AssistantRolePreset(id: "", skillID: "", name: "", instructions: "")
+    @State private var vaultDestinations: [ObsidianDestinationRecord] = []
+    @State private var confirmDeletePreset = false
 
     @State private var prompts: [AssistantPromptDocument] = []
     @State private var selectedPromptKind: AssistantPromptKind = .basePersona
@@ -277,6 +282,36 @@ struct AssistantSkillsView: View {
                         }
                     }
 
+                    Text(L("Role & Export Behavior")).font(.caption).foregroundStyle(.secondary)
+                    Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 8) {
+                        GridRow {
+                            Picker(L("Default mode"), selection: $draftSkill.defaultMode) {
+                                ForEach(AssistantEngagementMode.allCases, id: \.self) { mode in
+                                    Text(mode.title).tag(mode)
+                                }
+                            }
+                            Picker(L("Summary policy"), selection: $draftSkill.coreOutcomePolicy) {
+                                Text(L("Full summary + tasks")).tag(CoreOutcomePolicy.full)
+                                Text(L("Summary only (no tasks)")).tag(CoreOutcomePolicy.summaryOnly)
+                                Text(L("Expert summary only")).tag(CoreOutcomePolicy.expertOnly)
+                            }
+                        }
+                        GridRow {
+                            TextField(L("Summary heading"), text: $draftSkill.summaryBlockTitle)
+                            Picker(L("Target vault"), selection: Binding(
+                                get: { draftSkill.exportDestinationSlug ?? "" },
+                                set: { draftSkill.exportDestinationSlug = $0.trimmed.isEmpty ? nil : $0 }
+                            )) {
+                                Text(L("Primary Vault (default)")).tag("")
+                                ForEach(vaultDestinations) { dest in
+                                    Text(dest.displayName).tag(dest.resolvedSlug)
+                                }
+                            }
+                        }
+                    }
+                    Toggle(L("Route entire meeting to target vault (auto-remove from others)"), isOn: $draftSkill.routeEntireMeeting)
+                        .font(.caption)
+
                     Text(L("Markdown instructions (saved verbatim in Obsidian)")).font(.caption).foregroundStyle(.secondary)
                     TextEditor(text: $draftSkill.instructions)
                         .font(.system(.callout, design: .monospaced))
@@ -359,6 +394,114 @@ struct AssistantSkillsView: View {
                     }
                 }
                 .padding(6)
+            }
+
+            if !draftSkill.id.isEmpty {
+                let matchingPresets = rolePresets.filter { $0.skillID == AssistantSkill.sanitizedSlug(from: draftSkill.id) }
+                GroupBox {
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Text(L("Role Presets (`Presets/%@/*.md`)", AssistantSkill.sanitizedSlug(from: draftSkill.id)))
+                                .font(.headline)
+                            Spacer()
+                            Button(L("+ New Preset")) {
+                                let cleanSkillID = AssistantSkill.sanitizedSlug(from: draftSkill.id)
+                                selectedPresetID = nil
+                                draftPreset = AssistantRolePreset(
+                                    id: "preset-\(Int.random(in: 100...999))",
+                                    skillID: cleanSkillID,
+                                    name: L("Custom Preset"),
+                                    focusSpeakerRole: cleanSkillID == "hiring-interviewer" ? "Candidate" : "",
+                                    rubricDimensions: [],
+                                    instructions: "",
+                                    owningDestinationID: draftSkill.owningDestinationID
+                                )
+                            }
+                            .controlSize(.small)
+                        }
+
+                        if !matchingPresets.isEmpty {
+                            ScrollView(.horizontal, showsIndicators: false) {
+                                HStack(spacing: 6) {
+                                    ForEach(matchingPresets) { preset in
+                                        Button(preset.name) {
+                                            selectedPresetID = preset.id
+                                            draftPreset = preset
+                                        }
+                                        .buttonStyle(.bordered)
+                                        .tint(selectedPresetID == preset.id ? .accentColor : .secondary)
+                                    }
+                                }
+                            }
+                        }
+
+                        HStack(spacing: 10) {
+                            TextField(L("Preset name (e.g. Senior iOS Engineer)"), text: $draftPreset.name)
+                            TextField(L("Preset slug"), text: $draftPreset.id).frame(width: 160)
+                        }
+                        TextField(L("Focus speaker label (e.g. Candidate)"), text: $draftPreset.focusSpeakerRole)
+                        TextField(
+                            L("Rubric dimensions (comma-separated)"),
+                            text: Binding(
+                                get: { draftPreset.rubricDimensions.joined(separator: ", ") },
+                                set: { text in
+                                    draftPreset.rubricDimensions = text
+                                        .split(separator: ",")
+                                        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                                        .filter { !$0.isEmpty }
+                                }
+                            )
+                        )
+                        Text(L("Preset instructions & evaluation rubric")).font(.caption).foregroundStyle(.secondary)
+                        TextEditor(text: $draftPreset.instructions)
+                            .font(.system(.callout, design: .monospaced))
+                            .frame(minHeight: 110)
+                            .padding(4)
+                            .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 6))
+                        HStack {
+                            Button(L("Save Preset")) {
+                                Task {
+                                    var updated = draftPreset
+                                    updated.skillID = AssistantSkill.sanitizedSlug(from: draftSkill.id)
+                                    updated.id = AssistantSkill.sanitizedSlug(from: updated.id.isEmpty ? updated.name : updated.id)
+                                    do {
+                                        let saved = try await attention.saveAssistantPreset(updated, owningDestinationID: draftSkill.owningDestinationID)
+                                        selectedPresetID = saved.id
+                                        draftPreset = saved
+                                        await reloadAll()
+                                        statusIsError = false
+                                        statusMessage = L("Saved preset “%@”.", saved.name)
+                                    } catch {
+                                        statusIsError = true
+                                        statusMessage = error.localizedDescription
+                                    }
+                                }
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .disabled(draftPreset.name.trimmed.isEmpty)
+
+                            Spacer()
+                            if selectedPresetID != nil {
+                                Button(L("Delete Preset"), role: .destructive) {
+                                    confirmDeletePreset = true
+                                }
+                                .confirmationDialog(L("Delete Preset"), isPresented: $confirmDeletePreset, titleVisibility: .visible) {
+                                    Button(L("Delete"), role: .destructive) {
+                                        let targetSkill = draftSkill.id
+                                        let targetPreset = draftPreset.id
+                                        Task {
+                                            try? await attention.deleteAssistantPreset(skillID: targetSkill, id: targetPreset, owningDestinationID: draftSkill.owningDestinationID)
+                                            selectedPresetID = nil
+                                            await reloadAll()
+                                        }
+                                    }
+                                    Button(L("Cancel"), role: .cancel) {}
+                                }
+                            }
+                        }
+                    }
+                    .padding(6)
+                }
             }
         }
     }
@@ -733,16 +876,41 @@ struct AssistantSkillsView: View {
 
         people = await attention.loadPeopleDirectory()
         teamContext = await attention.loadTeamContext()
+        rolePresets = await attention.listAssistantPresets()
+        vaultDestinations = (try? await attention.store.meetingLibrary.store.destinations()) ?? []
         let loadedPrompts = await attention.listAssistantPrompts()
         prompts = loadedPrompts
         draftPromptContent = loadedPrompts.first(where: { $0.kind == selectedPromptKind })?.content
             ?? DefaultAssistantPrompts.content(for: selectedPromptKind)
+        if let activeID = selectedSkillID, !rolePresets.filter({ $0.skillID == activeID }).isEmpty {
+            if let currentPreset = selectedPresetID.flatMap({ pid in rolePresets.first(where: { $0.skillID == activeID && $0.id == pid }) }) {
+                draftPreset = currentPreset
+            } else if let firstPreset = rolePresets.first(where: { $0.skillID == activeID }) {
+                selectedPresetID = firstPreset.id
+                draftPreset = firstPreset
+            }
+        }
     }
 
     private func selectSkill(_ skill: AssistantSkill) {
         selectedSkillID = skill.id
         draftSkill = skill
         draftTriggersText = skill.triggers.joined(separator: ", ")
+        if let firstPreset = rolePresets.first(where: { $0.skillID == skill.id }) {
+            selectedPresetID = firstPreset.id
+            draftPreset = firstPreset
+        } else {
+            selectedPresetID = nil
+            draftPreset = AssistantRolePreset(
+                id: "",
+                skillID: skill.id,
+                name: "",
+                focusSpeakerRole: skill.id == "hiring-interviewer" ? "Candidate" : "",
+                rubricDimensions: [],
+                instructions: "",
+                owningDestinationID: skill.owningDestinationID
+            )
+        }
     }
 
     private func createNewSkill() {
@@ -867,15 +1035,24 @@ private struct NativeMeetingAssistantPopover: View {
     let close: () -> Void
 
     @State private var skills: [AssistantSkill] = []
+    @State private var presets: [AssistantRolePreset] = []
+    @State private var selectedMode: AssistantEngagementMode = .facilitate
+    @State private var selectedPresetID: String? = nil
     @State private var loadedSkills = false
     @State private var hoveredRowID: String?
 
+    private var activeRoleState: (skillID: String, presetID: String?, mode: AssistantEngagementMode) {
+        attention.effectiveRoleAndMode(for: meeting)
+    }
+
     private var activeSkillID: String? {
-        facilitator.activeSessionSkills[meeting.sessionID]
+        if let fac = facilitator.activeSessionSkills[meeting.sessionID] { return fac }
+        if activeRoleState.mode.isAdvisorFamily { return activeRoleState.skillID }
+        return nil
     }
 
     private var isFacilitatorActive: Bool {
-        activeSkillID != nil
+        activeSkillID != nil || activeRoleState.mode == .advise || activeRoleState.mode == .observe
     }
 
     private var enabledSkills: [AssistantSkill] {
@@ -925,6 +1102,54 @@ private struct NativeMeetingAssistantPopover: View {
             Divider()
 
             VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text(L("Engagement Mode"))
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    if selectedMode.isSilentToRoom {
+                        Text(L("Silent to room"))
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(.orange)
+                            .padding(.horizontal, 6).padding(.vertical, 2)
+                            .background(Color.orange.opacity(0.14), in: Capsule())
+                    }
+                }
+                Picker(L("Engagement Mode"), selection: $selectedMode) {
+                    Text(L("Observe")).tag(AssistantEngagementMode.observe)
+                    Text(L("Advise")).tag(AssistantEngagementMode.advise)
+                    Text(L("Facilitate")).tag(AssistantEngagementMode.facilitate)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+            }
+
+            let skillPresets = presets.filter { $0.skillID == resolvedActiveSkillID }
+            if !skillPresets.isEmpty {
+                Picker(L("Role Preset"), selection: Binding(
+                    get: { selectedPresetID ?? "" },
+                    set: { val in
+                        selectedPresetID = val.isEmpty ? nil : val
+                        if isFacilitatorActive {
+                            attention.setMeetingRoleAndMode(
+                                model: meeting,
+                                skillID: resolvedActiveSkillID,
+                                presetID: selectedPresetID,
+                                mode: selectedMode
+                            )
+                        }
+                    }
+                )) {
+                    Text(L("General")).tag("")
+                    ForEach(skillPresets) { preset in
+                        Text(preset.name).tag(preset.id)
+                    }
+                }
+            }
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 6) {
                 Text(L("Skill Role"))
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
@@ -940,7 +1165,12 @@ private struct NativeMeetingAssistantPopover: View {
                         accessibilityID: "meeting.facilitator.off"
                     ) {
                         if isFacilitatorActive {
-                            facilitator.disable(for: meeting.sessionID)
+                            attention.setMeetingRoleAndMode(
+                                model: meeting,
+                                skillID: AssistantSkill.personalAssistantID,
+                                presetID: nil,
+                                mode: .off
+                            )
                         }
                         close()
                     }
@@ -1018,7 +1248,18 @@ private struct NativeMeetingAssistantPopover: View {
         .frame(width: 310)
         .foregroundStyle(.primary)
         .task {
-            skills = await attention.listAssistantSkills()
+            let (loadedSkillsList, loadedPresetsList) = await attention.withCompositeSkillRepository { repo, _ in
+                (repo.listSkills(), repo.listPresets())
+            }
+            skills = loadedSkillsList
+            presets = loadedPresetsList
+            let current = attention.effectiveRoleAndMode(for: meeting)
+            if current.mode.isAdvisorFamily || current.mode == .facilitate {
+                selectedMode = current.mode
+                selectedPresetID = current.presetID
+            } else {
+                selectedMode = .facilitate
+            }
             loadedSkills = true
         }
     }
@@ -1073,7 +1314,21 @@ private struct NativeMeetingAssistantPopover: View {
                     useAccent: true,
                     accessibilityID: "meeting.facilitator.skill.\(skill.id)"
                 ) {
-                    facilitator.enable(for: meeting, skillID: skill.id)
+                    let chosenMode: AssistantEngagementMode = skill.defaultMode == .advise || skill.defaultMode == .observe || skill.defaultMode == .facilitate
+                        ? (selectedMode == .observe || selectedMode == .advise || selectedMode == .facilitate ? selectedMode : skill.defaultMode)
+                        : selectedMode
+                    let matchingPresetID = presets.first(where: { $0.skillID == skill.id && $0.id == selectedPresetID })?.id
+                        ?? presets.first(where: { $0.skillID == skill.id })?.id
+                    if chosenMode == .facilitate {
+                        facilitator.enable(for: meeting, skillID: skill.id)
+                    } else {
+                        attention.setMeetingRoleAndMode(
+                            model: meeting,
+                            skillID: skill.id,
+                            presetID: matchingPresetID,
+                            mode: chosenMode
+                        )
+                    }
                     close()
                 }
             }

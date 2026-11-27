@@ -78,6 +78,29 @@ actor ObsidianFileWriter {
         return try result.get()
     }
 
+    func delete(target: URL, expectedIdentity: FileIdentity, vaultRoot: URL? = nil,
+                relativePath: String? = nil) throws {
+        let coordinator = NSFileCoordinator(filePresenter: nil)
+        var coordinationError: NSError?
+        var result: Result<Void, Error>?
+        coordinator.coordinate(writingItemAt: target, options: .forDeleting, error: &coordinationError) { coordinatedURL in
+            result = Result {
+                guard coordinatedURL.standardizedFileURL == target.standardizedFileURL else {
+                    throw ObsidianExportError.destinationChanged
+                }
+                try self.validateVaultTarget(coordinatedURL, vaultRoot: vaultRoot, relativePath: relativePath)
+                guard let existing = try FileIdentity.fingerprint(coordinatedURL) else { return }
+                guard existing == expectedIdentity else {
+                    throw ObsidianExportError.destinationChanged
+                }
+                _ = try makeBackup(of: coordinatedURL)
+                try FileManager.default.removeItem(at: coordinatedURL)
+            }
+        }
+        if let coordinationError { throw coordinationError }
+        try result?.get()
+    }
+
     private func validateVaultTarget(_ target: URL, vaultRoot: URL?, relativePath: String?) throws {
         guard let vaultRoot, let relativePath else { return }
         guard case .success(let verifiedURL) = ObsidianVaultAccess.validate(relativePath: relativePath, in: vaultRoot),

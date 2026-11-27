@@ -407,6 +407,27 @@ func nativeMCPToolDefinitions() -> [MCPToolDefinition] {
                 "jira_username": .string("Explicit Jira Server/DC username for assign."),
                 "jira_account_id": .string("Explicit Jira Cloud accountId for assign."),
               ], required: ["action_id", "operation"])),
+        .init(name: "rocknroll_list_role_presets", description: "List specialized Markdown Role Presets under Rock Assistant/Presets/<skill_id>/.",
+              readOnly: true, scope: "meetings:read",
+              schema: .init(properties: [
+                "skill_id": .string("Optional parent Role skill slug to filter presets.", minLength: 1),
+              ], required: [])),
+        .init(name: "rocknroll_list_expert_opinions", description: "List persisted Primary and Secondary Expert Opinion blocks and dominant role governance for a meeting session.",
+              readOnly: true, scope: "meetings:read",
+              schema: .init(properties: [
+                "session_id": .string("Session UUID or session: identifier.", minLength: 1),
+              ], required: ["session_id"])),
+        .init(name: "rocknroll_generate_expert_opinion", description: "Generate or regenerate an Expert Opinion block on a meeting using full-transcript evaluation and a Role/Preset.",
+              readOnly: false, scope: "tasks:write",
+              schema: .init(properties: [
+                "action_id": actionID,
+                "session_id": .string("Session UUID or session: identifier.", minLength: 1),
+                "skill_id": .string("Target Role skill slug (e.g. hiring-interviewer).", minLength: 1),
+                "preset_id": .string("Optional Role Preset slug under skill_id.", minLength: 1),
+                "focus_speakers": .array("Optional speaker names to evaluate (e.g. Candidate names).", items: .string("Speaker display name.", minLength: 1)),
+                "extra_context": .string("Optional ad-hoc instructions, rubric, or job description."),
+                "make_primary": .boolean("Set this Role as the Dominant ★ Primary role for the meeting."),
+              ], required: ["action_id", "session_id", "skill_id"])),
     ]
 }
 

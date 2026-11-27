@@ -233,6 +233,9 @@ import XCTest
         func controlBoard(_: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON { [:] }
         func joinMeetings(_: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON { [:] }
         func jiraAction(_: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON { [:] }
+        func listRolePresets(_: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON { [:] }
+        func listExpertOpinions(_: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON { [:] }
+        func generateExpertOpinion(_: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON { [:] }
     }
 
     func testToolsListExposesTwelveToolsWithHonestAnnotations() {

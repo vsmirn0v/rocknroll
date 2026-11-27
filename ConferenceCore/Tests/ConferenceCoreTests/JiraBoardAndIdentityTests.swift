@@ -245,7 +245,13 @@ final class JiraBoardAndIdentityTests: XCTestCase {
             )
         )
         let iosChanged = AssistantCloudSync.exportLocalState(iosInput, into: &iosDoc, baseline: &iosBaseline)
-        XCTAssertEqual(iosChanged, AssistantCloudSync.allScopeKeys)
+        XCTAssertEqual(iosChanged, [
+            AssistantCloudSync.peopleScopeKey,
+            AssistantCloudSync.teamContextScopeKey,
+            AssistantCloudSync.skillsScopeKey,
+            AssistantCloudSync.promptsScopeKey,
+            AssistantCloudSync.preferencesScopeKey,
+        ])
 
         // Device B (Mac) concurrently has an unexported local teammate Bob in People.md.
         var macDoc = MeetingWorkspaceSyncDocument(device: "mac-1")

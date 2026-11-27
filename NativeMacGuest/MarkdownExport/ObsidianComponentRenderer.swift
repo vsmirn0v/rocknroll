@@ -34,10 +34,14 @@ enum ObsidianComponentRenderer {
         case .meeting, .worklog:
             let shared = binding.component == .worklog
             let heading = shared ? (layout.groupByDay ? 4 : 3) : 1
+            let effectiveDominantRole = snapshot.dominantRole ?? session.dominantRole
             content = MeetingMarkdownTemplate.managedContent(session: session, note: snapshot.note, outcome: snapshot.outcome,
                 outcomeState: snapshot.outcomeState, sections: layout.sections, headingLevel: heading,
                 boldTitle: shared && layout.runtimeStyle, snapshots: visualSnapshots,
-                useWikiLinksForSnapshots: true) + transcriptSection(component: binding.component, layout: layout,
+                useWikiLinksForSnapshots: true,
+                expertBlocks: snapshot.expertBlocks,
+                dominantRole: effectiveDominantRole,
+                coreOutcomePolicy: snapshot.coreOutcomePolicy) + transcriptSection(component: binding.component, layout: layout,
                     path: binding.relativePath, body: transcriptBody, transcriptPath: transcriptRelativePath)
         case .transcript:
             content = "# " + MeetingMarkdownTemplate.transcriptText(session.title) + transcriptSection(component: .transcript, layout: layout,
@@ -51,9 +55,12 @@ enum ObsidianComponentRenderer {
         if existing.isEmpty, binding.lastExportedRevision > 0 {
             throw ObsidianExportError.markerDamage("The previously exported file is missing or empty.")
         }
+        let visibleExpertBlocksCount = snapshot.expertBlocks.filter { !$0.isDeleted.value }.count
         let metadata = binding.component == .meeting ? MeetingMarkdownTemplate.frontmatter(session: session,
             note: snapshot.note, outcome: snapshot.outcome, outcomeState: snapshot.outcomeState,
-            exportRevision: session.exportRevision) : nil
+            exportRevision: session.exportRevision,
+            dominantRole: snapshot.dominantRole ?? session.dominantRole,
+            expertBlocksCount: visibleExpertBlocksCount) : nil
         if existing.isEmpty, !fileExists, let metadata {
             var result = MarkdownFilePatcher.create(sessionID: session.id, nonce: nonce, frontmatter: metadata, managedContent: content)
             result.metadataSHA256 = try ObsidianOwnedMetadata.hash(in: metadata)
@@ -123,6 +130,10 @@ enum ObsidianComponentRenderer {
         let path = relativeLink(from: indexPath, to: meetingPath)
         let open = snapshot.outcome?.tasks.filter { !$0.done }.count ?? 0
         let label = "- [\(title)](\(path)) · " + L("Open tasks: %ld", open)
+        if let verdict = snapshot.expertBlocks.first(where: { !$0.isDeleted.value })?.headlineVerdict.value?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !verdict.isEmpty, sections.contains(.expertOpinions), snapshot.coreOutcomePolicy == .expertOnly || snapshot.outcome == nil {
+            return label + "\n  " + String(verdict.split(whereSeparator: \.isWhitespace).joined(separator: " ").prefix(240))
+        }
         guard sections.contains(.summary) else { return label }
         let summary: String
         switch snapshot.outcomeState {

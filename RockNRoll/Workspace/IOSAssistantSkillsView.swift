@@ -132,7 +132,7 @@ struct IOSAssistantSkillsView: View {
             board.isInlineSheetActive = isShowing
         }
         .sheet(item: $editingSkill) { draft in
-            IOSSkillEditorSheet(skill: draft) { updated in
+            IOSSkillEditorSheet(skill: draft, skills: skills) { updated in
                 do {
                     _ = try skills.saveSkill(updated)
                     showStatus(L("Saved skill “%@”.", updated.name))
@@ -684,14 +684,21 @@ struct IOSAssistantSkillsView: View {
 private struct IOSSkillEditorSheet: View {
     @State private var draft: AssistantSkill
     @State private var triggersText: String
+    @ObservedObject var skills: IOSAssistantSkillsController
     let onSave: (AssistantSkill) -> Void
 
     @Environment(\.dismiss) private var dismiss
+    @State private var editingPreset: AssistantRolePreset?
 
-    init(skill: AssistantSkill, onSave: @escaping (AssistantSkill) -> Void) {
+    init(skill: AssistantSkill, skills: IOSAssistantSkillsController, onSave: @escaping (AssistantSkill) -> Void) {
         _draft = State(initialValue: skill)
         _triggersText = State(initialValue: skill.triggers.joined(separator: ", "))
+        self.skills = skills
         self.onSave = onSave
+    }
+
+    private var presetsForSkill: [AssistantRolePreset] {
+        skills.presets.filter { $0.skillID == draft.id }
     }
 
     var body: some View {
@@ -701,6 +708,66 @@ private struct IOSSkillEditorSheet: View {
                     TextField(L("Name"), text: $draft.name)
                     TextField(L("Role summary"), text: $draft.role)
                     TextField(L("Trigger keywords (comma-separated)"), text: $triggersText)
+                }
+                Section(L("Defaults & Export Routing")) {
+                    Picker(L("Default Mode"), selection: $draft.defaultMode) {
+                        ForEach(AssistantEngagementMode.allCases, id: \.self) { mode in
+                            Text(mode.title).tag(mode)
+                        }
+                    }
+                    Picker(L("Core Meeting Summary Policy"), selection: $draft.coreOutcomePolicy) {
+                        ForEach(CoreOutcomePolicy.allCases, id: \.self) { policy in
+                            Text(policy.title).tag(policy)
+                        }
+                    }
+                    TextField(L("Expert block heading"), text: $draft.summaryBlockTitle)
+                    if !skills.syncedVaultDestinations.isEmpty {
+                        Picker(L("Dedicated Git / Obsidian Vault"), selection: $draft.exportDestinationSlug) {
+                            Text(L("Primary Vault")).tag(String?.none)
+                            ForEach(skills.syncedVaultDestinations) { dest in
+                                Text(dest.name).tag(String?.some(dest.slug))
+                            }
+                        }
+                        Toggle(L("Route entire meeting note to this vault"), isOn: $draft.routeEntireMeeting)
+                    }
+                }
+                Section {
+                    Button {
+                        editingPreset = AssistantRolePreset(
+                            id: "preset-\(Int.random(in: 100...999))",
+                            skillID: draft.id,
+                            name: L("New Role Preset"),
+                            defaultMode: draft.defaultMode,
+                            coreOutcomePolicy: draft.coreOutcomePolicy,
+                            exportDestinationSlug: draft.exportDestinationSlug,
+                            routeEntireMeeting: draft.routeEntireMeeting,
+                            instructions: "# Rubric\n"
+                        )
+                    } label: {
+                        Label(L("Add Preset"), systemImage: "plus.circle")
+                    }
+                    ForEach(presetsForSkill) { preset in
+                        Button {
+                            editingPreset = preset
+                        } label: {
+                            HStack {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(preset.name).foregroundStyle(.primary)
+                                    if !preset.focusSpeakerRole.isEmpty {
+                                        Text(preset.focusSpeakerRole)
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                }
+                                Spacer()
+                                Image(systemName: "chevron.right")
+                                    .font(.caption)
+                                    .foregroundStyle(.tertiary)
+                            }
+                        }
+                    }
+                } header: {
+                    Text(L("Role Presets"))
                 }
                 Section(L("Behavior & Safety")) {
                     Toggle(L("Enabled"), isOn: $draft.enabled)
@@ -746,6 +813,114 @@ private struct IOSSkillEditorSheet: View {
                     Button(L("Save")) {
                         draft.triggers = triggersText
                             .split(separator: ",")
+                            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                            .filter { !$0.isEmpty }
+                        onSave(draft)
+                        dismiss()
+                    }
+                }
+            }
+            .sheet(item: $editingPreset) { preset in
+                IOSRolePresetEditorSheet(
+                    preset: preset,
+                    vaults: skills.syncedVaultDestinations,
+                    onSave: { updated in
+                        _ = try? skills.savePreset(updated)
+                    },
+                    onDelete: { deleted in
+                        try? skills.deletePreset(skillID: deleted.skillID, id: deleted.id)
+                    }
+                )
+            }
+        }
+    }
+}
+
+private struct IOSRolePresetEditorSheet: View {
+    @State private var draft: AssistantRolePreset
+    @State private var rubricText: String
+    let vaults: [SyncedVaultDestinationDescriptor]
+    let onSave: (AssistantRolePreset) -> Void
+    let onDelete: (AssistantRolePreset) -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    init(
+        preset: AssistantRolePreset,
+        vaults: [SyncedVaultDestinationDescriptor],
+        onSave: @escaping (AssistantRolePreset) -> Void,
+        onDelete: @escaping (AssistantRolePreset) -> Void
+    ) {
+        _draft = State(initialValue: preset)
+        _rubricText = State(initialValue: preset.rubricDimensions.joined(separator: "\n"))
+        self.vaults = vaults
+        self.onSave = onSave
+        self.onDelete = onDelete
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section(L("Preset")) {
+                    TextField(L("Name"), text: $draft.name)
+                    TextField(L("Focus speaker role (e.g. Candidate)"), text: $draft.focusSpeakerRole)
+                    Toggle(L("Enabled"), isOn: $draft.enabled)
+                }
+                Section(L("Mode & Routing")) {
+                    Picker(L("Default Mode"), selection: Binding(
+                        get: { draft.defaultMode ?? .observe },
+                        set: { draft.defaultMode = $0 }
+                    )) {
+                        ForEach(AssistantEngagementMode.allCases, id: \.self) { m in
+                            Text(m.title).tag(m)
+                        }
+                    }
+                    Picker(L("Core Outcome Policy"), selection: Binding(
+                        get: { draft.coreOutcomePolicy ?? .full },
+                        set: { draft.coreOutcomePolicy = $0 }
+                    )) {
+                        ForEach(CoreOutcomePolicy.allCases, id: \.self) { p in
+                            Text(p.title).tag(p)
+                        }
+                    }
+                    if !vaults.isEmpty {
+                        Picker(L("Vault Destination"), selection: $draft.exportDestinationSlug) {
+                            Text(L("Inherit from Role")).tag(String?.none)
+                            ForEach(vaults) { v in
+                                Text(v.name).tag(String?.some(v.slug))
+                            }
+                        }
+                        Toggle(L("Route entire meeting"), isOn: Binding(
+                            get: { draft.routeEntireMeeting ?? true },
+                            set: { draft.routeEntireMeeting = $0 }
+                        ))
+                    }
+                }
+                Section(L("Rubric Dimensions (one per line)")) {
+                    TextEditor(text: $rubricText)
+                        .frame(minHeight: 90)
+                }
+                Section(L("Instructions")) {
+                    TextEditor(text: $draft.instructions)
+                        .font(.system(.caption, design: .monospaced))
+                        .frame(minHeight: 150)
+                }
+                Section {
+                    Button(L("Delete Preset"), role: .destructive) {
+                        onDelete(draft)
+                        dismiss()
+                    }
+                }
+            }
+            .navigationTitle(draft.name)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button(L("Cancel")) { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button(L("Save")) {
+                        draft.rubricDimensions = rubricText
+                            .split(separator: "\n")
                             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
                             .filter { !$0.isEmpty }
                         onSave(draft)

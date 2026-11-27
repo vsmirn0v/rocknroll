@@ -590,6 +590,8 @@ struct IOSWorkspaceHubView: View {
     private func meetingRow(_ session: IOSMeetingSessionItem, openTasks: Int) -> some View {
         let outcome = workspace.outcomesBySession[session.id]
         let note = workspace.notesBySession[session.id]
+        let expertBlocks = (workspace.expertBlocksBySession[session.id] ?? []).filter { !$0.isDeleted.value }
+        let primaryExpert = expertBlocks.first(where: { $0.id == session.dominantRole?.expertBlockID }) ?? expertBlocks.first
 
         return VStack(alignment: .leading, spacing: 5) {
             HStack(alignment: .firstTextBaseline) {
@@ -610,6 +612,15 @@ struct IOSWorkspaceHubView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
+                if let dom = session.dominantRole,
+                   dom.skillID != AssistantSkill.personalAssistantID || !expertBlocks.isEmpty {
+                    Label(primaryExpert?.title.value ?? dom.skillID, systemImage: "star.fill")
+                        .font(.caption2.weight(.semibold))
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Color.purple.opacity(0.15), in: Capsule())
+                        .foregroundStyle(.purple)
+                }
                 if openTasks > 0 {
                     Text(L("%ld tasks", openTasks))
                         .font(.caption2.weight(.semibold))
@@ -627,6 +638,16 @@ struct IOSWorkspaceHubView: View {
 
             if let summary = outcome?.summary, !summary.isEmpty {
                 Text(summary)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            } else if let verdict = primaryExpert?.headlineVerdict.value?.trimmingCharacters(in: .whitespacesAndNewlines), !verdict.isEmpty {
+                Text(verdict)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            } else if let expertBody = primaryExpert?.markdownBody.value.trimmingCharacters(in: .whitespacesAndNewlines), !expertBody.isEmpty {
+                Text(expertBody)
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
                     .lineLimit(2)

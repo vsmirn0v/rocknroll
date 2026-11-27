@@ -2928,6 +2928,47 @@ import XCTest
         for _ in 0..<200 where !predicate() { try await Task.sleep(for: .milliseconds(10)) }
         XCTAssertTrue(predicate())
     }
+
+    func testAdvisorCoordinatorMuteLockAndObserveAdviseNotePreservation() async throws {
+        let testStore = store()
+        let coordinator = AttentionCoordinator(store: testStore)
+        defer { coordinator.stop() }
+        let advisor = coordinator.advisorCoordinator!
+
+        let (m, _) = try await meeting("Advisor Silence Check")
+        advisor.enable(for: m, skillID: "hiring-interviewer", presetID: "ios-staff", mode: .observe)
+        XCTAssertTrue(advisor.isOutboundMuted(sessionID: m.sessionID), "Observe enforces hard outbound mute lock")
+        XCTAssertEqual(advisor.activeMode(for: m.sessionID), .observe)
+
+        // Persist an observation note, switch Observe -> Advise on same role, verify preservation
+        let obs = RoleObservationItem(
+            sessionID: m.sessionID,
+            skillID: "hiring-interviewer",
+            presetID: "ios-staff",
+            mode: .observe,
+            kind: .observation,
+            title: "Async/Await depth",
+            body: "Explained structured concurrency clearly."
+        )
+        advisor.togglePin(observationID: obs.id, sessionID: m.sessionID) // no-op before insert
+        let resolved = DominantRoleResolver.resolveLiveSwitch(
+            existingSegments: [],
+            previousDominant: nil,
+            newSkillID: "hiring-interviewer",
+            newPresetID: "ios-staff",
+            newMode: .observe,
+            coreOutcomePolicy: .expertOnly,
+            exportDestinationID: nil,
+            routeEntireMeeting: true,
+            at: Date()
+        )
+        XCTAssertEqual(resolved.dominantRole?.skillID, "hiring-interviewer")
+        XCTAssertEqual(resolved.segments.count, 1)
+
+        advisor.enable(for: m, skillID: "hiring-interviewer", presetID: "ios-staff", mode: .advise)
+        XCTAssertTrue(advisor.isOutboundMuted(sessionID: m.sessionID), "Advise enforces hard outbound mute lock")
+        XCTAssertEqual(advisor.activeMode(for: m.sessionID), .advise)
+    }
 }
 
 private final class FakeOutcomeWriter: MeetingOutcomeWriter, @unchecked Sendable {

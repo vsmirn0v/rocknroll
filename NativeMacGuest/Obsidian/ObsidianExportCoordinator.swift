@@ -3,6 +3,7 @@ import Foundation
 
 @MainActor final class ObsidianExportCoordinator: ObservableObject {
     @Published private(set) var destination: ObsidianDestinationRecord?
+    @Published private(set) var destinations: [ObsidianDestinationRecord] = []
     @Published private(set) var pendingCount = 0
     @Published private(set) var heldCount = 0
     @Published private(set) var conflictCount = 0
@@ -51,9 +52,14 @@ import Foundation
             guard let self else { return }
             await settingsWrite?.value
             destination = try? await library.store.destination()
+            destinations = (try? await library.store.destinations()) ?? []
             await refreshStatus()
             await worker.start()
         }
+    }
+
+    var secondaryDestinations: [ObsidianDestinationRecord] {
+        destinations.filter { !$0.isPrimary }
     }
 
     func setEnabled(_ value: Bool) { update { $0.enabled = value } }
@@ -69,6 +75,91 @@ import Foundation
             destination.mode = mode
             destination.meetingFolder = meetingFolder
             destination.layout = layout
+        }
+    }
+
+    func addSecondaryVault(name: String, loadsSkills: Bool = true) {
+        guard let choice = ObsidianVaultAccess.chooseVaultBookmark() else { return }
+        let record = ObsidianDestinationRecord(
+            id: UUID(),
+            enabled: true,
+            saveAfterMeeting: true,
+            syncChanges: true,
+            mode: .separateFiles,
+            meetingFolder: "Meetings",
+            layout: .init(),
+            configRevision: 1,
+            vaultBookmark: choice.bookmark,
+            name: name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? choice.url.lastPathComponent : name.trimmingCharacters(in: .whitespacesAndNewlines),
+            slug: "",
+            isPrimary: false,
+            loadsSkills: loadsSkills
+        )
+        saveExplicitDestination(record)
+    }
+
+    func updateSecondaryDestination(_ updated: ObsidianDestinationRecord) {
+        var record = updated
+        record.isPrimary = false
+        record.configRevision += 1
+        saveExplicitDestination(record)
+    }
+
+    func setSecondaryLayout(id: UUID, mode: ObsidianExportMode, meetingFolder: String, layout: ObsidianExportLayout) {
+        guard var record = destinations.first(where: { $0.id == id }) else { return }
+        record.mode = mode
+        record.meetingFolder = meetingFolder
+        record.layout = layout
+        record.configRevision += 1
+        saveExplicitDestination(record)
+    }
+
+    func chooseVault(forSecondaryID id: UUID) {
+        guard var record = destinations.first(where: { $0.id == id }),
+              let choice = ObsidianVaultAccess.chooseVaultBookmark() else { return }
+        record.vaultBookmark = choice.bookmark
+        if record.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            record.name = choice.url.lastPathComponent
+        }
+        record.configRevision += 1
+        saveExplicitDestination(record)
+    }
+
+    func removeSecondaryDestination(id: UUID) {
+        Task { [weak self] in
+            guard let self else { return }
+            try? await library.store.deleteDestination(id: id)
+            destinations = (try? await library.store.destinations()) ?? []
+            await onDestinationChanged?()
+        }
+    }
+
+    private func saveExplicitDestination(_ record: ObsidianDestinationRecord) {
+        if let index = destinations.firstIndex(where: { $0.id == record.id }) {
+            destinations[index] = record
+        } else {
+            destinations.append(record)
+        }
+        let previous = settingsWrite
+        settingsWriteGeneration += 1
+        let generation = settingsWriteGeneration
+        settingsWrite = Task { [weak self] in
+            defer {
+                if let self, self.settingsWriteGeneration == generation {
+                    self.settingsWrite = nil
+                }
+            }
+            await previous?.value
+            guard let self else { return }
+            do {
+                try await library.store.saveDestination(record)
+                destinations = (try? await library.store.destinations()) ?? []
+                await worker.start()
+                await refreshStatus()
+                await onDestinationChanged?()
+            } catch {
+                lastError = error.localizedDescription
+            }
         }
     }
 

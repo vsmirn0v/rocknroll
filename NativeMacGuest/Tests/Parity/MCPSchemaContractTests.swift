@@ -92,6 +92,9 @@ import XCTest
         func controlBoard(_: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON { record("controlBoard") }
         func joinMeetings(_: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON { record("joinMeetings") }
         func jiraAction(_: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON { record("jiraAction") }
+        func listRolePresets(_: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON { record("listRolePresets") }
+        func listExpertOpinions(_: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON { record("listExpertOpinions") }
+        func generateExpertOpinion(_: MCPJSON, client: MCPClientIdentity) async throws -> MCPJSON { record("generateExpertOpinion") }
     }
 
     private func call(_ server: MCPJSONRPCServer, _ name: String, _ arguments: Any? = [:],
@@ -130,7 +133,7 @@ import XCTest
             let server = MCPJSONRPCServer(backend: CountingBackend())
             let list = await server.handle(["jsonrpc": "2.0", "id": 1, "method": "tools/list"], client: self.client())
             let tools = try XCTUnwrap((list?["result"] as? MCPJSON)?["tools"] as? [MCPJSON])
-            XCTAssertEqual(tools.count, 25)
+            XCTAssertEqual(tools.count, 28)
             for tool in tools {
                 let label = (tool["name"] as? String) ?? "?"
                 let schema = try XCTUnwrap(tool["inputSchema"] as? MCPJSON, label)
@@ -200,10 +203,13 @@ import XCTest
             "rocknroll_get_skill": (["skill_id"], ["skill_id"]),
             "rocknroll_upsert_skill": (["action_id", "skill_id", "name", "role", "enabled", "voice_activation", "approved_speakers_only", "realtime_preferred", "triggers", "tools", "instructions"], ["action_id", "skill_id", "name", "instructions"]),
             "rocknroll_search_knowledge": (["query", "limit"], ["query"]),
-            "rocknroll_manage_people": (["action_id", "operation", "query", "display_name", "aliases", "jira_username", "jira_account_id", "email", "role", "approved_voice_commander", "notes"], ["action_id", "operation"]),
-            "rocknroll_control_board": (["action_id", "command", "url", "meeting_id", "query", "selector", "text", "delta_y", "x", "y", "normalized"], ["action_id", "command"]),
+            "rocknroll_manage_people": (["action_id", "operation", "query", "display_name", "aliases", "jira_username", "jira_account_id", "email", "role", "approved_voice_commander", "force_without_jira", "notes"], ["action_id", "operation"]),
+            "rocknroll_control_board": (["action_id", "command", "url", "meeting_id", "query", "selector", "text", "issue_key", "status", "comment", "delta_y", "x", "y", "normalized"], ["action_id", "command"]),
             "rocknroll_join_meetings": (["action_id", "queries", "skill_id", "enable_voice_facilitation"], ["action_id", "queries"]),
-            "rocknroll_jira_action": (["action_id", "operation", "jql", "query", "assignee", "max_results", "issue_key", "comment"], ["action_id", "operation"]),
+            "rocknroll_jira_action": (["action_id", "operation", "jql", "query", "assignee", "max_results", "issue_key", "comment", "status", "role", "save_to_people_name", "aliases", "summary", "description", "project_key", "issue_kind", "priority", "parent_epic_key", "jira_username", "jira_account_id"], ["action_id", "operation"]),
+            "rocknroll_list_role_presets": (["skill_id"], []),
+            "rocknroll_list_expert_opinions": (["session_id"], ["session_id"]),
+            "rocknroll_generate_expert_opinion": (["action_id", "session_id", "skill_id", "preset_id", "focus_speakers", "extra_context", "make_primary"], ["action_id", "session_id", "skill_id"]),
         ]
         XCTAssertEqual(nativeMCPToolDefinitions().count, expected.count)
         for definition in nativeMCPToolDefinitions() {

@@ -177,6 +177,79 @@ public struct SyncedAssistantSkillsPayload: Codable, Equatable, Sendable {
     }
 }
 
+public struct SyncedAssistantPresetRecord: Codable, Equatable, Sendable {
+    public var preset: SyncValue<AssistantRolePreset>
+    public var deleted: SyncValue<Bool>
+
+    public init(preset: SyncValue<AssistantRolePreset>, deleted: SyncValue<Bool>) {
+        self.preset = preset
+        self.deleted = deleted
+    }
+
+    public func merging(_ other: Self) -> Self {
+        Self(preset: preset.merging(other.preset), deleted: deleted.merging(other.deleted))
+    }
+}
+
+public struct SyncedAssistantPresetsPayload: Codable, Equatable, Sendable {
+    public var presets: [String: SyncedAssistantPresetRecord] = [:]
+
+    public init(presets: [String: SyncedAssistantPresetRecord] = [:]) {
+        self.presets = presets
+    }
+
+    public func merging(_ other: Self) -> Self {
+        var merged = presets
+        for (key, record) in other.presets {
+            merged[key] = merged[key]?.merging(record) ?? record
+        }
+        return Self(presets: merged)
+    }
+}
+
+public struct SyncedVaultDestinationDescriptor: Codable, Equatable, Identifiable, Sendable {
+    public var id: UUID
+    public var slug: String
+    public var name: String
+    public var isPrimary: Bool
+    public var routeEntireMeetingDefault: Bool
+
+    public init(
+        id: UUID,
+        slug: String,
+        name: String,
+        isPrimary: Bool = false,
+        routeEntireMeetingDefault: Bool = true
+    ) {
+        self.id = id
+        self.slug = slug
+        self.name = name
+        self.isPrimary = isPrimary
+        self.routeEntireMeetingDefault = routeEntireMeetingDefault
+    }
+}
+
+public struct SyncedVaultDestinationsPayload: Codable, Equatable, Sendable {
+    public var destinations: SyncValue<[SyncedVaultDestinationDescriptor]>?
+
+    public init(destinations: SyncValue<[SyncedVaultDestinationDescriptor]>? = nil) {
+        self.destinations = destinations
+    }
+
+    public func merging(_ other: Self) -> Self {
+        switch (destinations, other.destinations) {
+        case (.some(let a), .some(let b)):
+            return Self(destinations: a.merging(b))
+        case (.some(let a), .none):
+            return Self(destinations: a)
+        case (.none, .some(let b)):
+            return Self(destinations: b)
+        case (.none, .none):
+            return Self(destinations: nil)
+        }
+    }
+}
+
 public struct SyncedAssistantPromptsPayload: Codable, Equatable, Sendable {
     public var prompts: [String: SyncValue<String?>] = [:]
 
@@ -269,8 +342,10 @@ public struct AssistantLocalSyncBaseline: Codable, Equatable, Sendable {
     public var freeformNotes: String = ""
     public var teamContext: TeamContextBaseline?
     public var skillHashes: [String: String] = [:]
+    public var presetHashes: [String: String] = [:]
     public var promptHashes: [String: String] = [:]
     public var preferences: LocalAssistantPortablePreferences?
+    public var vaultDestinationsHash: String?
 
     public struct TeamContextBaseline: Codable, Equatable, Sendable {
         public var defaultJiraBoardURL: String
@@ -291,15 +366,35 @@ public struct AssistantLocalSyncBaseline: Codable, Equatable, Sendable {
         freeformNotes: String = "",
         teamContext: TeamContextBaseline? = nil,
         skillHashes: [String: String] = [:],
+        presetHashes: [String: String] = [:],
         promptHashes: [String: String] = [:],
-        preferences: LocalAssistantPortablePreferences? = nil
+        preferences: LocalAssistantPortablePreferences? = nil,
+        vaultDestinationsHash: String? = nil
     ) {
         self.people = people
         self.freeformNotes = freeformNotes
         self.teamContext = teamContext
         self.skillHashes = skillHashes
+        self.presetHashes = presetHashes
         self.promptHashes = promptHashes
         self.preferences = preferences
+        self.vaultDestinationsHash = vaultDestinationsHash
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case people, freeformNotes, teamContext, skillHashes, presetHashes, promptHashes, preferences, vaultDestinationsHash
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        people = try c.decodeIfPresent([String: AssistantPersonEntry].self, forKey: .people) ?? [:]
+        freeformNotes = try c.decodeIfPresent(String.self, forKey: .freeformNotes) ?? ""
+        teamContext = try c.decodeIfPresent(TeamContextBaseline.self, forKey: .teamContext)
+        skillHashes = try c.decodeIfPresent([String: String].self, forKey: .skillHashes) ?? [:]
+        presetHashes = try c.decodeIfPresent([String: String].self, forKey: .presetHashes) ?? [:]
+        promptHashes = try c.decodeIfPresent([String: String].self, forKey: .promptHashes) ?? [:]
+        preferences = try c.decodeIfPresent(LocalAssistantPortablePreferences.self, forKey: .preferences)
+        vaultDestinationsHash = try c.decodeIfPresent(String.self, forKey: .vaultDestinationsHash)
     }
 }
 
@@ -307,15 +402,19 @@ public enum AssistantCloudSync {
     public static let peopleScopeKey = "global:assistantPeople"
     public static let teamContextScopeKey = "global:assistantTeamContext"
     public static let skillsScopeKey = "global:assistantSkills"
+    public static let presetsScopeKey = "global:assistantPresets"
     public static let promptsScopeKey = "global:assistantPrompts"
     public static let preferencesScopeKey = "global:assistantPreferences"
+    public static let vaultDestinationsScopeKey = "global:assistantVaultDestinations"
 
     public static let allScopeKeys: Set<String> = [
         peopleScopeKey,
         teamContextScopeKey,
         skillsScopeKey,
+        presetsScopeKey,
         promptsScopeKey,
         preferencesScopeKey,
+        vaultDestinationsScopeKey,
     ]
 
     public static func isAssistantScopeKey(_ key: String) -> Bool {
@@ -343,12 +442,26 @@ public enum AssistantCloudSync {
     public static func normalizedSkill(_ skill: AssistantSkill) -> AssistantSkill {
         var copy = skill
         copy.updatedAt = nil
+        copy.owningDestinationID = nil
         copy.sourceRelativePath = "Skills/\(copy.id).md"
+        return copy
+    }
+
+    public static func normalizedPreset(_ preset: AssistantRolePreset) -> AssistantRolePreset {
+        var copy = preset
+        copy.updatedAt = nil
+        copy.owningDestinationID = nil
+        copy.sourceRelativePath = "Presets/\(copy.skillID)/\(copy.id).md"
         return copy
     }
 
     public static func skillDigest(_ skill: AssistantSkill) -> String {
         let text = encodeJSON(normalizedSkill(skill))
+        return SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+
+    public static func presetDigest(_ preset: AssistantRolePreset) -> String {
+        let text = encodeJSON(normalizedPreset(preset))
         return SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
     }
 
@@ -382,6 +495,11 @@ public enum AssistantCloudSync {
                    let sB = decodeJSON(b.value, as: SyncedAssistantSkillsPayload.self) {
                     return SyncValue(encodeJSON(sA.merging(sB)), version: maxVer)
                 }
+            case presetsScopeKey:
+                if let prA = decodeJSON(a.value, as: SyncedAssistantPresetsPayload.self),
+                   let prB = decodeJSON(b.value, as: SyncedAssistantPresetsPayload.self) {
+                    return SyncValue(encodeJSON(prA.merging(prB)), version: maxVer)
+                }
             case promptsScopeKey:
                 if let rA = decodeJSON(a.value, as: SyncedAssistantPromptsPayload.self),
                    let rB = decodeJSON(b.value, as: SyncedAssistantPromptsPayload.self) {
@@ -391,6 +509,11 @@ public enum AssistantCloudSync {
                 if let fA = decodeJSON(a.value, as: SyncedAssistantPreferencesPayload.self),
                    let fB = decodeJSON(b.value, as: SyncedAssistantPreferencesPayload.self) {
                     return SyncValue(encodeJSON(fA.merging(fB)), version: maxVer)
+                }
+            case vaultDestinationsScopeKey:
+                if let vA = decodeJSON(a.value, as: SyncedVaultDestinationsPayload.self),
+                   let vB = decodeJSON(b.value, as: SyncedVaultDestinationsPayload.self) {
+                    return SyncValue(encodeJSON(vA.merging(vB)), version: maxVer)
                 }
             default:
                 break
@@ -409,21 +532,27 @@ public enum AssistantCloudSync {
         public var people: AssistantPeopleDirectory
         public var teamContext: AssistantTeamContextDocument
         public var skills: [AssistantSkill]
+        public var presets: [AssistantRolePreset]
         public var prompts: [AssistantPromptDocument]
         public var preferences: LocalAssistantPortablePreferences
+        public var vaultDestinations: [SyncedVaultDestinationDescriptor]
 
         public init(
             people: AssistantPeopleDirectory,
             teamContext: AssistantTeamContextDocument,
             skills: [AssistantSkill],
+            presets: [AssistantRolePreset] = [],
             prompts: [AssistantPromptDocument],
-            preferences: LocalAssistantPortablePreferences
+            preferences: LocalAssistantPortablePreferences,
+            vaultDestinations: [SyncedVaultDestinationDescriptor] = []
         ) {
             self.people = people
             self.teamContext = teamContext
             self.skills = skills
+            self.presets = presets
             self.prompts = prompts
             self.preferences = preferences
+            self.vaultDestinations = vaultDestinations
         }
     }
 
@@ -578,6 +707,62 @@ public enum AssistantCloudSync {
             changedScopeKeys.insert(skillsScopeKey)
         }
 
+        // 3b. Role Presets (`Presets/<skill-id>/<preset>.md`)
+        let currentPresetMap = Dictionary(
+            input.presets.map { ($0.compositeKey, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        let currentPresetHashes = currentPresetMap.mapValues(presetDigest)
+        var presetsPayload = doc.contextSettings[presetsScopeKey]?.about.flatMap {
+            decodeJSON($0.value, as: SyncedAssistantPresetsPayload.self)
+        } ?? SyncedAssistantPresetsPayload()
+        var presetsDirty = false
+        for (key, hash) in currentPresetHashes {
+            guard let rawPreset = currentPresetMap[key] else { continue }
+            let preset = normalizedPreset(rawPreset)
+            let existingDigest = presetsPayload.presets[key].map { presetDigest($0.preset.value) }
+            let existingDeleted = presetsPayload.presets[key]?.deleted.value ?? false
+            if prevBaseline?.presetHashes[key] != hash, (existingDigest != hash || existingDeleted) {
+                let v = doc.nextVersion()
+                presetsPayload.presets[key] = SyncedAssistantPresetRecord(
+                    preset: SyncValue(preset, version: v),
+                    deleted: SyncValue(false, version: v)
+                )
+                presetsDirty = true
+            }
+        }
+        if let prevPresets = prevBaseline?.presetHashes {
+            for key in prevPresets.keys where currentPresetHashes[key] == nil {
+                if let existing = presetsPayload.presets[key], !existing.deleted.value {
+                    let v = doc.nextVersion()
+                    presetsPayload.presets[key] = SyncedAssistantPresetRecord(
+                        preset: existing.preset,
+                        deleted: SyncValue(true, version: v)
+                    )
+                    presetsDirty = true
+                }
+            }
+        }
+        if presetsDirty {
+            upsertScope(presetsScopeKey, title: "Assistant Role Presets", json: encodeJSON(presetsPayload), into: &doc)
+            changedScopeKeys.insert(presetsScopeKey)
+        }
+
+        // 3c. Portable Vault Destinations (published primarily from Mac)
+        if !input.vaultDestinations.isEmpty || prevBaseline?.vaultDestinationsHash != nil {
+            let destDigest = textDigest(encodeJSON(input.vaultDestinations))
+            if prevBaseline?.vaultDestinationsHash != destDigest {
+                var payload = doc.contextSettings[vaultDestinationsScopeKey]?.about.flatMap {
+                    decodeJSON($0.value, as: SyncedVaultDestinationsPayload.self)
+                } ?? SyncedVaultDestinationsPayload()
+                if payload.destinations?.value != input.vaultDestinations {
+                    payload.destinations = SyncValue(input.vaultDestinations, version: doc.nextVersion())
+                    upsertScope(vaultDestinationsScopeKey, title: "Assistant Vault Destinations", json: encodeJSON(payload), into: &doc)
+                    changedScopeKeys.insert(vaultDestinationsScopeKey)
+                }
+            }
+        }
+
         // 4. Core Prompts (only customized non-default texts, or explicit reset after customization)
         var promptsPayload = doc.contextSettings[promptsScopeKey]?.about.flatMap {
             decodeJSON($0.value, as: SyncedAssistantPromptsPayload.self)
@@ -669,9 +854,12 @@ public enum AssistantCloudSync {
         public var skillsToSave: [AssistantSkill] = []
         public var skillIDsToRestoreDefault: [String] = []
         public var skillIDsToDelete: [String] = []
+        public var presetsToSave: [AssistantRolePreset] = []
+        public var presetsToDelete: [(skillID: String, id: String)] = []
         public var promptsToSave: [(kind: AssistantPromptKind, content: String)] = []
         public var promptKindsToRestoreDefault: [AssistantPromptKind] = []
         public var updatedPreferences: LocalAssistantPortablePreferences?
+        public var updatedVaultDestinations: [SyncedVaultDestinationDescriptor]?
         public var updatedBaseline: AssistantLocalSyncBaseline
 
         public var hasAnyChange: Bool {
@@ -680,9 +868,12 @@ public enum AssistantCloudSync {
                 || !skillsToSave.isEmpty
                 || !skillIDsToRestoreDefault.isEmpty
                 || !skillIDsToDelete.isEmpty
+                || !presetsToSave.isEmpty
+                || !presetsToDelete.isEmpty
                 || !promptsToSave.isEmpty
                 || !promptKindsToRestoreDefault.isEmpty
                 || updatedPreferences != nil
+                || updatedVaultDestinations != nil
         }
     }
 
@@ -780,6 +971,31 @@ public enum AssistantCloudSync {
             }
         }
 
+        var resultingPresets = Dictionary(
+            currentInput.presets.map { ($0.compositeKey, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        var presetsToSave: [AssistantRolePreset] = []
+        var presetsToDelete: [(skillID: String, id: String)] = []
+        if let raw = contextSettings[presetsScopeKey]?.about?.value,
+           let payload = decodeJSON(raw, as: SyncedAssistantPresetsPayload.self) {
+            for (key, record) in payload.presets.sorted(by: { $0.key < $1.key }) {
+                if record.deleted.value {
+                    if let existing = resultingPresets.removeValue(forKey: key) {
+                        presetsToDelete.append((skillID: existing.skillID, id: existing.id))
+                    }
+                } else {
+                    let remotePreset = normalizedPreset(record.preset.value)
+                    let remoteHash = presetDigest(remotePreset)
+                    let localHash = resultingPresets[key].map(presetDigest)
+                    if localHash != remoteHash {
+                        presetsToSave.append(remotePreset)
+                        resultingPresets[key] = remotePreset
+                    }
+                }
+            }
+        }
+
         var resultingPrompts = Dictionary(
             currentInput.prompts.map { ($0.kind, $0) },
             uniquingKeysWith: { first, _ in first }
@@ -817,12 +1033,24 @@ public enum AssistantCloudSync {
             }
         }
 
+        var resultingVaultDestinations = currentInput.vaultDestinations
+        var updatedVaultDestinations: [SyncedVaultDestinationDescriptor]?
+        if let raw = contextSettings[vaultDestinationsScopeKey]?.about?.value,
+           let payload = decodeJSON(raw, as: SyncedVaultDestinationsPayload.self),
+           let remoteDests = payload.destinations?.value,
+           remoteDests != currentInput.vaultDestinations {
+            updatedVaultDestinations = remoteDests
+            resultingVaultDestinations = remoteDests
+        }
+
         let finalInput = LocalSnapshotInput(
             people: resultingPeople,
             teamContext: resultingTeamContext,
             skills: Array(resultingSkills.values),
+            presets: Array(resultingPresets.values),
             prompts: Array(resultingPrompts.values),
-            preferences: resultingPreferences
+            preferences: resultingPreferences,
+            vaultDestinations: resultingVaultDestinations
         )
 
         return RemoteApplicationPlan(
@@ -831,9 +1059,12 @@ public enum AssistantCloudSync {
             skillsToSave: skillsToSave,
             skillIDsToRestoreDefault: skillIDsToRestoreDefault,
             skillIDsToDelete: skillIDsToDelete,
+            presetsToSave: presetsToSave,
+            presetsToDelete: presetsToDelete,
             promptsToSave: promptsToSave,
             promptKindsToRestoreDefault: promptKindsToRestoreDefault,
             updatedPreferences: updatedPreferences,
+            updatedVaultDestinations: updatedVaultDestinations,
             updatedBaseline: makeBaseline(from: finalInput)
         )
     }
@@ -857,6 +1088,12 @@ public enum AssistantCloudSync {
         for skillID in plan.skillIDsToDelete {
             try repository.deleteSkill(id: skillID)
         }
+        for preset in plan.presetsToSave {
+            _ = try repository.savePreset(preset)
+        }
+        for presetRef in plan.presetsToDelete {
+            try repository.deletePreset(skillID: presetRef.skillID, id: presetRef.id)
+        }
         for (kind, content) in plan.promptsToSave {
             _ = try repository.savePrompt(kind, content: content)
         }
@@ -877,19 +1114,25 @@ public enum AssistantCloudSync {
             }
             acc[skill.id] = hash
         }
+        let presetHashes: [String: String] = input.presets.reduce(into: [:]) { acc, preset in
+            acc[preset.compositeKey] = presetDigest(preset)
+        }
         let promptHashes: [String: String] = input.prompts.reduce(into: [:]) { acc, docItem in
             let defText = DefaultAssistantPrompts.content(for: docItem.kind)
             let hash = textDigest(docItem.content)
             if hash == textDigest(defText) { return }
             acc[docItem.kind.rawValue] = hash
         }
+        let vaultHash = input.vaultDestinations.isEmpty ? nil : textDigest(encodeJSON(input.vaultDestinations))
         return AssistantLocalSyncBaseline(
             people: peopleMap,
             freeformNotes: input.people.freeformNotes,
             teamContext: AssistantLocalSyncBaseline.TeamContextBaseline(doc: input.teamContext),
             skillHashes: skillHashes,
+            presetHashes: presetHashes,
             promptHashes: promptHashes,
-            preferences: input.preferences
+            preferences: input.preferences,
+            vaultDestinationsHash: vaultHash
         )
     }
 

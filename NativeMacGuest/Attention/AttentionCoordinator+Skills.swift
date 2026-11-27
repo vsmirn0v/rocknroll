@@ -2,22 +2,66 @@ import ConferenceCore
 import Foundation
 
 extension AttentionCoordinator {
-    private func resolveSkillRepositoryContext() async -> (repo: AssistantSkillRepository, securityScopedVaultURL: URL?) {
-        if let destination = try? await store.meetingLibrary.store.destination(),
-           let bookmark = destination.vaultBookmark {
+    private struct ResolvedSkillRepoContext {
+        var primary: AssistantSkillRepository
+        var composite: CompositeAssistantSkillRepository
+        var primaryVaultURL: URL?
+        var securityScopedURLs: [URL]
+    }
+
+    private func resolveSkillRepositoryContext() async -> ResolvedSkillRepoContext {
+        let destinations = (try? await store.meetingLibrary.store.destinations()) ?? []
+        let primaryDest = destinations.first(where: \.isPrimary) ?? destinations.first
+
+        var primaryRepo = store.localSkillRepository()
+        var primaryVaultURL: URL?
+        var scopedURLs: [URL] = []
+
+        if let primaryDest, let bookmark = primaryDest.vaultBookmark {
             let resolved = ObsidianVaultAccess.resolveWithRefresh(bookmark)
             if let refreshed = resolved.refreshedBookmark, case .granted = resolved.resolution {
-                var updated = destination
+                var updated = primaryDest
                 updated.vaultBookmark = refreshed
                 try? await store.meetingLibrary.store.saveDestination(updated)
             }
             if case .granted(let vaultURL) = resolved.resolution {
-                let repo = AssistantSkillRepository(rootURL: vaultURL.appendingPathComponent("Rock Assistant", isDirectory: true))
+                scopedURLs.append(vaultURL)
+                primaryVaultURL = vaultURL
+                let repo = AssistantSkillRepository(
+                    rootURL: vaultURL.appendingPathComponent("Rock Assistant", isDirectory: true),
+                    owningDestinationID: primaryDest.id
+                )
                 try? repo.ensureDefaultsInstalled()
-                return (repo, vaultURL)
+                primaryRepo = repo
             }
         }
-        return (store.localSkillRepository(), nil)
+
+        var secondaryRepos: [AssistantSkillRepository] = []
+        for dest in destinations where !dest.isPrimary && dest.loadsSkills {
+            guard let bookmark = dest.vaultBookmark else { continue }
+            let resolved = ObsidianVaultAccess.resolveWithRefresh(bookmark)
+            if let refreshed = resolved.refreshedBookmark, case .granted = resolved.resolution {
+                var updated = dest
+                updated.vaultBookmark = refreshed
+                try? await store.meetingLibrary.store.saveDestination(updated)
+            }
+            if case .granted(let vaultURL) = resolved.resolution {
+                scopedURLs.append(vaultURL)
+                let repo = AssistantSkillRepository(
+                    rootURL: vaultURL.appendingPathComponent("Rock Assistant", isDirectory: true),
+                    owningDestinationID: dest.id
+                )
+                secondaryRepos.append(repo)
+            }
+        }
+
+        let composite = CompositeAssistantSkillRepository(primary: primaryRepo, secondary: secondaryRepos)
+        return ResolvedSkillRepoContext(
+            primary: primaryRepo,
+            composite: composite,
+            primaryVaultURL: primaryVaultURL,
+            securityScopedURLs: scopedURLs
+        )
     }
 
     /// Resolves `<ObsidianVault>/Rock Assistant` when an Obsidian destination bookmark is configured,
@@ -25,15 +69,21 @@ extension AttentionCoordinator {
     /// only for the duration of `operation`.
     func withSkillRepository<T>(_ operation: (AssistantSkillRepository, URL?) throws -> T) async rethrows -> T {
         let context = await resolveSkillRepositoryContext()
-        defer { context.securityScopedVaultURL?.stopAccessingSecurityScopedResource() }
-        return try operation(context.repo, context.securityScopedVaultURL)
+        defer { context.securityScopedURLs.forEach { $0.stopAccessingSecurityScopedResource() } }
+        return try operation(context.primary, context.primaryVaultURL)
+    }
+
+    func withCompositeSkillRepository<T>(_ operation: (CompositeAssistantSkillRepository, URL?) throws -> T) async rethrows -> T {
+        let context = await resolveSkillRepositoryContext()
+        defer { context.securityScopedURLs.forEach { $0.stopAccessingSecurityScopedResource() } }
+        return try operation(context.composite, context.primaryVaultURL)
     }
 
     /// Async counterpart to `withSkillRepository` holding security-scoped access across `operation`.
     func withSkillRepositoryAsync<T>(_ operation: (AssistantSkillRepository, URL?) async throws -> T) async rethrows -> T {
         let context = await resolveSkillRepositoryContext()
-        defer { context.securityScopedVaultURL?.stopAccessingSecurityScopedResource() }
-        return try await operation(context.repo, context.securityScopedVaultURL)
+        defer { context.securityScopedURLs.forEach { $0.stopAccessingSecurityScopedResource() } }
+        return try await operation(context.primary, context.primaryVaultURL)
     }
 
     func skillStorageSummary() async -> (isObsidianBacked: Bool, folderPath: String) {
@@ -43,9 +93,31 @@ extension AttentionCoordinator {
     }
 
     func listAssistantSkills() async -> [AssistantSkill] {
-        await withSkillRepository { repo, _ in
-            repo.listSkills()
+        await withCompositeSkillRepository { composite, _ in
+            composite.listSkills()
         }
+    }
+
+    func listAssistantPresets(skillID: String? = nil) async -> [AssistantRolePreset] {
+        await withCompositeSkillRepository { composite, _ in
+            composite.listPresets(skillID: skillID)
+        }
+    }
+
+    @discardableResult
+    func saveAssistantPreset(_ preset: AssistantRolePreset, owningDestinationID: UUID? = nil) async throws -> AssistantRolePreset {
+        let saved = try await withCompositeSkillRepository { composite, _ in
+            try composite.savePreset(preset, preferredDestinationID: owningDestinationID)
+        }
+        notifyLocalAssistantDataChanged()
+        return saved
+    }
+
+    func deleteAssistantPreset(skillID: String, id: String, owningDestinationID: UUID? = nil) async throws {
+        try await withCompositeSkillRepository { composite, _ in
+            try composite.deletePreset(skillID: skillID, id: id, owningDestinationID: owningDestinationID)
+        }
+        notifyLocalAssistantDataChanged()
     }
 
     private func notifyLocalAssistantDataChanged() {
@@ -188,18 +260,29 @@ extension AttentionCoordinator {
     }
 
     func currentAssistantCloudInput() async -> AssistantCloudSync.LocalSnapshotInput {
-        let repoSnapshot = await withSkillRepository { repo, _ in
+        let destinations = (try? await store.meetingLibrary.store.destinations()) ?? []
+        let vaultDescriptors = destinations.map { dest in
+            SyncedVaultDestinationDescriptor(
+                id: dest.id,
+                slug: dest.resolvedSlug,
+                name: dest.displayName,
+                isPrimary: dest.isPrimary
+            )
+        }
+        let repoSnapshot = await withCompositeSkillRepository { composite, _ in
             (
-                people: repo.loadPeople(),
-                teamContext: repo.loadTeamContext(),
-                skills: repo.listSkills(),
-                prompts: repo.listPrompts()
+                people: composite.primary.loadPeople(),
+                teamContext: composite.primary.loadTeamContext(),
+                skills: composite.listSkills(),
+                presets: composite.listPresets(),
+                prompts: composite.primary.listPrompts()
             )
         }
         return AssistantCloudSync.LocalSnapshotInput(
             people: repoSnapshot.people,
             teamContext: repoSnapshot.teamContext,
             skills: repoSnapshot.skills,
+            presets: repoSnapshot.presets,
             prompts: repoSnapshot.prompts,
             preferences: LocalAssistantPortablePreferences(
                 selectedSkillIDs: store.selectedSkillIDs,
@@ -211,7 +294,8 @@ extension AttentionCoordinator {
                 realtimeFolderID: store.realtimeFolderID,
                 realtimeVoiceRole: store.realtimeVoiceRole,
                 lastBoardURL: store.lastBoardURL
-            )
+            ),
+            vaultDestinations: vaultDescriptors
         )
     }
 
@@ -227,6 +311,11 @@ extension AttentionCoordinator {
         ) else {
             return previousBaseline
         }
+        if let updated = plan.updatedVaultDestinations, !updated.isEmpty, syncedVaultDestinations != updated {
+            syncedVaultDestinations = updated
+        } else if !currentInput.vaultDestinations.isEmpty && syncedVaultDestinations.isEmpty {
+            syncedVaultDestinations = currentInput.vaultDestinations
+        }
         guard plan.hasAnyChange else {
             return plan.updatedBaseline
         }
@@ -234,8 +323,8 @@ extension AttentionCoordinator {
         isApplyingRemoteCloudSync = true
         defer { isApplyingRemoteCloudSync = false }
 
-        try? await withSkillRepository { repo, _ in
-            try AssistantCloudSync.applyRepositoryChanges(from: plan, to: repo)
+        try? await withCompositeSkillRepository { composite, _ in
+            try AssistantCloudSync.applyRepositoryChanges(from: plan, to: composite.primary)
         }
 
         if let prefs = plan.updatedPreferences {

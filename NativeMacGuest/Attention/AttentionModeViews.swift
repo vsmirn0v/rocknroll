@@ -1,4 +1,55 @@
+import ConferenceCore
 import SwiftUI
+
+extension AssistantEngagementMode {
+    var title: String {
+        switch self {
+        case .off: L("Off")
+        case .mentions: L("Mentions")
+        case .follow: L("Follow")
+        case .observe: L("Observe")
+        case .advise: L("Advise")
+        case .participate: L("Participate")
+        case .facilitate: L("Facilitate")
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case .off: L("Leave me alone here")
+        case .mentions: L("Only when I'm called or it's urgent")
+        case .follow: L("Also when it concerns me")
+        case .observe: L("Silent to room · structured Role Notes only")
+        case .advise: L("Silent to room · live private coaching & Whisper")
+        case .participate: L("Contribute in chat or by voice")
+        case .facilitate: L("Autonomous meeting facilitator & board actions")
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .off: "bell.slash"
+        case .mentions: "at"
+        case .follow: "eye"
+        case .observe: "note.text"
+        case .advise: "lightbulb"
+        case .participate: "bubble.left"
+        case .facilitate: "sparkles.rectangle.stack"
+        }
+    }
+
+    var tint: Color {
+        switch self {
+        case .off: .secondary
+        case .mentions: .blue
+        case .follow: .teal
+        case .observe: .indigo
+        case .advise: .orange
+        case .participate: .teal
+        case .facilitate: .purple
+        }
+    }
+}
 
 extension AttentionMode {
     var title: String {
@@ -54,16 +105,31 @@ struct AttentionModeChip: View {
 
     var body: some View {
         let resolved = attention.resolvedMode(model)
+        let roleAndMode = attention.effectiveRoleAndMode(for: model)
         let participating = participation.status != .inactive
-        let title = participating ? participation.status.title : resolved.mode.title
+        let title: String = {
+            if participating { return participation.status.title }
+            if roleAndMode.mode.isAdvisorFamily || roleAndMode.mode == .facilitate { return roleAndMode.mode.title }
+            return resolved.mode.title
+        }()
+        let symbol: String = {
+            if participating { return "bubble.left" }
+            if roleAndMode.mode.isAdvisorFamily || roleAndMode.mode == .facilitate { return roleAndMode.mode.symbol }
+            return resolved.mode.symbol
+        }()
+        let tint: Color = {
+            if participating { return .teal }
+            if roleAndMode.mode.isAdvisorFamily || roleAndMode.mode == .facilitate { return roleAndMode.mode.tint }
+            return resolved.mode.tint
+        }()
         Button { open.toggle() } label: {
             HStack(spacing: 3) {
-                Image(systemName: participating ? "bubble.left" : resolved.mode.symbol).font(.system(size: 10, weight: .semibold))
+                Image(systemName: symbol).font(.system(size: 10, weight: .semibold))
                 if !compact { Text(title).font(.caption2.weight(.semibold)) }
             }
-            .foregroundStyle(resolved.mode.tint)
+            .foregroundStyle(tint)
             .padding(.horizontal, compact ? 4 : 6).frame(minWidth: 20, minHeight: 18)
-            .background(resolved.mode.tint.opacity(resolved.mode == .off ? 0.12 : 0.16), in: Capsule())
+            .background(tint.opacity(tint == .secondary ? 0.12 : 0.16), in: Capsule())
             .contentShape(Capsule())
         }
         .buttonStyle(.plain)
@@ -120,11 +186,17 @@ struct AttentionModePicker: View {
 
     private var modes: some View {
         let resolved = attention.resolvedMode(model)
+        let activeRole = attention.effectiveRoleAndMode(for: model)
         return VStack(alignment: .leading, spacing: 10) {
             Text(L("Attention for “%@”", model.title)).font(.caption).foregroundStyle(.secondary).lineLimit(1)
             VStack(spacing: 2) {
                 ForEach(AttentionMode.allCases, id: \.self) { mode in
-                    Button { attention.setMode(mode, for: model, scope: currentScope(resolved)) } label: {
+                    let isSelected = mode == resolved.mode && participation.status == .inactive && !activeRole.mode.isAdvisorFamily && activeRole.mode != .facilitate
+                    Button {
+                        attention.advisorCoordinator?.disable(for: model.sessionID)
+                        attention.facilitator?.disable(for: model.sessionID)
+                        attention.setMode(mode, for: model, scope: currentScope(resolved))
+                    } label: {
                         HStack(spacing: 10) {
                             Image(systemName: mode.symbol).font(.system(size: 13, weight: .semibold)).foregroundStyle(mode.tint)
                                 .frame(width: 26, height: 26).background(mode.tint.opacity(0.14), in: RoundedRectangle(cornerRadius: 7))
@@ -133,17 +205,48 @@ struct AttentionModePicker: View {
                                 Text(mode.detail).font(.caption).foregroundStyle(.secondary)
                             }
                             Spacer(minLength: 8)
-                            if mode == resolved.mode, participation.status == .inactive {
+                            if isSelected {
                                 Image(systemName: "checkmark").font(.caption.weight(.bold)).foregroundStyle(mode.tint)
                             }
                         }
                         .padding(.horizontal, 8).padding(.vertical, 6).contentShape(Rectangle())
-                        .background(mode == resolved.mode && participation.status == .inactive ? mode.tint.opacity(0.08) : .clear,
+                        .background(isSelected ? mode.tint.opacity(0.08) : .clear,
                                     in: RoundedRectangle(cornerRadius: 8))
                     }
                     .buttonStyle(.plain)
                     .accessibilityIdentifier("attention.mode.\(mode.rawValue)")
-                    .accessibilityAddTraits(mode == resolved.mode && participation.status == .inactive ? .isSelected : [])
+                    .accessibilityAddTraits(isSelected ? .isSelected : [])
+                }
+                ForEach([AssistantEngagementMode.observe, AssistantEngagementMode.advise], id: \.self) { advisorMode in
+                    let isSelected = activeRole.mode == advisorMode
+                    Button {
+                        attention.setMeetingRoleAndMode(
+                            model: model,
+                            skillID: activeRole.skillID,
+                            presetID: activeRole.presetID,
+                            mode: advisorMode,
+                            scope: currentScope(resolved)
+                        )
+                    } label: {
+                        HStack(spacing: 10) {
+                            Image(systemName: advisorMode.symbol).font(.system(size: 13, weight: .semibold)).foregroundStyle(advisorMode.tint)
+                                .frame(width: 26, height: 26).background(advisorMode.tint.opacity(0.14), in: RoundedRectangle(cornerRadius: 7))
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(advisorMode.title).fontWeight(.semibold)
+                                Text(advisorMode.detail).font(.caption).foregroundStyle(.secondary)
+                            }
+                            Spacer(minLength: 8)
+                            if isSelected {
+                                Image(systemName: "checkmark").font(.caption.weight(.bold)).foregroundStyle(advisorMode.tint)
+                            }
+                        }
+                        .padding(.horizontal, 8).padding(.vertical, 6).contentShape(Rectangle())
+                        .background(isSelected ? advisorMode.tint.opacity(0.08) : .clear,
+                                    in: RoundedRectangle(cornerRadius: 8))
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityIdentifier("attention.mode.\(advisorMode.rawValue)")
+                    .accessibilityAddTraits(isSelected ? .isSelected : [])
                 }
                 Button { showingParticipation = true } label: {
                     HStack(spacing: 10) {
