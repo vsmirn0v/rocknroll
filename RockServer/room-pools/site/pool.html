@@ -32,11 +32,17 @@
       <p id="pool-meta" class="pool-meta"></p>
       <div id="pool-origins" class="pool-origins"></div>
       <div class="pool-link-box">
+        <p class="link-box-label">Coordination link (add to app / claim rooms):</p>
         <code id="coord-url-display"></code>
+      </div>
+      <div id="manage-link-box" class="pool-link-box manage-link-box" hidden>
+        <p class="link-box-label">Manage link (add / remove pool links):</p>
+        <code id="manage-url-display"></code>
       </div>
       <div class="jam-actions">
         <button id="claim-room-btn" class="button primary" type="button">Claim 1 Room</button>
         <button id="copy-coord-btn" class="button quiet" type="button">Copy Coordination Link</button>
+        <button id="copy-manage-btn" class="button quiet" type="button" hidden>Copy Manage Link</button>
       </div>
       <div id="claimed-box" class="claimed-box" hidden>
         <p class="claimed-label">Claimed room link (marked as used):</p>
@@ -52,7 +58,7 @@
     <section class="jam-card pool-card">
       <div class="card-heading">
         <span id="manage-heading">POOL MANAGEMENT</span>
-        <span class="pill">Write password required</span>
+        <span id="manage-pill" class="pill">Write password required</span>
       </div>
 
       <label for="write-token-input">Write password (X-Pool-Write-Token)</label>

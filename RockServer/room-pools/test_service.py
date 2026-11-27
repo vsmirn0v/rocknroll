@@ -25,7 +25,10 @@ class PoolCoreTests(unittest.TestCase):
         created = s.create_pool(self.db, 1000, pool_id='363636', label='Team Pool')
         self.assertEqual(created['poolId'], '363636')
         auth = created['auth']
+        pool_write_token = created['writeToken']
+        self.assertTrue(len(pool_write_token) >= 20)
         self.assertTrue(created['coordinationUrl'].endswith(f'/363636#auth={auth}'))
+        self.assertTrue(created['manageUrl'].endswith(f'/363636#auth={auth}&write={pool_write_token}'))
 
         # Verify plaintext room URL never appears in SQLite file
         links = [
@@ -252,6 +255,69 @@ class PoolHTTPTests(unittest.TestCase):
         )
         self.assertEqual(code, 200)
         self.assertEqual(removed['removed'], 0)
+
+    def test_per_pool_write_token_scope_and_legacy_fallback(self):
+        code, p1 = self._req('POST', '/api/pools', body={'poolId': 'poolone', 'label': 'One'}, write_token=self.write_token)
+        self.assertEqual(code, 201)
+        code, p2 = self._req('POST', '/api/pools', body={'poolId': 'pooltwo', 'label': 'Two'}, write_token=self.write_token)
+        self.assertEqual(code, 201)
+
+        # Per-pool write token can add, list, and remove links for its own pool
+        code, added = self._req(
+            'POST',
+            '/api/pools/poolone/links',
+            body={'links': ['https://jazz.sber.ru/calls/p1-a', 'https://jazz.sber.ru/calls/p1-b']},
+            auth=p1['auth'],
+            write_token=p1['writeToken'],
+        )
+        self.assertEqual(code, 200)
+        self.assertEqual(added['added'], 2)
+
+        code, listed = self._req('GET', '/api/pools/poolone/links', auth=p1['auth'], write_token=p1['writeToken'])
+        self.assertEqual(code, 200)
+        self.assertEqual(len(listed['links']), 2)
+
+        first_id = listed['links'][0]['id']
+        code, removed = self._req(
+            'POST',
+            '/api/pools/poolone/links/remove',
+            body={'ids': [first_id]},
+            auth=p1['auth'],
+            write_token=p1['writeToken'],
+        )
+        self.assertEqual(code, 200)
+        self.assertEqual(removed['removed'], 1)
+
+        # Per-pool write token cannot create new pools or touch another pool
+        code, _ = self._req('POST', '/api/pools', body={'poolId': 'poolthree'}, write_token=p1['writeToken'])
+        self.assertEqual(code, 403)
+        code, _ = self._req(
+            'GET',
+            '/api/pools/pooltwo/links',
+            auth=p2['auth'],
+            write_token=p1['writeToken'],
+        )
+        self.assertEqual(code, 403)
+
+        # Legacy pool without write_verifier still accepts master write token
+        with self.server.lock:
+            self.server.db.execute("UPDATE pools SET write_verifier=NULL WHERE pool_id='pooltwo'")
+        code, added_legacy = self._req(
+            'POST',
+            '/api/pools/pooltwo/links',
+            body={'links': ['https://jazz.sber.ru/calls/p2-legacy']},
+            auth=p2['auth'],
+            write_token=self.write_token,
+        )
+        self.assertEqual(code, 200)
+        self.assertEqual(added_legacy['added'], 1)
+        code, _ = self._req(
+            'GET',
+            '/api/pools/pooltwo/links',
+            auth=p2['auth'],
+            write_token=p2['writeToken'],
+        )
+        self.assertEqual(code, 403)
 
 
 if __name__ == '__main__':

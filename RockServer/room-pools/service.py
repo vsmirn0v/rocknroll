@@ -69,11 +69,15 @@ def init(db):
                 label TEXT NOT NULL DEFAULT '',
                 salt BLOB NOT NULL,
                 auth_verifier BLOB NOT NULL,
+                write_verifier BLOB,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL,
                 used_count INTEGER NOT NULL DEFAULT 0
             )'''
         )
+        cols = {row[1] for row in db.execute('PRAGMA table_info(pools)').fetchall()}
+        if 'write_verifier' not in cols:
+            db.execute('ALTER TABLE pools ADD COLUMN write_verifier BLOB')
         db.execute(
             '''CREATE TABLE IF NOT EXISTS pool_links (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -110,6 +114,10 @@ def _generate_auth_token():
 
 def _auth_verifier(salt, auth_token):
     return hmac.digest(salt, b'verify:' + auth_token.encode('ascii'), 'sha256')
+
+
+def _write_verifier(salt, write_token):
+    return hmac.digest(salt, b'write:' + write_token.encode('utf-8'), 'sha256')
 
 
 def _derive_key(salt, auth_token):
@@ -222,12 +230,12 @@ def _verify_pool_auth(db, pool_id, auth_token):
     if not isinstance(auth_token, str) or not AUTH_TOKEN_RE.fullmatch(auth_token):
         raise PoolError(401, 'invalid_auth', 'Invalid pool ID or auth token.')
     row = db.execute(
-        'SELECT label, salt, auth_verifier, used_count FROM pools WHERE pool_id=?',
+        'SELECT label, salt, auth_verifier, write_verifier, used_count FROM pools WHERE pool_id=?',
         (pool_id,),
     ).fetchone()
     if not row:
         raise PoolError(401, 'invalid_auth', 'Invalid pool ID or auth token.')
-    label, salt, stored_verifier, used_count = row
+    label, salt, stored_verifier, write_verifier, used_count = row
     expected_verifier = _auth_verifier(salt, auth_token)
     if not hmac.compare_digest(stored_verifier, expected_verifier):
         raise PoolError(401, 'invalid_auth', 'Invalid pool ID or auth token.')
@@ -236,6 +244,7 @@ def _verify_pool_auth(db, pool_id, auth_token):
         'pool_id': pool_id,
         'label': label,
         'salt': salt,
+        'write_verifier': write_verifier,
         'used_count': used_count,
         'enc_key': enc_key,
     }
@@ -287,18 +296,22 @@ def create_pool(db, now, pool_id=None, label=''):
             raise PoolError(409, 'pool_exists', 'This pool ID already exists.')
 
         auth = _generate_auth_token()
+        write_token = _generate_auth_token()
         salt = secrets.token_bytes(16)
         verifier = _auth_verifier(salt, auth)
+        w_verifier = _write_verifier(salt, write_token)
         db.execute(
-            'INSERT INTO pools(pool_id, label, salt, auth_verifier, created_at, updated_at, used_count) VALUES(?,?,?,?,?,?,0)',
-            (pool_id, label, salt, verifier, now, now),
+            'INSERT INTO pools(pool_id, label, salt, auth_verifier, write_verifier, created_at, updated_at, used_count) VALUES(?,?,?,?,?,?,?,0)',
+            (pool_id, label, salt, verifier, w_verifier, now, now),
         )
         db.commit()
         return {
             'poolId': pool_id,
             'auth': auth,
+            'writeToken': write_token,
             'label': label,
             'coordinationUrl': f'{COORD_BASE_URL}/{pool_id}#auth={auth}',
+            'manageUrl': f'{COORD_BASE_URL}/{pool_id}#auth={auth}&write={write_token}',
         }
     except Exception:
         db.rollback()
@@ -624,6 +637,26 @@ class Handler(BaseHTTPRequestHandler):
             self._check_rate_limit(ip, is_auth_failure=True)
             raise PoolError(403, 'invalid_write_token', 'Invalid write password.')
 
+    def _require_pool_write_access(self, ip, pool_id, auth_token):
+        provided = self.headers.get('X-Pool-Write-Token', '').strip()
+        if not provided:
+            self._check_rate_limit(ip, is_auth_failure=True)
+            raise PoolError(401, 'write_token_required', 'Write password is required.')
+        try:
+            with self.server.lock:
+                ctx = _verify_pool_auth(self.server.db, pool_id, auth_token)
+        except PoolError as err:
+            if err.status == 401:
+                self._check_rate_limit(ip, is_auth_failure=True)
+            raise
+        if hmac.compare_digest(provided.encode('utf-8'), self.server.write_token.encode('utf-8')):
+            return
+        w_verifier = ctx.get('write_verifier')
+        if w_verifier is not None and hmac.compare_digest(w_verifier, _write_verifier(ctx['salt'], provided)):
+            return
+        self._check_rate_limit(ip, is_auth_failure=True)
+        raise PoolError(403, 'invalid_write_token', 'Invalid write password.')
+
     def _bearer_token(self, ip):
         raw = self.headers.get('Authorization', '').strip()
         if not raw.lower().startswith('bearer '):
@@ -749,8 +782,8 @@ class Handler(BaseHTTPRequestHandler):
 
                 # GET /api/pools/<id>/links (plain GET without action lists queued links)
                 if method == 'GET' and not action and len(parts) == 4 and parts[3] == 'links':
-                    self._require_write_token(ip)
                     auth = self._bearer_token(ip)
+                    self._require_pool_write_access(ip, pool_id, auth)
                     try:
                         with self.server.lock:
                             result = list_links(self.server.db, pool_id, auth)
@@ -762,8 +795,8 @@ class Handler(BaseHTTPRequestHandler):
 
                 # POST /api/pools/<id>/links (or GET with X-Pool-Action: add_links)
                 if (method == 'POST' or action == 'add_links') and len(parts) == 4 and parts[3] == 'links':
-                    self._require_write_token(ip)
                     auth = self._bearer_token(ip)
+                    self._require_pool_write_access(ip, pool_id, auth)
                     body = self._read_action_payload() if action == 'add_links' else self._read_json_body(optional=False)
                     try:
                         with self.server.lock:
@@ -780,8 +813,8 @@ class Handler(BaseHTTPRequestHandler):
                 ) or (
                     action == 'remove_links' and ((len(parts) == 5 and parts[3:5] == ['links', 'remove']) or (len(parts) == 4 and parts[3] == 'links'))
                 ):
-                    self._require_write_token(ip)
                     auth = self._bearer_token(ip)
+                    self._require_pool_write_access(ip, pool_id, auth)
                     body = self._read_action_payload() if action == 'remove_links' else self._read_json_body(optional=False)
                     try:
                         with self.server.lock:

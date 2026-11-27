@@ -9,8 +9,11 @@
   var poolMeta = document.getElementById('pool-meta');
   var poolOrigins = document.getElementById('pool-origins');
   var coordUrlDisplay = document.getElementById('coord-url-display');
+  var manageLinkBox = document.getElementById('manage-link-box');
+  var manageUrlDisplay = document.getElementById('manage-url-display');
   var claimRoomBtn = document.getElementById('claim-room-btn');
   var copyCoordBtn = document.getElementById('copy-coord-btn');
+  var copyManageBtn = document.getElementById('copy-manage-btn');
   var claimedBox = document.getElementById('claimed-box');
   var claimedUrlEl = document.getElementById('claimed-url');
   var copyClaimedBtn = document.getElementById('copy-claimed-btn');
@@ -18,6 +21,7 @@
   var consumerStatus = document.getElementById('consumer-status');
 
   var manageHeading = document.getElementById('manage-heading');
+  var managePill = document.getElementById('manage-pill');
   var writeTokenInput = document.getElementById('write-token-input');
   var newPoolIdInput = document.getElementById('new-pool-id');
   var newPoolLabelInput = document.getElementById('new-pool-label');
@@ -35,6 +39,7 @@
   var state = {
     poolId: null,
     auth: null,
+    writeToken: null,
     lastClaimedUrl: null
   };
   var preferGetRpc = false;
@@ -58,25 +63,35 @@
     var path = window.location.pathname || '';
     var match = path.match(/^\/pools\/([^/?#]+)$/);
     var poolId = null;
-    var pathAuth = null;
+    var pathParams = {};
     if (match) {
       var seg = match[1];
       var amp = seg.indexOf('&');
       if (amp >= 0) {
         poolId = decodeURIComponent(seg.slice(0, amp)).toLowerCase();
-        pathAuth = parseParams(seg.slice(amp + 1)).auth || null;
+        pathParams = parseParams(seg.slice(amp + 1));
       } else {
         poolId = decodeURIComponent(seg).toLowerCase();
       }
     }
     var hashParams = parseParams(window.location.hash);
     var queryParams = parseParams(window.location.search);
-    var auth = hashParams.auth || queryParams.auth || pathAuth || null;
-    return { poolId: poolId, auth: auth, needsCanonicalUrl: Boolean(poolId && auth && (window.location.search || pathAuth)) };
+    var auth = hashParams.auth || queryParams.auth || pathParams.auth || null;
+    var write = hashParams.write || queryParams.write || pathParams.write || null;
+    return {
+      poolId: poolId,
+      auth: auth,
+      write: write,
+      needsCanonicalUrl: Boolean(poolId && auth && (window.location.search || pathParams.auth || pathParams.write))
+    };
   }
 
   function canonicalCoordUrl(poolId, auth) {
     return window.location.origin + '/pools/' + encodeURIComponent(poolId) + '#auth=' + encodeURIComponent(auth);
+  }
+
+  function canonicalManageUrl(poolId, auth, writeToken) {
+    return canonicalCoordUrl(poolId, auth) + '&write=' + encodeURIComponent(writeToken);
   }
 
   function setStatus(el, msg, kind) {
@@ -91,6 +106,10 @@
 
   function getWriteToken() {
     return (writeTokenInput.value || '').trim();
+  }
+
+  function getPoolWriteToken() {
+    return getWriteToken() || state.writeToken || '';
   }
 
   function persistWriteToken() {
@@ -196,6 +215,17 @@
     poolBadge.textContent = status.availableCount + ' available';
     poolMeta.textContent = status.availableCount + ' unused · ' + status.usedCount + ' already used';
     coordUrlDisplay.textContent = canonicalCoordUrl(state.poolId, state.auth);
+    if (state.writeToken) {
+      manageLinkBox.hidden = false;
+      copyManageBtn.hidden = false;
+      manageUrlDisplay.textContent = canonicalManageUrl(state.poolId, state.auth, state.writeToken);
+      managePill.textContent = 'Admin link active';
+    } else {
+      manageLinkBox.hidden = true;
+      copyManageBtn.hidden = true;
+      manageUrlDisplay.textContent = '';
+      managePill.textContent = 'Write password required';
+    }
     claimRoomBtn.disabled = status.availableCount <= 0;
 
     poolOrigins.innerHTML = '';
@@ -243,12 +273,12 @@
   }
 
   function loadQueuedLinks() {
-    var writeToken = getWriteToken();
+    var writeToken = getPoolWriteToken();
     if (!writeToken) {
-      setStatus(manageStatus, 'Enter the write password first.', 'error');
+      setStatus(manageStatus, 'Enter the write password or open the manage link first.', 'error');
       return;
     }
-    persistWriteToken();
+    if (getWriteToken()) persistWriteToken();
     setStatus(manageStatus, 'Loading queued links…', '');
     apiRequest('/api/pools/' + encodeURIComponent(state.poolId) + '/links', {
       auth: state.auth,
@@ -262,12 +292,12 @@
   }
 
   function removeByIds(ids) {
-    var writeToken = getWriteToken();
+    var writeToken = getPoolWriteToken();
     if (!writeToken) {
-      setStatus(manageStatus, 'Enter the write password first.', 'error');
+      setStatus(manageStatus, 'Enter the write password or open the manage link first.', 'error');
       return;
     }
-    persistWriteToken();
+    if (getWriteToken()) persistWriteToken();
     apiRequest('/api/pools/' + encodeURIComponent(state.poolId) + '/links/remove', {
       method: 'POST',
       auth: state.auth,
@@ -318,6 +348,11 @@
     copyText(canonicalCoordUrl(state.poolId, state.auth), consumerStatus, 'Coordination link copied.');
   });
 
+  copyManageBtn.addEventListener('click', function () {
+    if (!state.poolId || !state.auth || !state.writeToken) return;
+    copyText(canonicalManageUrl(state.poolId, state.auth, state.writeToken), consumerStatus, 'Manage link copied.');
+  });
+
   copyClaimedBtn.addEventListener('click', function () {
     if (!state.lastClaimedUrl) return;
     copyText(state.lastClaimedUrl, consumerStatus, 'Claimed room link copied.');
@@ -344,10 +379,15 @@
     }).then(function (res) {
       state.poolId = res.poolId;
       state.auth = res.auth;
-      var targetUrl = canonicalCoordUrl(res.poolId, res.auth);
-      window.history.replaceState(null, '', '/pools/' + encodeURIComponent(res.poolId) + '#auth=' + encodeURIComponent(res.auth));
+      state.writeToken = res.writeToken || null;
+      var targetUrl = res.writeToken
+        ? canonicalManageUrl(res.poolId, res.auth, res.writeToken)
+        : canonicalCoordUrl(res.poolId, res.auth);
+      var relUrl = '/pools/' + encodeURIComponent(res.poolId) + '#auth=' + encodeURIComponent(res.auth)
+        + (res.writeToken ? '&write=' + encodeURIComponent(res.writeToken) : '');
+      window.history.replaceState(null, '', relUrl);
       setStatus(manageStatus, 'Created pool ' + res.poolId + '.', 'ok');
-      copyText(targetUrl, consumerStatus, 'New coordination link copied.');
+      copyText(canonicalCoordUrl(res.poolId, res.auth), consumerStatus, 'New coordination link copied (use Manage link above to edit links).');
       refreshStatus();
     }).catch(function (err) {
       setStatus(manageStatus, err.message, 'error');
@@ -355,12 +395,12 @@
   });
 
   addLinksBtn.addEventListener('click', function () {
-    var writeToken = getWriteToken();
+    var writeToken = getPoolWriteToken();
     if (!writeToken) {
-      setStatus(manageStatus, 'Enter the write password first.', 'error');
+      setStatus(manageStatus, 'Enter the write password or open the manage link first.', 'error');
       return;
     }
-    persistWriteToken();
+    if (getWriteToken()) persistWriteToken();
     var links = extractCandidateLinks(bulkLinksInput.value || '');
     if (!links.length) {
       setStatus(manageStatus, 'Paste at least one https:// meeting link first.', 'error');
@@ -405,12 +445,12 @@
   loadLinksBtn.addEventListener('click', loadQueuedLinks);
 
   clearLinksBtn.addEventListener('click', function () {
-    var writeToken = getWriteToken();
+    var writeToken = getPoolWriteToken();
     if (!writeToken) {
-      setStatus(manageStatus, 'Enter the write password first.', 'error');
+      setStatus(manageStatus, 'Enter the write password or open the manage link first.', 'error');
       return;
     }
-    persistWriteToken();
+    if (getWriteToken()) persistWriteToken();
     apiRequest('/api/pools/' + encodeURIComponent(state.poolId) + '/links/remove', {
       method: 'POST',
       auth: state.auth,
@@ -430,13 +470,16 @@
   if (parsed.poolId && parsed.auth) {
     state.poolId = parsed.poolId;
     state.auth = parsed.auth;
+    state.writeToken = parsed.write || null;
     if (parsed.needsCanonicalUrl) {
-      window.history.replaceState(
-        null,
-        '',
-        '/pools/' + encodeURIComponent(parsed.poolId) + '#auth=' + encodeURIComponent(parsed.auth)
-      );
+      var canonicalRel = '/pools/' + encodeURIComponent(parsed.poolId) + '#auth=' + encodeURIComponent(parsed.auth)
+        + (parsed.write ? '&write=' + encodeURIComponent(parsed.write) : '');
+      window.history.replaceState(null, '', canonicalRel);
     }
-    refreshStatus();
+    refreshStatus().then(function () {
+      if (state.writeToken) {
+        loadQueuedLinks();
+      }
+    });
   }
 })();
