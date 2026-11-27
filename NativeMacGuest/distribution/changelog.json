@@ -6,7 +6,7 @@
       "version": "0.3.0",
       "channel": "beta",
       "date": "2026-11-27",
-      "commit": "13631980",
+      "commit": "50129ad3",
       "items": [
         "Optimize CPU and memory usage in large meetings: silence-gate local transcription, skip idle ONNX/SileroVAD allocation, vectorize I420->NV12 chroma interleaving, and offload WebRTC stats parsing",
         "Deactivate muted Opus encoding and bypass VPIO while muted when warm microphone readiness is off, while keeping instant unmute when warm mic is enabled",
