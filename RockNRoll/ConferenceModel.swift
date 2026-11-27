@@ -89,6 +89,7 @@ final class ConferenceModel: ObservableObject {
     @Published var isCreatingInstantRoom = false
     @Published var instantRoomError: String?
     @Published var instantRoomAuthChallengeOrigin: URL?
+    @Published var instantRoomAllowsPoolFallback = false
     @Published var pendingInstantRoomOrigin: URL?
     @Published var instantRoomShortcutRequested = false
     @Published private var joinAwaitingName: JoinDestination?
@@ -465,6 +466,9 @@ final class ConferenceModel: ObservableObject {
 
     var createInstantRoomHandler: @MainActor (URL, MeetingEngineKind?, RoomCreationOptions) async throws -> CreatedMeetingRoom = { origin, engine, options in
         try await MeetingRoomCreator(auth: .shared).createRoom(on: origin, engine: engine, options: options)
+    }
+    var createInstantRoomFromPoolHandler: @MainActor (String) async throws -> CreatedMeetingRoom = { title in
+        try await MeetingRoomCreator(auth: .shared).createRoomFromActivePool(preferredOrigin: nil, title: title)
     }
     var copyInvitationToClipboard: @MainActor (URL) -> Void = { url in
         UIPasteboard.general.url = url
@@ -1277,6 +1281,10 @@ final class ConferenceModel: ObservableObject {
     func join() {
         guard !isLeaving, joinTask == nil, phase != .joining || !nonLeavingSessions.isEmpty else { return }
         pendingAuthChallengeOrigin = nil
+        if let poolLink = RoomPoolLink.parseOptional(invite, joinLinkHost: joinLinkHost) {
+            Task { await startInstantRoomFromPoolLink(poolLink) }
+            return
+        }
         do {
             let target = try destination(for: invite)
             if !nonLeavingSessions.isEmpty || phase != .idle {
@@ -2216,6 +2224,9 @@ final class ConferenceModel: ObservableObject {
         let cleanTitle = created.title.trimmingCharacters(in: .whitespacesAndNewlines)
         let roomTitle = cleanTitle.isEmpty ? nil : cleanTitle
         pendingAuthChallengeOrigin = nil
+        instantRoomError = nil
+        instantRoomAuthChallengeOrigin = nil
+        instantRoomAllowsPoolFallback = false
         invite = created.invitationURL.absoluteString
         rejoinEvidence = (created.invitationURL, created.engine)
         if !nonLeavingSessions.isEmpty || phase != .idle {
@@ -2247,6 +2258,7 @@ final class ConferenceModel: ObservableObject {
         isCreatingInstantRoom = true
         instantRoomError = nil
         instantRoomAuthChallengeOrigin = nil
+        instantRoomAllowsPoolFallback = false
         pendingInstantRoomOrigin = nil
         defer { isCreatingInstantRoom = false }
 
@@ -2276,10 +2288,71 @@ final class ConferenceModel: ObservableObject {
             joinCreatedRoom(created, saveFavorite: false, invitationAlreadyCopied: true)
         } catch {
             UINotificationFeedbackGenerator().notificationOccurred(.error)
+            instantRoomAllowsPoolFallback = RoomCreationError.allowsPoolFallback(error, engine: resolvedEngine)
             if let challengeOrigin = SiteAuthError.challengeOrigin(from: error, attemptedURL: origin, store: .shared) {
                 instantRoomAuthChallengeOrigin = challengeOrigin
                 pendingInstantRoomOrigin = origin
             }
+            instantRoomError = error.localizedDescription
+        }
+    }
+
+    func startInstantRoomFromActivePool() async {
+        guard !isCreatingInstantRoom,
+              !isJoining,
+              !isLeaving,
+              (isCallMinimized || !isInConference) else {
+            return
+        }
+        calendar.cancelAutomaticJoin(suppress: true)
+        isCreatingInstantRoom = true
+        instantRoomError = nil
+        instantRoomAuthChallengeOrigin = nil
+        instantRoomAllowsPoolFallback = false
+        defer { isCreatingInstantRoom = false }
+
+        let title = InstantRoomPreferences.defaultRoomTitle(displayName: displayName)
+        do {
+            let created = try await createInstantRoomFromPoolHandler(title)
+            copyInvitationToClipboard(created.invitationURL)
+            UINotificationFeedbackGenerator().notificationOccurred(.success)
+            joinCreatedRoom(created, saveFavorite: false, invitationAlreadyCopied: true)
+        } catch {
+            UINotificationFeedbackGenerator().notificationOccurred(.error)
+            instantRoomAllowsPoolFallback = RoomCreationError.allowsPoolFallback(error, engine: .guest)
+            instantRoomError = error.localizedDescription
+        }
+    }
+
+    func startInstantRoomFromPoolLink(_ poolLink: RoomPoolLink) async {
+        guard !isCreatingInstantRoom,
+              !isJoining,
+              !isLeaving,
+              (isCallMinimized || !isInConference) else {
+            return
+        }
+        calendar.cancelAutomaticJoin(suppress: true)
+        isCreatingInstantRoom = true
+        instantRoomError = nil
+        instantRoomAuthChallengeOrigin = nil
+        instantRoomAllowsPoolFallback = false
+        status = L("Claiming a room from the coordination pool…")
+        statusIsError = false
+        defer { isCreatingInstantRoom = false }
+
+        do {
+            let poolStatus = try await RoomPoolClient().fetchStatus(link: poolLink)
+            RoomPoolStore.shared.upsertPool(poolLink, status: poolStatus, makeActive: true)
+            let title = InstantRoomPreferences.defaultRoomTitle(displayName: displayName)
+            let created = try await createInstantRoomFromPoolHandler(title)
+            copyInvitationToClipboard(created.invitationURL)
+            UINotificationFeedbackGenerator().notificationOccurred(.success)
+            joinCreatedRoom(created, saveFavorite: false, invitationAlreadyCopied: true)
+        } catch {
+            UINotificationFeedbackGenerator().notificationOccurred(.error)
+            instantRoomAllowsPoolFallback = RoomCreationError.allowsPoolFallback(error, engine: .guest)
+            status = error.localizedDescription
+            statusIsError = true
             instantRoomError = error.localizedDescription
         }
     }

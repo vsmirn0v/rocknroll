@@ -1,0 +1,22 @@
+[Unit]
+Description=Rock room coordination pool service
+After=network.target
+
+[Service]
+Type=simple
+User=rock-pools
+Group=rock-pools
+EnvironmentFile=/opt/rocknroll/room-pools.env
+ExecStart=/usr/bin/python3 /opt/rock-room-pools/service.py
+Restart=on-failure
+RestartSec=2
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/rock-room-pools
+RestrictAddressFamilies=AF_UNIX AF_INET
+
+[Install]
+WantedBy=multi-user.target

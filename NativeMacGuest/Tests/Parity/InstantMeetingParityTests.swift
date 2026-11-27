@@ -163,9 +163,38 @@ final class InstantMeetingParityTests: XCTestCase {
         await workspace.startInstantRoom()
 
         XCTAssertEqual(workspace.instantRoomAuthChallengeOrigin, origin)
+        XCTAssertTrue(workspace.instantRoomAllowsPoolFallback)
         XCTAssertNil(workspace.instantRoomError)
         XCTAssertTrue(workspace.meetings.isEmpty)
         XCTAssertFalse(workspace.isCreatingInstantRoom)
+    }
+
+    func testStartInstantRoomUsesActivePoolWhenNoOriginConfigured() async throws {
+        let defaults = try makeIsolatedDefaults()
+        var copiedTexts: [String] = []
+        let inviteURL = try XCTUnwrap(URL(string: "https://jazz.example.com/calls/pool-1?psw=secret"))
+        let workspace = makeWorkspace(historyURLs: [], defaults: defaults) { copiedTexts.append($0) }
+        addTeardownBlock { _ = await workspace.leave() }
+
+        workspace.instantHasActivePoolProvider = { true }
+        workspace.createInstantRoomFromPoolHandler = { title in
+            CreatedMeetingRoom(
+                origin: URL(string: "https://jazz.example.com")!,
+                engine: .guest,
+                roomID: "pool-1",
+                title: title,
+                invitationURL: inviteURL,
+                destination: try .verified(inviteURL, engine: .guest)
+            )
+        }
+
+        await workspace.startInstantRoom()
+
+        XCTAssertFalse(workspace.showCreateRoomSheetRequested)
+        XCTAssertEqual(copiedTexts, [inviteURL.absoluteString])
+        XCTAssertNil(workspace.instantRoomError)
+        try await spin { workspace.selectedMeeting != nil && !workspace.preparing }
+        XCTAssertEqual(workspace.selectedMeeting?.invitation, inviteURL)
     }
 
     func testStartInstantRoomGenericFailureRecordsError() async throws {

@@ -1,0 +1,159 @@
+.pool-page {
+  padding: 46px 0 96px;
+}
+
+.pool-page h1 {
+  font-size: clamp(46px, 7vw, 92px);
+  line-height: 0.94;
+  letter-spacing: -0.06em;
+  margin: 20px 0 22px;
+  font-weight: 900;
+}
+
+.pool-page h1 em {
+  color: var(--pink);
+  font-style: normal;
+}
+
+.pool-card {
+  margin-top: 28px;
+}
+
+.pool-meta {
+  margin: 18px 0 8px;
+  color: var(--soft);
+}
+
+.pool-origins {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 18px;
+}
+
+.origin-chip {
+  font-size: 12px;
+  padding: 5px 10px;
+  border-radius: 99px;
+  border: 1px solid var(--line);
+  background: #101016;
+  color: var(--ink);
+}
+
+.pool-link-box,
+.claimed-box {
+  background: #101016;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 14px 16px;
+  margin-bottom: 18px;
+  overflow-wrap: anywhere;
+}
+
+.claimed-box {
+  margin-top: 18px;
+  border-color: #44592e;
+}
+
+.claimed-label {
+  margin: 0 0 8px;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--lime);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.pool-link-box code,
+.claimed-box code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 13px;
+  color: var(--ink);
+}
+
+.pool-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.jam-card textarea {
+  display: block;
+  background: #101016;
+  border: 1px solid #53515a;
+  border-radius: 12px;
+  color: var(--ink);
+  width: 100%;
+  padding: 14px;
+  margin-bottom: 18px;
+  font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  resize: vertical;
+}
+
+.jam-card textarea:focus {
+  outline: 2px solid var(--lime);
+  outline-offset: 2px;
+}
+
+.button.danger:hover {
+  border-color: var(--pink);
+  color: var(--pink);
+}
+
+.queued-list {
+  list-style: none;
+  margin: 14px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.queued-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  background: #101016;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 10px 14px;
+}
+
+.queued-item code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+  color: var(--ink);
+}
+
+.queued-remove {
+  flex: none;
+  background: #28272d;
+  color: var(--ink);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 6px 12px;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.queued-remove:hover {
+  border-color: var(--pink);
+  color: var(--pink);
+}
+
+.status.error {
+  color: var(--pink);
+}
+
+.status.ok {
+  color: var(--lime);
+}
+
+@media (max-width: 750px) {
+  .pool-grid {
+    grid-template-columns: 1fr;
+  }
+}

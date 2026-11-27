@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="robots" content="noindex,nofollow">
+  <title>Room Coordination Pool · Rock’n’Roll</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/pools/pool.css">
+</head>
+<body>
+  <header class="wrap top">
+    <a class="wordmark" href="/">Rock<span>’n’</span>Roll<span class="dot">.</span></a>
+    <nav>
+      <a href="/">Home</a>
+      <a href="/jams/test">Test Jam</a>
+      <a href="/pools">New Pool</a>
+    </nav>
+  </header>
+
+  <main class="wrap pool-page">
+    <p class="eyebrow"><span class="live-dot"></span> Room coordination pool</p>
+    <h1>Pre-created <em>room</em> pool.</h1>
+    <p class="lede">Share one coordination link so guests can claim unused meeting rooms one by one without exposing unused links to previews or crawlers.</p>
+
+    <section id="consumer-card" class="jam-card pool-card" hidden>
+      <div class="card-heading">
+        <span id="pool-heading">POOL</span>
+        <span id="pool-badge" class="pill">0 available</span>
+      </div>
+      <p id="pool-meta" class="pool-meta"></p>
+      <div id="pool-origins" class="pool-origins"></div>
+      <div class="pool-link-box">
+        <code id="coord-url-display"></code>
+      </div>
+      <div class="jam-actions">
+        <button id="claim-room-btn" class="button primary" type="button">Claim 1 Room</button>
+        <button id="copy-coord-btn" class="button quiet" type="button">Copy Coordination Link</button>
+      </div>
+      <div id="claimed-box" class="claimed-box" hidden>
+        <p class="claimed-label">Claimed room link (marked as used):</p>
+        <code id="claimed-url"></code>
+        <div class="jam-actions">
+          <button id="copy-claimed-btn" class="button quiet" type="button">Copy Claimed Link</button>
+          <a id="open-claimed-link" class="button quiet" href="#" target="_blank" rel="noopener noreferrer">Open Room</a>
+        </div>
+      </div>
+      <p id="consumer-status" class="status" role="status"></p>
+    </section>
+
+    <section class="jam-card pool-card">
+      <div class="card-heading">
+        <span id="manage-heading">POOL MANAGEMENT</span>
+        <span class="pill">Write password required</span>
+      </div>
+
+      <label for="write-token-input">Write password (X-Pool-Write-Token)</label>
+      <input id="write-token-input" type="password" autocomplete="off" placeholder="Enter server write password">
+
+      <div id="create-pool-section">
+        <div class="pool-grid">
+          <div>
+            <label for="new-pool-id">Custom Pool ID (optional)</label>
+            <input id="new-pool-id" type="text" autocomplete="off" placeholder="e.g. team-sync or 363636">
+          </div>
+          <div>
+            <label for="new-pool-label">Label (optional)</label>
+            <input id="new-pool-label" type="text" autocomplete="off" placeholder="e.g. Design team Jazz rooms">
+          </div>
+        </div>
+        <div class="jam-actions">
+          <button id="create-pool-btn" class="button primary" type="button">Create New Room Pool</button>
+        </div>
+      </div>
+
+      <div id="manage-links-section" hidden>
+        <div class="rule"></div>
+        <label for="bulk-links-input">Add room invitation links (paste one per line or full invite messages)</label>
+        <textarea id="bulk-links-input" rows="5" placeholder="https://jazz.example.com/calls/abc?psw=..."></textarea>
+        <div class="jam-actions">
+          <button id="add-links-btn" class="button primary" type="button">Add Links to Pool</button>
+          <button id="load-links-btn" class="button quiet" type="button">View / Manage Queued Links</button>
+          <button id="clear-links-btn" class="button quiet danger" type="button">Clear All Unused</button>
+        </div>
+
+        <div id="queued-links-wrap" hidden>
+          <div class="rule"></div>
+          <p class="smallprint" id="queued-links-summary"></p>
+          <ul id="queued-links-list" class="queued-list"></ul>
+        </div>
+      </div>
+
+      <p id="manage-status" class="status" role="status"></p>
+    </section>
+  </main>
+
+  <footer class="wrap">
+    <span>Rock’n’Roll Room Coordination</span>
+    <div>
+      <a href="/privacy">Privacy</a>
+      <a href="/support">Support</a>
+    </div>
+  </footer>
+
+  <script src="/pools/pool.js" defer></script>
+</body>
+</html>

@@ -54,6 +54,7 @@ public struct CreateCalendarMeetingSheet: View {
 
     @Environment(\.dismiss) private var dismiss
     @ObservedObject private var store = SiteAccountStore.shared
+    @ObservedObject private var poolStore = RoomPoolStore.shared
 
     @State private var title: String = ""
     @State private var startDate: Date
@@ -76,8 +77,12 @@ public struct CreateCalendarMeetingSheet: View {
     @State private var enableLobby = false
     @State private var saveToFavorites = false
     @State private var signInRequiredOrigin: URL?
+    @State private var allowsPoolFallback = false
+    @State private var isPoolExhaustedError = false
     @State private var signInRequest: SignInRequest?
+    @State private var showRoomPoolSheet = false
     @State private var retryAfterSignIn = false
+    @State private var retryAfterPool = false
     @State private var createdRoom: CreatedMeetingRoom?
     @State private var copiedFeedback = false
 
@@ -142,11 +147,16 @@ public struct CreateCalendarMeetingSheet: View {
         return result
     }
 
+    private var usePoolSource: Bool {
+        sitePickerValue == "__pool__"
+    }
+
     private var useCustomOrigin: Bool {
         sitePickerValue == "__custom__"
     }
 
     private var activeOrigin: URL? {
+        if usePoolSource { return nil }
         if useCustomOrigin {
             return SiteOrigin.normalize(customOriginText)
         }
@@ -211,6 +221,13 @@ public struct CreateCalendarMeetingSheet: View {
                 SiteSignInSheet(initialOrigin: nil, suggestedOrigins: suggestedOrigins) { account in
                     handleSignedIn(account)
                 }
+            }
+        }
+        .sheet(isPresented: $showRoomPoolSheet, onDismiss: {
+            retryAfterPool = false
+        }) {
+            RoomPoolSheet(initialPool: poolStore.activePool) { _ in
+                handlePoolConfigured()
             }
         }
     }
@@ -332,19 +349,40 @@ public struct CreateCalendarMeetingSheet: View {
                         let label = account.map { "\(host) · \($0.displayAccountSummary)" } ?? host
                         Text(label).tag(origin.absoluteString)
                     }
+                    if let pool = poolStore.activePool {
+                        Text(L("Coordination pool · %@", pool.displayTitle)).tag("__pool__")
+                    }
                     Text(L("Another website…")).tag("__custom__")
                 }
                 .disabled(createdRoom != nil)
                 .onChange(of: sitePickerValue) { value in
                     errorMessage = nil
                     signInRequiredOrigin = nil
-                    if value != "__custom__" {
+                    allowsPoolFallback = false
+                    isPoolExhaustedError = false
+                    if value != "__custom__" && value != "__pool__" {
                         selectedEngineOverride = nil
                         UserDefaults.standard.set(value, forKey: Self.lastOriginKey)
                     }
                 }
 
-                if useCustomOrigin {
+                if usePoolSource {
+                    if let pool = poolStore.activePool {
+                        HStack {
+                            let countText = pool.lastKnownAvailable.map { L("%ld available", $0) } ?? L("Ready")
+                            Label("\(pool.displayTitle) · \(countText)", systemImage: "link.badge.plus")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                            Button(L("Manage pool…")) {
+                                retryAfterPool = false
+                                showRoomPoolSheet = true
+                            }
+                            .font(.caption)
+                            .disabled(createdRoom != nil)
+                        }
+                    }
+                } else if useCustomOrigin {
                     TextField("https://meetings.example.com", text: $customOriginText)
                         .disabled(createdRoom != nil)
                         #if os(iOS)
@@ -360,38 +398,40 @@ public struct CreateCalendarMeetingSheet: View {
                     .disabled(createdRoom != nil)
                 }
 
-                if let account = activeAccount {
-                    HStack {
-                        Label(
-                            account.needsReauthentication
-                                ? L("Session expired for %@", account.hostDisplayName)
-                                : L("Signed in as %@", account.displayAccountSummary),
-                            systemImage: account.needsReauthentication ? "exclamationmark.triangle" : "person.crop.circle.badge.checkmark"
-                        )
-                        .font(.caption)
-                        .foregroundStyle(account.needsReauthentication ? .orange : .secondary)
-                        Spacer()
-                        Button(account.needsReauthentication ? L("Sign in…") : L("Switch…")) {
-                            if let origin = activeOrigin {
+                if !usePoolSource {
+                    if let account = activeAccount {
+                        HStack {
+                            Label(
+                                account.needsReauthentication
+                                    ? L("Session expired for %@", account.hostDisplayName)
+                                    : L("Signed in as %@", account.displayAccountSummary),
+                                systemImage: account.needsReauthentication ? "exclamationmark.triangle" : "person.crop.circle.badge.checkmark"
+                            )
+                            .font(.caption)
+                            .foregroundStyle(account.needsReauthentication ? .orange : .secondary)
+                            Spacer()
+                            Button(account.needsReauthentication ? L("Sign in…") : L("Switch…")) {
+                                if let origin = activeOrigin {
+                                    retryAfterSignIn = false
+                                    signInRequest = .origin(origin)
+                                }
+                            }
+                            .font(.caption)
+                            .disabled(createdRoom != nil)
+                        }
+                    } else if let origin = activeOrigin {
+                        HStack {
+                            Text(L("Not signed in on %@", origin.host ?? ""))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                            Button(L("Sign in…")) {
                                 retryAfterSignIn = false
                                 signInRequest = .origin(origin)
                             }
-                        }
-                        .font(.caption)
-                        .disabled(createdRoom != nil)
-                    }
-                } else if let origin = activeOrigin {
-                    HStack {
-                        Text(L("Not signed in on %@", origin.host ?? ""))
                             .font(.caption)
-                            .foregroundStyle(.secondary)
-                        Spacer()
-                        Button(L("Sign in…")) {
-                            retryAfterSignIn = false
-                            signInRequest = .origin(origin)
+                            .disabled(createdRoom != nil)
                         }
-                        .font(.caption)
-                        .disabled(createdRoom != nil)
                     }
                 }
 
@@ -403,9 +443,20 @@ public struct CreateCalendarMeetingSheet: View {
                 }
                 .disabled(createdRoom != nil)
 
+                Button {
+                    retryAfterPool = false
+                    showRoomPoolSheet = true
+                } label: {
+                    Label(
+                        poolStore.activePool == nil ? L("Use coordination link…") : L("Manage coordination pool…"),
+                        systemImage: "link.badge.plus"
+                    )
+                }
+                .disabled(createdRoom != nil)
+
                 Toggle(L("Allow guests by link"), isOn: $allowGuests)
                     .disabled(createdRoom != nil)
-                if effectiveEngine == .guest && activeAccount?.isSignedIn == true {
+                if !usePoolSource && effectiveEngine == .guest && activeAccount?.isSignedIn == true {
                     Toggle(L("Enable waiting room (lobby)"), isOn: $enableLobby)
                         .disabled(createdRoom != nil)
                 }
@@ -484,14 +535,28 @@ public struct CreateCalendarMeetingSheet: View {
                     Text(errorMessage)
                         .font(.footnote)
                         .foregroundStyle(.red)
-                    if let required = signInRequiredOrigin {
-                        Button {
-                            retryAfterSignIn = true
-                            signInRequest = .origin(required)
-                        } label: {
-                            Label(L("Sign in to %@…", required.host ?? required.absoluteString), systemImage: "person.badge.key")
+                    HStack(spacing: 8) {
+                        if allowsPoolFallback {
+                            Button {
+                                retryAfterPool = true
+                                showRoomPoolSheet = true
+                            } label: {
+                                Label(
+                                    isPoolExhaustedError ? L("Refill / Change Pool…") : L("Use Coordination Link…"),
+                                    systemImage: "link.badge.plus"
+                                )
+                            }
+                            .buttonStyle(.borderedProminent)
                         }
-                        .buttonStyle(.borderedProminent)
+                        if let required = signInRequiredOrigin {
+                            Button {
+                                retryAfterSignIn = true
+                                signInRequest = .origin(required)
+                            } label: {
+                                Label(L("Sign in to %@…", required.host ?? required.absoluteString), systemImage: "person.badge.key")
+                            }
+                            .buttonStyle(.borderedProminent)
+                        }
                     }
                 }
             }
@@ -521,8 +586,13 @@ public struct CreateCalendarMeetingSheet: View {
         if isSaving || calendarPermissionDenied || writableCalendars.isEmpty {
             return true
         }
-        if linkMode == .autoCreateRoom && createdRoom == nil && activeOrigin == nil {
-            return true
+        if linkMode == .autoCreateRoom && createdRoom == nil {
+            if usePoolSource {
+                return poolStore.activePool == nil
+            }
+            if activeOrigin == nil {
+                return true
+            }
         }
         return false
     }
@@ -537,6 +607,8 @@ public struct CreateCalendarMeetingSheet: View {
                 customOriginText = preferred.absoluteString
                 sitePickerValue = "__custom__"
             }
+        } else if poolStore.activePool != nil {
+            sitePickerValue = "__pool__"
         } else {
             sitePickerValue = "__custom__"
             if availableSites.isEmpty {
@@ -574,8 +646,25 @@ public struct CreateCalendarMeetingSheet: View {
         }
         errorMessage = nil
         signInRequiredOrigin = nil
+        allowsPoolFallback = false
+        isPoolExhaustedError = false
         if retryAfterSignIn {
             retryAfterSignIn = false
+            Task { await submit() }
+        }
+    }
+
+    private func handlePoolConfigured() {
+        errorMessage = nil
+        signInRequiredOrigin = nil
+        allowsPoolFallback = false
+        isPoolExhaustedError = false
+        linkMode = .autoCreateRoom
+        if !usePoolSource && activeOrigin == nil {
+            sitePickerValue = "__pool__"
+        }
+        if retryAfterPool {
+            retryAfterPool = false
             Task { await submit() }
         }
     }
@@ -603,6 +692,8 @@ public struct CreateCalendarMeetingSheet: View {
     private func submit() async {
         errorMessage = nil
         signInRequiredOrigin = nil
+        allowsPoolFallback = false
+        isPoolExhaustedError = false
         guard endDate > startDate else {
             errorMessage = CalendarMeetingWriteError.invalidDateRange.localizedDescription
             return
@@ -621,6 +712,24 @@ public struct CreateCalendarMeetingSheet: View {
         if linkMode == .autoCreateRoom {
             if let existing = createdRoom {
                 finalMeetingURL = existing.invitationURL
+            } else if usePoolSource {
+                do {
+                    let room = try await MeetingRoomCreator(auth: .shared).createRoomFromActivePool(
+                        preferredOrigin: nil,
+                        title: chosenTitle
+                    )
+                    SiteAuthClipboard.copy(room.invitationURL.absoluteString)
+                    copiedFeedback = true
+                    createdRoom = room
+                    finalMeetingURL = room.invitationURL
+                } catch {
+                    allowsPoolFallback = RoomCreationError.allowsPoolFallback(error, engine: .guest)
+                    if case .poolExhausted = error as? RoomCreationError {
+                        isPoolExhaustedError = true
+                    }
+                    errorMessage = error.localizedDescription
+                    return
+                }
             } else {
                 guard let origin = activeOrigin else {
                     errorMessage = RoomCreationError.invalidSiteURL.localizedDescription
@@ -644,6 +753,13 @@ public struct CreateCalendarMeetingSheet: View {
                 } catch {
                     if let challengeOrigin = SiteAuthError.challengeOrigin(from: error, attemptedURL: origin, store: store) {
                         signInRequiredOrigin = challengeOrigin
+                    }
+                    allowsPoolFallback = RoomCreationError.allowsPoolFallback(
+                        error,
+                        engine: useCustomOrigin ? selectedEngineOverride : effectiveEngine
+                    )
+                    if case .poolExhausted = error as? RoomCreationError {
+                        isPoolExhaustedError = true
                     }
                     errorMessage = error.localizedDescription
                     return

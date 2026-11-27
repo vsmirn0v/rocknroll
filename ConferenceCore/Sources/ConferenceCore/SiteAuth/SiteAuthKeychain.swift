@@ -6,6 +6,8 @@ public protocol SiteSecretStoring: Sendable {
     @discardableResult func writeSiteSecret(_ payload: SiteSecretPayload?, originKey: String) -> Bool
     func readCertificateBlob(id: UUID) -> StoredPKCS12Blob?
     @discardableResult func writeCertificateBlob(_ blob: StoredPKCS12Blob?, id: UUID) -> Bool
+    func readPoolSecret(poolKey: String) -> StoredRoomPoolSecret?
+    @discardableResult func writePoolSecret(_ secret: StoredRoomPoolSecret?, poolKey: String) -> Bool
 }
 
 /// Data Protection Keychain store for per-site credentials/tokens and imported mTLS PKCS#12 blobs.
@@ -39,6 +41,20 @@ public struct KeychainSiteSecretStore: SiteSecretStoring {
     public func writeCertificateBlob(_ blob: StoredPKCS12Blob?, id: UUID) -> Bool {
         let account = "p12:\(id.uuidString.lowercased())"
         guard let blob, !blob.data.isEmpty, let data = try? JSONEncoder().encode(blob) else {
+            return deleteData(account: account)
+        }
+        return writeData(data, account: account)
+    }
+
+    public func readPoolSecret(poolKey: String) -> StoredRoomPoolSecret? {
+        guard let data = readData(account: "pool:\(poolKey.lowercased())") else { return nil }
+        return try? JSONDecoder().decode(StoredRoomPoolSecret.self, from: data)
+    }
+
+    @discardableResult
+    public func writePoolSecret(_ secret: StoredRoomPoolSecret?, poolKey: String) -> Bool {
+        let account = "pool:\(poolKey.lowercased())"
+        guard let secret, !secret.isEmpty, let data = try? JSONEncoder().encode(secret) else {
             return deleteData(account: account)
         }
         return writeData(data, account: account)
@@ -121,6 +137,7 @@ public final class InMemorySiteSecretStore: SiteSecretStoring, @unchecked Sendab
     private let lock = NSLock()
     private var secrets: [String: SiteSecretPayload] = [:]
     private var certs: [UUID: StoredPKCS12Blob] = [:]
+    private var poolSecrets: [String: StoredRoomPoolSecret] = [:]
 
     public init() {}
 
@@ -153,6 +170,23 @@ public final class InMemorySiteSecretStore: SiteSecretStoring, @unchecked Sendab
             certs[id] = blob
         } else {
             certs.removeValue(forKey: id)
+        }
+        return true
+    }
+
+    public func readPoolSecret(poolKey: String) -> StoredRoomPoolSecret? {
+        lock.lock(); defer { lock.unlock() }
+        return poolSecrets[poolKey.lowercased()]
+    }
+
+    @discardableResult
+    public func writePoolSecret(_ secret: StoredRoomPoolSecret?, poolKey: String) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        let key = poolKey.lowercased()
+        if let secret, !secret.isEmpty {
+            poolSecrets[key] = secret
+        } else {
+            poolSecrets.removeValue(forKey: key)
         }
         return true
     }

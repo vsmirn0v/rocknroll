@@ -41,6 +41,9 @@ public struct CreatedMeetingRoom: Equatable, Sendable {
 public enum RoomCreationError: LocalizedError, Equatable {
     case invalidSiteURL
     case signInRequired(origin: URL, engine: MeetingEngineKind)
+    case poolNotConfigured
+    case poolExhausted(origin: URL?, poolID: String)
+    case poolAuthInvalid(origin: URL?, poolID: String)
     case unsupportedEngine(MeetingEngineKind)
     case requestFailed(Int, String?)
     case invalidResponse
@@ -51,6 +54,12 @@ public enum RoomCreationError: LocalizedError, Equatable {
             return L("Enter a valid HTTPS meeting website address.")
         case .signInRequired(let origin, _):
             return L("Sign in to %@ to create a new room.", origin.host ?? origin.absoluteString)
+        case .poolNotConfigured:
+            return L("Add a room coordination link to create rooms from a pool.")
+        case .poolExhausted(_, let poolID):
+            return L("Pool %@ has no unused rooms left.", poolID)
+        case .poolAuthInvalid(_, let poolID):
+            return L("Pool %@ rejected the coordination link token.", poolID)
         case .unsupportedEngine:
             return L("This meeting service does not support creating rooms from the app.")
         case .requestFailed(let code, let detail):
@@ -62,29 +71,67 @@ public enum RoomCreationError: LocalizedError, Equatable {
             return L("The server returned an unexpected response when creating the room.")
         }
     }
+
+    public static func allowsPoolFallback(_ error: Error, engine: MeetingEngineKind?) -> Bool {
+        if let creation = error as? RoomCreationError {
+            switch creation {
+            case .poolNotConfigured, .poolExhausted, .poolAuthInvalid:
+                return true
+            case .signInRequired(_, let requiredEngine):
+                return requiredEngine == .guest
+            case .requestFailed(let code, _):
+                return engine == .guest && [400, 401, 403, 404, 405, 422].contains(code)
+            default:
+                return false
+            }
+        }
+        if let auth = error as? SiteAuthError {
+            if case .signInRequired(_, let requiredEngine) = auth {
+                return requiredEngine == .guest
+            }
+            return false
+        }
+        if let pool = error as? RoomPoolError {
+            switch pool {
+            case .poolEmpty, .invalidAuthToken, .invalidCoordinationLink:
+                return true
+            default:
+                return false
+            }
+        }
+        return false
+    }
 }
 
 @MainActor
 public final class MeetingRoomCreator {
     private let auth: SiteAuthCoordinator
+    private let poolStore: RoomPoolStore
+    private let poolClient: RoomPoolClient
     private let makeSession: @Sendable (URL) -> URLSession
 
     public init(
         auth: SiteAuthCoordinator? = nil,
+        poolStore: RoomPoolStore? = nil,
+        poolClient: RoomPoolClient? = nil,
         makeSession: (@Sendable (URL) -> URLSession)? = nil
     ) {
         let resolvedAuth = auth ?? .shared
         self.auth = resolvedAuth
+        self.poolStore = poolStore ?? .shared
         let registry = resolvedAuth.store.registry
-        self.makeSession = makeSession ?? { origin in
+        let resolvedMakeSession: @Sendable (URL) -> URLSession = makeSession ?? { origin in
             SiteTLSDelegate.makeEphemeralSession(preferredOrigin: origin, lookup: registry, timeout: 15, allowsCookies: false)
         }
+        self.makeSession = resolvedMakeSession
+        self.poolClient = poolClient ?? RoomPoolClient(makeSession: resolvedMakeSession)
     }
 
     public func createRoom(
         on rawOrigin: URL,
         engine explicitEngine: MeetingEngineKind? = nil,
-        options: RoomCreationOptions
+        options: RoomCreationOptions,
+        allowPoolFallback: Bool = true
     ) async throws -> CreatedMeetingRoom {
         guard let origin = SiteOrigin.canonicalOrigin(for: rawOrigin) else {
             throw RoomCreationError.invalidSiteURL
@@ -105,7 +152,7 @@ public final class MeetingRoomCreator {
 
         switch resolvedEngine {
         case .guest:
-            return try await createGuestRoom(origin: origin, title: effectiveTitle, options: options)
+            return try await createGuestRoom(origin: origin, title: effectiveTitle, options: options, allowPoolFallback: allowPoolFallback)
         case .trueconf:
             return try await createTrueConfRoom(origin: origin, title: effectiveTitle, options: options)
         case .telemost:
@@ -115,12 +162,29 @@ public final class MeetingRoomCreator {
         }
     }
 
+    public func createRoomFromActivePool(
+        preferredOrigin: URL? = nil,
+        title: String
+    ) async throws -> CreatedMeetingRoom {
+        let cleanTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let effectiveTitle = cleanTitle.isEmpty ? L("New meeting") : String(cleanTitle.prefix(120))
+        guard let poolLink = poolStore.activePoolLink() else {
+            throw RoomCreationError.poolNotConfigured
+        }
+        return try await claimAndVerifyGuestRoom(
+            poolLink: poolLink,
+            preferredOrigin: preferredOrigin.flatMap { SiteOrigin.canonicalOrigin(for: $0) },
+            title: effectiveTitle
+        )
+    }
+
     // MARK: - Guest (SaluteJazz / SberJazz)
 
     private func createGuestRoom(
         origin: URL,
         title: String,
-        options: RoomCreationOptions
+        options: RoomCreationOptions,
+        allowPoolFallback: Bool
     ) async throws -> CreatedMeetingRoom {
         let session = makeSession(origin)
         defer { session.finishTasksAndInvalidate() }
@@ -128,6 +192,13 @@ public final class MeetingRoomCreator {
 
         var creds = await auth.validCredentials(for: origin, engine: .guest)
         var didRefresh = false
+
+        if allowPoolFallback,
+           creds == nil,
+           poolStore.isAnonymousCreationDisabled(for: origin),
+           let poolLink = poolStore.activePoolLink() {
+            return try await claimAndVerifyGuestRoom(poolLink: poolLink, preferredOrigin: origin, title: title)
+        }
 
         while true {
             let headers = creds?.httpHeaders(for: origin, engine: .guest) ?? ["X-Jazz-Token": ""]
@@ -155,6 +226,9 @@ public final class MeetingRoomCreator {
                         headers: headers
                     )
                 }
+                if activeType == "ANONYMOUS" {
+                    poolStore.clearAnonymousCreationDisabled(for: origin)
+                }
                 probeLog("room-create", [
                     "engine": "guest",
                     "roomType": activeType,
@@ -163,21 +237,30 @@ public final class MeetingRoomCreator {
                     "outcome": activeType == primaryType ? "ok" : "ok-fallback"
                 ])
                 return try makeGuestCreatedRoom(origin: origin, title: title, invitation: invitation)
-            } catch GuestBootstrapError.httpStatus(let code) where code == 401 || code == 403 {
+            } catch GuestBootstrapError.httpStatus(let code) where [400, 401, 403, 404, 405, 422].contains(code) {
                 probeLog("room-create", [
                     "engine": "guest",
                     "roomType": activeType,
                     "hasToken": creds != nil,
                     "didRefresh": didRefresh,
                     "httpStatus": code,
-                    "outcome": "auth-rejected"
+                    "outcome": "auth-or-anon-rejected"
                 ])
-                if creds != nil && !didRefresh {
+                if creds != nil && !didRefresh && (code == 401 || code == 403) {
                     didRefresh = true
                     creds = await auth.validCredentials(for: origin, engine: .guest, forceRefresh: true)
                     if creds != nil { continue }
                 }
-                throw RoomCreationError.signInRequired(origin: origin, engine: .guest)
+                if creds == nil {
+                    poolStore.markAnonymousCreationDisabled(for: origin)
+                    if allowPoolFallback, let poolLink = poolStore.activePoolLink() {
+                        return try await claimAndVerifyGuestRoom(poolLink: poolLink, preferredOrigin: origin, title: title)
+                    }
+                }
+                if code == 401 || code == 403 || creds == nil {
+                    throw RoomCreationError.signInRequired(origin: origin, engine: .guest)
+                }
+                throw RoomCreationError.requestFailed(code, nil)
             } catch GuestBootstrapError.httpStatus(let code) {
                 probeLog("room-create", [
                     "engine": "guest",
@@ -200,6 +283,62 @@ public final class MeetingRoomCreator {
                 throw error
             }
         }
+    }
+
+    private func claimAndVerifyGuestRoom(
+        poolLink: RoomPoolLink,
+        preferredOrigin: URL?,
+        title: String
+    ) async throws -> CreatedMeetingRoom {
+        for attempt in 0..<2 {
+            let claimed: ClaimedPoolRoom
+            do {
+                claimed = try await poolClient.claimRoom(
+                    link: poolLink,
+                    preferredOrigin: preferredOrigin,
+                    requestID: UUID().uuidString
+                )
+            } catch RoomPoolError.poolEmpty(let poolID) {
+                poolStore.updateCounts(poolKey: poolLink.poolKey, availableCount: 0)
+                throw RoomCreationError.poolExhausted(origin: preferredOrigin, poolID: poolID.isEmpty ? poolLink.poolID : poolID)
+            } catch RoomPoolError.invalidAuthToken(let poolID) {
+                throw RoomCreationError.poolAuthInvalid(origin: preferredOrigin, poolID: poolID.isEmpty ? poolLink.poolID : poolID)
+            }
+            poolStore.updateCounts(poolKey: poolLink.poolKey, availableCount: claimed.remainingCount)
+
+            let target = try JoinTarget.parse(claimed.roomURL.absoluteString)
+            if let invitation = try? GuestInvitation.parse(claimed.roomURL) {
+                let verifySession = makeSession(invitation.origin)
+                defer { verifySession.finishTasksAndInvalidate() }
+                let verifyBootstrap = GuestBootstrap(session: verifySession, useBoundedHTTP: true)
+                do {
+                    _ = try await verifyBootstrap.prepare(invitation, participantName: "Check")
+                } catch GuestBootstrapError.httpStatus(let status) where status == 404 || status == 410 {
+                    if attempt == 0 {
+                        probeLog("room-pool-claim", ["poolId": poolLink.poolID, "status": status, "outcome": "retry-dead-room"])
+                        continue
+                    }
+                    throw RoomCreationError.requestFailed(status, L("The room from the coordination pool is no longer active."))
+                } catch {
+                    // Transport, TLS, or mTLS challenges should not burn another room link from the pool.
+                }
+            }
+
+            probeLog("room-pool-claim", [
+                "poolId": poolLink.poolID,
+                "remainingCount": claimed.remainingCount,
+                "outcome": "ok"
+            ])
+            return CreatedMeetingRoom(
+                origin: target.originURL,
+                engine: .guest,
+                roomID: target.roomID,
+                title: title,
+                invitationURL: target.invitationURL,
+                destination: .guest(target)
+            )
+        }
+        throw RoomCreationError.poolExhausted(origin: preferredOrigin, poolID: poolLink.poolID)
     }
 
     private func makeGuestCreatedRoom(origin: URL, title: String, invitation: GuestInvitation) throws -> CreatedMeetingRoom {

@@ -18,7 +18,66 @@ public struct SiteAccountsSettingsSections: View {
 
     public var body: some View {
         SiteAccountsSection(suggestedOrigins: suggestedOrigins, onCreateRoom: onCreateRoom)
+        RoomPoolSettingsSection()
         SiteCertificatesSection()
+    }
+}
+
+public struct RoomPoolSettingsSection: View {
+    @ObservedObject private var poolStore = RoomPoolStore.shared
+    @State private var showingPoolSheet = false
+    @State private var copiedFeedback = false
+
+    public init() {}
+
+    public var body: some View {
+        Section {
+            if let active = poolStore.activePool {
+                HStack(spacing: 10) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(active.displayTitle)
+                            .font(.subheadline.weight(.semibold))
+                        let countText = active.lastKnownAvailable.map { L("%ld available", $0) } ?? L("Ready")
+                        Text("\(active.serviceOrigin) · \(countText)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    if let link = poolStore.link(for: active) {
+                        Button(copiedFeedback ? L("Copied") : L("Copy Link")) {
+                            SiteAuthClipboard.copy(link.canonicalURL.absoluteString)
+                            copiedFeedback = true
+                        }
+                        .font(.caption)
+                    }
+                }
+            } else {
+                Text(L("No room coordination pool configured. Add a coordination link to claim pre-created rooms when anonymous creation is unavailable."))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Button {
+                showingPoolSheet = true
+            } label: {
+                Label(
+                    poolStore.activePool == nil ? L("Add coordination link…") : L("Manage room pool & links…"),
+                    systemImage: "link.badge.plus"
+                )
+            }
+            .accessibilityIdentifier("settings.room-pool.manage")
+        } header: {
+            Text(L("Room coordination pools"))
+        } footer: {
+            Text(L("Coordination link secrets and write passwords are stored only in your device Keychain."))
+                .font(.caption)
+        }
+        .background(
+            Color.clear
+                .sheet(isPresented: $showingPoolSheet) {
+                    RoomPoolSheet(initialPool: poolStore.activePool)
+                }
+        )
     }
 }
 
@@ -407,6 +466,8 @@ public struct ManageWebsitesSheet: View {
                 Text(L("Signed-in websites and remembered servers stay listed here even after recent room links expire."))
                     .font(.caption)
             }
+
+            RoomPoolSettingsSection()
         }
     }
 

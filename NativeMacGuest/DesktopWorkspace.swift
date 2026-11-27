@@ -108,14 +108,17 @@ import UserNotifications
     @Published var isCreatingInstantRoom = false { didSet { refreshMenu() } }
     @Published var instantRoomError: String?
     @Published var instantRoomAuthChallengeOrigin: URL?
+    @Published var instantRoomAllowsPoolFallback = false
     @Published var pendingInstantRoomOrigin: URL?
     @Published var instantRoomPreferredOrigin: URL? { didSet { refreshMenu() } }
     @Published var showCreateRoomSheetRequested = false
+    @Published var showRoomPoolSheetRequested = false
 
     var instantRoomPreferencesDefaults: UserDefaults = .standard
     var instantRoomAccountsProvider: @MainActor () -> [SiteAccountRecord] = { SiteAccountStore.shared.accounts }
     var instantRoomRememberedOriginsProvider: @MainActor () -> [URL] = { SiteAccountStore.shared.rememberedOrigins }
     var instantRoomDismissedOriginsProvider: @MainActor () -> Set<String> = { SiteAccountStore.shared.dismissedOriginKeys }
+    var instantHasActivePoolProvider: @MainActor () -> Bool = { RoomPoolStore.shared.activePool != nil }
     var rememberInstantOriginHandler: @MainActor (URL, MeetingEngineKind?, Bool) -> Void = { origin, engine, restore in
         SiteAccountStore.shared.rememberOrigin(origin, engine: engine, forceRestoreIfDismissed: restore)
     }
@@ -123,6 +126,7 @@ import UserNotifications
         SiteAccountStore.shared.forgetSite(origin: origin)
     }
     var createInstantRoomHandler: (@MainActor (URL, MeetingEngineKind?) async throws -> CreatedMeetingRoom)?
+    var createInstantRoomFromPoolHandler: (@MainActor (String) async throws -> CreatedMeetingRoom)?
     var copyInvitationToClipboard: (@MainActor (String) -> Void) = { text in
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
@@ -632,8 +636,46 @@ import UserNotifications
     func windowDidExitFullScreen(_ notification: Notification) { mainHider.didExit() }
     func windowDidFailToExitFullScreen(_ window: NSWindow) { mainHider.failExit() }
     func joinInput() {
+        if let poolLink = RoomPoolLink.parseOptional(invitation) {
+            Task { await startInstantRoomFromPoolLink(poolLink) }
+            return
+        }
         do { let destination = try library.normalizedDestination(invitation); join(destination.invitationURL) }
         catch { self.error = error.localizedDescription }
+    }
+
+    func startInstantRoomFromPoolLink(_ poolLink: RoomPoolLink) async {
+        guard !isCreatingInstantRoom else { return }
+        guard mayAdmitMeeting() else {
+            let message = meetingAdmissionError() ?? L("An update is being installed. Please try again after Rock'N'Roll for Mac restarts.")
+            instantRoomError = message
+            error = message
+            return
+        }
+        guard meetings.count < Self.meetingLimit else {
+            let message = L("You can be in up to %d meetings at once.", Self.meetingLimit)
+            instantRoomError = message
+            error = message
+            return
+        }
+        instantRoomError = nil
+        instantRoomAuthChallengeOrigin = nil
+        instantRoomAllowsPoolFallback = false
+        isCreatingInstantRoom = true
+        defer { isCreatingInstantRoom = false }
+
+        do {
+            let status = try await RoomPoolClient().fetchStatus(link: poolLink)
+            RoomPoolStore.shared.upsertPool(poolLink, status: status, makeActive: true)
+            let title = InstantRoomPreferences.defaultRoomTitle(displayName: library.displayName)
+            let created = try await MeetingRoomCreator(auth: .shared).createRoomFromActivePool(preferredOrigin: nil, title: title)
+            copyInvitationToClipboard(created.invitationURL.absoluteString)
+            joinCreatedRoom(created, saveFavorite: false, invitationAlreadyCopied: true)
+        } catch {
+            instantRoomAllowsPoolFallback = RoomCreationError.allowsPoolFallback(error, engine: .guest)
+            instantRoomError = error.localizedDescription
+            self.error = error.localizedDescription
+        }
     }
     func canResumeHistory(_ id: UUID, invitation: URL) -> Bool {
         guard let association = workspaceSync.association(for: id),
@@ -907,6 +949,7 @@ import UserNotifications
         pendingAuthChallenge = nil
         instantRoomError = nil
         instantRoomAuthChallengeOrigin = nil
+        instantRoomAllowsPoolFallback = false
         selectInstantOrigin(created.origin)
         invitation = created.invitationURL.absoluteString
         selection = .home
@@ -978,6 +1021,10 @@ import UserNotifications
 
         let targetOrigin = origin.flatMap { SiteOrigin.canonicalOrigin(for: $0) ?? $0 } ?? preferredInstantOrigin
         guard let targetOrigin else {
+            if instantHasActivePoolProvider() {
+                await startInstantRoomFromActivePool()
+                return
+            }
             show()
             show(section: .home)
             showCreateRoomSheetRequested = true
@@ -987,6 +1034,7 @@ import UserNotifications
         pendingInstantRoomOrigin = targetOrigin
         instantRoomError = nil
         instantRoomAuthChallengeOrigin = nil
+        instantRoomAllowsPoolFallback = false
         isCreatingInstantRoom = true
         defer { isCreatingInstantRoom = false }
 
@@ -1032,6 +1080,7 @@ import UserNotifications
             pendingInstantRoomOrigin = nil
             joinCreatedRoom(created, saveFavorite: false, invitationAlreadyCopied: true)
         } catch {
+            instantRoomAllowsPoolFallback = RoomCreationError.allowsPoolFallback(error, engine: resolvedEngine)
             if let challenge = SiteAuthError.challengeOrigin(from: error, attemptedURL: targetOrigin, store: .shared) {
                 instantRoomAuthChallengeOrigin = challenge
                 show()
@@ -1041,6 +1090,53 @@ import UserNotifications
                 if selection != .home || selectedMeeting != nil {
                     self.error = error.localizedDescription
                 }
+            }
+        }
+    }
+
+    func startInstantRoomFromActivePool() async {
+        guard !isCreatingInstantRoom else { return }
+        guard mayAdmitMeeting() else {
+            let message = meetingAdmissionError() ?? L("An update is being installed. Please try again after Rock'N'Roll for Mac restarts.")
+            instantRoomError = message
+            error = message
+            return
+        }
+        guard meetings.count < Self.meetingLimit else {
+            let message = L("You can be in up to %d meetings at once.", Self.meetingLimit)
+            instantRoomError = message
+            error = message
+            return
+        }
+        instantRoomError = nil
+        instantRoomAuthChallengeOrigin = nil
+        instantRoomAllowsPoolFallback = false
+        isCreatingInstantRoom = true
+        defer { isCreatingInstantRoom = false }
+
+        let title = InstantRoomPreferences.defaultRoomTitle(displayName: library.displayName)
+        do {
+            let created: CreatedMeetingRoom
+            if let handler = createInstantRoomFromPoolHandler {
+                created = try await handler(title)
+            } else {
+                created = try await MeetingRoomCreator(auth: .shared).createRoomFromActivePool(preferredOrigin: nil, title: title)
+            }
+            copyInvitationToClipboard(created.invitationURL.absoluteString)
+            NSAccessibility.post(
+                element: NSApp as Any,
+                notification: .announcementRequested,
+                userInfo: [
+                    .announcement: L("Invitation link copied"),
+                    .priority: NSAccessibilityPriorityLevel.high.rawValue
+                ]
+            )
+            joinCreatedRoom(created, saveFavorite: false, invitationAlreadyCopied: true)
+        } catch {
+            instantRoomAllowsPoolFallback = RoomCreationError.allowsPoolFallback(error, engine: .guest)
+            instantRoomError = error.localizedDescription
+            if selection != .home || selectedMeeting != nil {
+                self.error = error.localizedDescription
             }
         }
     }

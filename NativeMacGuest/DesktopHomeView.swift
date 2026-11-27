@@ -56,6 +56,8 @@ struct NativeDesktopHomeView: View {
     @State private var showMultiJoinSheet = false
     @State private var showingCreateRoom = false
     @State private var showingManageWebsites = false
+    @State private var showingRoomPool = false
+    @State private var retryInstantAfterPool = false
     @State private var createRoomOrigin: URL?
     @State private var signInSheetOrigin: IdentifiableSiteOrigin?
     @State private var retryAfterSignIn: (url: URL, title: String?)?
@@ -69,7 +71,7 @@ struct NativeDesktopHomeView: View {
     private var blocksScheduledJoining: Bool {
         editingName || addingFavorite || editRoom != nil || library.calendar.choosingMeeting != nil ||
         library.calendar.reminders.editing != nil || library.setup.isPresented || showMultiJoinSheet ||
-        showingCreateRoom || showingManageWebsites || signInSheetOrigin != nil
+        showingCreateRoom || showingManageWebsites || showingRoomPool || signInSheetOrigin != nil
     }
     private var suggestedSiteOrigins: [URL] {
         workspace.suggestedSiteOrigins
@@ -330,6 +332,27 @@ struct NativeDesktopHomeView: View {
                 }
             )
         }
+        .sheet(isPresented: $showingRoomPool, onDismiss: {
+            retryInstantAfterPool = false
+        }) {
+            RoomPoolSheet(initialPool: RoomPoolStore.shared.activePool) { _ in
+                let shouldRetry = retryInstantAfterPool
+                retryInstantAfterPool = false
+                if shouldRetry {
+                    let pendingOrigin = workspace.pendingInstantRoomOrigin
+                    workspace.instantRoomAllowsPoolFallback = false
+                    workspace.instantRoomAuthChallengeOrigin = nil
+                    workspace.instantRoomError = nil
+                    Task { await workspace.startInstantRoom(on: pendingOrigin) }
+                }
+            }
+        }
+        .onChange(of: workspace.showRoomPoolSheetRequested) { requested in
+            guard requested else { return }
+            workspace.showRoomPoolSheetRequested = false
+            retryInstantAfterPool = false
+            showingRoomPool = true
+        }
         .sheet(item: $signInSheetOrigin, onDismiss: {
             retryAfterSignIn = nil
             retryInstantOriginAfterSignIn = nil
@@ -402,6 +425,10 @@ struct NativeDesktopHomeView: View {
                     },
                     onManageWebsites: {
                         showingManageWebsites = true
+                    },
+                    onOpenRoomPool: {
+                        retryInstantAfterPool = false
+                        showingRoomPool = true
                     }
                 )
             }
@@ -575,6 +602,10 @@ struct NativeDesktopHomeView: View {
                 },
                 onManageWebsites: {
                     showingManageWebsites = true
+                },
+                onOpenRoomPool: { shouldRetry in
+                    retryInstantAfterPool = shouldRetry
+                    showingRoomPool = true
                 }
             )
             HStack {

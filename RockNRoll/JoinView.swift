@@ -22,6 +22,7 @@ private enum ActiveHomeSheet: Identifiable {
     case createRoom(URL?)
     case signInSite(URL?)
     case manageWebsites
+    case roomPool(retryInstant: Bool)
 
     var id: String {
         switch self {
@@ -35,6 +36,7 @@ private enum ActiveHomeSheet: Identifiable {
         case .createRoom(let url): "createRoom.\(url?.absoluteString ?? "default")"
         case .signInSite(let url): "signInSite.\(url?.absoluteString ?? "default")"
         case .manageWebsites: "manageWebsites"
+        case .roomPool(let retry): "roomPool.\(retry)"
         }
     }
 
@@ -59,6 +61,7 @@ struct JoinView: View {
     @ObservedObject var continuation: MeetingContinuationCoordinator
     @ObservedObject var calendar: CalendarMeetingStore
     @ObservedObject var setup: MeetingSetupCoordinator
+    @ObservedObject private var poolStore = RoomPoolStore.shared
     @Environment(\.openURL) private var openURL
     @State private var setupAfterSettings: Int?
     @FocusState private var nameFocused: Bool
@@ -332,6 +335,7 @@ struct JoinView: View {
                     else if case .devices = activeSheet { calendar.cancelAutomaticJoin(suppress: true) }
                     else if case .createRoom = activeSheet { calendar.cancelAutomaticJoin(suppress: true) }
                     else if case .signInSite = activeSheet { calendar.cancelAutomaticJoin(suppress: true) }
+                    else if case .roomPool = activeSheet { calendar.cancelAutomaticJoin(suppress: true) }
                 }
                 if oldID == "settings" && newID != "settings" {
                     if let generation = setupAfterSettings {
@@ -603,18 +607,35 @@ struct JoinView: View {
                     .fixedSize(horizontal: false, vertical: true)
                     .accessibilityIdentifier("home.instant-room.error")
             }
-            if let challengeOrigin = model.instantRoomAuthChallengeOrigin {
-                Button {
-                    activeSheet = .signInSite(challengeOrigin)
-                } label: {
-                    Label(
-                        L("Sign in to %@…", challengeOrigin.host ?? challengeOrigin.absoluteString),
-                        systemImage: "person.crop.circle.badge.checkmark"
-                    )
+            if model.instantRoomAllowsPoolFallback || model.instantRoomAuthChallengeOrigin != nil {
+                HStack(spacing: 8) {
+                    if model.instantRoomAllowsPoolFallback {
+                        Button {
+                            activeSheet = .roomPool(retryInstant: true)
+                        } label: {
+                            Label(
+                                poolStore.activePool == nil ? L("Use Coordination Link…") : L("Manage Room Pool…"),
+                                systemImage: "link.badge.plus"
+                            )
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .accessibilityIdentifier("home.instant-room.use-pool")
+                    }
+                    if let challengeOrigin = model.instantRoomAuthChallengeOrigin {
+                        Button {
+                            activeSheet = .signInSite(challengeOrigin)
+                        } label: {
+                            Label(
+                                L("Sign in to %@…", challengeOrigin.host ?? challengeOrigin.absoluteString),
+                                systemImage: "person.crop.circle.badge.checkmark"
+                            )
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .accessibilityIdentifier("home.instant-room.signin")
+                    }
                 }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .accessibilityIdentifier("home.instant-room.signin")
             }
             VStack(alignment: .leading, spacing: 4) {
                 row {
@@ -731,7 +752,11 @@ struct JoinView: View {
                             .font(.subheadline.weight(.semibold))
                             .foregroundStyle(.black)
                             .lineLimit(textSize.isAccessibilitySize ? 2 : 1)
-                        Text(origin.flatMap(\.host).map { L("Join & copy link · %@", $0) } ?? L("Choose website & start"))
+                        Text(
+                            origin.flatMap(\.host).map { L("Join & copy link · %@", $0) }
+                                ?? poolStore.activePool.map { L("Join & copy link · Pool %@", $0.poolID) }
+                                ?? L("Choose website & start")
+                        )
                             .font(.caption)
                             .foregroundStyle(Color.black.opacity(0.76))
                             .lineLimit(textSize.isAccessibilitySize ? 2 : 1)
@@ -795,6 +820,11 @@ struct JoinView: View {
                     Label(L("Manage websites & sign in…"), systemImage: "globe")
                 }
                 Button {
+                    activeSheet = .roomPool(retryInstant: false)
+                } label: {
+                    Label(L("Coordination pool…"), systemImage: "link.badge.plus")
+                }
+                Button {
                     activeSheet = .createRoom(origin)
                 } label: {
                     Label(L("New room with options…"), systemImage: "slider.horizontal.3")
@@ -825,6 +855,9 @@ struct JoinView: View {
         if let origin = preferredInstantOrigin {
             UIImpactFeedbackGenerator(style: .medium).impactOccurred()
             Task { await model.startInstantRoom(on: origin) }
+        } else if poolStore.activePool != nil {
+            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+            Task { await model.startInstantRoomFromActivePool() }
         } else {
             activeSheet = .createRoom(nil)
         }
@@ -1219,6 +1252,22 @@ struct JoinView: View {
                     activeSheet = .createRoom(origin)
                 }
             )
+        case .roomPool(let retryInstant):
+            RoomPoolSheet(initialPool: poolStore.activePool) { _ in
+                activeSheet = nil
+                if retryInstant {
+                    let pendingOrigin = model.pendingInstantRoomOrigin ?? preferredInstantOrigin
+                    model.pendingInstantRoomOrigin = nil
+                    model.instantRoomAuthChallengeOrigin = nil
+                    model.instantRoomAllowsPoolFallback = false
+                    model.instantRoomError = nil
+                    if let pendingOrigin {
+                        Task { await model.startInstantRoom(on: pendingOrigin) }
+                    } else {
+                        Task { await model.startInstantRoomFromActivePool() }
+                    }
+                }
+            }
         }
     }
 

@@ -70,6 +70,7 @@ struct NativeDesktopInstantSiteMenuContent: View {
     let onOpenOptions: (URL?) -> Void
     let onSignIn: (URL) -> Void
     let onManageWebsites: () -> Void
+    let onOpenRoomPool: () -> Void
 
     var body: some View {
         let preferred = workspace.preferredInstantOrigin
@@ -107,6 +108,11 @@ struct NativeDesktopInstantSiteMenuContent: View {
             Label(L("Manage websites & sign in…"), systemImage: "globe")
         }
         Button {
+            onOpenRoomPool()
+        } label: {
+            Label(L("Coordination pool…"), systemImage: "link.badge.plus")
+        }
+        Button {
             onOpenOptions(preferred)
         } label: {
             Label(L("New room with options…"), systemImage: "plus.bubble")
@@ -120,8 +126,10 @@ struct NativeDesktopInstantMeetingBar: View {
     let onOpenOptions: (URL?) -> Void
     let onSignIn: (URL) -> Void
     let onManageWebsites: () -> Void
+    let onOpenRoomPool: (Bool) -> Void
 
     @ObservedObject private var accountStore = SiteAccountStore.shared
+    @ObservedObject private var poolStore = RoomPoolStore.shared
 
     private var preferredOrigin: URL? {
         workspace.preferredInstantOrigin
@@ -129,6 +137,16 @@ struct NativeDesktopInstantMeetingBar: View {
 
     private var activeAccount: SiteAccountRecord? {
         preferredOrigin.flatMap { accountStore.account(for: $0) }
+    }
+
+    private var subtitleText: String {
+        if let host = preferredOrigin?.host {
+            return L("Join & copy link · %@", host)
+        }
+        if let pool = poolStore.activePool {
+            return L("Join & copy link · Pool %@", pool.poolID)
+        }
+        return L("Choose website & start")
     }
 
     var body: some View {
@@ -172,10 +190,7 @@ struct NativeDesktopInstantMeetingBar: View {
                             }
 
                             HStack(spacing: 5) {
-                                Text(
-                                    origin.flatMap(\.host).map { L("Join & copy link · %@", $0) }
-                                        ?? L("Choose website & start")
-                                )
+                                Text(subtitleText)
                                 .font(.caption)
                                 .foregroundStyle(Color.black.opacity(0.75))
                                 .lineLimit(1)
@@ -209,7 +224,8 @@ struct NativeDesktopInstantMeetingBar: View {
                         workspace: workspace,
                         onOpenOptions: onOpenOptions,
                         onSignIn: onSignIn,
-                        onManageWebsites: onManageWebsites
+                        onManageWebsites: onManageWebsites,
+                        onOpenRoomPool: { onOpenRoomPool(false) }
                     )
                 } label: {
                     Image(systemName: "chevron.down")
@@ -235,19 +251,37 @@ struct NativeDesktopInstantMeetingBar: View {
             )
             .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
 
-            if let challenge = workspace.instantRoomAuthChallengeOrigin {
-                Button {
-                    onSignIn(challenge)
-                } label: {
-                    Label(
-                        L("Sign in to %@…", challenge.host ?? challenge.absoluteString),
-                        systemImage: "person.crop.circle.badge.checkmark"
-                    )
+            if workspace.instantRoomAuthChallengeOrigin != nil || workspace.instantRoomAllowsPoolFallback {
+                HStack(spacing: 8) {
+                    if workspace.instantRoomAllowsPoolFallback {
+                        Button {
+                            onOpenRoomPool(true)
+                        } label: {
+                            Label(
+                                poolStore.activePool == nil ? L("Use Coordination Link…") : L("Manage Room Pool…"),
+                                systemImage: "link.badge.plus"
+                            )
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .accessibilityIdentifier("nativeGuest.instantRoom.usePool")
+                    }
+                    if let challenge = workspace.instantRoomAuthChallengeOrigin {
+                        Button {
+                            onSignIn(challenge)
+                        } label: {
+                            Label(
+                                L("Sign in to %@…", challenge.host ?? challenge.absoluteString),
+                                systemImage: "person.crop.circle.badge.checkmark"
+                            )
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .accessibilityIdentifier("nativeGuest.instantRoom.signIn")
+                    }
                 }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .accessibilityIdentifier("nativeGuest.instantRoom.signIn")
-            } else if let errorText = workspace.instantRoomError {
+            }
+            if let errorText = workspace.instantRoomError {
                 Label(errorText, systemImage: "exclamationmark.triangle")
                     .font(.caption)
                     .foregroundStyle(.red)
@@ -262,8 +296,10 @@ struct NativeDesktopInstantToolbarControl: View {
     let onOpenOptions: (URL?) -> Void
     let onSignIn: (URL) -> Void
     let onManageWebsites: () -> Void
+    let onOpenRoomPool: () -> Void
 
     @ObservedObject private var accountStore = SiteAccountStore.shared
+    @ObservedObject private var poolStore = RoomPoolStore.shared
 
     var body: some View {
         let origin = workspace.preferredInstantOrigin
@@ -271,7 +307,7 @@ struct NativeDesktopInstantToolbarControl: View {
         let signedIn = account?.isSignedIn == true
         let labelText = workspace.isCreatingInstantRoom
             ? L("Creating room…")
-            : (origin?.host ?? L("Instant meeting"))
+            : (origin?.host ?? poolStore.activePool.map { L("Pool %@", $0.poolID) } ?? L("Instant meeting"))
         let isDisabled = workspace.isCreatingInstantRoom || workspace.joinSettingUp
 
         HStack(spacing: 0) {
@@ -319,7 +355,8 @@ struct NativeDesktopInstantToolbarControl: View {
                     workspace: workspace,
                     onOpenOptions: onOpenOptions,
                     onSignIn: onSignIn,
-                    onManageWebsites: onManageWebsites
+                    onManageWebsites: onManageWebsites,
+                    onOpenRoomPool: onOpenRoomPool
                 )
             } label: {
                 Image(systemName: "chevron.down")

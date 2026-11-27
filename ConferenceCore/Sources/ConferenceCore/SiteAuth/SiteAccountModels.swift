@@ -216,3 +216,17 @@ public struct StoredPKCS12Blob: Codable, Equatable, Sendable {
         self.passphrase = passphrase
     }
 }
+
+public struct StoredRoomPoolSecret: Codable, Equatable, Sendable {
+    public var authToken: String
+    public var writeToken: String?
+
+    public init(authToken: String, writeToken: String? = nil) {
+        self.authToken = authToken
+        self.writeToken = writeToken
+    }
+
+    public var isEmpty: Bool {
+        authToken.isEmpty && (writeToken?.isEmpty ?? true)
+    }
+}
