@@ -55,6 +55,7 @@ public struct SiteSignInSheet: View {
     @State private var capturedClientID: String?
     @State private var lastAutoVerifyURL: String?
     @State private var pendingAutoVerify = false
+    @State private var suppressAutoVerifyUntilLoginNav = false
     @State private var detectTask: Task<Void, Never>?
     @FocusState private var urlFieldFocused: Bool
     @StateObject private var certImport = PKCS12ImportFlow()
@@ -181,6 +182,7 @@ public struct SiteSignInSheet: View {
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
                     .keyboardType(.URL)
+                    .textContentType(.URL)
                     #endif
                     .onSubmit { commitSiteInput() }
 
@@ -374,7 +376,7 @@ public struct SiteSignInSheet: View {
                             clientID: clientID,
                             pageHost: pageHost,
                             origin: origin
-                        ) {
+                        ), !suppressAutoVerifyUntilLoginNav {
                             Task { await verifyWebSession(origin: origin, interactive: false) }
                         }
                     },
@@ -387,14 +389,17 @@ public struct SiteSignInSheet: View {
                             // Clear lastAutoVerifyURL when hopping off-origin to an IdP (e.g. passport.yandex.ru)
                             // so returning to the same site URL triggers auto-verification.
                             lastAutoVerifyURL = nil
+                            suppressAutoVerifyUntilLoginNav = false
                             return
                         }
                         let lowerPath = url.path.lowercased()
                         let looksLikeLoginPage = lowerPath.contains("login") || lowerPath.contains("signin") || lowerPath.contains("sso") || lowerPath.contains("auth") || currentHost.lowercased().hasPrefix("passport.")
                         if looksLikeLoginPage {
                             lastAutoVerifyURL = nil
+                            suppressAutoVerifyUntilLoginNav = false
                             return
                         }
+                        guard !suppressAutoVerifyUntilLoginNav else { return }
                         if lastAutoVerifyURL != url.absoluteString {
                             lastAutoVerifyURL = url.absoluteString
                             await verifyWebSession(origin: origin, interactive: false)
@@ -439,12 +444,19 @@ public struct SiteSignInSheet: View {
                     Section {
                         TextField(L("Username or email"), text: $username)
                             .accessibilityIdentifier("siteAuth.username")
+                            #if os(iOS) || os(macOS)
+                            .textContentType(.username)
+                            #endif
                             #if os(iOS)
                             .textInputAutocapitalization(.never)
                             .autocorrectionDisabled()
+                            .keyboardType(.emailAddress)
                             #endif
                         SecureField(L("Password"), text: $password)
                             .accessibilityIdentifier("siteAuth.password")
+                            #if os(iOS) || os(macOS)
+                            .textContentType(.password)
+                            #endif
                             .onSubmit {
                                 Task { await signInWithPassword(origin: origin) }
                             }
@@ -525,6 +537,7 @@ public struct SiteSignInSheet: View {
     private func loadInitialAccountState() {
         guard let origin = resolvedOrigin else { return }
         if let existing = store.account(for: origin) {
+            suppressAutoVerifyUntilLoginNav = existing.isSignedIn
             selectedEngine = existing.engine
             username = existing.username ?? ""
             if let certID = existing.clientCertificateID, store.certificate(for: certID) != nil {
@@ -569,6 +582,7 @@ public struct SiteSignInSheet: View {
         statusMessage = nil
 
         if let existing = store.account(for: normalized) {
+            suppressAutoVerifyUntilLoginNav = existing.isSignedIn
             selectedEngine = existing.engine
             username = existing.username ?? ""
             if let id = existing.clientCertificateID, store.certificate(for: id) != nil {
@@ -585,6 +599,7 @@ public struct SiteSignInSheet: View {
                 certSelection = .none
             }
         } else {
+            suppressAutoVerifyUntilLoginNav = false
             certSelection = .none
         }
         webViewNonce = UUID()
@@ -906,12 +921,14 @@ private final class SiteAuthWebCoordinator: NSObject, WKNavigationDelegate, WKUI
     }
 }
 
+@MainActor
 private func makeSiteAuthWebView(
     startURL: URL,
+    origin: URL,
     coordinator: SiteAuthWebCoordinator
 ) -> WKWebView {
     let config = WKWebViewConfiguration()
-    config.websiteDataStore = .nonPersistent()
+    config.websiteDataStore = SiteWebDataStore.dataStore(for: origin)
     let script = WKUserScript(source: SiteAuthWebScript.captureSource, injectionTime: .atDocumentStart, forMainFrameOnly: false)
     config.userContentController.addUserScript(script)
     config.userContentController.add(coordinator, name: "siteAuthBridge")
@@ -952,7 +969,7 @@ private struct SiteAuthWebViewContainer: UIViewRepresentable {
 
     func makeUIView(context: Context) -> WKWebView {
         context.coordinator.lastNonce = nonce
-        let webView = makeSiteAuthWebView(startURL: startURL, coordinator: context.coordinator)
+        let webView = makeSiteAuthWebView(startURL: startURL, origin: origin, coordinator: context.coordinator)
         Task { @MainActor in onWebViewReady(webView) }
         return webView
     }
@@ -994,7 +1011,7 @@ private struct SiteAuthWebViewContainer: NSViewRepresentable {
 
     func makeNSView(context: Context) -> WKWebView {
         context.coordinator.lastNonce = nonce
-        let webView = makeSiteAuthWebView(startURL: startURL, coordinator: context.coordinator)
+        let webView = makeSiteAuthWebView(startURL: startURL, origin: origin, coordinator: context.coordinator)
         Task { @MainActor in onWebViewReady(webView) }
         return webView
     }

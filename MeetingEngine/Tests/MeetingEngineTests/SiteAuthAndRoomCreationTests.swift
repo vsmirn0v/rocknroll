@@ -1133,4 +1133,78 @@ final class SiteAuthAndRoomCreationTests: XCTestCase {
         XCTAssertEqual(store.rememberedOrigins, [URL(string: "https://telemost.yandex.ru")!])
         XCTAssertFalse(store.dismissedOriginKeys.contains("https://telemost.yandex.ru"))
     }
+
+    func testSiteWebDataStoreIdentifierDeterminismAndRFC4122Bits() {
+        let canonical = SiteWebDataStore.identifier(for: URL(string: "https://Meet.Corp.RU:443/login?next=/room")!)
+        let bare = SiteWebDataStore.identifier(forOriginKey: "meet.corp.ru")
+        XCTAssertNotNil(canonical)
+        XCTAssertEqual(canonical, bare)
+
+        let bytes = withUnsafeBytes(of: canonical!.uuid) { Array($0) }
+        XCTAssertEqual(bytes[6] & 0xF0, 0x50)
+        XCTAssertEqual(bytes[8] & 0xC0, 0x80)
+
+        // Telemost host aliases collapse to one store identifier.
+        XCTAssertEqual(
+            SiteWebDataStore.identifier(for: URL(string: "https://telemost.360.yandex.ru/j/abc")!),
+            SiteWebDataStore.identifier(for: URL(string: "https://telemost.yandex.ru")!)
+        )
+
+        // Distinct hosts and non-default ports remain isolated.
+        XCTAssertNotEqual(canonical, SiteWebDataStore.identifier(for: URL(string: "https://meet.corp.ru:8443")!))
+        XCTAssertNotEqual(canonical, SiteWebDataStore.identifier(for: URL(string: "https://other.corp.ru")!))
+
+        // Invalid or non-HTTPS origins return nil.
+        XCTAssertNil(SiteWebDataStore.identifier(for: URL(string: "http://meet.corp.ru")!))
+        XCTAssertNil(SiteWebDataStore.identifier(forOriginKey: "not a url"))
+    }
+
+    @MainActor
+    func testSiteAccountStoreClearsWebSessionOnSignOutRemoveAndForget() {
+        let (store, prefs, suite) = makeIsolatedStore()
+        var clearedKeys: [String] = []
+        let trackedStore = SiteAccountStore(
+            preferences: prefs,
+            secretStore: store.secretStore,
+            registry: store.registry,
+            loadSystemIdentities: false,
+            onClearWebSession: { clearedKeys.append($0) }
+        )
+        defer { prefs.removePersistentDomain(forName: suite) }
+
+        let certID = UUID()
+        let mTLSRecord = SiteAccountRecord(
+            originKey: "https://mtls.corp.ru",
+            engine: .guest,
+            authMethod: .webSSO,
+            username: "alice",
+            clientCertificateID: certID
+        )
+        trackedStore.upsertAccount(mTLSRecord, secret: SiteSecretPayload(accessToken: "tok-1"))
+        trackedStore.signOut(originKey: "https://MTLS.CORP.RU/path", keepCertificate: true)
+        XCTAssertEqual(clearedKeys, ["https://mtls.corp.ru"])
+        XCTAssertEqual(trackedStore.account(forOriginKey: "https://mtls.corp.ru")?.authMethod, .mtlsOnly)
+
+        trackedStore.signOut(originKey: "https://mtls.corp.ru", keepCertificate: false)
+        XCTAssertEqual(clearedKeys, ["https://mtls.corp.ru", "https://mtls.corp.ru"])
+        XCTAssertNil(trackedStore.account(forOriginKey: "https://mtls.corp.ru"))
+
+        let webRecord = SiteAccountRecord(
+            originKey: "https://jazz.corp.ru",
+            engine: .guest,
+            authMethod: .webSSO
+        )
+        trackedStore.upsertAccount(webRecord, secret: SiteSecretPayload(accessToken: "tok-2"))
+        trackedStore.removeSite(originKey: "https://JAZZ.CORP.RU:443")
+        XCTAssertEqual(clearedKeys, ["https://mtls.corp.ru", "https://mtls.corp.ru", "https://jazz.corp.ru"])
+
+        trackedStore.upsertAccount(webRecord, secret: SiteSecretPayload(accessToken: "tok-3"))
+        trackedStore.forgetSite(origin: URL(string: "https://jazz.corp.ru/room/1")!)
+        XCTAssertEqual(clearedKeys, [
+            "https://mtls.corp.ru",
+            "https://mtls.corp.ru",
+            "https://jazz.corp.ru",
+            "https://jazz.corp.ru"
+        ])
+    }
 }

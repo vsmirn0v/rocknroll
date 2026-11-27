@@ -20,14 +20,29 @@ public final class SiteAccountStore: ObservableObject {
     public let registry: SiteClientIdentityRegistry
     public var secretStore: any SiteSecretStoring { registry.secretStore }
     private let preferences: UserDefaults
+    private let onClearWebSession: (@MainActor (String) -> Void)?
 
     public init(
         preferences: UserDefaults = .standard,
         secretStore: (any SiteSecretStoring)? = nil,
         registry: SiteClientIdentityRegistry? = nil,
-        loadSystemIdentities: Bool = true
+        loadSystemIdentities: Bool = true,
+        onClearWebSession: (@MainActor (String) -> Void)? = nil
     ) {
         self.preferences = preferences
+        if let onClearWebSession {
+            self.onClearWebSession = onClearWebSession
+        } else if secretStore == nil && registry == nil {
+            #if canImport(WebKit) && (os(iOS) || os(macOS))
+            self.onClearWebSession = { originKey in
+                SiteWebDataStore.scheduleRemoval(forOriginKey: originKey)
+            }
+            #else
+            self.onClearWebSession = nil
+            #endif
+        } else {
+            self.onClearWebSession = nil
+        }
         if let registry {
             self.registry = registry
         } else if let secretStore {
@@ -163,8 +178,12 @@ public final class SiteAccountStore: ObservableObject {
     public func signOut(originKey: String, keepCertificate: Bool = true) {
         let key = SiteOrigin.canonicalKey(normalizing: originKey) ?? originKey.lowercased()
         _ = secretStore.writeSiteSecret(nil, originKey: key)
-        guard var existing = accounts.first(where: { $0.originKey == key }) else { return }
+        guard var existing = accounts.first(where: { $0.originKey == key }) else {
+            onClearWebSession?(key)
+            return
+        }
         if keepCertificate && existing.hasClientCertificate {
+            onClearWebSession?(key)
             existing.authMethod = .mtlsOnly
             existing.username = nil
             existing.userDisplayName = nil
@@ -225,6 +244,7 @@ public final class SiteAccountStore: ObservableObject {
 
     public func removeSite(originKey: String) {
         let key = SiteOrigin.canonicalKey(normalizing: originKey) ?? originKey.lowercased()
+        onClearWebSession?(key)
         if let host = (accounts.first(where: { $0.originKey == key })?.originURL ?? URL(string: key))?.host {
             clearClientCertificateChallenge(host: host)
         }
