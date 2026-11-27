@@ -2,6 +2,18 @@
   "schemaVersion": 1,
   "mac": [
     {
+      "build": 167,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-27",
+      "commit": "5e3a551a",
+      "items": [
+        "Add unified role advisor/observe modes, presets, dominant governance, multi-vault Write-Then-Retract, and retroactive expert opinions",
+        "Add room coordination pool fallback for Jazz/Guest room creation",
+        "Show cumulative update changelog diff and add automated release pipeline"
+      ]
+    },
+    {
       "build": 166,
       "version": "0.3.0",
       "channel": "beta",
@@ -971,6 +983,18 @@
     }
   ],
   "ios": [
+    {
+      "build": 174,
+      "version": "0.2.0",
+      "channel": "beta",
+      "date": "2026-11-27",
+      "commit": "5e3a551a",
+      "items": [
+        "Add unified role advisor/observe modes, presets, dominant governance, multi-vault Write-Then-Retract, and retroactive expert opinions",
+        "Add room coordination pool fallback for Jazz/Guest room creation",
+        "Show cumulative update changelog diff and add automated release pipeline"
+      ]
+    },
     {
       "build": 173,
       "version": "0.2.0",
