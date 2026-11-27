@@ -105,6 +105,9 @@ final class CalendarMeetingStore: ObservableObject {
     private var extraRangeMonthOrder: [String] = []
     private var remoteOccurrences: [SyncedCalendarOccurrence] = []
     private var lastLocalDeviceID: String = ""
+    private var previousLocalInvitations: [String: URL] = [:]
+    private var locallyChangedInviteKeys: Set<String> = []
+    private var seenRemoteInviteVersions: [String: SyncVersion] = [:]
     private let clock: () -> Date
     private let countdownInterval: Duration
     private var observer: NSObjectProtocol?
@@ -275,7 +278,7 @@ final class CalendarMeetingStore: ObservableObject {
         foreground = true; automaticEntry = allowAutomaticJoin
         reminders.foregrounded()
         if (automaticJoinMode == .scheduled || hasPerMeetingAutoJoinCandidate), joiningMeeting != nil { return }
-        refresh()
+        refresh(refreshSources: true)
     }
     func backgrounded() {
         foreground = false; automaticEntry = false
@@ -296,7 +299,7 @@ final class CalendarMeetingStore: ObservableObject {
             self?.notificationTask = nil; self?.refresh()
         }
     }
-    func refresh(requestPermission: Bool = false) {
+    func refresh(requestPermission: Bool = false, refreshSources: Bool = false) {
         guard enabled else { return }
         task?.cancel(); cancelAutomaticJoin(preservingActivity: scheduledTransportPreparing || preparingScheduledMeeting != nil)
         if let meeting = preparingScheduledMeeting { onScheduledActivity(meeting.start.addingTimeInterval(15)) }
@@ -317,6 +320,10 @@ final class CalendarMeetingStore: ObservableObject {
                     onLocalScheduleSnapshot?([], state.bindings, state.suppressed)
                     return
                 }
+                if refreshSources {
+                    await reader.refreshSources()
+                    guard !Task.isCancelled, revision == token else { return }
+                }
                 let snapshot = await reader.read(selected: selected, now: clock(), knownOrigins: knownOrigins(), aliases: aliases())
                 guard !Task.isCancelled, revision == token else { return }
                 calendars = snapshot.calendars
@@ -333,7 +340,16 @@ final class CalendarMeetingStore: ObservableObject {
                 // Deduplicate identical copies without collapsing different events in one room.
                 now = clock()
                 var seen: Set<CalendarCopy> = []
-                localMeetings = resolved.filter { seen.insert(CalendarCopy($0)).inserted }
+                let deduplicated = resolved.filter { seen.insert(CalendarCopy($0)).inserted }
+                for meeting in deduplicated {
+                    guard meeting.hasResolvedInvitation, let inv = meeting.invitation else { continue }
+                    let key = meeting.occurrenceSyncKey
+                    if let prev = previousLocalInvitations[key], prev != inv {
+                        locallyChangedInviteKeys.insert(key)
+                    }
+                    previousLocalInvitations[key] = inv
+                }
+                localMeetings = deduplicated
                 extraRangeMeetings = []
                 loadedMonthKeys.removeAll()
                 rebuildMeetings()
@@ -361,12 +377,57 @@ final class CalendarMeetingStore: ObservableObject {
         }
         hasAppliedRemoteSchedule = true
         lastLocalDeviceID = localDeviceID
+        for occ in occurrences where !occ.isDeleted.value {
+            let remoteKey = occ.occurrenceKey
+            let remoteInvite = occ.boundInvitation?.value ?? occ.invitation
+            let prevVer = seenRemoteInviteVersions[remoteKey]
+            let hasNewerOtherDeviceVer: Bool
+            if let ver = occ.invitationVersion {
+                hasNewerOtherDeviceVer = ver.device != localDeviceID && (prevVer == nil || ver > prevVer!)
+                if prevVer == nil || ver > prevVer! {
+                    seenRemoteInviteVersions[remoteKey] = ver
+                }
+            } else {
+                hasNewerOtherDeviceVer = false
+            }
+            if let localInv = previousLocalInvitations[remoteKey], localInv == remoteInvite {
+                locallyChangedInviteKeys.remove(remoteKey)
+            }
+            if hasNewerOtherDeviceVer {
+                locallyChangedInviteKeys.remove(remoteKey)
+            }
+            for local in localMeetings where local.occurrenceSyncKey != remoteKey &&
+                (occ.semanticFingerprint.matches(local.semanticFingerprint) ||
+                 (!localDeviceID.isEmpty && occ.sourceDevices[localDeviceID] != nil &&
+                  occ.semanticFingerprint.matchesScheduleSlot(local.semanticFingerprint))) {
+                let localKey = local.occurrenceSyncKey
+                if previousLocalInvitations[localKey] == remoteInvite || hasNewerOtherDeviceVer {
+                    locallyChangedInviteKeys.remove(localKey)
+                }
+            }
+        }
         remoteOccurrences = occurrences
         rebuildMeetings()
         reminders.applyRemoteOccurrenceStates(occurrences, to: meetings, localDeviceID: localDeviceID)
         updateReminders()
         scheduleBoundary()
         considerAutomaticJoin()
+    }
+    private func linksMatch(_ links: [URL], invitation: URL, engine: MeetingEngineKind?) -> Bool {
+        let targetIdentity = MeetingRoomIdentity(invitation, engine: engine)
+        let normalizedFallback = invitationNormalizer(invitation) ?? invitation
+        return links.contains { link in
+            let normalizedLink = invitationNormalizer(link) ?? link
+            if normalizedLink == normalizedFallback || link == invitation {
+                return true
+            }
+            if let targetIdentity,
+               let linkIdentity = MeetingRoomIdentity(normalizedLink, engine: engine),
+               linkIdentity == targetIdentity {
+                return true
+            }
+            return false
+        }
     }
     private func rebuildMeetings() {
         let localKeys = Set(localMeetings.map(\.occurrenceSyncKey))
@@ -376,17 +437,68 @@ final class CalendarMeetingStore: ObservableObject {
             remoteOccurrences.map { ($0.occurrenceKey, $0) },
             uniquingKeysWith: { lhs, rhs in lhs.merging(rhs) }
         )
+        var matchedRemoteKeys: Set<String> = []
         let enrichedLocal = localMeetings.map { item -> CalendarMeeting in
             var updated = item
-            let matchedRemote = remoteByKey[item.occurrenceSyncKey]
-                ?? activeRemote.first(where: { $0.semanticFingerprint.matches(item.semanticFingerprint) })
-            let fallbackInvite = (matchedRemote?.engine != nil && matchedRemote?.requiresChoice == false)
+            let directRemote = remoteByKey[item.occurrenceSyncKey].flatMap { $0.isDeleted.value ? nil : $0 }
+            let matchedRemote: SyncedCalendarOccurrence?
+            if let directRemote {
+                matchedRemote = directRemote
+            } else if let fpMatch = activeRemote.first(where: { $0.semanticFingerprint.matches(item.semanticFingerprint) }) {
+                matchedRemote = fpMatch
+            } else if !lastLocalDeviceID.isEmpty {
+                let slotMatches = activeRemote.filter {
+                    !matchedRemoteKeys.contains($0.occurrenceKey) &&
+                        $0.sourceDevices[lastLocalDeviceID] != nil &&
+                        $0.semanticFingerprint.matchesScheduleSlot(item.semanticFingerprint)
+                }
+                matchedRemote = slotMatches.count == 1 ? slotMatches.first : nil
+            } else {
+                matchedRemote = nil
+            }
+            if let matchedRemote {
+                matchedRemoteKeys.insert(matchedRemote.occurrenceKey)
+            }
+            let hasLocalBinding = state.bindings[item.id] != nil || state.bindings[item.seriesID] != nil
+            let remoteBound = matchedRemote?.boundInvitation?.value
+            let remoteFallback = (matchedRemote?.engine != nil && matchedRemote?.requiresChoice == false)
                 ? matchedRemote?.invitation
                 : nil
-            if updated.invitation == nil, let bound = matchedRemote?.boundInvitation?.value ?? fallbackInvite {
-                updated.invitation = bound
-                updated.engine = updated.engine ?? matchedRemote?.engine
-                updated.requiresChoice = false
+            let remoteEndpoint = matchedRemote?.endpoint.flatMap(URL.init(string:))
+
+            if updated.invitation == nil {
+                if let bound = remoteBound {
+                    updated.invitation = bound
+                    updated.engine = updated.engine ?? matchedRemote?.engine
+                    updated.endpoint = updated.endpoint ?? remoteEndpoint
+                    updated.requiresChoice = false
+                } else if let fallback = remoteFallback,
+                          item.links.isEmpty || linksMatch(item.links, invitation: fallback, engine: matchedRemote?.engine) {
+                    updated.invitation = fallback
+                    updated.engine = updated.engine ?? matchedRemote?.engine
+                    updated.endpoint = updated.endpoint ?? remoteEndpoint
+                    updated.requiresChoice = false
+                }
+            } else if !hasLocalBinding {
+                if let remoteBound, remoteBound != updated.invitation {
+                    updated.invitation = remoteBound
+                    updated.engine = matchedRemote?.engine ?? updated.engine
+                    updated.endpoint = remoteEndpoint
+                    updated.requiresChoice = false
+                } else if let matchedRemote,
+                          let remoteInvite = remoteFallback,
+                          let remoteEngine = matchedRemote.engine,
+                          let remoteVersion = matchedRemote.invitationVersion,
+                          remoteVersion.device != lastLocalDeviceID,
+                          remoteInvite != updated.invitation,
+                          !locallyChangedInviteKeys.contains(item.occurrenceSyncKey) {
+                    updated.invitation = remoteInvite
+                    updated.engine = remoteEngine
+                    updated.endpoint = remoteEndpoint
+                    updated.requiresChoice = false
+                } else if updated.endpoint == nil, let remoteEndpoint, remoteFallback == updated.invitation {
+                    updated.endpoint = remoteEndpoint
+                }
             }
             return updated
         }
@@ -394,6 +506,7 @@ final class CalendarMeetingStore: ObservableObject {
         let remoteOnly: [CalendarMeeting] = remoteOccurrences.compactMap { occ in
             let fp = occ.semanticFingerprint
             guard !localKeys.contains(occ.occurrenceKey),
+                  !matchedRemoteKeys.contains(occ.occurrenceKey),
                   !localFingerprints.contains(where: { $0.matches(fp) }),
                   !occ.isDeleted.value,
                   occ.sourceDevices.keys.contains(where: { $0 != lastLocalDeviceID }) || lastLocalDeviceID.isEmpty,

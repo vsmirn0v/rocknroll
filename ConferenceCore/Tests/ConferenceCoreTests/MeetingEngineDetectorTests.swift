@@ -134,4 +134,19 @@ final class MeetingEngineDetectorTests: XCTestCase {
             XCTAssertThrowsError(try JamTarget.parseCompatibleInvitation("https://other.example.test" + path))
         }
     }
+
+    func testGuestProbeFallsBackToServiceSpecificWellKnownEndpoint() async throws {
+        let json = guestJSON
+        Fixture.reset { request in
+            if request.url?.path == "/.well-known/fixture-engine-services.json" {
+                return .init(status: 200, body: json)
+            }
+            return .init(status: 404, body: Data())
+        }
+        let invitation = URL(string: "https://jazz.example.test/calls/demo?psw=secret")!
+        let result = try await detector().detect(invitation)
+        XCTAssertEqual(result, .verified(.guest(endpoint: URL(string: "https://backend.example.test")!)))
+        XCTAssertEqual(Fixture.received.compactMap { $0.url?.path }.filter { $0.hasPrefix("/.well-known/") },
+                       ["/.well-known/s2b-services.json", "/.well-known/fixture-engine-services.json"])
+    }
 }

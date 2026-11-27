@@ -17,11 +17,13 @@ struct CalendarSnapshot: Sendable {
 protocol CalendarReading: Sendable {
     func access() async -> CalendarAccess
     func requestAccess() async throws -> Bool
+    func refreshSources() async
     func read(selected: Set<String>, now: Date, knownOrigins: Set<String>, aliases: [String: URL]) async -> CalendarSnapshot
     func readRange(selected: Set<String>, interval: DateInterval, knownOrigins: Set<String>, aliases: [String: URL]) async -> [CalendarMeeting]
 }
 
 extension CalendarReading {
+    func refreshSources() async {}
     func readRange(selected: Set<String>, interval: DateInterval, knownOrigins: Set<String>, aliases: [String: URL]) async -> [CalendarMeeting] {
         []
     }
@@ -30,6 +32,15 @@ extension CalendarReading {
 /// EventKit objects never leave this actor. Only value snapshots reach the UI.
 actor AppleCalendarReader: CalendarReading {
     private lazy var store = EKEventStore()
+    private var lastSourcesRefresh: Date = .distantPast
+
+    func refreshSources() {
+        guard access() == .allowed else { return }
+        let now = Date()
+        guard now.timeIntervalSince(lastSourcesRefresh) >= 30 else { return }
+        lastSourcesRefresh = now
+        store.refreshSourcesIfNecessary()
+    }
     func access() -> CalendarAccess {
         let status = EKEventStore.authorizationStatus(for: .event)
         if #available(iOS 17, macOS 14, *) {

@@ -150,6 +150,14 @@ public struct CalendarOccurrenceSemanticFingerprint: Equatable, Sendable {
         return roomKeys.isEmpty || other.roomKeys.isEmpty || !roomKeys.isDisjoint(with: other.roomKeys)
     }
 
+    public func matchesScheduleSlot(_ other: Self) -> Bool {
+        allDay == other.allDay &&
+            startMinute == other.startMinute &&
+            endMinute == other.endMinute &&
+            !normalizedTitle.isEmpty &&
+            normalizedTitle == other.normalizedTitle
+    }
+
     private static func canonicalRoomKey(for url: URL) -> String? {
         if let identity = MeetingRoomIdentity(url, engine: nil) {
             return "\(identity.origin)|\(identity.room.lowercased())"

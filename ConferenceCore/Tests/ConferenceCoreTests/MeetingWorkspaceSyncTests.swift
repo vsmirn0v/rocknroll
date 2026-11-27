@@ -1214,4 +1214,103 @@ final class MeetingWorkspaceSyncTests: XCTestCase {
         restored.restoreCloudTranscriptIndex(loadedCursors.state?.cloudTranscriptIndex ?? [:])
         XCTAssertEqual(restored.cloudTranscriptIndex, doc.cloudTranscriptIndex)
     }
+
+    func testCalendarSchedulePropagatesUpdatedRoomLinkWithoutStaleReversion() throws {
+        let now = Date(timeIntervalSince1970: 1_795_070_000)
+        let start = now.addingTimeInterval(1800)
+        let end = now.addingTimeInterval(3600)
+        let oldURL = URL(string: "https://old.example.test/calls/demo123?psw=old")!
+        let newURL = URL(string: "https://new.example.test/calls/demo456?psw=new")!
+
+        func makeMeeting(id: String, series: String, ext: String, url: URL) -> CalendarMeeting {
+            var m = CalendarMeeting(
+                id: id,
+                seriesID: series,
+                calendarID: "cal-1",
+                calendarTitle: "Work",
+                title: "Weekly Demo",
+                start: start,
+                end: end,
+                links: [url],
+                externalSeriesID: ext
+            )
+            m.invitation = url
+            m.engine = .guest
+            return m
+        }
+
+        // 1. Both devices converge on oldURL.
+        var macDoc = CalendarScheduleSyncDocument(device: "mac")
+        var iosDoc = CalendarScheduleSyncDocument(device: "ios")
+        let macOld = makeMeeting(id: "mac-1", series: "mac-s", ext: "a-ext", url: oldURL)
+        let iosOld = makeMeeting(id: "ios-1", series: "ios-s", ext: "z-ext", url: oldURL)
+
+        macDoc.updateLocalMeetings([macOld], bindings: [:], suppressed: [:], reminderStates: [:], now: now)
+        iosDoc.updateLocalMeetings([iosOld], bindings: [:], suppressed: [:], reminderStates: [:], now: now.addingTimeInterval(1))
+        _ = macDoc.merge(iosDoc.records)
+        _ = iosDoc.merge(macDoc.records)
+        macDoc.updateLocalMeetings([macOld], bindings: [:], suppressed: [:], reminderStates: [:], now: now.addingTimeInterval(2))
+        iosDoc.updateLocalMeetings([iosOld], bindings: [:], suppressed: [:], reminderStates: [:], now: now.addingTimeInterval(3))
+        _ = macDoc.merge(iosDoc.records)
+        _ = iosDoc.merge(macDoc.records)
+
+        let convergedKey = macOld.occurrenceSyncKey
+        XCTAssertEqual(macDoc.projectedOccurrences(now: now).map(\.invitation), [oldURL])
+
+        // 2. Mac receives updated calendar link newURL and syncs it with a version bump, dropping oldURL from links.
+        let macNew = makeMeeting(id: "mac-1", series: "mac-s", ext: "a-ext", url: newURL)
+        macDoc.updateLocalMeetings([macNew], bindings: [:], suppressed: [:], reminderStates: [:], now: now.addingTimeInterval(10))
+        let updatedOcc = try XCTUnwrap(macDoc.occurrences[convergedKey])
+        XCTAssertEqual(updatedOcc.invitation, newURL)
+        XCTAssertEqual(updatedOcc.links, [newURL])
+        XCTAssertNotNil(updatedOcc.invitationVersion)
+        XCTAssertEqual(updatedOcc.invitationVersion?.device, "mac")
+
+        // 3. iOS merges Mac's update while iOS's local EventKit still has stale oldURL.
+        _ = iosDoc.merge(macDoc.records)
+        XCTAssertEqual(iosDoc.projectedOccurrences(now: now).map(\.invitation), [newURL])
+
+        iosDoc.updateLocalMeetings([iosOld], bindings: [:], suppressed: [:], reminderStates: [:], now: now.addingTimeInterval(11))
+        let iosOccAfterStaleLocal = try XCTUnwrap(iosDoc.occurrences[convergedKey])
+        XCTAssertEqual(iosOccAfterStaleLocal.invitation, newURL, "Stale local EventKit must not revert Mac's link update")
+        XCTAssertEqual(iosOccAfterStaleLocal.links, [newURL], "Stale local link must not be re-added")
+        XCTAssertEqual(iosDoc.projectedOccurrences(now: now).count, 1, "Cross-account slot match must not duplicate")
+
+        // 4. Steady-state repeats on both devices produce zero counter or record mutations.
+        _ = macDoc.merge(iosDoc.records)
+        let macCounter = macDoc.counter
+        let macRecords = macDoc.records
+        let iosCounter = iosDoc.counter
+        let iosRecords = iosDoc.records
+        macDoc.updateLocalMeetings([macNew], bindings: [:], suppressed: [:], reminderStates: [:], now: now.addingTimeInterval(20))
+        iosDoc.updateLocalMeetings([iosOld], bindings: [:], suppressed: [:], reminderStates: [:], now: now.addingTimeInterval(21))
+        XCTAssertEqual(macDoc.counter, macCounter)
+        XCTAssertEqual(macDoc.records, macRecords)
+        XCTAssertEqual(iosDoc.counter, iosCounter)
+        XCTAssertEqual(iosDoc.records, iosRecords)
+
+        // 5. Legacy replica upgrade (empty lastLocalInvitations + nil invitationVersion) still adopts Mac's newURL.
+        var legacyDoc = CalendarScheduleSyncDocument(device: "mac")
+        let legacyRecord = MeetingScheduleSyncRecord.occurrence(SyncedCalendarOccurrence(
+            occurrenceKey: convergedKey,
+            seriesKey: "a-ext",
+            title: "Weekly Demo",
+            calendarTitle: "Work",
+            start: start,
+            end: end,
+            links: [oldURL],
+            invitation: oldURL,
+            engine: .guest,
+            sourceDevices: ["mac": now, "ios": now],
+            isDeleted: SyncValue(false, version: SyncVersion(counter: 1, device: "ios")),
+            updatedAt: now
+        ))
+        _ = legacyDoc.merge([legacyRecord])
+        let encodedLegacy = try JSONEncoder().encode(legacyDoc)
+        var decodedLegacy = try JSONDecoder().decode(CalendarScheduleSyncDocument.self, from: encodedLegacy)
+        decodedLegacy.updateLocalMeetings([macNew], bindings: [:], suppressed: [:], reminderStates: [:], now: now.addingTimeInterval(30))
+        XCTAssertEqual(decodedLegacy.occurrences[convergedKey]?.invitation, newURL)
+        XCTAssertEqual(decodedLegacy.occurrences[convergedKey]?.links, [newURL])
+        XCTAssertNotNil(decodedLegacy.occurrences[convergedKey]?.invitationVersion)
+    }
 }

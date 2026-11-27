@@ -954,6 +954,7 @@ public struct SyncedCalendarOccurrence: Codable, Equatable, Identifiable, Sendab
     public var engine: MeetingEngineKind?
     public var endpoint: String?
     public var requiresChoice: Bool
+    public var invitationVersion: SyncVersion?
     public var sourceDevices: [String: Date]
     public var boundInvitation: SyncValue<URL?>?
     public var reminderOverride: SyncValue<ReminderOverride?>?
@@ -970,7 +971,7 @@ public struct SyncedCalendarOccurrence: Codable, Equatable, Identifiable, Sendab
     private enum CodingKeys: String, CodingKey {
         case occurrenceKey, seriesKey, title, calendarTitle, start, end
         case originalOccurrenceStart, allDay, tentative, links, invitation
-        case engine, endpoint, requiresChoice, sourceDevices, boundInvitation
+        case engine, endpoint, requiresChoice, invitationVersion, sourceDevices, boundInvitation
         case reminderOverride, skipped, snoozeUntil, snoozeScope
         case attendedDevices, linkedSessionID, isDeleted, updatedAt
     }
@@ -991,6 +992,7 @@ public struct SyncedCalendarOccurrence: Codable, Equatable, Identifiable, Sendab
         try container.encodeIfPresent(engine, forKey: .engine)
         try container.encodeIfPresent(endpoint, forKey: .endpoint)
         try container.encode(requiresChoice, forKey: .requiresChoice)
+        try container.encodeIfPresent(invitationVersion, forKey: .invitationVersion)
         try container.encode(sourceDevices, forKey: .sourceDevices)
         try container.encodeIfPresent(boundInvitation, forKey: .boundInvitation)
         try container.encodeIfPresent(reminderOverride, forKey: .reminderOverride)
@@ -1019,6 +1021,7 @@ public struct SyncedCalendarOccurrence: Codable, Equatable, Identifiable, Sendab
         engine: MeetingEngineKind? = nil,
         endpoint: String? = nil,
         requiresChoice: Bool = false,
+        invitationVersion: SyncVersion? = nil,
         sourceDevices: [String: Date] = [:],
         boundInvitation: SyncValue<URL?>? = nil,
         reminderOverride: SyncValue<ReminderOverride?>? = nil,
@@ -1044,6 +1047,7 @@ public struct SyncedCalendarOccurrence: Codable, Equatable, Identifiable, Sendab
         self.engine = engine
         self.endpoint = endpoint
         self.requiresChoice = requiresChoice
+        self.invitationVersion = invitationVersion
         self.sourceDevices = sourceDevices
         self.boundInvitation = boundInvitation
         self.reminderOverride = reminderOverride
@@ -1058,6 +1062,7 @@ public struct SyncedCalendarOccurrence: Codable, Equatable, Identifiable, Sendab
 
     public var maximumCounter: Int64 {
         [
+            invitationVersion?.counter,
             boundInvitation?.version.counter,
             reminderOverride?.version.counter,
             skipped?.version.counter,
@@ -1086,6 +1091,26 @@ public struct SyncedCalendarOccurrence: Codable, Equatable, Identifiable, Sendab
         let preferOtherMeta = (otherFresh, other.invitation != nil ? 1 : 0) >
             (selfFresh, invitation != nil ? 1 : 0)
         var result = preferOtherMeta ? other : self
+        let preferOtherInvite: Bool
+        switch (invitationVersion, other.invitationVersion) {
+        case (.some(let lhs), .some(let rhs)) where lhs != rhs:
+            preferOtherInvite = rhs > lhs
+        case (.none, .some):
+            preferOtherInvite = true
+        case (.some, .none):
+            preferOtherInvite = false
+        default:
+            preferOtherInvite = preferOtherMeta
+        }
+        if preferOtherInvite != preferOtherMeta {
+            let inviteSource = preferOtherInvite ? other : self
+            result.links = inviteSource.links
+            result.invitation = inviteSource.invitation
+            result.engine = inviteSource.engine
+            result.endpoint = inviteSource.endpoint
+            result.requiresChoice = inviteSource.requiresChoice
+            result.invitationVersion = inviteSource.invitationVersion
+        }
         result.originalOccurrenceStart = result.originalOccurrenceStart ?? (preferOtherMeta ? originalOccurrenceStart : other.originalOccurrenceStart)
         let mergedDeleted = isDeleted.merging(other.isDeleted)
         result.isDeleted = mergedDeleted
@@ -1129,9 +1154,30 @@ public struct SyncedCalendarOccurrence: Codable, Equatable, Identifiable, Sendab
         let selfFresh = sourceDevices.values.max() ?? updatedAt
         let otherFresh = other.sourceDevices.values.max() ?? other.updatedAt
 
-        let selfRank = (isDeleted.value ? 0 : 1, selfResolved, selfAny, selfFresh)
-        let otherRank = (other.isDeleted.value ? 0 : 1, otherResolved, otherAny, otherFresh)
-        let preferOther = otherRank > selfRank || (otherRank == selfRank && other.occurrenceKey < occurrenceKey)
+        let selfBaseRank = (isDeleted.value ? 0 : 1, selfResolved, selfAny)
+        let otherBaseRank = (other.isDeleted.value ? 0 : 1, otherResolved, otherAny)
+        let preferOther: Bool
+        if otherBaseRank != selfBaseRank {
+            preferOther = otherBaseRank > selfBaseRank
+        } else {
+            let versionDecision: Bool? = switch (invitationVersion, other.invitationVersion) {
+            case (.some(let lhs), .some(let rhs)) where lhs != rhs:
+                rhs > lhs
+            case (.none, .some):
+                true
+            case (.some, .none):
+                false
+            default:
+                nil
+            }
+            if let versionDecision {
+                preferOther = versionDecision
+            } else if otherFresh != selfFresh {
+                preferOther = otherFresh > selfFresh
+            } else {
+                preferOther = other.occurrenceKey < occurrenceKey
+            }
+        }
 
         let base = preferOther ? other : self
         let secondary = preferOther ? self : other
@@ -1144,15 +1190,28 @@ public struct SyncedCalendarOccurrence: Codable, Equatable, Identifiable, Sendab
         }
         result.sourceDevices = sources
 
-        var mergedLinks = base.links
-        var seenLinks = Set(base.links)
-        for link in secondary.links where seenLinks.insert(link).inserted {
-            mergedLinks.append(link)
+        let baseHasNewerInvite: Bool = switch (base.invitationVersion, secondary.invitationVersion) {
+        case (.some(let b), .some(let s)):
+            b > s || (base.invitation != secondary.invitation)
+        case (.some, .none):
+            true
+        default:
+            false
         }
-        result.links = mergedLinks
+        if baseHasNewerInvite {
+            result.links = base.links
+        } else {
+            var mergedLinks = base.links
+            var seenLinks = Set(base.links)
+            for link in secondary.links where seenLinks.insert(link).inserted {
+                mergedLinks.append(link)
+            }
+            result.links = mergedLinks
+        }
         result.invitation = base.invitation ?? secondary.invitation
         result.engine = base.engine ?? secondary.engine
         result.endpoint = base.endpoint ?? secondary.endpoint
+        result.invitationVersion = base.invitationVersion ?? secondary.invitationVersion
         result.boundInvitation = mergeOptional(base.boundInvitation, secondary.boundInvitation)
         result.reminderOverride = mergeOptional(base.reminderOverride, secondary.reminderOverride)
         result.skipped = mergeOptional(base.skipped, secondary.skipped)

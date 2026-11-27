@@ -106,15 +106,29 @@ public actor MeetingEngineDetector {
 
     private static func probeGuest(_ target: JoinTarget, serviceName: String,
                                    session: URLSession, timeout: TimeInterval) async -> MeetingEngineEvidence? {
-        var components = URLComponents(url: target.originURL, resolvingAgainstBaseURL: false)!
-        components.path = "/.well-known/s2b-services.json"
-        do {
-            let (data, response) = try await load(components.url!, session: session,
-                                                timeout: timeout, maximumBytes: 65_536)
-            let endpoint = try ConferenceEndpointResolver.endpoint(in: data, response: response,
-                                                       origin: target.originURL, serviceName: serviceName)
-            return .guest(endpoint: endpoint)
-        } catch { return nil }
+        let deadline = Date().addingTimeInterval(timeout)
+        var paths = ["/.well-known/s2b-services.json"]
+        let servicePath = "/.well-known/\(serviceName)-services.json"
+        if serviceName.lowercased() != "s2b", servicePath != paths[0] {
+            paths.append(servicePath)
+        }
+        for path in paths {
+            guard !Task.isCancelled else { return nil }
+            let remaining = deadline.timeIntervalSinceNow
+            guard remaining > 0.05 else { return nil }
+            var components = URLComponents(url: target.originURL, resolvingAgainstBaseURL: false)!
+            components.path = path
+            do {
+                let (data, response) = try await load(components.url!, session: session,
+                                                      timeout: remaining, maximumBytes: 65_536)
+                let endpoint = try ConferenceEndpointResolver.endpoint(in: data, response: response,
+                                                                       origin: target.originURL, serviceName: serviceName)
+                return .guest(endpoint: endpoint)
+            } catch {
+                continue
+            }
+        }
+        return nil
     }
 
     private static func probeTrueConf(_ target: TrueConfTarget?, allowAuthenticated: Bool,

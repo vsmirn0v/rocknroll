@@ -456,6 +456,182 @@ final class CalendarMeetingStoreTests: XCTestCase {
         XCTAssertEqual(store.upcoming.first?.engine, .guest)
         XCTAssertNil(store.countdown)
     }
+
+    func testHomeMeetingCardResolvesRemoteSyncedMeetingsEvenWithoutLocalCalendarSelection() async throws {
+        let now = Date()
+        let url = URL(string: "https://new.example.test/calls/demo?psw=new")!
+        let reader = Reader(events: [])
+        let (store, _) = make(reader)
+        store.setEnabled(false)
+
+        let remoteOcc = SyncedCalendarOccurrence(
+            occurrenceKey: "mac-ext|1",
+            seriesKey: "mac-ext",
+            title: "Weekly Demo",
+            calendarTitle: "Work",
+            start: now.addingTimeInterval(-60),
+            end: now.addingTimeInterval(3600),
+            links: [url],
+            invitation: url,
+            engine: .guest,
+            invitationVersion: SyncVersion(counter: 2, device: "mac"),
+            sourceDevices: ["mac": now],
+            isDeleted: SyncValue(false, version: SyncVersion(counter: 1, device: "mac")),
+            updatedAt: now
+        )
+        store.applyRemoteSchedule([remoteOcc], localDeviceID: "ios")
+        let candidate = try XCTUnwrap(HomeMeetingPolicy.candidates(meetings: store.upcoming, handoffs: [], at: now).first)
+        XCTAssertEqual(HomeMeetingCard.resolvedCalendarMeeting(for: candidate, in: store, at: now)?.invitation, url)
+
+        // Replaced room identity must still be rejected for the frozen card.
+        let replacedURL = URL(string: "https://other.example.test/calls/replaced?psw=two")!
+        let replacedOcc = SyncedCalendarOccurrence(
+            occurrenceKey: "mac-ext|1",
+            seriesKey: "mac-ext",
+            title: "Weekly Demo",
+            calendarTitle: "Work",
+            start: now.addingTimeInterval(-60),
+            end: now.addingTimeInterval(3600),
+            links: [replacedURL],
+            invitation: replacedURL,
+            engine: .guest,
+            invitationVersion: SyncVersion(counter: 3, device: "mac"),
+            sourceDevices: ["mac": now],
+            isDeleted: SyncValue(false, version: SyncVersion(counter: 1, device: "mac")),
+            updatedAt: now
+        )
+        store.applyRemoteSchedule([replacedOcc], localDeviceID: "ios")
+        XCTAssertNil(HomeMeetingCard.resolvedCalendarMeeting(for: candidate, in: store, at: now))
+
+        // Unselected local calendar remains unavailable.
+        let localOnly = CalendarMeeting(
+            id: "local-unselected",
+            seriesID: "s",
+            calendarID: "personal",
+            calendarTitle: "Personal",
+            title: "Private",
+            start: now.addingTimeInterval(-60),
+            end: now.addingTimeInterval(3600),
+            links: [url]
+        )
+        var resolvedLocal = localOnly
+        resolvedLocal.invitation = url
+        resolvedLocal.engine = .guest
+        let localItem = try XCTUnwrap(HomeMeetingPolicy.candidates(meetings: [resolvedLocal], handoffs: [], at: now).first)
+        XCTAssertNil(HomeMeetingCard.resolvedCalendarMeeting(for: localItem, in: store, at: now))
+    }
+
+    func testRebuildMeetingsRejectsStaleFallbackAndAppliesNewerRemoteLinkWithoutDuplicates() async throws {
+        let now = Date()
+        let start = now.addingTimeInterval(-60)
+        let end = now.addingTimeInterval(3600)
+        let oldURL = URL(string: "https://meeting.example.test/calls/old?psw=one")!
+        let newURL = URL(string: "https://meeting.example.test/calls/new?psw=two")!
+        let failingNewURL = URL(string: "https://unsupported.example.test/calls/new?psw=two")!
+        let thirdURL = URL(string: "https://meeting.example.test/calls/third?psw=three")!
+
+        // 1. Local meeting changed to failingNewURL (probing returns unknown): stale remote oldURL must NOT be resurrected.
+        let updatedLocalUnresolved = CalendarMeeting(
+            id: "ev-1",
+            seriesID: "ser-1",
+            calendarID: "work",
+            calendarTitle: "Work",
+            title: "Weekly Demo",
+            start: start,
+            end: end,
+            links: [failingNewURL],
+            externalSeriesID: "ios-ext"
+        )
+        let (storeA, _) = make(Reader(events: [updatedLocalUnresolved]))
+        storeA.foregrounded(allowAutomaticJoin: false); try await ready(storeA)
+        let staleRemote = SyncedCalendarOccurrence(
+            occurrenceKey: updatedLocalUnresolved.occurrenceSyncKey,
+            seriesKey: "ios-ext",
+            title: updatedLocalUnresolved.title,
+            calendarTitle: "Work",
+            start: start,
+            end: end,
+            links: [oldURL],
+            invitation: oldURL,
+            engine: .guest,
+            sourceDevices: ["mac": now],
+            isDeleted: SyncValue(false, version: SyncVersion(counter: 1, device: "mac")),
+            updatedAt: now
+        )
+        storeA.applyRemoteSchedule([staleRemote], localDeviceID: "ios")
+        XCTAssertTrue(storeA.upcoming.isEmpty, "Stale remote oldURL must not override changed local links")
+
+        // When remote matches local link (failingNewURL), verified remote resolution still assists.
+        let matchingRemote = SyncedCalendarOccurrence(
+            occurrenceKey: updatedLocalUnresolved.occurrenceSyncKey,
+            seriesKey: "ios-ext",
+            title: updatedLocalUnresolved.title,
+            calendarTitle: "Work",
+            start: start,
+            end: end,
+            links: [failingNewURL],
+            invitation: failingNewURL,
+            engine: .guest,
+            sourceDevices: ["mac": now],
+            isDeleted: SyncValue(false, version: SyncVersion(counter: 2, device: "mac")),
+            updatedAt: now
+        )
+        storeA.applyRemoteSchedule([matchingRemote], localDeviceID: "ios")
+        XCTAssertEqual(storeA.upcoming.first?.invitation, failingNewURL)
+
+        // 2. Local EventKit still has oldURL, while Mac published newer versioned newURL under converged key.
+        let localOld = CalendarMeeting(
+            id: "ev-2",
+            seriesID: "ser-2",
+            calendarID: "work",
+            calendarTitle: "Work",
+            title: "Weekly Demo",
+            start: start,
+            end: end,
+            links: [oldURL],
+            externalSeriesID: "z-ios-ext"
+        )
+        let reader = Reader(events: [localOld])
+        let (storeB, _) = make(reader)
+        storeB.foregrounded(allowAutomaticJoin: false); try await ready(storeB)
+        XCTAssertEqual(storeB.upcoming.first?.invitation, oldURL)
+
+        let macNewRemote = SyncedCalendarOccurrence(
+            occurrenceKey: "a-mac-ext|" + String(Int64(start.timeIntervalSince1970.rounded())),
+            seriesKey: "a-mac-ext",
+            title: localOld.title,
+            calendarTitle: "Work",
+            start: start,
+            end: end,
+            links: [newURL],
+            invitation: newURL,
+            engine: .guest,
+            invitationVersion: SyncVersion(counter: 4, device: "mac"),
+            sourceDevices: ["mac": now, "ios": now],
+            isDeleted: SyncValue(false, version: SyncVersion(counter: 1, device: "mac")),
+            updatedAt: now
+        )
+        storeB.applyRemoteSchedule([macNewRemote], localDeviceID: "ios")
+        XCTAssertEqual(storeB.upcoming.count, 1, "Converged cross-account update must not spawn a duplicate")
+        XCTAssertEqual(storeB.upcoming.first?.invitation, newURL, "Newer Mac invitationVersion must replace stale local oldURL")
+
+        // 3. Subsequent local edit on iOS to thirdURL must be preserved (not overwritten by Mac's older remote update).
+        let localThird = CalendarMeeting(
+            id: "ev-2",
+            seriesID: "ser-2",
+            calendarID: "work",
+            calendarTitle: "Work",
+            title: "Weekly Demo",
+            start: start,
+            end: end,
+            links: [thirdURL],
+            externalSeriesID: "z-ios-ext"
+        )
+        await reader.setEvents([localThird], delay: .zero)
+        storeB.refresh(); try await ready(storeB)
+        XCTAssertEqual(storeB.upcoming.count, 1)
+        XCTAssertEqual(storeB.upcoming.first?.invitation, thirdURL)
+    }
 }
 
 @MainActor

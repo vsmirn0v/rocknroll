@@ -17,9 +17,17 @@ struct HomeMeetingCard: View {
     private var lines: Int { textSize.isAccessibilitySize ? 2 : 1 }
 
     private var meeting: CalendarMeeting? {
-        guard calendar.enabled, calendar.access == .allowed,
-              let meeting = item.currentCalendar(in: calendar.upcoming),
-              calendar.selected.contains(meeting.calendarID), meeting.end > Date() else { return nil }
+        Self.resolvedCalendarMeeting(for: item, in: calendar)
+    }
+
+    static func resolvedCalendarMeeting(
+        for item: HomeMeeting,
+        in calendar: CalendarMeetingStore,
+        at now: Date = Date()
+    ) -> CalendarMeeting? {
+        guard let meeting = item.currentCalendar(in: calendar.upcoming),
+              meeting.isRemoteSynced || (calendar.enabled && calendar.access == .allowed && calendar.selected.contains(meeting.calendarID)),
+              meeting.end > now else { return nil }
         return meeting
     }
     private var source: ActiveJam? {

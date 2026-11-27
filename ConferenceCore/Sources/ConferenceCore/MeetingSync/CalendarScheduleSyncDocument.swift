@@ -8,9 +8,32 @@ public struct CalendarScheduleSyncDocument: Codable, Equatable, Sendable {
     public let device: String
     public private(set) var counter: Int64 = 0
     public private(set) var occurrences: [String: SyncedCalendarOccurrence] = [:]
+    private var lastLocalInvitations: [String: URL] = [:]
+
+    private enum CodingKeys: String, CodingKey {
+        case device, counter, occurrences, lastLocalInvitations
+    }
 
     public init(device: String = UUID().uuidString) {
         self.device = device
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        device = try c.decode(String.self, forKey: .device)
+        counter = try c.decodeIfPresent(Int64.self, forKey: .counter) ?? 0
+        occurrences = try c.decodeIfPresent([String: SyncedCalendarOccurrence].self, forKey: .occurrences) ?? [:]
+        lastLocalInvitations = try c.decodeIfPresent([String: URL].self, forKey: .lastLocalInvitations) ?? [:]
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(device, forKey: .device)
+        try c.encode(counter, forKey: .counter)
+        try c.encode(occurrences, forKey: .occurrences)
+        if !lastLocalInvitations.isEmpty {
+            try c.encode(lastLocalInvitations, forKey: .lastLocalInvitations)
+        }
     }
 
     public mutating func nextVersion() -> SyncVersion {
@@ -41,6 +64,17 @@ public struct CalendarScheduleSyncDocument: Codable, Equatable, Sendable {
             var candidates = occurrences.values
                 .filter { !$0.isDeleted.value && $0.semanticFingerprint.matches(fp) }
                 .map(\.occurrenceKey)
+            if candidates.isEmpty, (occurrences[localKey] == nil || occurrences[localKey]?.isDeleted.value == true) {
+                let slotMatches = occurrences.values.filter {
+                    !$0.isDeleted.value &&
+                        !seenKeys.contains($0.occurrenceKey) &&
+                        $0.sourceDevices[device] != nil &&
+                        $0.semanticFingerprint.matchesScheduleSlot(fp)
+                }
+                if slotMatches.count == 1, let matched = slotMatches.first {
+                    candidates.append(matched.occurrenceKey)
+                }
+            }
             if !candidates.contains(localKey) {
                 candidates.append(localKey)
             }
@@ -66,6 +100,14 @@ public struct CalendarScheduleSyncDocument: Codable, Equatable, Sendable {
             let isSuppressed = suppressed[meeting.id] != nil || (reminder?.skipped ?? false)
 
             let localInvitation = boundURL ?? meeting.invitation
+            let localResolved = localInvitation != nil && meeting.engine != nil && !meeting.requiresChoice
+            let previousLocalInvitation = lastLocalInvitations[key] ?? (localKey != key ? lastLocalInvitations[localKey] : nil)
+            if let localInvitation, localResolved || boundURL != nil {
+                lastLocalInvitations[key] = localInvitation
+            }
+            if localKey != key {
+                lastLocalInvitations.removeValue(forKey: localKey)
+            }
             let localEndpoint = MeetingRoomIdentity.normalizedEndpoint(meeting.endpoint)
             let hasOtherDevice = existing?.sourceDevices.keys.contains(where: { $0 != device }) ?? false
 
@@ -81,6 +123,7 @@ public struct CalendarScheduleSyncDocument: Codable, Equatable, Sendable {
             let resolvedEngine: MeetingEngineKind?
             let resolvedEndpoint: String?
             let resolvedRequiresChoice: Bool
+            let resolvedInvitationVersion: SyncVersion?
             var metadataChanged = false
 
             if let existing, hasOtherDevice {
@@ -98,35 +141,60 @@ public struct CalendarScheduleSyncDocument: Codable, Equatable, Sendable {
                 resolvedAllDay = meeting.allDay
                 resolvedTentative = meeting.tentative
 
-                var mergedLinks = existing.links
-                var seenLinks = Set(existing.links)
-                for url in meeting.links where seenLinks.insert(url).inserted {
-                    mergedLinks.append(url)
-                }
-                resolvedLinks = mergedLinks
-
                 let existingResolved = existing.invitation != nil && existing.engine != nil && !existing.requiresChoice
-                let localResolved = localInvitation != nil && meeting.engine != nil && !meeting.requiresChoice
-                if boundURL != nil || (!existingResolved && localResolved) || (existing.invitation == nil && localInvitation != nil) {
+                let localChangedFromPrevious = previousLocalInvitation != nil && localInvitation != previousLocalInvitation
+                let legacyUpgradeChange = previousLocalInvitation == nil && existing.invitationVersion == nil && localResolved && localInvitation != existing.invitation
+                let shouldAdoptLocalInvitation = boundURL != nil
+                    || (!existingResolved && localResolved)
+                    || (existing.invitation == nil && localInvitation != nil)
+                    || (localResolved && (localChangedFromPrevious || legacyUpgradeChange))
+
+                if shouldAdoptLocalInvitation {
                     resolvedInvitation = localInvitation ?? existing.invitation
                     resolvedEngine = meeting.engine ?? existing.engine
-                    resolvedEndpoint = localEndpoint ?? existing.endpoint
+                    let sameRoom = resolvedInvitation.flatMap { MeetingRoomIdentity($0, engine: resolvedEngine) }
+                        == existing.invitation.flatMap { MeetingRoomIdentity($0, engine: existing.engine) }
+                    resolvedEndpoint = localEndpoint ?? (sameRoom ? existing.endpoint : nil)
                     resolvedRequiresChoice = (boundURL != nil || localResolved) ? false : meeting.requiresChoice
+                    if sameRoom {
+                        var mergedLinks = existing.links
+                        var seenLinks = Set(existing.links)
+                        for url in meeting.links where seenLinks.insert(url).inserted {
+                            mergedLinks.append(url)
+                        }
+                        resolvedLinks = mergedLinks
+                    } else {
+                        resolvedLinks = meeting.links.isEmpty ? (resolvedInvitation.map { [$0] } ?? []) : meeting.links
+                    }
                 } else {
                     resolvedInvitation = existing.invitation
                     resolvedEngine = existing.engine
-                    resolvedEndpoint = existing.endpoint ?? localEndpoint
+                    resolvedEndpoint = existing.endpoint ?? (existing.invitation == localInvitation ? localEndpoint : nil)
                     resolvedRequiresChoice = existing.requiresChoice
+                    if existingResolved && localInvitation != nil && localInvitation != existing.invitation {
+                        resolvedLinks = existing.links
+                    } else {
+                        var mergedLinks = existing.links
+                        var seenLinks = Set(existing.links)
+                        for url in meeting.links where seenLinks.insert(url).inserted {
+                            mergedLinks.append(url)
+                        }
+                        resolvedLinks = mergedLinks
+                    }
                 }
+
+                let invitationChanged = resolvedInvitation != existing.invitation
+                    || resolvedEngine != existing.engine
+                    || resolvedEndpoint != existing.endpoint
+                    || resolvedRequiresChoice != existing.requiresChoice
+                resolvedInvitationVersion = (shouldAdoptLocalInvitation && invitationChanged) ? nextVersion() : existing.invitationVersion
 
                 metadataChanged = titleChanged
                     || timingChanged
                     || resolvedCalendarTitle != existing.calendarTitle
                     || resolvedLinks != existing.links
-                    || resolvedInvitation != existing.invitation
-                    || resolvedEngine != existing.engine
-                    || resolvedEndpoint != existing.endpoint
-                    || resolvedRequiresChoice != existing.requiresChoice
+                    || invitationChanged
+                    || resolvedInvitationVersion != existing.invitationVersion
             } else {
                 resolvedSeriesKey = existing?.seriesKey ?? (meeting.externalSeriesID ?? meeting.seriesID)
                 resolvedTitle = meeting.title
@@ -142,6 +210,11 @@ public struct CalendarScheduleSyncDocument: Codable, Equatable, Sendable {
                 resolvedRequiresChoice = meeting.requiresChoice
 
                 if let existing {
+                    let invitationChanged = resolvedInvitation != existing.invitation
+                        || resolvedEngine != existing.engine
+                        || resolvedEndpoint != existing.endpoint
+                        || resolvedRequiresChoice != existing.requiresChoice
+                    resolvedInvitationVersion = invitationChanged ? nextVersion() : existing.invitationVersion
                     metadataChanged = resolvedTitle != existing.title
                         || resolvedCalendarTitle != existing.calendarTitle
                         || abs(resolvedStart.timeIntervalSince(existing.start)) >= 1
@@ -149,11 +222,10 @@ public struct CalendarScheduleSyncDocument: Codable, Equatable, Sendable {
                         || resolvedAllDay != existing.allDay
                         || resolvedTentative != existing.tentative
                         || resolvedLinks != existing.links
-                        || resolvedInvitation != existing.invitation
-                        || resolvedEngine != existing.engine
-                        || resolvedEndpoint != existing.endpoint
-                        || resolvedRequiresChoice != existing.requiresChoice
+                        || invitationChanged
+                        || resolvedInvitationVersion != existing.invitationVersion
                 } else {
+                    resolvedInvitationVersion = nil
                     metadataChanged = true
                 }
             }
@@ -245,6 +317,7 @@ public struct CalendarScheduleSyncDocument: Codable, Equatable, Sendable {
                 engine: resolvedEngine,
                 endpoint: resolvedEndpoint,
                 requiresChoice: resolvedRequiresChoice,
+                invitationVersion: resolvedInvitationVersion,
                 sourceDevices: sources,
                 boundInvitation: nextBoundInvitation,
                 reminderOverride: nextReminderOverride,
@@ -341,6 +414,7 @@ public struct CalendarScheduleSyncDocument: Codable, Equatable, Sendable {
             occurrence.boundInvitation = res.value
             if occurrence.invitation != boundInvitation {
                 occurrence.invitation = boundInvitation
+                occurrence.invitationVersion = nextVersion()
                 changed = true
             }
             changed = changed || res.changed
@@ -374,6 +448,7 @@ public struct CalendarScheduleSyncDocument: Codable, Equatable, Sendable {
         let expiredKeys = occurrences.values.filter { $0.end < cutoff }.map(\.occurrenceKey)
         for key in expiredKeys {
             occurrences.removeValue(forKey: key)
+            lastLocalInvitations.removeValue(forKey: key)
         }
         return expiredKeys.map { "cal:" + $0 }
     }
