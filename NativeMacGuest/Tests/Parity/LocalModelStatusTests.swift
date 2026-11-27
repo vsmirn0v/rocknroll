@@ -262,6 +262,70 @@ import XCTest
         XCTAssertEqual(sherpaStatus.speechStatus.computePath.summary, L("CPU"))
     }
 
+    func testSpeechStatusSurfacesOutdatedWarningNoticeForV3AndClearsOnV4() throws {
+        func model(_ id: String, kind: String, config: [String: String]) -> ListenModelCatalog.Model {
+            let names = Set(config.values.map { $0.hasSuffix(".mlpackage") ? $0 + "/Manifest.json" : $0 }).sorted()
+            let files = names.map { ListenModelCatalog.File(name: $0, size: 1024,
+                url: URL(string: "https://example.test/\($0)")!, sha256: String(repeating: "a", count: 64)) }
+            return .init(id: id, role: "listen", title: id, kind: kind, featureDim: 64, languages: ["ru"],
+                         licence: "MIT", source: URL(string: "https://example.test/m")!, files: files, config: config)
+        }
+        let vad = model("silero-vad", kind: "silero_vad", config: ["model": "m.onnx"])
+        let vadFixed = ListenModelCatalog.Model(id: vad.id, role: "vad", title: vad.title, kind: vad.kind,
+                                                featureDim: nil, languages: [], licence: "MIT", source: vad.source,
+                                                files: vad.files, config: vad.config)
+        let v3 = model(ListenModelStore.previousDefaultModel, kind: ListenModelStore.coreMLGigaAMKind,
+                       config: ["encoder": "e.mlpackage", "decoder": "d.onnx", "joint": "j.onnx", "tokens": "t.json"])
+        let v4 = model(ListenModelStore.defaultModel, kind: ListenModelStore.coreMLGigaAMV4Kind,
+                       config: ["encoder": "encoder-1024/stage-00.mlpackage", "runtime": "runtime.json",
+                                "window": "window.f32", "mel": "mel.f32", "head": "e2e.f32"])
+        let listen = listenStore(models: [vadFixed, v4, v3])
+        for item in [vadFixed, v3] {
+            let dir = listen.folder(item)
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            for file in item.files {
+                let u = dir.appendingPathComponent(file.name)
+                try FileManager.default.createDirectory(at: u.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try Data(repeating: 0, count: Int(file.size)).write(to: u)
+            }
+            try item.files.map { "\($0.name) \($0.sha256)" }.joined(separator: "\n")
+                .write(to: dir.appendingPathComponent(".verified"), atomically: true, encoding: .utf8)
+        }
+        listen.refresh()
+        listen.selectedID = v3.id
+        let (_, voice) = try voiceFixtures()
+        let store = statusStore(listen: listen, voice: voice, attention: attentionStore())
+        let v3Model = try XCTUnwrap(listen.recognizerModel())
+        store.refreshForTesting(asr: .init(model: v3Model, phase: .loaded, preparedModel: v3Model))
+
+        XCTAssertEqual(store.speechStatus.readiness, .ready)
+        XCTAssertEqual(store.overallSummary, L("Ready"))
+        XCTAssertTrue(store.accessibilitySummary.contains(L("Outdated")))
+        let notice = try XCTUnwrap(store.speechStatus.upgradeNotice)
+        XCTAssertEqual(notice.targetModelID, ListenModelStore.defaultModel)
+        XCTAssertFalse(notice.targetInstalled)
+        XCTAssertNil(notice.downloadError)
+        listen.setStateForTesting(.failed("network down"), for: v4.id)
+        store.refreshForTesting()
+        XCTAssertEqual(store.speechStatus.upgradeNotice?.downloadError, "network down")
+
+        // Switching to installed v4 clears the warning notice.
+        let v4Dir = listen.folder(v4)
+        try FileManager.default.createDirectory(at: v4Dir, withIntermediateDirectories: true)
+        for file in v4.files {
+            let u = v4Dir.appendingPathComponent(file.name)
+            try FileManager.default.createDirectory(at: u.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data(repeating: 0, count: Int(file.size)).write(to: u)
+        }
+        try v4.files.map { "\($0.name) \($0.sha256)" }.joined(separator: "\n")
+            .write(to: v4Dir.appendingPathComponent(".verified"), atomically: true, encoding: .utf8)
+        listen.refresh()
+        listen.selectedID = v4.id
+        store.refreshForTesting(asr: .init(model: nil, phase: .unloaded, preparedModel: listen.recognizerModel()))
+        XCTAssertNil(store.speechStatus.upgradeNotice)
+        XCTAssertEqual(store.speechStatus.computePath.summary, L("Neural Engine + CPU"))
+    }
+
     // MARK: Voice readiness
 
     func testClonedVoiceReadyOnlyWithSampleAndPreparation() throws {

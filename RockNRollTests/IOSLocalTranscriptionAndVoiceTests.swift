@@ -6,6 +6,8 @@ import CryptoKit
 import Foundation
 import Metal
 import MLXAudioTTS
+import SwiftUI
+import UIKit
 import XCTest
 @testable import MeetingEngine
 @testable import RockNRoll
@@ -1286,6 +1288,73 @@ final class IOSLocalTranscriptionAndVoiceTests: XCTestCase {
             out.append(buf, count: n)
         }
         return out
+    }
+
+    func testListenModelStoreV4Int8DefaultFallbackAndUpgradePrompt() async throws {
+        XCTAssertEqual(IOSListenModelStore.defaultModel, .gigaamV4CoreMLInt8)
+        XCTAssertEqual(IOSListenModelStore.gigaamV4Files.count, 7)
+        for spec in IOSListenModelStore.gigaamV4Files {
+            XCTAssertGreaterThan(spec.byteCount, 0)
+            XCTAssertEqual(spec.sha256Hex.count, 64, spec.relativePath)
+            XCTAssertTrue(spec.sha256Hex.allSatisfy(\.isHexDigit), spec.relativePath)
+        }
+
+        let tempRoot = FileManager.default.temporaryDirectory.appendingPathComponent("ListenV4Test-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: tempRoot) }
+        let suiteName = "IOSListenV4Tests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        // Tampered download is rejected atomically.
+        let store = IOSListenModelStore(
+            modelsDirectory: tempRoot,
+            preferences: defaults,
+            downloader: { _, destination, _ in
+                try Data("tampered".utf8).write(to: destination)
+            }
+        )
+        XCTAssertEqual(store.selectedModel, .gigaamV4CoreMLInt8)
+        XCTAssertEqual(store.effectiveBackend(), .appleSpeech)
+        XCTAssertFalse(store.shouldPresentUpgradePromptOnBoot)
+        store.autoStartLocalTranscription = true
+        XCTAssertTrue(store.shouldPresentUpgradePromptOnBoot)
+        store.selectedModel = .appleSpeech
+        XCTAssertFalse(store.shouldPresentUpgradePromptOnBoot)
+        store.selectedModel = .gigaamV4CoreMLInt8
+        XCTAssertFalse(store.isUsingOutdatedV3Model)
+
+        store.downloadGigaAMV4()
+        for _ in 0..<100 {
+            if case .failed = store.gigaamV4State { break }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        guard case .failed = store.gigaamV4State else {
+            return XCTFail("Expected verification failure for tampered v4 download")
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: store.gigaamV4Directory.path))
+
+        // Existing user with v3 installed keeps v3 without breaking, sees outdated warning and upgrade invitation.
+        for spec in IOSListenModelStore.gigaamFiles {
+            let fileURL = store.gigaamDirectory.appendingPathComponent(spec.relativePath)
+            try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data("v3".utf8).write(to: fileURL)
+        }
+        let existingV3Defaults = try XCTUnwrap(UserDefaults(suiteName: "IOSListenV4ExistingV3.\(UUID().uuidString)"))
+        let existingV3User = IOSListenModelStore(modelsDirectory: tempRoot, preferences: existingV3Defaults)
+        XCTAssertEqual(existingV3User.selectedModel, .gigaamV3CoreML)
+        XCTAssertEqual(existingV3User.effectiveBackend(), .gigaamV3CoreML)
+        XCTAssertTrue(existingV3User.isUsingOutdatedV3Model)
+        XCTAssertTrue(existingV3User.shouldPresentUpgradePromptOnBoot)
+        existingV3User.dismissUpgradePrompt()
+        XCTAssertFalse(existingV3User.shouldPresentUpgradePromptOnBoot)
+
+        // Pause-aware chunking splits > 9.9s audio cleanly inside quiet valley.
+        var samples = [Float](repeating: 0.3, count: 16_000 * 14)
+        for i in (16_000 * 75 / 10)..<(16_000 * 79 / 10) { samples[i] = 0 }
+        let chunks = CoreMLGigaAMV4Recognizer.splitChunksPauseAware(samples)
+        XCTAssertEqual(chunks.count, 2)
+        XCTAssertLessThanOrEqual(chunks[0].count, CoreMLGigaAMV4Recognizer.maxChunkSamples)
     }
 }
 

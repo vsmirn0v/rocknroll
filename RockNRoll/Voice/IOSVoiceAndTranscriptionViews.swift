@@ -174,11 +174,24 @@ struct VoiceReplySheetView: View {
 }
 
 struct TranscriptionAndVoiceSettingsView: View {
+    @Environment(\.colorScheme) private var colorScheme
     @ObservedObject var modelStore: IOSListenModelStore
     @ObservedObject var voiceStore: IOSVoiceStore
     @ObservedObject var voxStore: IOSVoxCPM2Store
     @ObservedObject private var previewPlayer = IOSVoicePreviewPlayer.shared
     var onDone: (() -> Void)?
+
+    private var warningColor: Color {
+        colorScheme == .dark ? .orange : Color(red: 0.72, green: 0.35, blue: 0.0)
+    }
+
+    private var recommendedColor: Color {
+        colorScheme == .dark ? .green : Color(red: 0.08, green: 0.45, blue: 0.16)
+    }
+
+    private var gigaamV4SizeText: String {
+        ByteCountFormatter.string(fromByteCount: IOSListenModelStore.gigaamV4TotalByteCount, countStyle: .file)
+    }
 
     private enum ActivePreviewKind {
         case voiceReply
@@ -195,6 +208,7 @@ struct TranscriptionAndVoiceSettingsView: View {
     @State private var showingEnrollmentSheet = false
     @State private var confirmingDeleteVoxModel = false
     @State private var confirmingDeleteVoxVoice = false
+    @State private var confirmingDeleteGigaAMV4 = false
     @State private var confirmingDeleteGigaAM = false
     @State private var recordPermission = AVAudioApplication.shared.recordPermission
     @State private var speechPermission = SFSpeechRecognizer.authorizationStatus()
@@ -223,11 +237,16 @@ struct TranscriptionAndVoiceSettingsView: View {
                     .font(.footnote)
                     .foregroundStyle(.secondary)
 
+                iosModelStatusRow
+
                 Picker(L("Spoken language"), selection: $modelStore.language) {
                     ForEach(IOSTranscriptionLanguage.allCases) { language in
                         Text(language.title).tag(language)
                     }
                 }
+                Text(L("Applies when using Apple On-Device Speech. GigaAM v4 detects Russian and English automatically (v3 is Russian-only)."))
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
 
                 Toggle(L("Start automatically when joining"), isOn: $modelStore.autoStartLocalTranscription)
             } header: {
@@ -236,15 +255,15 @@ struct TranscriptionAndVoiceSettingsView: View {
                 Text(L("Processes meeting audio in memory on this iPhone without sending audio to external transcription servers."))
             }
 
-            Section(L("GigaAM v3 (Offline CoreML)")) {
-                switch modelStore.gigaamState {
+            Section {
+                switch modelStore.gigaamV4State {
                 case .notInstalled:
                     Button {
-                        modelStore.downloadGigaAM()
+                        modelStore.downloadGigaAMV4()
                     } label: {
-                        Label(L("Download GigaAM v3 (~425 MB)"), systemImage: "arrow.down.circle")
+                        Label(L("Download GigaAM v4 INT8 (%@)", gigaamV4SizeText), systemImage: "arrow.down.circle")
                     }
-                    .accessibilityIdentifier("transcription.download-gigaam")
+                    .accessibilityIdentifier("transcription.download-gigaam-v4")
                 case .downloading(let progress):
                     VStack(alignment: .leading, spacing: 8) {
                         ProgressView(value: progress)
@@ -254,18 +273,26 @@ struct TranscriptionAndVoiceSettingsView: View {
                                 .foregroundStyle(.secondary)
                             Spacer()
                             Button(L("Cancel")) {
-                                modelStore.cancelDownload()
+                                modelStore.cancelV4Download()
                             }
                             .font(.footnote)
                         }
                     }
                 case .installed:
+                    if modelStore.selectedModel != .gigaamV4CoreMLInt8 {
+                        Button {
+                            modelStore.downloadAndSwitchToV4()
+                        } label: {
+                            Label(L("Use GigaAM v4 INT8"), systemImage: "checkmark.circle")
+                        }
+                        .accessibilityIdentifier("transcription.use-gigaam-v4")
+                    }
                     HStack {
                         Label(L("Installed and verified"), systemImage: "checkmark.circle.fill")
-                            .foregroundStyle(.green)
+                            .foregroundStyle(recommendedColor)
                         Spacer()
                         Button(L("Delete"), role: .destructive) {
-                            confirmingDeleteGigaAM = true
+                            confirmingDeleteGigaAMV4 = true
                         }
                     }
                 case .failed(let message):
@@ -274,11 +301,85 @@ struct TranscriptionAndVoiceSettingsView: View {
                             .font(.footnote)
                             .foregroundStyle(.red)
                         Button {
-                            modelStore.downloadGigaAM()
+                            modelStore.downloadGigaAMV4()
                         } label: {
                             Label(L("Try again"), systemImage: "arrow.clockwise")
                         }
                     }
+                }
+            } header: {
+                HStack(spacing: 6) {
+                    Text(L("GigaAM v4 INT8 (CoreML)"))
+                    Text(L("Recommended"))
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(recommendedColor)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 1)
+                        .background(Color.green.opacity(colorScheme == .dark ? 0.20 : 0.16), in: Capsule())
+                        .lineLimit(1)
+                        .fixedSize(horizontal: true, vertical: false)
+                }
+            } footer: {
+                Text(L("~4× faster offline Neural Engine transcription for Russian & English (%@).", gigaamV4SizeText))
+            }
+
+            if modelStore.gigaamState != .notInstalled || modelStore.selectedModel == .gigaamV3CoreML {
+                Section {
+                    switch modelStore.gigaamState {
+                    case .notInstalled:
+                        Button {
+                            modelStore.downloadGigaAM()
+                        } label: {
+                            Label(L("Download GigaAM v3 (~446 MB)"), systemImage: "arrow.down.circle")
+                        }
+                        .accessibilityIdentifier("transcription.download-gigaam")
+                    case .downloading(let progress):
+                        VStack(alignment: .leading, spacing: 8) {
+                            ProgressView(value: progress)
+                            HStack {
+                                Text(L("Downloading… %ld%%", Int((progress * 100).rounded())))
+                                    .font(.footnote)
+                                    .foregroundStyle(.secondary)
+                                Spacer()
+                                Button(L("Cancel")) {
+                                    modelStore.cancelDownload()
+                                }
+                                .font(.footnote)
+                            }
+                        }
+                    case .installed:
+                        HStack {
+                            Label(L("Installed (~446 MB)"), systemImage: "exclamationmark.triangle.fill")
+                                .foregroundStyle(.orange)
+                            Spacer()
+                            Button(L("Delete"), role: .destructive) {
+                                confirmingDeleteGigaAM = true
+                            }
+                        }
+                    case .failed(let message):
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text(message)
+                                .font(.footnote)
+                                .foregroundStyle(.red)
+                            Button {
+                                modelStore.downloadGigaAM()
+                            } label: {
+                                Label(L("Try again"), systemImage: "arrow.clockwise")
+                            }
+                        }
+                    }
+                } header: {
+                    HStack(spacing: 6) {
+                        Text(L("GigaAM v3 (CoreML)"))
+                        Text(L("Outdated"))
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(.orange)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 1)
+                            .background(Color.orange.opacity(0.16), in: Capsule())
+                    }
+                } footer: {
+                    Text(L("Previous-generation Russian-only model. Switch to GigaAM v4 INT8 above and delete v3 to free ~446 MB."))
                 }
             }
 
@@ -477,6 +578,16 @@ struct TranscriptionAndVoiceSettingsView: View {
             IOSVoiceEnrollmentSheet(voxStore: voxStore)
         }
         .confirmationDialog(
+            L("Delete GigaAM v4 INT8 model?"),
+            isPresented: $confirmingDeleteGigaAMV4,
+            titleVisibility: .visible
+        ) {
+            Button(L("Delete"), role: .destructive) {
+                modelStore.deleteGigaAMV4()
+            }
+            Button(L("Cancel"), role: .cancel) {}
+        }
+        .confirmationDialog(
             L("Delete transcription model?"),
             isPresented: $confirmingDeleteGigaAM,
             titleVisibility: .visible
@@ -510,6 +621,69 @@ struct TranscriptionAndVoiceSettingsView: View {
         } message: {
             Text(L("Deletes your saved voice prompt features from this iPhone. The VoxCPM2 model stays installed."))
         }
+    }
+
+    @ViewBuilder
+    private var iosModelStatusRow: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(L("Model preparation"))
+                    .font(.subheadline.weight(.medium))
+                Spacer(minLength: 8)
+                if modelStore.isUsingOutdatedV3Model {
+                    HStack(spacing: 4) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                        Text(L("Outdated"))
+                    }
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(warningColor)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 2)
+                    .background(Color.orange.opacity(0.15), in: Capsule())
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
+                    .layoutPriority(1)
+                    .accessibilityIdentifier("ios-transcription.outdated-badge")
+                } else {
+                    Text(modelStore.activeModelReadinessSummary)
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.trailing)
+                }
+            }
+            if modelStore.isUsingOutdatedV3Model {
+                Text(modelStore.activeModelReadinessSummary)
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.secondary)
+            }
+
+            if modelStore.isUsingOutdatedV3Model {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(L("GigaAM v3 is outdated. Upgrade to GigaAM v4 INT8 (%@) for ~4× faster offline Russian & English transcription.", gigaamV4SizeText))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    if case .downloading(let progress) = modelStore.gigaamV4State {
+                        Text(L("Downloading GigaAM v4 INT8 below… %ld%%", Int((progress * 100).rounded())))
+                            .font(.caption.weight(.medium))
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Button(modelStore.gigaamV4State.isInstalled
+                               ? L("Switch to v4 INT8")
+                               : L("Download & Switch (%@)", gigaamV4SizeText)) {
+                            modelStore.downloadAndSwitchToV4()
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                        .accessibilityIdentifier("ios-transcription.upgrade-v4")
+                    }
+                }
+                .padding(10)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            }
+        }
+        .padding(.vertical, 2)
     }
 
     @ViewBuilder

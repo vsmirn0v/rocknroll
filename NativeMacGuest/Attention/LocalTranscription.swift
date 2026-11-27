@@ -53,6 +53,7 @@ struct SpeakingTimeline: Equatable {
 enum ListenRecognizerModel: Equatable, Sendable {
     case sherpa(SherpaRecognizerModel)
     case coreMLGigaAM(CoreMLGigaAMModel)
+    case coreMLGigaAMV4(CoreMLGigaAMV4Model)
 }
 
 enum LocalSpeechRecognizerPhase: Equatable, Sendable {
@@ -271,6 +272,9 @@ final class LocalSpeechRecognizer: @unchecked Sendable {
             case .coreMLGigaAM(let configuration):
                 let engine = try CoreMLGigaAMRecognizer(configuration)
                 recognizer = { try engine.transcribe($0) }
+            case .coreMLGigaAMV4(let configuration):
+                let engine = try CoreMLGigaAMV4Recognizer(configuration)
+                recognizer = { try engine.transcribe($0) }
             }
             loaded = model
             let seconds = ProcessInfo.processInfo.systemUptime - started
@@ -305,7 +309,11 @@ final class LocalSpeechRecognizer: @unchecked Sendable {
 
 extension ListenRecognizerModel {
     var engineName: String {
-        switch self { case .sherpa: "sherpa-onnx"; case .coreMLGigaAM: "coreml" }
+        switch self {
+        case .sherpa: "sherpa-onnx"
+        case .coreMLGigaAM: "coreml"
+        case .coreMLGigaAMV4: "coreml-v4"
+        }
     }
 }
 

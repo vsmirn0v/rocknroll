@@ -17,6 +17,22 @@ struct LocalModelStatusIndicator: View {
     var style: Style = .toolbar
     @State private var showingPopover = false
 
+    @Environment(\.colorScheme) private var colorScheme
+
+    private var warningColor: Color {
+        colorScheme == .dark ? .orange : Color(red: 0.72, green: 0.35, blue: 0.0)
+    }
+
+    private var showsOutdatedBadgeOnChip: Bool {
+        guard models.speechStatus.upgradeNotice != nil else { return false }
+        switch models.speechStatus.readiness {
+        case .ready, .preparationNeeded, .preparing, .loading:
+            return true
+        default:
+            return false
+        }
+    }
+
     private var readinessColor: Color {
         // The chip color follows the least ready applicable model.
         let statuses = [models.speechStatus, models.voiceStatus]
@@ -62,6 +78,11 @@ struct LocalModelStatusIndicator: View {
                     .foregroundStyle(.primary)
                     .lineLimit(1)
                     .truncationMode(.tail)
+                if showsOutdatedBadgeOnChip {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.caption2)
+                        .foregroundStyle(warningColor)
+                }
                 Spacer(minLength: 4)
                 Image(systemName: "info.circle")
                     .font(.caption)
@@ -84,7 +105,10 @@ struct LocalModelStatusIndicator: View {
             HStack(spacing: 5) {
                 Image(systemName: "laptopcomputer")
                 Text(models.overallSummary)
-                if models.speechStatus.readiness == .ready || models.voiceStatus.readiness == .ready {
+                if showsOutdatedBadgeOnChip {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(warningColor)
+                } else if models.speechStatus.readiness == .ready || models.voiceStatus.readiness == .ready {
                     Image(systemName: "checkmark.circle.fill").foregroundStyle(.teal)
                 }
             }
@@ -114,6 +138,8 @@ struct LocalModelStatusPopover: View {
                     case .download: models.downloadSpeech()
                     case .prepare: models.prepareSpeech()
                     case .retry: models.retrySpeech()
+                    case .upgradeToRecommended: models.upgradeSpeechToRecommended()
+                    case .cancelUpgrade: models.cancelRecommendedSpeechUpgrade()
                     }
                 }
                 Divider()
@@ -123,6 +149,7 @@ struct LocalModelStatusPopover: View {
                     case .download: models.downloadVoice()
                     case .prepare: models.prepareVoice()
                     case .retry: models.retryVoice()
+                    case .upgradeToRecommended, .cancelUpgrade: break
                     }
                 }
             }
@@ -217,24 +244,49 @@ struct LocalModelStatusPopover: View {
     }
 }
 
-private enum LocalModelStatusAction { case download, prepare, retry }
+private enum LocalModelStatusAction { case download, prepare, retry, upgradeToRecommended, cancelUpgrade }
 
 /// One model: readiness pill, residency, compute path, memory estimate and actions.
 private struct LocalModelStatusRow: View {
+    @Environment(\.colorScheme) private var colorScheme
     let status: LocalModelStatusSnapshot
     let systemMemory: LocalSystemMemorySnapshot?
     let onOpenSettings: (() -> Void)?
     let action: (LocalModelStatusAction) -> Void
 
+    private var warningColor: Color {
+        colorScheme == .dark ? .orange : Color(red: 0.72, green: 0.35, blue: 0.0)
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(alignment: .firstTextBaseline) {
                 Text(status.title).font(.body.weight(.semibold))
-                Spacer()
+                Spacer(minLength: 8)
                 readinessPill
             }
             if let modelName = status.modelName {
-                Text(modelName).font(.caption).foregroundStyle(.secondary)
+                HStack(spacing: 6) {
+                    Text(modelName).font(.caption).foregroundStyle(.secondary)
+                    if status.upgradeNotice != nil {
+                        HStack(spacing: 4) {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                            Text(L("Outdated"))
+                        }
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(warningColor)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 1)
+                        .background(Color.orange.opacity(colorScheme == .dark ? 0.16 : 0.14), in: Capsule())
+                        .lineLimit(1)
+                        .fixedSize(horizontal: true, vertical: false)
+                        .layoutPriority(1)
+                        .accessibilityIdentifier("local-models.speech.outdated-badge")
+                    }
+                }
+            }
+            if let upgrade = status.upgradeNotice {
+                upgradeWarningCard(upgrade)
             }
             residencyLine
             computePath
@@ -249,12 +301,78 @@ private struct LocalModelStatusRow: View {
         .accessibilityIdentifier(status.role == .speech ? "local-models.speech" : "local-models.voice")
     }
 
+    @ViewBuilder private func upgradeWarningCard(_ upgrade: LocalModelUpgradeNotice) -> some View {
+        let sizeText = ByteCountFormatter.string(fromByteCount: upgrade.targetSizeBytes, countStyle: .file)
+        VStack(alignment: .leading, spacing: 6) {
+            Text(L("GigaAM v4 INT8 is ~4× faster, takes %@, and supports Russian & English.", sizeText))
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if let progress = upgrade.downloadProgress {
+                HStack(spacing: 8) {
+                    ProgressView(value: progress).controlSize(.small)
+                    Text(L("%ld%%", Int((progress * 100).rounded())))
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                    Button(L("Cancel")) { action(.cancelUpgrade) }
+                        .buttonStyle(.borderless)
+                        .controlSize(.small)
+                }
+            } else if let error = upgrade.downloadError {
+                Text(error)
+                    .font(.caption2)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+                Button(L("Try again")) {
+                    action(.upgradeToRecommended)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
+                .accessibilityIdentifier("local-models.speech.upgrade")
+            } else if upgrade.targetInstalled && upgrade.pendingSwitch && upgrade.waitingForVoiceDetector {
+                Text(L("Downloaded; waiting for the voice detector."))
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else if upgrade.targetInstalled && upgrade.pendingSwitch && upgrade.activeMeetingsBlockingSwitch {
+                Text(L("Downloaded — switches automatically once active transcription finishes."))
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                HStack(spacing: 8) {
+                    Button(upgrade.targetInstalled
+                           ? L("Switch to GigaAM v4 INT8")
+                           : L("Upgrade to GigaAM v4 INT8 (%@)", sizeText)) {
+                        action(.upgradeToRecommended)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
+                    .accessibilityIdentifier("local-models.speech.upgrade")
+                }
+            }
+        }
+        .padding(8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .strokeBorder(Color.orange.opacity(0.28), lineWidth: 1)
+        )
+    }
+
     private var readinessPill: some View {
         Label(readinessTitle, systemImage: readinessIcon)
             .font(.caption2.weight(.semibold))
             .padding(.horizontal, 7).padding(.vertical, 2)
             .foregroundStyle(readinessColor)
-            .overlay(Capsule().stroke(readinessColor.opacity(0.6), lineWidth: 1))
+            .overlay(Capsule().strokeBorder(readinessColor.opacity(0.6), lineWidth: 1))
+            .lineLimit(1)
+            .fixedSize(horizontal: true, vertical: false)
             .accessibilityAddTraits(.isStaticText)
     }
 

@@ -88,6 +88,9 @@ struct JoinView: View {
     @State private var undoToken = UUID()
     @State private var staleContinuation: ActiveJam?
     @State private var confirmingStaleContinuation = false
+    @State private var showingSpeechUpgradePrompt = false
+    @State private var scheduledSpeechUpgradeCheck = false
+    @State private var dismissedSpeechUpgradeForMeeting = false
     @State private var activeSheet: ActiveHomeSheet?
     @ObservedObject private var siteAccounts = SiteAccountStore.shared
     @State private var preferredOriginOverride: URL? = InstantRoomPreferences.loadLastOrigin()
@@ -323,6 +326,27 @@ struct JoinView: View {
                 }
                 Button(L("Cancel"), role: .cancel) { model.dismissPending() }
             }
+            .sheet(isPresented: $showingSpeechUpgradePrompt, onDismiss: {
+                if dismissedSpeechUpgradeForMeeting {
+                    dismissedSpeechUpgradeForMeeting = false
+                } else if case .failed = IOSListenModelStore.shared.gigaamV4State {
+                    // Keep boot prompt available if a download failure interrupted upgrading.
+                } else {
+                    IOSListenModelStore.shared.dismissUpgradePrompt()
+                }
+            }) {
+                IOSSpeechModelUpgradeSheet(
+                    modelStore: .shared,
+                    onOpenSettings: {
+                        dismissedSpeechUpgradeForMeeting = true
+                        showingSpeechUpgradePrompt = false
+                        activeSheet = .settings
+                    },
+                    onDismiss: {
+                        showingSpeechUpgradePrompt = false
+                    }
+                )
+            }
     }
 
     @ViewBuilder
@@ -367,7 +391,29 @@ struct JoinView: View {
                 }
             }
             .onChange(of: model.isJoining) {
-                if $0 { setup.suspendForMeeting(); nameFocused = false; linkFocused = false; sync.endNameEditing(); mediaCheck.close() }
+                if $0 {
+                    setup.suspendForMeeting()
+                    nameFocused = false
+                    linkFocused = false
+                    sync.endNameEditing()
+                    mediaCheck.close()
+                    if showingSpeechUpgradePrompt {
+                        dismissedSpeechUpgradeForMeeting = true
+                        showingSpeechUpgradePrompt = false
+                    }
+                }
+            }
+            .onChange(of: model.isInConference) { _, inConference in
+                if inConference && showingSpeechUpgradePrompt {
+                    dismissedSpeechUpgradeForMeeting = true
+                    showingSpeechUpgradePrompt = false
+                }
+            }
+            .onChange(of: calendar.joiningMeeting?.id) { _, joiningID in
+                if joiningID != nil && showingSpeechUpgradePrompt {
+                    dismissedSpeechUpgradeForMeeting = true
+                    showingSpeechUpgradePrompt = false
+                }
             }
             .onReceive(NotificationCenter.default.publisher(for: UIScene.willDeactivateNotification)) { _ in
                 nameFocused = false
@@ -429,6 +475,7 @@ struct JoinView: View {
                 }
                 if model.isNameRequiredForJoin { nameFocused = true }
                 handleInstantRoomShortcutIfRequested()
+                scheduleSpeechUpgradePromptIfNeeded()
             }
             .onDisappear {
                 homeVisible = false; calendar.reminders.isEventVisible = { _ in false }
@@ -459,6 +506,33 @@ struct JoinView: View {
     private var shouldTick: Bool {
         homeVisible && foreground && !model.isInConference && !homeModalPresented &&
             (calendar.enabled || !calendar.syncedRemoteMeetings.isEmpty || !continuation.candidates.isEmpty)
+    }
+
+    private func scheduleSpeechUpgradePromptIfNeeded() {
+        guard !scheduledSpeechUpgradeCheck else { return }
+        scheduledSpeechUpgradeCheck = true
+        let env = ProcessInfo.processInfo.environment
+        guard env["XCTestConfigurationFilePath"] == nil,
+              !CommandLine.arguments.contains(where: { $0.hasPrefix("-uiTest") || $0.hasPrefix("--fixture") }) else {
+            return
+        }
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(1.2))
+            guard IOSListenModelStore.shared.shouldPresentUpgradePromptOnBoot,
+                  homeVisible,
+                  foreground,
+                  !homeInteracting,
+                  !homeModalPresented,
+                  !setup.isPresented,
+                  !model.isCreatingInstantRoom,
+                  calendar.joiningMeeting == nil,
+                  !calendar.reminders.presenting,
+                  !calendar.reminders.hasOpenIntent,
+                  !busy,
+                  model.sessions.isEmpty,
+                  !showingSpeechUpgradePrompt else { return }
+            showingSpeechUpgradePrompt = true
+        }
     }
     private func refreshHome(meetings: [CalendarMeeting]? = nil, handoffs: [ActiveJam]? = nil) {
         homeNow = Date()

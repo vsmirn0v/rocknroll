@@ -62,6 +62,9 @@ struct NativeDesktopHomeView: View {
     @State private var signInSheetOrigin: IdentifiableSiteOrigin?
     @State private var retryAfterSignIn: (url: URL, title: String?)?
     @State private var retryInstantOriginAfterSignIn: URL?
+    @State private var showingSpeechModelUpgradePrompt = false
+    @State private var scheduledSpeechUpgradeCheck = false
+    @State private var suppressSpeechPromptDismissPersistence = false
     @FocusState private var editingName: Bool
     #if NATIVE_DIRECT_UPDATES
     @FocusState private var homeHeadingFocused: Bool
@@ -239,8 +242,30 @@ struct NativeDesktopHomeView: View {
             }
         }
         .tint(.orange)
-        .onAppear { refreshHome(); library.calendar.setScheduledUIBlocked(blocksScheduledJoining) }
+        .onAppear {
+            refreshHome()
+            library.calendar.setScheduledUIBlocked(blocksScheduledJoining)
+            scheduleSpeechModelUpgradePromptIfNeeded()
+        }
         .onChange(of: blocksScheduledJoining) { library.calendar.setScheduledUIBlocked($0); refreshHome() }
+        .onChange(of: workspace.meetings.isEmpty) { empty in
+            if !empty && showingSpeechModelUpgradePrompt {
+                suppressSpeechPromptDismissPersistence = true
+                showingSpeechModelUpgradePrompt = false
+            }
+        }
+        .onChange(of: workspace.selectedMeeting != nil) { hasSelected in
+            if hasSelected && showingSpeechModelUpgradePrompt {
+                suppressSpeechPromptDismissPersistence = true
+                showingSpeechModelUpgradePrompt = false
+            }
+        }
+        .onChange(of: workspace.preparing) { preparing in
+            if preparing && showingSpeechModelUpgradePrompt {
+                suppressSpeechPromptDismissPersistence = true
+                showingSpeechModelUpgradePrompt = false
+            }
+        }
         .onChange(of: homeSnapshot.items.isEmpty) { if $0 { hoveringHomeMeetings = false } }
         .onDisappear { library.calendar.setScheduledUIBlocked(false); if editingName { library.sync.endNameEditing() } }
         .onReceive(library.objectWillChange) { _ in Task { @MainActor in refreshHome() } }
@@ -381,6 +406,29 @@ struct NativeDesktopHomeView: View {
             workspace.showCreateRoomSheetRequested = false
             createRoomOrigin = workspace.preferredInstantOrigin
             showingCreateRoom = true
+        }
+        .sheet(isPresented: $showingSpeechModelUpgradePrompt, onDismiss: {
+            if suppressSpeechPromptDismissPersistence {
+                suppressSpeechPromptDismissPersistence = false
+            } else if let target = ListenModelStore.shared.recommendedModel,
+                      case .failed = ListenModelStore.shared.state(target) {
+                // Keep boot invitation eligible if a download error interrupted the upgrade.
+            } else {
+                ListenModelStore.shared.dismissUpgradePrompt()
+            }
+        }) {
+            SpeechModelUpgradePromptView(
+                store: .shared,
+                onOpenSettings: {
+                    suppressSpeechPromptDismissPersistence = true
+                    showingSpeechModelUpgradePrompt = false
+                    workspace.settingsTab = 5
+                    workspace.selection = .settings
+                },
+                onDismiss: {
+                    showingSpeechModelUpgradePrompt = false
+                }
+            )
         }
         .alert(alertTitle, isPresented: alertShown) {
             if workspace.error != nil, let challenge = workspace.pendingAuthChallenge {
@@ -757,6 +805,28 @@ struct NativeDesktopHomeView: View {
     private func roomDetail(_ url: URL, engine: MeetingEngineKind?) -> String {
         let identity = MeetingRoomIdentity(url, engine: engine)
         return [url.host, identity?.room].compactMap { $0 }.joined(separator: " · ")
+    }
+
+    private func scheduleSpeechModelUpgradePromptIfNeeded() {
+        guard !scheduledSpeechUpgradeCheck else { return }
+        scheduledSpeechUpgradeCheck = true
+        guard ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil else { return }
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(1.2))
+            guard NSApp.isActive,
+                  workspace.selection == .home,
+                  ListenModelStore.shared.shouldPresentUpgradePromptOnBoot,
+                  workspace.meetings.isEmpty,
+                  workspace.selectedMeeting == nil,
+                  !workspace.preparing,
+                  !workspace.joinSettingUp,
+                  !workspace.isCreatingInstantRoom,
+                  !blocksScheduledJoining,
+                  workspace.attention.inspecting == nil,
+                  workspace.attention.editingPreset == nil,
+                  !showingSpeechModelUpgradePrompt else { return }
+            showingSpeechModelUpgradePrompt = true
+        }
     }
 }
 

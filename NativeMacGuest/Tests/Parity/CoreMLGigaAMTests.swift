@@ -1,3 +1,4 @@
+import AppKit
 import AVFoundation
 import CoreML
 import CoreVideo
@@ -146,7 +147,7 @@ import XCTest
     /// The Neural Engine model is the default, but someone already transcribing with the
     /// previous default (never chosen explicitly) keeps it until the new one is installed.
     func testNewDefaultDoesNotStopSomeoneUsingThePreviousOne() async throws {
-        XCTAssertEqual(ListenModelStore.defaultModel, "gigaam-v3-e2e-rnnt-coreml")
+        XCTAssertEqual(ListenModelStore.defaultModel, "gigaam-v4-coreml-int8")
         XCTAssertNotNil(ListenModelCatalog.bundled.model(ListenModelStore.previousDefaultModel))
         let source = temporaryFolder(), root = temporaryFolder()
         try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
@@ -155,15 +156,21 @@ import XCTest
             return .init(name: name, size: Int64(name.utf8.count), url: url, sha256: try ListenModelStore.sha256(of: url))
         }
         func model(_ id: String, kind: String) throws -> ListenModelCatalog.Model {
-            .init(id: id, role: "listen", title: id, kind: kind, featureDim: 64, languages: ["ru"], licence: "MIT", source: source,
-                  files: [try file("m.bin"), try file("tokens.txt")], config: ["model": "m.bin", "tokens": "tokens.txt"])
+            if kind == ListenModelStore.coreMLGigaAMV4Kind {
+                return .init(id: id, role: "listen", title: id, kind: kind, featureDim: 64, languages: ["ru", "en"], licence: "MIT", source: source,
+                             files: [try file("runtime.json"), try file("window.f32"), try file("mel.f32"), try file("e2e.f32"),
+                                     try file("encoder-1024/stage-00.mlpackage/Manifest.json")],
+                             config: ["encoder": "encoder-1024/stage-00.mlpackage", "runtime": "runtime.json", "window": "window.f32", "mel": "mel.f32", "head": "e2e.f32"])
+            }
+            return .init(id: id, role: "listen", title: id, kind: kind, featureDim: 64, languages: ["ru"], licence: "MIT", source: source,
+                         files: [try file("m.bin"), try file("tokens.txt")], config: ["model": "m.bin", "tokens": "tokens.txt"])
         }
         let catalog = ListenModelCatalog(schemaVersion: 1, runtime: "test", models: [
             try model(ListenModelStore.previousDefaultModel, kind: "nemo_ctc"),
-            try model(ListenModelStore.defaultModel, kind: ListenModelStore.coreMLGigaAMKind)])
+            try model(ListenModelStore.defaultModel, kind: ListenModelStore.coreMLGigaAMV4Kind)])
         func store() -> ListenModelStore { .init(catalog: catalog, root: root, defaults: UserDefaults(suiteName: "listen-\(UUID())")!) }
 
-        XCTAssertEqual(store().selectedID, ListenModelStore.defaultModel, "A new user gets the Neural Engine model")
+        XCTAssertEqual(store().selectedID, ListenModelStore.defaultModel, "A new user gets the GigaAM v4 INT8 model")
         let first = store(), previous = catalog.models[0], current = catalog.models[1]
         first.download(previous)
         for _ in 0..<200 where !first.state(previous).installed { try await Task.sleep(for: .milliseconds(20)) }
@@ -303,5 +310,48 @@ import XCTest
         wait(for: [expectation], timeout: 10)
         XCTAssertNil(result.errorMessage)
         XCTAssertEqual(result.aliveInBlock, 0, "MLMultiArray helpers must not autorelease-pin arrays inside GCD blocks")
+    }
+
+    func testGigaAMV4PauseAwareSplittingPrefersSilentGap() {
+        var samples = [Float](repeating: 0.4, count: 16_000 * 14)
+        // Put a clear 400 ms silence valley at 7.5 s so splitter cuts inside it.
+        for idx in (16_000 * 75 / 10)..<(16_000 * 79 / 10) {
+            samples[idx] = 0
+        }
+        let chunks = CoreMLGigaAMV4Recognizer.splitChunksPauseAware(samples)
+        XCTAssertEqual(chunks.count, 2)
+        XCTAssertGreaterThanOrEqual(chunks[0].count, 16_000 * 7)
+        XCTAssertLessThanOrEqual(chunks[0].count, CoreMLGigaAMV4Recognizer.maxChunkSamples)
+    }
+
+    func testGigaAMV4Int8RecognizerTranscribesBenchmarkSample() throws {
+        let v4Folder = bench.appendingPathComponent("models/gigaam-v4-coreml-int8")
+        guard FileManager.default.fileExists(atPath: v4Folder.appendingPathComponent("runtime.json").path) else {
+            throw XCTSkip("gigaam-v4-coreml-int8 not staged in .build/asr-bench/models")
+        }
+        let wavURL = bench.appendingPathComponent("fleurs-ru-50/000_12991791007873426296.wav")
+        guard let file = try? AVAudioFile(forReading: wavURL),
+              let buffer = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: AVAudioFrameCount(file.length)) else {
+            throw XCTSkip("FLEURS wav sample missing")
+        }
+        var samples: [Float] = []
+        while file.framePosition < file.length {
+            try file.read(into: buffer)
+            guard buffer.frameLength > 0 else { break }
+            samples += UnsafeBufferPointer(start: buffer.floatChannelData![0], count: Int(buffer.frameLength))
+        }
+        let v4Model = CoreMLGigaAMV4Model(
+            encoder: v4Folder.appendingPathComponent("encoder-1024/stage-00.mlpackage"),
+            runtime: v4Folder.appendingPathComponent("runtime.json"),
+            window: v4Folder.appendingPathComponent("window.f32"),
+            mel: v4Folder.appendingPathComponent("mel.f32"),
+            head: v4Folder.appendingPathComponent("e2e.f32"),
+            cache: temporaryFolder(),
+            computeUnits: .cpuAndNeuralEngine
+        )
+        let recognizer = try CoreMLGigaAMV4Recognizer(v4Model)
+        let transcript = try recognizer.transcribe(samples)
+        XCTAssertTrue(transcript.contains("Молдавии") && transcript.contains("христианство"), transcript)
+        XCTAssertEqual(try recognizer.transcribe([]), "")
     }
 }

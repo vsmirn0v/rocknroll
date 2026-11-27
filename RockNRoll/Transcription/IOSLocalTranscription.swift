@@ -122,7 +122,7 @@ private final class AudioIngressRouter: @unchecked Sendable {
     private var localMicOnly = false
     private var backend: IOSListenModel = .appleSpeech
     private var language: IOSTranscriptionLanguage = .english
-    private var gigaam: CoreMLGigaAMRecognizer?
+    private var gigaam: (any IOSGigaAMTranscribing)?
     private var localSpeaker = ""
     private var speakerNames: [String: String] = [:]
     private var pendingWorkCount = 0
@@ -202,7 +202,7 @@ private final class AudioIngressRouter: @unchecked Sendable {
         localMicOnly: Bool = false,
         backend: IOSListenModel,
         language: IOSTranscriptionLanguage,
-        gigaam: CoreMLGigaAMRecognizer?,
+        gigaam: (any IOSGigaAMTranscribing)?,
         localSpeaker: String,
         speakerNames: [String: String]
     ) {
@@ -309,7 +309,7 @@ private final class AudioIngressRouter: @unchecked Sendable {
     }
 
     func enqueueLocal(_ buffer: AVAudioPCMBuffer, isAudible: Bool = true) {
-        let state: (running: Bool, tapOnly: Bool, backend: IOSListenModel, language: IOSTranscriptionLanguage, gigaam: CoreMLGigaAMRecognizer?, speaker: String)? = lock.withLock {
+        let state: (running: Bool, tapOnly: Bool, backend: IOSListenModel, language: IOSTranscriptionLanguage, gigaam: (any IOSGigaAMTranscribing)?, speaker: String)? = lock.withLock {
             guard running, pendingWorkCount < Self.maxPendingWorkCount else { return nil }
             pendingWorkCount += 1
             return (running, audioTapOnly, backend, language, gigaam, localSpeaker)
@@ -335,7 +335,7 @@ private final class AudioIngressRouter: @unchecked Sendable {
     }
 
     func enqueueRemote(streamID: String, buffer: AVAudioPCMBuffer, isAudible: Bool = true) {
-        let state: (running: Bool, tapOnly: Bool, backend: IOSListenModel, language: IOSTranscriptionLanguage, gigaam: CoreMLGigaAMRecognizer?, speaker: String?)? = lock.withLock {
+        let state: (running: Bool, tapOnly: Bool, backend: IOSListenModel, language: IOSTranscriptionLanguage, gigaam: (any IOSGigaAMTranscribing)?, speaker: String?)? = lock.withLock {
             guard running, pendingWorkCount < Self.maxPendingWorkCount else { return nil }
             let effectiveTapOnly = audioTapOnly || localMicOnly
             if effectiveTapOnly && onPCM16Audio == nil {
@@ -445,7 +445,7 @@ private final class AudioIngressRouter: @unchecked Sendable {
         tapOnly: Bool,
         backend: IOSListenModel,
         language: IOSTranscriptionLanguage,
-        gigaam: CoreMLGigaAMRecognizer?,
+        gigaam: (any IOSGigaAMTranscribing)?,
         buffer: AVAudioPCMBuffer,
         isAudible: Bool
     ) {
@@ -507,17 +507,27 @@ private final class AudioIngressRouter: @unchecked Sendable {
 }
 
 private final class SharedGigaAMLeaseBox: @unchecked Sendable {
-    private let lock = NSLock()
-    private var directory: URL?
+    enum Lease: Equatable {
+        case v3(URL)
+        case v4(URL)
+    }
 
-    func replace(with newDirectory: URL?) {
-        let previous: URL? = lock.withLock {
-            let old = directory
-            directory = newDirectory
+    private let lock = NSLock()
+    private var lease: Lease?
+
+    func replace(with newLease: Lease?) {
+        let previous: Lease? = lock.withLock {
+            let old = lease
+            lease = newLease
             return old
         }
-        if let previous {
-            CoreMLGigaAMRecognizer.releaseShared(directory: previous)
+        switch previous {
+        case .v3(let dir):
+            CoreMLGigaAMRecognizer.releaseShared(directory: dir)
+        case .v4(let dir):
+            CoreMLGigaAMV4Recognizer.releaseShared(directory: dir)
+        case nil:
+            break
         }
     }
 
@@ -540,11 +550,14 @@ final class IOSMeetingTranscriber: ObservableObject {
 
     var isCapturingAudio: Bool { running || isAudioTapOnly }
     var canStartWithoutPermissionPrompt: Bool {
-        if modelStore.effectiveBackend() == .gigaamV3CoreML,
-           modelStore.installedGigaAMDirectoryIfReady() != nil {
-            return true
+        switch modelStore.effectiveBackend() {
+        case .gigaamV4CoreMLInt8:
+            return modelStore.installedGigaAMV4DirectoryIfReady() != nil
+        case .gigaamV3CoreML:
+            return modelStore.installedGigaAMDirectoryIfReady() != nil
+        case .appleSpeech:
+            return SFSpeechRecognizer.authorizationStatus() == .authorized && localAppleSpeechAvailable()
         }
-        return SFSpeechRecognizer.authorizationStatus() == .authorized && localAppleSpeechAvailable()
     }
 
     var onSegmentsChanged: (([TranscriptSegment]) -> Void)?
@@ -554,6 +567,7 @@ final class IOSMeetingTranscriber: ObservableObject {
     private let participantNameLookup: (String) -> String?
     private let setOutputDemand: (Bool) async -> Bool
     private let gigaamLoader: @Sendable (URL) async throws -> CoreMLGigaAMRecognizer
+    private let gigaamV4Loader: @Sendable (URL) async throws -> CoreMLGigaAMV4Recognizer
     private let usesSharedGigaAMLease: Bool
     private let sharedGigaAMLease = SharedGigaAMLeaseBox()
     private let speechAuthorization: @MainActor () async -> Bool
@@ -563,7 +577,7 @@ final class IOSMeetingTranscriber: ObservableObject {
     private var taps: [String: (source: MeetingAudioSource, sink: MeetingAudioSink)] = [:]
     nonisolated private let router = AudioIngressRouter()
     private var currentBackend: IOSListenModel?
-    private var gigaamRecognizer: CoreMLGigaAMRecognizer?
+    private var gigaamRecognizer: (any IOSGigaAMTranscribing)?
     private var activeRun: UUID?
     private var running: Bool { activeRun != nil }
     private var segmentOrder = 0
@@ -579,17 +593,21 @@ final class IOSMeetingTranscriber: ObservableObject {
         setOutputDemand: @escaping (Bool) async -> Bool,
         gigaamLoader: (@Sendable (URL) async throws -> CoreMLGigaAMRecognizer)? = nil,
         speechAuthorization: (@MainActor () async -> Bool)? = nil,
-        localAppleSpeechAvailable: (@MainActor () -> Bool)? = nil
+        localAppleSpeechAvailable: (@MainActor () -> Bool)? = nil,
+        gigaamV4Loader: (@Sendable (URL) async throws -> CoreMLGigaAMV4Recognizer)? = nil
     ) {
         self.modelStore = modelStore
         self.localDisplayName = localDisplayName
         self.participantNameLookup = participantNameLookup
         self.setOutputDemand = setOutputDemand
-        self.usesSharedGigaAMLease = (gigaamLoader == nil)
+        self.usesSharedGigaAMLease = (gigaamLoader == nil && gigaamV4Loader == nil)
         self.speechAuthorization = speechAuthorization ?? Self.requestSpeechAuthorization
         self.localAppleSpeechAvailable = localAppleSpeechAvailable ?? modelStore.appleSpeechAvailableOnDevice
         self.gigaamLoader = gigaamLoader ?? { dir in
             try await CoreMLGigaAMRecognizer.acquireShared(directory: dir)
+        }
+        self.gigaamV4Loader = gigaamV4Loader ?? { dir in
+            try await CoreMLGigaAMV4Recognizer.acquireShared(directory: dir)
         }
         self.router.onText = { [weak self] stream, speaker, text, isFinal, spokenAt in
             Task { @MainActor [weak self] in
@@ -664,44 +682,103 @@ final class IOSMeetingTranscriber: ObservableObject {
         let backend = modelStore.effectiveBackend()
         AppDiagnostics.log("local-transcription-start", ["backend": backend.rawValue])
 
-        if backend == .gigaamV3CoreML, let dir = modelStore.installedGigaAMDirectoryIfReady() {
+        enum CoreMLStartOutcome {
+            case ready
+            case cancelled
+            case fallbackNeeded
+        }
+
+        func attemptCoreML(
+            model: IOSListenModel,
+            directory: URL,
+            lease: SharedGigaAMLeaseBox.Lease,
+            load: @Sendable (URL) async throws -> any IOSGigaAMTranscribing,
+            release: @Sendable (URL) -> Void
+        ) async -> CoreMLStartOutcome {
             do {
-                let recognizer = try await gigaamLoader(dir)
+                let recognizer = try await load(directory)
                 guard activeRun == run else {
-                    if usesSharedGigaAMLease {
-                        CoreMLGigaAMRecognizer.releaseShared(directory: dir)
-                    }
-                    return false
+                    if usesSharedGigaAMLease { release(directory) }
+                    return .cancelled
                 }
                 if usesSharedGigaAMLease {
-                    sharedGigaAMLease.replace(with: dir)
+                    sharedGigaAMLease.replace(with: lease)
                 }
                 self.gigaamRecognizer = recognizer
-                self.currentBackend = .gigaamV3CoreML
-                state = .active(.gigaamV3CoreML)
+                self.currentBackend = model
+                state = .active(model)
                 let ms = Int(((ProcessInfo.processInfo.systemUptime - startedAt) * 1000).rounded())
-                AppDiagnostics.log("local-transcription-ready", ["backend": IOSListenModel.gigaamV3CoreML.rawValue, "ms": ms])
+                AppDiagnostics.log("local-transcription-ready", ["backend": model.rawValue, "ms": ms])
+                return .ready
             } catch is CancellationError {
-                guard activeRun == run else { return false }
+                guard activeRun == run else { return .cancelled }
                 self.gigaamRecognizer = nil
                 sharedGigaAMLease.release()
                 activeRun = nil
                 if case .starting = state { state = .off }
-                return false
+                return .cancelled
             } catch {
-                guard activeRun == run else { return false }
+                guard activeRun == run else { return .cancelled }
                 modelStore.refreshInstallState()
+                return .fallbackNeeded
+            }
+        }
+
+        var ready = false
+        if backend == .gigaamV4CoreMLInt8, let dirV4 = modelStore.installedGigaAMV4DirectoryIfReady() {
+            let outcome = await attemptCoreML(
+                model: .gigaamV4CoreMLInt8,
+                directory: dirV4,
+                lease: .v4(dirV4),
+                load: gigaamV4Loader,
+                release: { CoreMLGigaAMV4Recognizer.releaseShared(directory: $0) }
+            )
+            switch outcome {
+            case .ready: ready = true
+            case .cancelled: return false
+            case .fallbackNeeded:
+                if let dirV3 = modelStore.installedGigaAMDirectoryIfReady() {
+                    AppDiagnostics.log("local-transcription-fallback", [
+                        "from": IOSListenModel.gigaamV4CoreMLInt8.rawValue,
+                        "to": IOSListenModel.gigaamV3CoreML.rawValue
+                    ])
+                    let v3Outcome = await attemptCoreML(
+                        model: .gigaamV3CoreML,
+                        directory: dirV3,
+                        lease: .v3(dirV3),
+                        load: gigaamLoader,
+                        release: { CoreMLGigaAMRecognizer.releaseShared(directory: $0) }
+                    )
+                    switch v3Outcome {
+                    case .ready: ready = true
+                    case .cancelled: return false
+                    case .fallbackNeeded: break
+                    }
+                }
+            }
+        } else if backend == .gigaamV3CoreML, let dirV3 = modelStore.installedGigaAMDirectoryIfReady() {
+            let outcome = await attemptCoreML(
+                model: .gigaamV3CoreML,
+                directory: dirV3,
+                lease: .v3(dirV3),
+                load: gigaamLoader,
+                release: { CoreMLGigaAMRecognizer.releaseShared(directory: $0) }
+            )
+            switch outcome {
+            case .ready: ready = true
+            case .cancelled: return false
+            case .fallbackNeeded: break
+            }
+        }
+
+        if !ready {
+            if backend != .appleSpeech {
                 AppDiagnostics.log("local-transcription-fallback", [
-                    "from": IOSListenModel.gigaamV3CoreML.rawValue,
+                    "from": backend.rawValue,
                     "to": IOSListenModel.appleSpeech.rawValue
                 ])
-                self.gigaamRecognizer = nil
-                sharedGigaAMLease.release()
-                guard await startAppleSpeech(for: run) else { return false }
-                let ms = Int(((ProcessInfo.processInfo.systemUptime - startedAt) * 1000).rounded())
-                AppDiagnostics.log("local-transcription-ready", ["backend": IOSListenModel.appleSpeech.rawValue, "ms": ms])
             }
-        } else {
+            self.gigaamRecognizer = nil
             sharedGigaAMLease.release()
             guard await startAppleSpeech(for: run) else { return false }
             let ms = Int(((ProcessInfo.processInfo.systemUptime - startedAt) * 1000).rounded())
@@ -949,7 +1026,7 @@ private final class SpeakerPipeline {
     private var speakerName: String?
     private let backend: IOSListenModel
     private let language: IOSTranscriptionLanguage
-    private let gigaam: CoreMLGigaAMRecognizer?
+    private let gigaam: (any IOSGigaAMTranscribing)?
     private let workerQueue: DispatchQueue
     private let onSamples16k: (@Sendable (String, [Float]) -> Void)?
     private let onText: (String, String?, String, Bool, Date) -> Void
@@ -979,7 +1056,7 @@ private final class SpeakerPipeline {
         speakerName: String?,
         backend: IOSListenModel,
         language: IOSTranscriptionLanguage,
-        gigaam: CoreMLGigaAMRecognizer?,
+        gigaam: (any IOSGigaAMTranscribing)?,
         workerQueue: DispatchQueue,
         onSamples16k: (@Sendable (String, [Float]) -> Void)? = nil,
         onText: @escaping (String, String?, String, Bool, Date) -> Void

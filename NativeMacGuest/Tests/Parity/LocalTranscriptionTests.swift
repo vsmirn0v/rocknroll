@@ -29,6 +29,7 @@ import XCTest
             let keys: [String: [String]] = ["nemo_transducer": ["encoder", "decoder", "joiner", "tokens"],
                 "nemo_ctc": ["model", "tokens"], "whisper": ["encoder", "decoder", "tokens"], "silero_vad": ["model"],
                 ListenModelStore.coreMLGigaAMKind: ["encoder", "decoder", "joint", "tokens"],
+                ListenModelStore.coreMLGigaAMV4Kind: ["encoder", "runtime", "window", "mel", "head"],
                 VoiceCloneSupport.kind: [], VoxCPM2GPUModelCatalog.kind: []]
             if model.kind == VoiceCloneSupport.kind {
                 XCTAssertNotNil(model.config["architecture"])
@@ -713,6 +714,75 @@ import XCTest
         XCTAssertEqual(transcriber.currentSummary.audioSeconds, 0)
         transcriber.stop()
         _ = await transcriber.waitForDelivery()
+    }
+
+    func testOutdatedV3DetectionUpgradePromptEligibilityAndSafeMeetingSwitch() async throws {
+        let source = temporaryFolder(), root = temporaryFolder()
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        func file(_ name: String) throws -> ListenModelCatalog.File {
+            let url = source.appendingPathComponent(UUID().uuidString)
+            try Data(name.utf8).write(to: url)
+            return .init(name: name, size: Int64(name.utf8.count), url: url, sha256: try ListenModelStore.sha256(of: url))
+        }
+        let vad = ListenModelCatalog.Model(id: "silero-vad", role: "vad", title: "VAD", kind: "silero_vad",
+                                           featureDim: nil, languages: [], licence: "MIT", source: source,
+                                           files: [try file("vad.onnx")], config: ["model": "vad.onnx"])
+        let v3 = ListenModelCatalog.Model(id: ListenModelStore.previousDefaultModel, role: "listen", title: "GigaAM v3",
+                                          kind: "nemo_ctc", featureDim: 64, languages: ["ru"], licence: "MIT", source: source,
+                                          files: [try file("v3.onnx"), try file("tokens.txt")],
+                                          config: ["model": "v3.onnx", "tokens": "tokens.txt"])
+        let v4 = ListenModelCatalog.Model(id: ListenModelStore.defaultModel, role: "listen", title: "GigaAM v4 INT8",
+                                          kind: ListenModelStore.coreMLGigaAMV4Kind, featureDim: 64, languages: ["ru", "en"],
+                                          licence: "MIT", source: source,
+                                          files: [try file("runtime.json"), try file("window.f32"), try file("mel.f32"),
+                                                  try file("e2e.f32"), try file("encoder-1024/stage-00.mlpackage/Manifest.json")],
+                                          config: ["encoder": "encoder-1024/stage-00.mlpackage", "runtime": "runtime.json",
+                                                   "window": "window.f32", "mel": "mel.f32", "head": "e2e.f32"])
+        let catalog = ListenModelCatalog(schemaVersion: 1, runtime: "test", models: [vad, v4, v3])
+        let defaults = UserDefaults(suiteName: "listen-upgrade-\(UUID())")!
+        var activeUsers = 1
+        let userChanges = PassthroughSubject<Int, Never>()
+        let store = ListenModelStore(catalog: catalog, root: root, defaults: defaults,
+                                     recognizerUserCount: { activeUsers },
+                                     recognizerUserChanges: userChanges.eraseToAnyPublisher())
+        store.download(v3)
+        for _ in 0..<200 where !(store.state(v3).installed && store.state(vad).installed) {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        store.selectModel(v3)
+        for _ in 0..<50 where store.selectedID != v3.id {
+            userChanges.send(0); activeUsers = 0; break
+        }
+        activeUsers = 1
+        userChanges.send(1)
+        let restarted = ListenModelStore(catalog: catalog, root: root, defaults: defaults,
+                                         recognizerUserCount: { activeUsers },
+                                         recognizerUserChanges: userChanges.eraseToAnyPublisher())
+        XCTAssertTrue(restarted.isSelectedModelOutdated)
+        XCTAssertTrue(restarted.shouldPresentUpgradePromptOnBoot)
+
+        // Active meeting prevents immediate disruption while background download completes.
+        restarted.startRecommendedModelUpgrade()
+        for _ in 0..<200 where !restarted.state(v4).installed {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        XCTAssertEqual(restarted.selectedID, v3.id, "Active meeting keeps v3 running until transcription ends")
+        XCTAssertEqual(restarted.pendingID, v4.id)
+
+        activeUsers = 0
+        userChanges.send(0)
+        for _ in 0..<50 where restarted.selectedID != v4.id {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        XCTAssertEqual(restarted.selectedID, v4.id, "Switches seamlessly once no meeting is active")
+        XCTAssertFalse(restarted.isSelectedModelOutdated)
+        XCTAssertFalse(restarted.shouldPresentUpgradePromptOnBoot)
+
+        // Fresh store with local transcription disabled does not prompt uninvited on boot.
+        let freshStore = ListenModelStore(catalog: catalog, root: temporaryFolder(), defaults: UserDefaults(suiteName: "listen-fresh-\(UUID())")!)
+        XCTAssertFalse(freshStore.shouldPresentUpgradePromptOnBoot)
+        freshStore.enabled = true
+        XCTAssertTrue(freshStore.shouldPresentUpgradePromptOnBoot)
     }
 }
 

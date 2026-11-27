@@ -23,6 +23,134 @@
       }
     },
     {
+      "id": "gigaam-v4-coreml-int8",
+      "role": "listen",
+      "title": "GigaAM v4 INT8 (Neural Engine)",
+      "kind": "coreml_gigaam_v4_rnnt",
+      "featureDim": 64,
+      "languages": [
+        "ru",
+        "en"
+      ],
+      "licence": "MIT",
+      "source": "https://github.com/vsmirn0v/rocknroll/releases/tag/models-gigaam-v4-coreml-int8-v1",
+      "files": [
+        {
+          "name": "runtime.json",
+          "size": 19454,
+          "url": "https://github.com/vsmirn0v/rocknroll/releases/download/models-gigaam-v4-coreml-int8-v1/runtime.json",
+          "sha256": "0e7458a589178d2514f847eb7418fc70104e218dd2b81ff28e3c8822f3e0dead"
+        },
+        {
+          "name": "window.f32",
+          "size": 1280,
+          "url": "https://github.com/vsmirn0v/rocknroll/releases/download/models-gigaam-v4-coreml-int8-v1/window.f32",
+          "sha256": "42e25fcba0bf1e83f24f71368f6ccedef245e6faeac6ec2b9ebabb6cf6e66705"
+        },
+        {
+          "name": "mel.f32",
+          "size": 41216,
+          "url": "https://github.com/vsmirn0v/rocknroll/releases/download/models-gigaam-v4-coreml-int8-v1/mel.f32",
+          "sha256": "03f0c05dba900b44f54d816789838e498908cd4ee492ef231f8459c61a5158ac"
+        },
+        {
+          "name": "e2e.f32",
+          "size": 7310340,
+          "url": "https://github.com/vsmirn0v/rocknroll/releases/download/models-gigaam-v4-coreml-int8-v1/e2e.f32",
+          "sha256": "11106fa8d3d6e23ea4db4500bee7f0178e6cfa4b9cab01287f963e98c559d507"
+        },
+        {
+          "name": "encoder-1024/stage-00.mlpackage/Manifest.json",
+          "size": 617,
+          "url": "https://github.com/vsmirn0v/rocknroll/releases/download/models-gigaam-v4-coreml-int8-v1/stage-00-Manifest.json",
+          "sha256": "5d6f53200259ba966839d08ee4a8b62410f06026087e39a0a33ba82f7b4bff32"
+        },
+        {
+          "name": "encoder-1024/stage-00.mlpackage/Data/com.apple.CoreML/model.mlmodel",
+          "size": 521464,
+          "url": "https://github.com/vsmirn0v/rocknroll/releases/download/models-gigaam-v4-coreml-int8-v1/stage-00-model.mlmodel",
+          "sha256": "7fccc583d7baf1c466f8e94a1dd6cfd081579cb6c2216de908b0fa17c6f6252b"
+        },
+        {
+          "name": "encoder-1024/stage-00.mlpackage/Data/com.apple.CoreML/weights/weight.bin",
+          "size": 237974144,
+          "url": "https://github.com/vsmirn0v/rocknroll/releases/download/models-gigaam-v4-coreml-int8-v1/stage-00-weight.bin",
+          "sha256": "869757bf6c939e5c31984c2ddd93730ff19151ace89a71f5c1bbdb04ad950173"
+        }
+      ],
+      "config": {
+        "encoder": "encoder-1024/stage-00.mlpackage",
+        "runtime": "runtime.json",
+        "window": "window.f32",
+        "mel": "mel.f32",
+        "head": "e2e.f32"
+      }
+    },
+    {
+      "id": "gigaam-v4-coreml",
+      "role": "listen",
+      "title": "GigaAM v4 FP16 (Neural Engine)",
+      "kind": "coreml_gigaam_v4_rnnt",
+      "featureDim": 64,
+      "languages": [
+        "ru",
+        "en"
+      ],
+      "licence": "MIT",
+      "source": "https://huggingface.co/ilsvls/gigaam-v4-coreml",
+      "files": [
+        {
+          "name": "runtime.json",
+          "size": 19454,
+          "url": "https://huggingface.co/ilsvls/gigaam-v4-coreml/resolve/c39fee9dd35bddce703becaf84fa3bb315e49d5c/runtime.json",
+          "sha256": "0e7458a589178d2514f847eb7418fc70104e218dd2b81ff28e3c8822f3e0dead"
+        },
+        {
+          "name": "window.f32",
+          "size": 1280,
+          "url": "https://huggingface.co/ilsvls/gigaam-v4-coreml/resolve/c39fee9dd35bddce703becaf84fa3bb315e49d5c/window.f32",
+          "sha256": "42e25fcba0bf1e83f24f71368f6ccedef245e6faeac6ec2b9ebabb6cf6e66705"
+        },
+        {
+          "name": "mel.f32",
+          "size": 41216,
+          "url": "https://huggingface.co/ilsvls/gigaam-v4-coreml/resolve/c39fee9dd35bddce703becaf84fa3bb315e49d5c/mel.f32",
+          "sha256": "03f0c05dba900b44f54d816789838e498908cd4ee492ef231f8459c61a5158ac"
+        },
+        {
+          "name": "e2e.f32",
+          "size": 7310340,
+          "url": "https://huggingface.co/ilsvls/gigaam-v4-coreml/resolve/c39fee9dd35bddce703becaf84fa3bb315e49d5c/e2e.f32",
+          "sha256": "11106fa8d3d6e23ea4db4500bee7f0178e6cfa4b9cab01287f963e98c559d507"
+        },
+        {
+          "name": "encoder-1024/stage-00.mlpackage/Manifest.json",
+          "size": 617,
+          "url": "https://huggingface.co/ilsvls/gigaam-v4-coreml/resolve/c39fee9dd35bddce703becaf84fa3bb315e49d5c/encoder-1024/stage-00.mlpackage/Manifest.json",
+          "sha256": "e9adababb61a26940ddf3f5dcda5b860760e881a3de77f1e5ba3060f65fafd97"
+        },
+        {
+          "name": "encoder-1024/stage-00.mlpackage/Data/com.apple.CoreML/model.mlmodel",
+          "size": 500709,
+          "url": "https://huggingface.co/ilsvls/gigaam-v4-coreml/resolve/c39fee9dd35bddce703becaf84fa3bb315e49d5c/encoder-1024/stage-00.mlpackage/Data/com.apple.CoreML/model.mlmodel",
+          "sha256": "9814ee6a66f80fdc4139abbc613e3d63cfc567ebd6e93bff56c509d604e085dd"
+        },
+        {
+          "name": "encoder-1024/stage-00.mlpackage/Data/com.apple.CoreML/weights/weight.bin",
+          "size": 474560320,
+          "url": "https://huggingface.co/ilsvls/gigaam-v4-coreml/resolve/c39fee9dd35bddce703becaf84fa3bb315e49d5c/encoder-1024/stage-00.mlpackage/Data/com.apple.CoreML/weights/weight.bin",
+          "sha256": "66f30c7d170b4416d86710a9cc4daf69527b88d5ce7175b1b150ea33bdba538a"
+        }
+      ],
+      "config": {
+        "encoder": "encoder-1024/stage-00.mlpackage",
+        "runtime": "runtime.json",
+        "window": "window.f32",
+        "mel": "mel.f32",
+        "head": "e2e.f32"
+      }
+    },
+    {
       "id": "gigaam-v3-rnnt-punct",
       "role": "listen",
       "title": "GigaAM v3 RNN-T with punctuation",

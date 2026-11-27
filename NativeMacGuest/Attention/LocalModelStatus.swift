@@ -35,6 +35,19 @@ struct LocalModelComputePath: Equatable, Sendable {
     var detail: String
 }
 
+struct LocalModelUpgradeNotice: Equatable, Sendable {
+    let currentTitle: String
+    let targetModelID: String
+    let targetTitle: String
+    let targetSizeBytes: Int64
+    let targetInstalled: Bool
+    let downloadProgress: Double?
+    let downloadError: String?
+    let pendingSwitch: Bool
+    let waitingForVoiceDetector: Bool
+    let activeMeetingsBlockingSwitch: Bool
+}
+
 struct LocalModelStatusSnapshot: Equatable, Sendable {
     let role: LocalModelRole
     let title: String
@@ -50,6 +63,8 @@ struct LocalModelStatusSnapshot: Equatable, Sendable {
     let memoryContended: Bool
     /// ANE status remains available for repair while the GPU fallback is usable.
     var neuralEngineReadiness: LocalModelReadiness? = nil
+    /// Non-nil when the configured ASR model is an outdated v3 model.
+    var upgradeNotice: LocalModelUpgradeNotice? = nil
 }
 
 /// Reduces model stores and engine runtime snapshots into the surface shown in
@@ -153,6 +168,8 @@ struct LocalModelStatusSnapshot: Equatable, Sendable {
     func prepareVoice() { voiceStore.prepareIfNeeded() }
     func retryVoice() { voiceStore.prepare() }
     func downloadVoice() { voiceStore.download() }
+    func upgradeSpeechToRecommended() { listenStore.startRecommendedModelUpgrade() }
+    func cancelRecommendedSpeechUpgrade() { listenStore.cancelPendingSelection() }
 
     /// Deterministic entry used by parity tests without touching real engines.
     func refreshForTesting(asr: LocalSpeechRecognizerRuntimeSnapshot? = nil,
@@ -292,7 +309,10 @@ struct LocalModelStatusSnapshot: Equatable, Sendable {
         case .unloaded: residency = L("Not loaded")
         case .notApplicable: residency = ""
         }
-        return residency.isEmpty ? state : state + ". " + residency
+        var parts = [state]
+        if status.upgradeNotice != nil { parts.append(L("Outdated")) }
+        if !residency.isEmpty { parts.append(residency) }
+        return parts.joined(separator: ". ")
     }
 
     private func rebuildStatuses() {
@@ -303,9 +323,11 @@ struct LocalModelStatusSnapshot: Equatable, Sendable {
     private func makeSpeechStatus() -> LocalModelStatusSnapshot {
         let relevant = listenStore.enabled || attentionStore.pushToTalk
         let selected = listenStore.selected
+        let upgradeNotice = relevant ? makeSpeechUpgradeNotice(selected: selected) : nil
         let base = LocalModelStatusSnapshot(role: .speech, title: L("Speech recognition"), modelName: selected?.title,
             readiness: .off, residency: relevant ? .unloaded : .notApplicable,
-            computePath: computePath(for: selected), memory: nil, memoryContended: memory.contended.contains(.speech))
+            computePath: computePath(for: selected), memory: nil, memoryContended: memory.contended.contains(.speech),
+            upgradeNotice: upgradeNotice)
         guard relevant else { return base }
         guard let selected else {
             return replacing(base, readiness: .setupNeeded(L("Choose a speech model.")), residency: .notApplicable)
@@ -468,6 +490,10 @@ struct LocalModelStatusSnapshot: Equatable, Sendable {
 
     private func computePath(for model: ListenModelCatalog.Model?) -> LocalModelComputePath {
         guard let model else { return .init(summary: L("Not selected"), detail: "") }
+        if model.kind == ListenModelStore.coreMLGigaAMV4Kind {
+            return .init(summary: L("Neural Engine + CPU"),
+                         detail: L("The v4 encoder requests the Neural Engine; the RNN-T head runs on the CPU."))
+        }
         if model.kind == ListenModelStore.coreMLGigaAMKind {
             return .init(summary: L("Neural Engine + CPU"),
                          detail: L("The encoder requests the Neural Engine; the decoder and joint run on the CPU."))
@@ -475,11 +501,42 @@ struct LocalModelStatusSnapshot: Equatable, Sendable {
         return .init(summary: L("CPU"), detail: L("Recognition runs through sherpa-onnx on the processor."))
     }
 
+    private func makeSpeechUpgradeNotice(selected: ListenModelCatalog.Model?) -> LocalModelUpgradeNotice? {
+        guard let selected, listenStore.isOutdated(selected),
+              let recommended = listenStore.recommendedModel else { return nil }
+        let recommendedState = listenStore.state(recommended)
+        let progress: Double?
+        let errorMessage: String?
+        if case .downloading(let fraction) = recommendedState {
+            progress = fraction
+            errorMessage = nil
+        } else if case .failed(let message) = recommendedState {
+            progress = nil
+            errorMessage = message
+        } else {
+            progress = nil
+            errorMessage = nil
+        }
+        return LocalModelUpgradeNotice(
+            currentTitle: selected.title,
+            targetModelID: recommended.id,
+            targetTitle: recommended.title,
+            targetSizeBytes: recommended.size,
+            targetInstalled: recommendedState.installed,
+            downloadProgress: progress,
+            downloadError: errorMessage,
+            pendingSwitch: listenStore.pendingID == recommended.id,
+            waitingForVoiceDetector: listenStore.pendingID == recommended.id && recommendedState.installed && !listenStore.detectorConfigurationReady,
+            activeMeetingsBlockingSwitch: listenStore.activeRecognizerUsers > 0
+        )
+    }
+
     private func replacing(_ snapshot: LocalModelStatusSnapshot, readiness: LocalModelReadiness,
                            residency: LocalModelResidency, memory: ModelMemoryEstimate? = nil,
                            memoryLastKnown: ModelMemoryRecord? = nil) -> LocalModelStatusSnapshot {
         .init(role: snapshot.role, title: snapshot.title, modelName: snapshot.modelName, readiness: readiness,
               residency: residency, computePath: snapshot.computePath, memory: memory,
-              memoryLastKnown: memoryLastKnown, memoryContended: snapshot.memoryContended)
+              memoryLastKnown: memoryLastKnown, memoryContended: snapshot.memoryContended,
+              neuralEngineReadiness: snapshot.neuralEngineReadiness, upgradeNotice: snapshot.upgradeNotice)
     }
 }

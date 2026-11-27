@@ -118,10 +118,13 @@ struct ListenModelCatalog: Decodable, Equatable {
     static let rockKey = "attention.transcribeRock"
     static let modelKey = "attention.listenModel"
     static let pendingModelKey = "attention.listenModelPending"
-    /// Neural Engine GigaAM: same accuracy as the CPU models at a fraction of the processor time.
-    static let defaultModel = "gigaam-v3-e2e-rnnt-coreml"
-    /// The default before the Neural Engine model; kept for people who already downloaded it.
-    static let previousDefaultModel = "gigaam-v3-rnnt-punct"
+    static let upgradePromptDismissedKey = "attention.listenModelUpgradePromptDismissed.v4int8"
+    /// Neural Engine GigaAM v4 INT8: ~4x faster, bilingual Ru+En, half the disk footprint.
+    static let defaultModel = "gigaam-v4-coreml-int8"
+    /// Previous Neural Engine default; kept for people who already downloaded it.
+    static let previousDefaultModel = "gigaam-v3-e2e-rnnt-coreml"
+    static let previousDefaultModels = ["gigaam-v3-e2e-rnnt-coreml", "gigaam-v3-rnnt-punct"]
+    static let outdatedModelIDs: Set<String> = ["gigaam-v3-e2e-rnnt-coreml", "gigaam-v3-rnnt-punct", "gigaam-v3-e2e-ctc"]
     static let shared = ListenModelStore()
 
     let catalog: ListenModelCatalog
@@ -133,7 +136,7 @@ struct ListenModelCatalog: Decodable, Equatable {
             }
         }
     }
-    private var configurationReadyCache: [String: Bool] = [:]
+    private var configurationReadyCache: [String: [(path: String, directoryAllowed: Bool)]] = [:]
     /// Transient local-only measurements; never include these in diagnostics.
     @Published private(set) var storageFailures: [String: VoiceStorageSnapshot] = [:]
     @Published var enabled: Bool { didSet { defaults.set(enabled, forKey: Self.enabledKey) } }
@@ -153,6 +156,7 @@ struct ListenModelCatalog: Decodable, Equatable {
         }
     }
     @Published private(set) var activeRecognizerUsers: Int
+    @Published private(set) var upgradePromptDismissed: Bool = false
     private let defaults: UserDefaults
     private let recognizerUserCount: () -> Int
     private var recognizerObservation: AnyCancellable?
@@ -172,16 +176,17 @@ struct ListenModelCatalog: Decodable, Equatable {
         includesMicrophone = defaults.object(forKey: Self.microphoneKey) as? Bool ?? true
         transcribesExternal = defaults.object(forKey: Self.externalKey) as? Bool ?? true
         transcribesRock = defaults.bool(forKey: Self.rockKey)
+        upgradePromptDismissed = defaults.bool(forKey: Self.upgradePromptDismissedKey)
         selectedID = defaults.string(forKey: Self.modelKey).flatMap { catalog.model($0)?.id } ?? Self.defaultModel
         pendingID = defaults.string(forKey: Self.pendingModelKey).flatMap {
             guard let model = catalog.model($0), model.role == "listen" else { return nil }
             return model.id
         }
         refresh()
-        // Someone transcribing with the previous default never chose it explicitly; a new
-        // default must not stop their transcription until a 446 MB download. Keep theirs.
+        // Someone transcribing with a previous default never chose it explicitly; a new
+        // default must not stop their transcription until the new download finishes. Keep theirs.
         if defaults.string(forKey: Self.modelKey) == nil, let current = catalog.model(Self.defaultModel), !state(current).installed,
-           let previous = catalog.model(Self.previousDefaultModel), state(previous).installed {
+           let previous = Self.previousDefaultModels.compactMap(catalog.model).first(where: { state($0).installed }) {
             selectedID = previous.id
         }
         let changes = recognizerUserChanges ?? LocalSpeechRecognizer.shared.runtime.map(\.users).eraseToAnyPublisher()
@@ -194,10 +199,31 @@ struct ListenModelCatalog: Decodable, Equatable {
     }
 
     var selected: ListenModelCatalog.Model? { catalog.model(selectedID) }
+    var recommendedModel: ListenModelCatalog.Model? { catalog.model(Self.defaultModel) }
+    func isOutdated(_ model: ListenModelCatalog.Model) -> Bool { Self.outdatedModelIDs.contains(model.id) }
+    var isSelectedModelOutdated: Bool { selected.map(isOutdated) == true }
+    var shouldPresentUpgradePromptOnBoot: Bool {
+        guard !upgradePromptDismissed, let recommended = recommendedModel else { return false }
+        if selectedID == recommended.id && state(recommended).installed { return false }
+        if pendingID == recommended.id { return false }
+        if case .downloading = state(recommended) { return false }
+        return isSelectedModelOutdated || (enabled && selectedID == Self.defaultModel && !state(recommended).installed)
+    }
+    func dismissUpgradePrompt() {
+        upgradePromptDismissed = true
+        defaults.set(true, forKey: Self.upgradePromptDismissedKey)
+    }
+    func startRecommendedModelUpgrade() {
+        guard let recommended = recommendedModel else { return }
+        selectModel(recommended)
+    }
     /// Installed models and the space they take.
     var installed: [ListenModelCatalog.Model] { catalog.models.filter { state($0).installed } }
     var installedSize: Int64 { installed.reduce(0) { $0 + $1.size } }
     func state(_ model: ListenModelCatalog.Model) -> State { states[model.id] ?? .absent }
+    #if DEBUG
+    func setStateForTesting(_ state: State, for modelID: String) { states[modelID] = state }
+    #endif
     func storageFailure(_ model: ListenModelCatalog.Model) -> VoiceStorageSnapshot? { storageFailures[model.id] }
 
     /// Re-check the same known destination after the user frees space. Unknown
@@ -249,6 +275,7 @@ struct ListenModelCatalog: Decodable, Equatable {
         } else if modelConfigurationReady(model), detectorConfigurationReady, recognizerUserCount() == 0 {
             pendingID = nil
             selectedID = model.id
+            if model.id == Self.defaultModel { dismissUpgradePrompt() }
         } else {
             pendingID = model.id
             if state(model).installed {
@@ -268,6 +295,7 @@ struct ListenModelCatalog: Decodable, Equatable {
               detectorConfigurationReady, recognizerUserCount() == 0 else { return }
         selectedID = model.id
         self.pendingID = nil
+        if model.id == Self.defaultModel { dismissUpgradePrompt() }
     }
 
     /// Downloads a listen model and, when missing, the voice activity detector.
@@ -438,6 +466,12 @@ struct ListenModelCatalog: Decodable, Equatable {
         guard state(model).installed else { return nil }
         let folder = folder(model)
         func file(_ key: String) -> URL? { model.config[key].map { folder.appendingPathComponent($0) } }
+        if model.kind == Self.coreMLGigaAMV4Kind {
+            guard let encoder = file("encoder"), let runtime = file("runtime"), let window = file("window"),
+                  let mel = file("mel"), let head = file("head") else { return nil }
+            return .coreMLGigaAMV4(.init(encoder: encoder, runtime: runtime, window: window, mel: mel, head: head,
+                                         cache: folder.appendingPathComponent("compiled", isDirectory: true)))
+        }
         guard let tokens = file("tokens") else { return nil }
         if model.kind == Self.coreMLGigaAMKind {
             guard let encoder = file("encoder"), let decoder = file("decoder"), let joint = file("joint") else { return nil }
@@ -480,40 +514,106 @@ struct ListenModelCatalog: Decodable, Equatable {
         return path
     }
 
+    private func cachedConfigurationFilesExist(for id: String) -> Bool {
+        guard let entries = configurationReadyCache[id] else { return false }
+        let fm = FileManager.default
+        return entries.allSatisfy { entry in
+            var isDirectory: ObjCBool = false
+            return fm.fileExists(atPath: entry.path, isDirectory: &isDirectory) &&
+                (entry.directoryAllowed || !isDirectory.boolValue)
+        }
+    }
+
     func modelConfigurationReady(_ model: ListenModelCatalog.Model) -> Bool {
         guard model.role == "listen", state(model).installed else { return false }
         let cacheable = catalog.model(model.id) == model
-        if cacheable, let cached = configurationReadyCache[model.id] { return cached }
+        if cacheable, cachedConfigurationFilesExist(for: model.id) { return true }
+        var verified: [(path: String, directoryAllowed: Bool)] = []
         let ready: Bool
-        if recognizerModel(for: model) == nil || pinnedConfigurationPath("tokens", model: model) == nil {
+        if recognizerModel(for: model) == nil {
             ready = false
-        } else {
+        } else if model.kind == Self.coreMLGigaAMV4Kind {
+            if let enc = pinnedConfigurationPath("encoder", model: model, directoryAllowed: true) {
+                verified.append((enc.path, true))
+                var ok = true
+                for key in ["runtime", "window", "mel", "head"] {
+                    if let url = pinnedConfigurationPath(key, model: model) {
+                        verified.append((url.path, false))
+                    } else {
+                        ok = false; break
+                    }
+                }
+                ready = ok
+            } else {
+                ready = false
+            }
+        } else if let tokens = pinnedConfigurationPath("tokens", model: model) {
+            verified.append((tokens.path, false))
             switch model.kind {
             case Self.coreMLGigaAMKind:
-                ready = ["encoder", "decoder", "joint"].allSatisfy { pinnedConfigurationPath($0, model: model, directoryAllowed: true) != nil }
+                var ok = true
+                for key in ["encoder", "decoder", "joint"] {
+                    if let url = pinnedConfigurationPath(key, model: model, directoryAllowed: true) {
+                        verified.append((url.path, true))
+                    } else {
+                        ok = false; break
+                    }
+                }
+                ready = ok
             case "nemo_transducer":
-                ready = ["encoder", "decoder", "joiner"].allSatisfy { pinnedConfigurationPath($0, model: model) != nil }
+                var ok = true
+                for key in ["encoder", "decoder", "joiner"] {
+                    if let url = pinnedConfigurationPath(key, model: model) {
+                        verified.append((url.path, false))
+                    } else {
+                        ok = false; break
+                    }
+                }
+                ready = ok
             case "nemo_ctc":
-                ready = pinnedConfigurationPath("model", model: model) != nil
+                if let url = pinnedConfigurationPath("model", model: model) {
+                    verified.append((url.path, false))
+                    ready = true
+                } else {
+                    ready = false
+                }
             case "whisper":
-                ready = ["encoder", "decoder"].allSatisfy { pinnedConfigurationPath($0, model: model) != nil }
+                var ok = true
+                for key in ["encoder", "decoder"] {
+                    if let url = pinnedConfigurationPath(key, model: model) {
+                        verified.append((url.path, false))
+                    } else {
+                        ok = false; break
+                    }
+                }
+                ready = ok
             default:
                 ready = false
             }
+        } else {
+            ready = false
         }
-        if cacheable { configurationReadyCache[model.id] = ready }
+        if cacheable {
+            if ready { configurationReadyCache[model.id] = verified }
+            else { configurationReadyCache.removeValue(forKey: model.id) }
+        }
         return ready
     }
 
     var detectorConfigurationReady: Bool {
         guard let vad = catalog.vad, state(vad).installed, vad.kind == "silero_vad" else { return false }
-        if let cached = configurationReadyCache[vad.id] { return cached }
-        let ready = pinnedConfigurationPath("model", model: vad) != nil
-        configurationReadyCache[vad.id] = ready
-        return ready
+        if cachedConfigurationFilesExist(for: vad.id) { return true }
+        guard let path = pinnedConfigurationPath("model", model: vad) else {
+            configurationReadyCache.removeValue(forKey: vad.id)
+            return false
+        }
+        configurationReadyCache[vad.id] = [(path.path, false)]
+        return true
     }
-    /// Native Core ML GigaAM: encoder on the Neural Engine, packages as nested files.
+    /// Native Core ML GigaAM v3: encoder on the Neural Engine, packages as nested files.
     static let coreMLGigaAMKind = "coreml_gigaam_rnnt"
+    /// Native Core ML GigaAM v4: encoder on the Neural Engine, Accelerate RNN-T head on CPU.
+    static let coreMLGigaAMV4Kind = "coreml_gigaam_v4_rnnt"
 
     var vadURL: URL? {
         guard let vad = catalog.vad, state(vad).installed, let name = vad.config["model"] else { return nil }

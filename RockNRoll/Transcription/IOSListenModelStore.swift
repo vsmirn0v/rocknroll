@@ -4,26 +4,35 @@ import Foundation
 import Speech
 
 enum IOSListenModel: String, CaseIterable, Identifiable, Codable {
+    case gigaamV4CoreMLInt8
     case appleSpeech
     case gigaamV3CoreML
 
     var id: String { rawValue }
 
+    var isOutdatedV3: Bool {
+        self == .gigaamV3CoreML
+    }
+
     var title: String {
         switch self {
+        case .gigaamV4CoreMLInt8:
+            return L("GigaAM v4 INT8 (Recommended)")
         case .appleSpeech:
             return L("Apple On-Device Speech")
         case .gigaamV3CoreML:
-            return L("GigaAM v3 (Russian / CoreML)")
+            return L("GigaAM v3 (Outdated)")
         }
     }
 
     var subtitle: String {
         switch self {
+        case .gigaamV4CoreMLInt8:
+            return L("Downloaded once (~246 MB). Runs ~4× faster offline on Neural Engine for Russian & English.")
         case .appleSpeech:
             return L("Uses Apple Speech when on-device recognition is available for the selected language.")
         case .gigaamV3CoreML:
-            return L("Downloaded once (~425 MB). Runs offline on Neural Engine for noisy Russian rooms.")
+            return L("Previous-generation model (~446 MB). Russian only — upgrade to GigaAM v4 INT8 for faster offline transcription.")
         }
     }
 }
@@ -66,12 +75,61 @@ struct PinnedModelFile: Equatable {
 @MainActor
 final class IOSListenModelStore: ObservableObject {
     static let shared = IOSListenModelStore()
+    static let defaultModel: IOSListenModel = .gigaamV4CoreMLInt8
 
     private enum Keys {
         static let selectedModel = "ios.transcription.model"
         static let language = "ios.transcription.language"
         static let autoStart = "ios.transcription.auto-start"
+        static let v4PromptDismissed = "ios.transcription.v4-prompt-dismissed"
     }
+
+    static let gigaamV4BaseURL = URL(string: "https://github.com/vsmirn0v/rocknroll/releases/download/models-gigaam-v4-coreml-int8-v1/")!
+
+    static let gigaamV4Files: [PinnedModelFile] = [
+        PinnedModelFile(
+            relativePath: "runtime.json",
+            byteCount: 19_454,
+            sha256Hex: "0e7458a589178d2514f847eb7418fc70104e218dd2b81ff28e3c8822f3e0dead",
+            url: gigaamV4BaseURL.appendingPathComponent("runtime.json")
+        ),
+        PinnedModelFile(
+            relativePath: "window.f32",
+            byteCount: 1_280,
+            sha256Hex: "42e25fcba0bf1e83f24f71368f6ccedef245e6faeac6ec2b9ebabb6cf6e66705",
+            url: gigaamV4BaseURL.appendingPathComponent("window.f32")
+        ),
+        PinnedModelFile(
+            relativePath: "mel.f32",
+            byteCount: 41_216,
+            sha256Hex: "03f0c05dba900b44f54d816789838e498908cd4ee492ef231f8459c61a5158ac",
+            url: gigaamV4BaseURL.appendingPathComponent("mel.f32")
+        ),
+        PinnedModelFile(
+            relativePath: "e2e.f32",
+            byteCount: 7_310_340,
+            sha256Hex: "11106fa8d3d6e23ea4db4500bee7f0178e6cfa4b9cab01287f963e98c559d507",
+            url: gigaamV4BaseURL.appendingPathComponent("e2e.f32")
+        ),
+        PinnedModelFile(
+            relativePath: "encoder-1024/stage-00.mlpackage/Manifest.json",
+            byteCount: 617,
+            sha256Hex: "5d6f53200259ba966839d08ee4a8b62410f06026087e39a0a33ba82f7b4bff32",
+            url: gigaamV4BaseURL.appendingPathComponent("stage-00-Manifest.json")
+        ),
+        PinnedModelFile(
+            relativePath: "encoder-1024/stage-00.mlpackage/Data/com.apple.CoreML/model.mlmodel",
+            byteCount: 521_464,
+            sha256Hex: "7fccc583d7baf1c466f8e94a1dd6cfd081579cb6c2216de908b0fa17c6f6252b",
+            url: gigaamV4BaseURL.appendingPathComponent("stage-00-model.mlmodel")
+        ),
+        PinnedModelFile(
+            relativePath: "encoder-1024/stage-00.mlpackage/Data/com.apple.CoreML/weights/weight.bin",
+            byteCount: 237_974_144,
+            sha256Hex: "869757bf6c939e5c31984c2ddd93730ff19151ace89a71f5c1bbdb04ad950173",
+            url: gigaamV4BaseURL.appendingPathComponent("stage-00-weight.bin")
+        )
+    ]
 
     static let gigaamBaseURL = URL(string: "https://huggingface.co/smkrv/gigaam-v3-e2e-rnnt-coreml/resolve/846833ef075fde2a8e50521d093ddb9ed7b7fd45/")!
 
@@ -138,6 +196,8 @@ final class IOSListenModelStore: ObservableObject {
         )
     ]
 
+    static let gigaamV4TotalByteCount: Int64 = gigaamV4Files.reduce(0) { $0 + $1.byteCount }
+
     static var defaultModelsDirectory: URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
             ?? FileManager.default.temporaryDirectory
@@ -155,15 +215,76 @@ final class IOSListenModelStore: ObservableObject {
     @Published var autoStartLocalTranscription: Bool {
         didSet { preferences.set(autoStartLocalTranscription, forKey: Keys.autoStart) }
     }
+    @Published private(set) var gigaamV4State: IOSModelInstallState = .notInstalled
     @Published private(set) var gigaamState: IOSModelInstallState = .notInstalled
+    @Published private(set) var isV4UpgradePromptDismissed: Bool
 
     private let modelsDirectory: URL
     private let preferences: UserDefaults
     private let downloader: FileDownloader
     private var downloadTask: Task<Void, Never>?
+    private var downloadV4Task: Task<Void, Never>?
 
     var gigaamDirectory: URL {
         modelsDirectory.appendingPathComponent("gigaam-v3-e2e-rnnt-coreml", isDirectory: true)
+    }
+
+    var gigaamV4Directory: URL {
+        modelsDirectory.appendingPathComponent("gigaam-v4-coreml-int8", isDirectory: true)
+    }
+
+    var isUsingOutdatedV3Model: Bool {
+        if selectedModel == .gigaamV3CoreML { return true }
+        if selectedModel == .gigaamV4CoreMLInt8 && !gigaamV4State.isInstalled && gigaamState.isInstalled {
+            return true
+        }
+        return false
+    }
+
+    var shouldPresentUpgradePromptOnBoot: Bool {
+        guard !isV4UpgradePromptDismissed else { return false }
+        if selectedModel == .gigaamV4CoreMLInt8 && gigaamV4State.isInstalled {
+            return false
+        }
+        if case .downloading = gigaamV4State {
+            return false
+        }
+        return isUsingOutdatedV3Model || (autoStartLocalTranscription && selectedModel == .gigaamV4CoreMLInt8)
+    }
+
+    var activeModelReadinessSummary: String {
+        if selectedModel == .gigaamV4CoreMLInt8, !gigaamV4State.isInstalled {
+            switch gigaamV4State {
+            case .downloading(let progress):
+                return L("Downloading… %ld%%", Int((progress * 100).rounded()))
+            case .failed:
+                return L("Download failed · %@", activeModelStatusTitle)
+            case .installed:
+                break
+            case .notInstalled:
+                if gigaamState.isInstalled {
+                    return L("Ready · %@", activeModelStatusTitle)
+                }
+                return L("Not downloaded · Fallback: %@", activeModelStatusTitle)
+            }
+        } else if selectedModel == .gigaamV3CoreML, !gigaamState.isInstalled {
+            if case .downloading(let progress) = gigaamState {
+                return L("Downloading… %ld%%", Int((progress * 100).rounded()))
+            }
+            return L("Not downloaded · Fallback: %@", activeModelStatusTitle)
+        }
+        return L("Ready · %@", activeModelStatusTitle)
+    }
+
+    var activeModelStatusTitle: String {
+        switch effectiveBackend() {
+        case .gigaamV4CoreMLInt8:
+            return L("GigaAM v4 INT8")
+        case .gigaamV3CoreML:
+            return L("GigaAM v3")
+        case .appleSpeech:
+            return L("Apple On-Device Speech")
+        }
     }
 
     init(modelsDirectory: URL? = nil,
@@ -172,9 +293,24 @@ final class IOSListenModelStore: ObservableObject {
         self.modelsDirectory = modelsDirectory ?? Self.defaultModelsDirectory
         self.preferences = preferences
         self.downloader = downloader ?? Self.streamDownload
+        self.isV4UpgradePromptDismissed = preferences.bool(forKey: Keys.v4PromptDismissed)
+
+        let v4Installed = Self.hasAllFilesInstalled(Self.gigaamV4Files, in: self.modelsDirectory.appendingPathComponent("gigaam-v4-coreml-int8", isDirectory: true))
+        let v3Installed = Self.hasAllFilesInstalled(Self.gigaamFiles, in: self.modelsDirectory.appendingPathComponent("gigaam-v3-e2e-rnnt-coreml", isDirectory: true))
+        self.gigaamV4State = v4Installed ? .installed : .notInstalled
+        self.gigaamState = v3Installed ? .installed : .notInstalled
 
         let storedModel = preferences.string(forKey: Keys.selectedModel).flatMap(IOSListenModel.init(rawValue:))
-        self.selectedModel = storedModel ?? .appleSpeech
+        if let storedModel {
+            self.selectedModel = storedModel
+        } else if v4Installed {
+            self.selectedModel = .gigaamV4CoreMLInt8
+        } else if v3Installed {
+            // Preserve installed GigaAM v3 until user downloads v4 INT8 so meetings continue offline.
+            self.selectedModel = .gigaamV3CoreML
+        } else {
+            self.selectedModel = Self.defaultModel
+        }
 
         let storedLang = preferences.string(forKey: Keys.language).flatMap(IOSTranscriptionLanguage.init(rawValue:))
         let defaultLang: IOSTranscriptionLanguage = Locale.preferredLanguages.first?.lowercased().hasPrefix("ru") == true
@@ -186,17 +322,26 @@ final class IOSListenModelStore: ObservableObject {
         } else {
             self.autoStartLocalTranscription = false
         }
-
-        refreshInstallState()
     }
 
     func refreshInstallState() {
-        if case .downloading = gigaamState { return }
-        gigaamState = Self.hasAllFilesInstalled(in: gigaamDirectory) ? .installed : .notInstalled
+        if case .downloading = gigaamV4State {
+        } else {
+            gigaamV4State = Self.hasAllFilesInstalled(Self.gigaamV4Files, in: gigaamV4Directory) ? .installed : .notInstalled
+        }
+        if case .downloading = gigaamState {
+        } else {
+            gigaamState = Self.hasAllFilesInstalled(Self.gigaamFiles, in: gigaamDirectory) ? .installed : .notInstalled
+        }
     }
+    #if DEBUG
+    func setGigaAMV4StateForTesting(_ state: IOSModelInstallState) {
+        gigaamV4State = state
+    }
+    #endif
 
-    static func hasAllFilesInstalled(in directory: URL) -> Bool {
-        for spec in gigaamFiles {
+    static func hasAllFilesInstalled(_ specs: [PinnedModelFile] = gigaamFiles, in directory: URL) -> Bool {
+        for spec in specs {
             let fileURL = directory.appendingPathComponent(spec.relativePath)
             guard FileManager.default.fileExists(atPath: fileURL.path) else {
                 return false
@@ -209,8 +354,16 @@ final class IOSListenModelStore: ObservableObject {
         gigaamState.isInstalled ? gigaamDirectory : nil
     }
 
+    func installedGigaAMV4DirectoryIfReady() -> URL? {
+        gigaamV4State.isInstalled ? gigaamV4Directory : nil
+    }
+
     func effectiveBackend(for preferred: IOSListenModel? = nil) -> IOSListenModel {
         switch preferred ?? selectedModel {
+        case .gigaamV4CoreMLInt8:
+            if gigaamV4State.isInstalled { return .gigaamV4CoreMLInt8 }
+            if gigaamState.isInstalled { return .gigaamV3CoreML }
+            return .appleSpeech
         case .gigaamV3CoreML:
             return gigaamState.isInstalled ? .gigaamV3CoreML : .appleSpeech
         case .appleSpeech:
@@ -223,6 +376,63 @@ final class IOSListenModelStore: ObservableObject {
         return recognizer.isAvailable && recognizer.supportsOnDeviceRecognition
     }
 
+    func dismissUpgradePrompt() {
+        isV4UpgradePromptDismissed = true
+        preferences.set(true, forKey: Keys.v4PromptDismissed)
+    }
+
+    func downloadAndSwitchToV4() {
+        if gigaamV4State.isInstalled {
+            selectedModel = .gigaamV4CoreMLInt8
+            isV4UpgradePromptDismissed = true
+            preferences.set(true, forKey: Keys.v4PromptDismissed)
+        } else {
+            downloadGigaAMV4()
+        }
+    }
+
+    func downloadGigaAMV4() {
+        guard downloadV4Task == nil else { return }
+        gigaamV4State = .downloading(progress: 0)
+        downloadV4Task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.downloadV4Task = nil }
+            do {
+                try await self.performDownload(
+                    specs: Self.gigaamV4Files,
+                    targetDirectory: self.gigaamV4Directory
+                ) { [weak self] progress in
+                    self?.gigaamV4State = .downloading(progress: progress)
+                }
+                self.gigaamV4State = .installed
+                self.selectedModel = .gigaamV4CoreMLInt8
+                self.isV4UpgradePromptDismissed = true
+                self.preferences.set(true, forKey: Keys.v4PromptDismissed)
+            } catch is CancellationError {
+                self.refreshInstallState()
+            } catch {
+                self.gigaamV4State = .failed(error.localizedDescription)
+            }
+        }
+    }
+
+    func cancelV4Download() {
+        downloadV4Task?.cancel()
+        downloadV4Task = nil
+        refreshInstallState()
+    }
+
+    func deleteGigaAMV4() {
+        downloadV4Task?.cancel()
+        downloadV4Task = nil
+        CoreMLGigaAMV4Recognizer.invalidateCache(directory: gigaamV4Directory)
+        try? FileManager.default.removeItem(at: gigaamV4Directory)
+        gigaamV4State = .notInstalled
+        if selectedModel == .gigaamV4CoreMLInt8 {
+            selectedModel = gigaamState.isInstalled ? .gigaamV3CoreML : .appleSpeech
+        }
+    }
+
     func downloadGigaAM() {
         guard downloadTask == nil else { return }
         gigaamState = .downloading(progress: 0)
@@ -230,7 +440,12 @@ final class IOSListenModelStore: ObservableObject {
             guard let self else { return }
             defer { self.downloadTask = nil }
             do {
-                try await self.performGigaAMDownload()
+                try await self.performDownload(
+                    specs: Self.gigaamFiles,
+                    targetDirectory: self.gigaamDirectory
+                ) { [weak self] progress in
+                    self?.gigaamState = .downloading(progress: progress)
+                }
                 self.gigaamState = .installed
                 self.selectedModel = .gigaamV3CoreML
             } catch is CancellationError {
@@ -254,11 +469,15 @@ final class IOSListenModelStore: ObservableObject {
         try? FileManager.default.removeItem(at: gigaamDirectory)
         gigaamState = .notInstalled
         if selectedModel == .gigaamV3CoreML {
-            selectedModel = .appleSpeech
+            selectedModel = gigaamV4State.isInstalled ? .gigaamV4CoreMLInt8 : .appleSpeech
         }
     }
 
-    private func performGigaAMDownload() async throws {
+    private func performDownload(
+        specs: [PinnedModelFile],
+        targetDirectory target: URL,
+        onProgress: @escaping @MainActor (Double) -> Void
+    ) async throws {
         let fm = FileManager.default
         try fm.createDirectory(at: modelsDirectory, withIntermediateDirectories: true)
         Self.excludeFromBackup(modelsDirectory)
@@ -267,28 +486,27 @@ final class IOSListenModelStore: ObservableObject {
         defer { try? fm.removeItem(at: staging) }
         try fm.createDirectory(at: staging, withIntermediateDirectories: true)
 
-        let totalBytes = Double(Self.gigaamFiles.reduce(Int64(0)) { $0 + $1.byteCount })
+        let totalBytes = Double(specs.reduce(Int64(0)) { $0 + $1.byteCount })
         var completedBytes: Int64 = 0
 
-        for spec in Self.gigaamFiles {
+        for spec in specs {
             try Task.checkCancellation()
             let dest = staging.appendingPathComponent(spec.relativePath)
             try fm.createDirectory(at: dest.deletingLastPathComponent(), withIntermediateDirectories: true)
 
             let baseDone = completedBytes
-            try await downloader(spec.url, dest) { [weak self] written in
+            try await downloader(spec.url, dest) { written in
                 let fraction = min(0.99, Double(baseDone + written) / max(1, totalBytes))
-                Task { @MainActor [weak self] in
-                    self?.gigaamState = .downloading(progress: fraction)
+                Task { @MainActor in
+                    onProgress(fraction)
                 }
             }
             try Task.checkCancellation()
             try await Self.verifyFileAsync(at: dest, expectedBytes: spec.byteCount, expectedSHA256: spec.sha256Hex)
             completedBytes += spec.byteCount
-            gigaamState = .downloading(progress: min(0.99, Double(completedBytes) / max(1, totalBytes)))
+            onProgress(min(0.99, Double(completedBytes) / max(1, totalBytes)))
         }
 
-        let target = gigaamDirectory
         let backup = modelsDirectory.appendingPathComponent(".backup-\(UUID().uuidString)", isDirectory: true)
         if fm.fileExists(atPath: target.path) {
             try fm.moveItem(at: target, to: backup)
