@@ -2,6 +2,18 @@
   "schemaVersion": 1,
   "mac": [
     {
+      "build": 170,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-28",
+      "commit": "7b61660c",
+      "items": [
+        "Make GigaAM v4 INT8 (~246 MB, ~4× faster, Russian & English) the recommended default on-device speech model and add GigaAM v4 FP16 (Core ML) to the model catalog.",
+        "Add non-intrusive boot invitation to download and switch to GigaAM v4 INT8 without interrupting meetings.",
+        "Show outdated-model warnings and one-click upgrade controls in Model preparation status and Transcription settings when using v3 models."
+      ]
+    },
+    {
       "build": 169,
       "version": "0.3.0",
       "channel": "beta",
