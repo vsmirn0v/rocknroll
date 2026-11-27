@@ -2,6 +2,18 @@
   "schemaVersion": 1,
   "mac": [
     {
+      "build": 169,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-27",
+      "commit": "fd44cb8f",
+      "items": [
+        "Settings > Updates: browse and search full release notes history with Stable and Beta channel filtering",
+        "Fix Guest microphone unmute timing out and keep low-latency .inputMixer mute/unmute without live VPIO churn",
+        "Fix MainActor hang when leaving during Guest startup or session recovery, and harden transcription silence gating"
+      ]
+    },
+    {
       "build": 168,
       "version": "0.3.0",
       "channel": "beta",
@@ -995,6 +1007,18 @@
     }
   ],
   "ios": [
+    {
+      "build": 176,
+      "version": "0.2.0",
+      "channel": "beta",
+      "date": "2026-11-27",
+      "commit": "fd44cb8f",
+      "items": [
+        "Fix Guest microphone unmute timing out by keeping audio sender RTP active while muted",
+        "Fix Guest reactions readiness, server transcript permission transitions, and in-call Push-to-Talk capture",
+        "Keep active meeting CoreML GigaAM recognizer leased across background memory warnings and harden silence gating"
+      ]
+    },
     {
       "build": 175,
       "version": "0.2.0",
