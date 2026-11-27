@@ -160,6 +160,8 @@ def configure_distribution(root, spec_dir, spec, distribution):
     resource_anchor = next(anchor for anchor in resource_anchors if anchor in spec)
     language_bundle = root / 'NativeMacGuest/AuthorSupport/SupportLanguage.bundle'
     spec = spec.replace(resource_anchor, f'      - path: {language_bundle}\n        type: folder\n        buildPhase: resources\n' + resource_anchor, 1)
+    changelog_resource = root / 'NativeMacGuest/distribution/changelog.json'
+    spec = spec.replace(resource_anchor, f'      - path: {changelog_resource}\n        buildPhase: resources\n' + resource_anchor, 1)
     spec = spec.replace(resource_anchor, '      - path: ' + str(root / 'NativeMacGuest/distribution/Sparkle-LICENSE.txt') + '\n        buildPhase: resources\n' + resource_anchor, 1)
     test_anchor = '      - target: RockNRollNativeGuest\n'
     spec = spec.replace(test_anchor, test_anchor + f'      - framework: {bundle}\n        embed: false\n')

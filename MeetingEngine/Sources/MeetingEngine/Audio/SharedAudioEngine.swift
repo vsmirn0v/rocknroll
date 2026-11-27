@@ -252,15 +252,12 @@ public enum SharedAudioEngineError: LocalizedError, Equatable {
         self.makeModule = makeModule
     }
 
-#if os(macOS)
-    public nonisolated static let defaultLiveMutedInputHold: Duration? = .seconds(20)
-    private nonisolated static let defaultBypassVoiceProcessingWhenMuted = true
-#else
-    // On iOS, CallKit + AVAudioSession(.voiceChat) owns background audio continuity; never
-    // stop/reconfigure AVAudioEngine input on a muted timer while a call may be backgrounded.
+    // Once microphone capture is activated in a live talk meeting, keep `.inputMixer` mute active
+    // rather than tearing down `AVAudioEngine` on a muted timer: on macOS CoreAudio VPIO, toggling
+    // input availability takes ~1.8 s and interrupts playout, and on iOS CallKit owns background
+    // session continuity. Explicit `mutedInputHold` remains injectable for deterministic tests.
     public nonisolated static let defaultLiveMutedInputHold: Duration? = nil
     private nonisolated static let defaultBypassVoiceProcessingWhenMuted = false
-#endif
 
     /// The app's engine: one non-exclusive `GuestSystemAudio` owner whose factory
     /// LiveKit adopts up front when `installIntoLiveKitOnCreate` is true.

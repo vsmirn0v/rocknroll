@@ -35,6 +35,7 @@ public final class NativeVideoPixelBuffer {
             size = dimensions; pixelFormat = format
             let attributes: [CFString: Any] = [kCVPixelBufferWidthKey: width, kCVPixelBufferHeightKey: height,
                 kCVPixelBufferPixelFormatTypeKey: format,
+                kCVPixelBufferBytesPerRowAlignmentKey: 16,
                 kCVPixelBufferIOSurfacePropertiesKey: [:]]
             guard CVPixelBufferPoolCreate(nil, nil, attributes as CFDictionary, &pool) == kCVReturnSuccess else { return nil }
         }
@@ -71,7 +72,9 @@ public final class NativeVideoPixelBuffer {
                 v = (v | (v &<< 16)) & 0x0000_FFFF_0000_FFFF
                 v = (v | (v &<< 8)) & 0x00FF_00FF_00FF_00FF
                 let interleaved = (u | (v &<< 8)).littleEndian
-                dstRow.storeBytes(of: interleaved, toByteOffset: col * 2, as: UInt64.self)
+                withUnsafeBytes(of: interleaved) {
+                    dstRow.advanced(by: col * 2).copyMemory(from: $0.baseAddress!, byteCount: 8)
+                }
                 col += 4
             }
             if col < chromaWidth {

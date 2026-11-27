@@ -127,6 +127,7 @@ private final class AudioIngressRouter: @unchecked Sendable {
     private var speakerNames: [String: String] = [:]
     private var pendingWorkCount = 0
     private var audibleTailUntil: [String: TimeInterval] = [:]
+    private var lastSilentSweepScheduleUptime: TimeInterval = 0
     private static let maxPendingWorkCount = 64
     private static let audiblePeakThreshold: Float = 1e-4
     private static let silenceHangoverSeconds: TimeInterval = 1.2
@@ -148,68 +149,44 @@ private final class AudioIngressRouter: @unchecked Sendable {
         let frames = Int(buffer.frameLength)
         guard frames > 0 else { return false }
         let format = buffer.format
-        let channels = max(1, Int(format.channelCount))
+        let audioBuffers = UnsafeMutableAudioBufferListPointer(buffer.mutableAudioBufferList)
         switch format.commonFormat {
         case .pcmFormatFloat32:
-            if !format.isInterleaved, let data = buffer.floatChannelData {
-                for ch in 0..<channels {
-                    var peak: Float = 0
-                    vDSP_maxmgv(data[ch], 1, &peak, vDSP_Length(frames))
-                    if peak >= audiblePeakThreshold { return true }
-                }
-                return false
-            } else if let raw = buffer.audioBufferList.pointee.mBuffers.mData {
+            for ab in audioBuffers {
+                let expected = frames * max(1, Int(ab.mNumberChannels))
+                let count = min(expected, Int(ab.mDataByteSize) / MemoryLayout<Float>.size)
+                guard count > 0, let ptr = ab.mData?.assumingMemoryBound(to: Float.self) else { continue }
                 var peak: Float = 0
-                vDSP_maxmgv(raw.assumingMemoryBound(to: Float.self), 1, &peak, vDSP_Length(frames * channels))
-                return peak >= audiblePeakThreshold
+                vDSP_maxmgv(ptr, 1, &peak, vDSP_Length(count))
+                if peak >= audiblePeakThreshold { return true }
             }
-            return true
+            return false
         case .pcmFormatInt16:
             let intThreshold = Int16(max(4, Int((audiblePeakThreshold * 32768.0).rounded())))
-            if !format.isInterleaved, let data = buffer.int16ChannelData {
-                for ch in 0..<channels {
-                    let ptr = data[ch]
-                    for i in 0..<frames {
-                        let s = ptr[i]
-                        let mag = s == .min ? Int16.max : abs(s)
-                        if mag >= intThreshold { return true }
-                    }
-                }
-                return false
-            } else if let raw = buffer.audioBufferList.pointee.mBuffers.mData {
-                let ptr = raw.assumingMemoryBound(to: Int16.self)
-                let total = frames * channels
-                for i in 0..<total {
+            for ab in audioBuffers {
+                let expected = frames * max(1, Int(ab.mNumberChannels))
+                let count = min(expected, Int(ab.mDataByteSize) / MemoryLayout<Int16>.size)
+                guard count > 0, let ptr = ab.mData?.assumingMemoryBound(to: Int16.self) else { continue }
+                for i in 0..<count {
                     let s = ptr[i]
                     let mag = s == .min ? Int16.max : abs(s)
                     if mag >= intThreshold { return true }
                 }
-                return false
             }
-            return true
+            return false
         case .pcmFormatInt32:
             let intThreshold = Int32(max(256, Int64((Double(audiblePeakThreshold) * 2_147_483_648.0).rounded())))
-            if !format.isInterleaved, let data = buffer.int32ChannelData {
-                for ch in 0..<channels {
-                    let ptr = data[ch]
-                    for i in 0..<frames {
-                        let s = ptr[i]
-                        let mag = s == .min ? Int32.max : abs(s)
-                        if mag >= intThreshold { return true }
-                    }
-                }
-                return false
-            } else if let raw = buffer.audioBufferList.pointee.mBuffers.mData {
-                let ptr = raw.assumingMemoryBound(to: Int32.self)
-                let total = frames * channels
-                for i in 0..<total {
+            for ab in audioBuffers {
+                let expected = frames * max(1, Int(ab.mNumberChannels))
+                let count = min(expected, Int(ab.mDataByteSize) / MemoryLayout<Int32>.size)
+                guard count > 0, let ptr = ab.mData?.assumingMemoryBound(to: Int32.self) else { continue }
+                for i in 0..<count {
                     let s = ptr[i]
                     let mag = s == .min ? Int32.max : abs(s)
                     if mag >= intThreshold { return true }
                 }
-                return false
             }
-            return true
+            return false
         default:
             return true
         }
@@ -255,11 +232,23 @@ private final class AudioIngressRouter: @unchecked Sendable {
             }
             for (id, pipeline) in self.pipelines {
                 if id == "local" {
-                    pipeline.updateSpeaker(localSpeaker)
+                    pipeline.setSpeakerOnWorker(localSpeaker)
                 } else if let name = speakerNames[id] {
-                    pipeline.updateSpeaker(name)
+                    pipeline.setSpeakerOnWorker(name)
                 }
             }
+        }
+    }
+
+    private func scheduleSilentSweepIfNeeded(now: TimeInterval) {
+        let shouldDispatch = lock.withLock { () -> Bool in
+            guard running, now - lastSilentSweepScheduleUptime >= Self.idleSweepIntervalSeconds else { return false }
+            lastSilentSweepScheduleUptime = now
+            return true
+        }
+        guard shouldDispatch else { return }
+        workerQueue.async { [self] in
+            self.sweepIdlePipelinesIfNeeded(nowUptime: now)
         }
     }
 
@@ -285,6 +274,7 @@ private final class AudioIngressRouter: @unchecked Sendable {
             guard let until = audibleTailUntil["local"], now < until else { return false }
             return true
         }
+        if !accepted { scheduleSilentSweepIfNeeded(now: now) }
         return (accepted, audible)
     }
 
@@ -314,6 +304,7 @@ private final class AudioIngressRouter: @unchecked Sendable {
             guard let until = audibleTailUntil[streamID], now < until else { return false }
             return true
         }
+        if !accepted { scheduleSilentSweepIfNeeded(now: now) }
         return (accepted, audible)
     }
 
@@ -442,8 +433,7 @@ private final class AudioIngressRouter: @unchecked Sendable {
         lastIdleSweepUptime = nowUptime
         guard !pipelines.isEmpty else { return }
         for (id, pipeline) in Array(pipelines) {
-            if !pipeline.isSpeechActive,
-               (nowUptime - pipeline.lastAudibleUptime) >= Self.idlePipelineTTLSeconds {
+            if (nowUptime - pipeline.lastAudibleUptime) >= Self.idlePipelineTTLSeconds {
                 pipelines.removeValue(forKey: id)?.finishAndFlush()
             }
         }
@@ -480,7 +470,7 @@ private final class AudioIngressRouter: @unchecked Sendable {
         let pipeline: SpeakerPipeline
         if let existing = pipelines[streamID] {
             pipeline = existing
-            pipeline.updateSpeaker(speakerName)
+            pipeline.setSpeakerOnWorker(speakerName)
         } else {
             if !isAudible && lock.withLock({ onPCM16Audio == nil }) {
                 return
@@ -1008,11 +998,15 @@ private final class SpeakerPipeline {
         }
     }
 
+    func setSpeakerOnWorker(_ name: String?) {
+        if let name, !name.isEmpty {
+            self.speakerName = name
+        }
+    }
+
     func updateSpeaker(_ name: String?) {
         workerQueue.async {
-            if let name, !name.isEmpty {
-                self.speakerName = name
-            }
+            self.setSpeakerOnWorker(name)
         }
     }
 

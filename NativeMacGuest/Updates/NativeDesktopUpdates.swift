@@ -27,6 +27,7 @@ import SwiftUI
     @Published private(set) var beta = UserDefaults.standard.bool(forKey: "native.updates.beta")
     @Published private(set) var stagedUpdate: StagedUpdate?
     @Published private(set) var recoveryChangelog: UpdateChangelogDiff?
+    @Published private(set) var changelogHistory: [UpdateChangelogSection] = []
     @Published var showingChangelogSheet = false
     @Published private(set) var bannerDismissedBuild: Int?
     private var subscriptions = Set<AnyCancellable>()
@@ -53,6 +54,10 @@ import SwiftUI
     private let currentBuild: Int
     private let currentVersion: String
     private let changelogDefaults: UserDefaults
+    private var loadedBundledChangelog: [UpdateChangelogSection]?
+    @Published private(set) var availableChangelogBuild: Int?
+    var installedBuild: Int { currentBuild }
+    var installedVersion: String { currentVersion }
     var mayStartMeeting: Bool { safety.mayStartMeeting }
 
     init(
@@ -60,13 +65,15 @@ import SwiftUI
         mediaGate: NativeDesktopUpdateMediaGate? = nil,
         currentBuild: Int? = nil,
         currentVersion: String? = nil,
-        changelogDefaults: UserDefaults = .standard
+        changelogDefaults: UserDefaults = .standard,
+        bundledChangelog: [UpdateChangelogSection]? = nil
     ) {
         self.safety = safety
         self.mediaGate = mediaGate ?? .live
         self.currentBuild = currentBuild ?? (Int(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "") ?? 0)
         self.currentVersion = currentVersion ?? (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.3.0")
         self.changelogDefaults = changelogDefaults
+        self.loadedBundledChangelog = bundledChangelog
         super.init()
         driver = MeetingSafeUpdateDriver(owner: self)
         updater = SPUUpdater(hostBundle: .main, applicationBundle: .main, userDriver: driver, delegate: self)
@@ -81,9 +88,13 @@ import SwiftUI
                     installedBuild: self.currentBuild,
                     targetBuild: target,
                     installedVersion: self.currentVersion,
-                    targetVersion: cached.targetVersion
+                    targetVersion: cached.targetVersion,
+                    targetChannel: cached.channel
                 )
             }
+        }
+        if bundledChangelog != nil {
+            refreshChangelogHistory()
         }
     }
     /// A newer published build than the update Sparkle already downloaded.
@@ -148,12 +159,53 @@ import SwiftUI
     func dismissBannerForCurrentUpdate() {
         bannerDismissedBuild = stagedUpdate?.build
     }
+    func ensureChangelogHistoryLoaded() {
+        guard loadedBundledChangelog == nil else { return }
+        loadedBundledChangelog = UpdateChangelogLedger.loadBundled()
+        refreshChangelogHistory()
+    }
+
+    private func refreshChangelogHistory() {
+        guard let bundled = loadedBundledChangelog else { return }
+        var supplemental: [UpdateChangelogSection] = []
+        var activeAvailableBuild = stagedUpdate?.build ?? safety.recoveryTargetBuild
+        if let stagedSections = stagedUpdate?.diff.sections {
+            supplemental.append(contentsOf: stagedSections)
+        }
+        if let recoverySections = recoveryChangelog?.sections {
+            supplemental.append(contentsOf: recoverySections)
+        }
+        if let cached = UpdateChangelogCache.loadLatest(defaults: changelogDefaults),
+           cached.targetBuild > currentBuild,
+           beta || cached.channel != "beta" || safety.recoveryTargetBuild == cached.targetBuild {
+            if activeAvailableBuild == nil {
+                activeAvailableBuild = cached.targetBuild
+            }
+            supplemental.append(
+                contentsOf: UpdateChangelogParser.parseSections(
+                    cached.markdown,
+                    targetBuild: cached.targetBuild,
+                    targetChannel: cached.channel
+                )
+            )
+        }
+        if availableChangelogBuild != activeAvailableBuild {
+            availableChangelogBuild = activeAvailableBuild
+        }
+        let merged = UpdateChangelogLedger.merge(bundled: bundled, supplemental: supplemental)
+        if changelogHistory != merged {
+            changelogHistory = merged
+        }
+    }
+
     private func makeDiff(for item: SUAppcastItem, targetBuild: Int) -> UpdateChangelogDiff {
+        let itemChannel = (item.channel == "beta") ? "beta" : "stable"
         if let description = item.itemDescription, !description.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             UpdateChangelogCache.save(
                 markdown: description,
                 targetBuild: targetBuild,
                 targetVersion: item.displayVersionString,
+                channel: itemChannel,
                 defaults: changelogDefaults
             )
             return UpdateChangelogParser.slice(
@@ -161,7 +213,8 @@ import SwiftUI
                 installedBuild: currentBuild,
                 targetBuild: targetBuild,
                 installedVersion: currentVersion,
-                targetVersion: item.displayVersionString
+                targetVersion: item.displayVersionString,
+                targetChannel: itemChannel
             )
         }
         if let cached = UpdateChangelogCache.load(targetBuild: targetBuild, defaults: changelogDefaults) {
@@ -170,7 +223,8 @@ import SwiftUI
                 installedBuild: currentBuild,
                 targetBuild: targetBuild,
                 installedVersion: currentVersion,
-                targetVersion: item.displayVersionString
+                targetVersion: item.displayVersionString,
+                targetChannel: cached.channel ?? itemChannel
             )
         }
         return UpdateChangelogDiff(
@@ -187,6 +241,7 @@ import SwiftUI
         guard !channelLocked else { return }
         beta = value; newerThanDownloaded = nil; UserDefaults.standard.set(value, forKey: "native.updates.beta")
         updater.resetUpdateCycle()
+        refreshChangelogHistory()
     }
     func showWhenIdle(_ action: @escaping () -> Void) {
         if busy() { deferred.append(action); status = L("An update is waiting until the meeting ends.") }
@@ -252,6 +307,7 @@ import SwiftUI
     func updater(_ updater: SPUUpdater, didFindValidUpdate item: SUAppcastItem) {
         guard let target = Int(item.versionString) else { return }
         _ = makeDiff(for: item, targetBuild: target)
+        refreshChangelogHistory()
     }
     func updater(_ updater: SPUUpdater, shouldProceedWithUpdate item: SUAppcastItem, updateCheck: SPUUpdateCheck) throws {
         guard cycleActive, let target = Int(item.versionString) else { throw NativeUpdateSafety.SafetyError.invalidBuild }
@@ -267,6 +323,7 @@ import SwiftUI
         stagedAppcastItem = item
         stagedUpdate = StagedUpdate(version: item.displayVersionString, build: target, diff: diff)
         bannerDismissedBuild = nil
+        refreshChangelogHistory()
         stagedInstallAction = { [weak self] in
             guard let self, self.cycleActive, self.cycleEpoch == epoch else { return }
             self.installChoice(.install) { if $0 == .install { action() } }
@@ -290,6 +347,7 @@ import SwiftUI
         cycleActive = false; cycleEpoch = UUID(); installWhenIdle = nil; stagedInstallAction = nil
         stagedUpdate = nil; stagedAppcastItem = nil; showingChangelogSheet = false; newerThanDownloaded = nil
         deferred.removeAll(); driver.invalidate()
+        refreshChangelogHistory()
         if !safety.installationReserved {
             mediaPreparedForInstall = false
             // A native operation may outlive cancellation. Release its exclusion
@@ -603,7 +661,137 @@ struct NativeDesktopUpdatesView: View {
                 }
                 Text(L("Beta updates include early changes. Turning this off waits for a newer stable release; it does not downgrade your app.")).font(.caption).foregroundStyle(.secondary)
             }
+            NativeDesktopChangelogHistorySection(updates: updates)
         }.nativeSettingsReveal().formStyle(.grouped)
+    }
+}
+
+private struct NativeDesktopChangelogHistorySection: View {
+    @ObservedObject var updates: NativeDesktopUpdates
+    @State private var filterQuery = ""
+    @State private var channelFilter: UpdateChangelogLedger.ChannelFilter = .all
+    @State private var visibleLimit = 10
+
+    private var hasChannelMetadata: Bool {
+        updates.changelogHistory.contains { $0.channel != nil }
+    }
+
+    private var filteredSections: [UpdateChangelogSection] {
+        UpdateChangelogLedger.filter(updates.changelogHistory, channel: channelFilter, query: filterQuery)
+    }
+
+    var body: some View {
+        let filtered = filteredSections
+        let trimmed = filterQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cap = trimmed.isEmpty ? visibleLimit : max(visibleLimit, 50)
+        let displayed = Array(filtered.prefix(cap))
+        Section(L("Release notes")) {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 8) {
+                    HStack(spacing: 6) {
+                        TextField(L("Filter release notes…"), text: $filterQuery)
+                            .textFieldStyle(.roundedBorder)
+                            .accessibilityIdentifier("settings.changelog.filter")
+                        if !filterQuery.isEmpty {
+                            Button {
+                                filterQuery = ""
+                            } label: {
+                                Image(systemName: "xmark.circle.fill")
+                                    .foregroundStyle(.secondary)
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel(L("Clear filters"))
+                        }
+                    }
+                    if hasChannelMetadata {
+                        Picker(L("Channel"), selection: $channelFilter) {
+                            Text(L("All")).tag(UpdateChangelogLedger.ChannelFilter.all)
+                            Text(L("Stable")).tag(UpdateChangelogLedger.ChannelFilter.stable)
+                            Text(L("Beta")).tag(UpdateChangelogLedger.ChannelFilter.beta)
+                        }
+                        .pickerStyle(.segmented)
+                        .labelsHidden()
+                        .fixedSize()
+                        .accessibilityIdentifier("settings.changelog.channel")
+                    }
+                }
+            }
+            .nativeSettingAnchor("settings.changelog")
+            .onAppear {
+                updates.ensureChangelogHistoryLoaded()
+            }
+            .onChange(of: channelFilter) { _ in
+                visibleLimit = 10
+            }
+            .onChange(of: filterQuery) { _ in
+                visibleLimit = 10
+            }
+
+            if updates.changelogHistory.isEmpty {
+                Text(L("No release notes available."))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else if filtered.isEmpty {
+                Text(L("No matching release notes."))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(displayed) { section in
+                    VStack(alignment: .leading, spacing: 5) {
+                        HStack(spacing: 6) {
+                            Text(section.date.map { "\(section.version) (\(section.build)) — \($0)" }
+                                 ?? "\(section.version) (\(section.build))")
+                                .font(.subheadline.weight(.semibold))
+                            if section.build == updates.installedBuild {
+                                changelogBadge(L("Installed"), foreground: Color.accentColor, background: Color.accentColor.opacity(0.16), emphasized: true)
+                            } else if updates.installedBuild > 0,
+                                      let available = updates.availableChangelogBuild,
+                                      section.build > updates.installedBuild,
+                                      section.build <= available {
+                                changelogBadge(L("Available"), foreground: .green, background: Color.green.opacity(0.16), emphasized: true)
+                            }
+                            if section.channel == "beta" {
+                                changelogBadge(L("Beta"), foreground: .secondary, background: Color.secondary.opacity(0.14), emphasized: false)
+                            } else if section.channel == "stable" {
+                                changelogBadge(L("Stable"), foreground: .secondary, background: Color.secondary.opacity(0.14), emphasized: false)
+                            }
+                        }
+                        ForEach(Array(section.items.enumerated()), id: \.offset) { _, item in
+                            HStack(alignment: .top, spacing: 6) {
+                                Text("•").foregroundStyle(.secondary)
+                                Text(item)
+                                    .font(.callout)
+                                    .textSelection(.enabled)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                        }
+                    }
+                    .padding(.vertical, 3)
+                }
+
+                if filtered.count > displayed.count {
+                    HStack(spacing: 12) {
+                        Button(L("Show more (%ld remaining)", filtered.count - displayed.count)) {
+                            visibleLimit = displayed.count + 20
+                        }
+                        Button(L("Show all (%ld)", filtered.count)) {
+                            visibleLimit = filtered.count
+                        }
+                    }
+                    .buttonStyle(.borderless)
+                    .padding(.top, 2)
+                }
+            }
+        }
+    }
+
+    private func changelogBadge(_ title: String, foreground: Color, background: Color, emphasized: Bool) -> some View {
+        Text(title)
+            .font(emphasized ? .caption2.weight(.medium) : .caption2)
+            .foregroundStyle(foreground)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(background, in: Capsule())
     }
 }
 #endif

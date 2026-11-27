@@ -4801,3 +4801,14 @@
 "Visual snapshots (%ld)" = "Визуальные снимки (%ld)";
 "Watch / Contradiction" = "Риск / противоречие";
 "Whisper a private question…" = "Задать приватный вопрос в Whisper…";
+
+"Release notes" = "История изменений";
+"Browse changelog history for installed and previous builds." = "Просмотр истории изменений для установленной и предыдущих сборок.";
+"Filter release notes…" = "Фильтр по изменениям…";
+"Installed" = "Установлена";
+"Available" = "Доступна";
+"Show more (%ld remaining)" = "Показать ещё (осталось %ld)";
+"Show all (%ld)" = "Показать все (%ld)";
+"No matching release notes." = "Нет подходящих записей.";
+"No release notes available." = "История изменений недоступна.";
+"Channel" = "Канал";

@@ -114,5 +114,96 @@ final class UpdateChangelogTests: XCTestCase {
         let loadedHuge = UpdateChangelogCache.load(targetBuild: 400, defaults: defaults)
         XCTAssertTrue(loadedHuge?.markdown.contains("0.3.0 (400)") == true)
     }
+
+    func testCacheLoadLatestReturnsMostRecentSavedPayload() {
+        let suite = "UpdateChangelogLatestTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        addTeardownBlock { defaults.removePersistentDomain(forName: suite) }
+
+        XCTAssertNil(UpdateChangelogCache.loadLatest(defaults: defaults))
+        UpdateChangelogCache.save(markdown: sampleMarkdown, targetBuild: 167, targetVersion: "0.3.0", channel: "beta", defaults: defaults)
+        let loaded = UpdateChangelogCache.loadLatest(defaults: defaults)
+        XCTAssertEqual(loaded?.targetBuild, 167)
+        XCTAssertEqual(loaded?.targetVersion, "0.3.0")
+        XCTAssertEqual(loaded?.channel, "beta")
+        XCTAssertTrue(loaded?.markdown.contains("167") == true)
+    }
+
+    func testLedgerParsesDeduplicatesAndSortsBundledJSON() throws {
+        let json = """
+        {
+          "schemaVersion": 1,
+          "mac": [
+            {
+              "build": 53,
+              "version": "0.3.0",
+              "channel": "stable",
+              "date": "2026-11-01",
+              "commit": "aaaa1111",
+              "items": ["  Initial stable release  "]
+            },
+            {
+              "build": 168,
+              "version": "0.3.0",
+              "channel": "beta",
+              "date": "2026-11-27",
+              "commit": "bbbb2222",
+              "items": ["Reduce CPU in large rooms", ""]
+            },
+            {
+              "build": 168,
+              "version": "0.3.0",
+              "channel": "beta",
+              "date": "2026-11-27",
+              "commit": "cccc3333",
+              "items": ["Duplicate entry should be ignored"]
+            }
+          ],
+          "ios": []
+        }
+        """
+        let sections = UpdateChangelogLedger.parseJSON(Data(json.utf8))
+        XCTAssertEqual(sections.map(\.build), [168, 53])
+        XCTAssertEqual(sections[0].channel, "beta")
+        XCTAssertEqual(sections[0].items, ["Reduce CPU in large rooms"])
+        XCTAssertEqual(sections[1].channel, "stable")
+        XCTAssertEqual(sections[1].items, ["Initial stable release"])
+
+        let invalid = Data(#"{"schemaVersion": 2, "mac": []}"#.utf8)
+        XCTAssertTrue(UpdateChangelogLedger.parseJSON(invalid).isEmpty)
+    }
+
+    func testLedgerLoadsRealBundledChangelogResource() {
+        let sections = UpdateChangelogLedger.loadBundled(from: .main)
+        XCTAssertFalse(sections.isEmpty, "changelog.json must be bundled in direct builds")
+        XCTAssertEqual(sections, sections.sorted { $0.build > $1.build })
+        XCTAssertGreaterThanOrEqual(sections.first?.build ?? 0, 168)
+    }
+
+    func testLedgerMergesBundledAndSupplementalAndFiltersByChannelAndQuery() {
+        let bundled = [
+            UpdateChangelogSection(version: "0.3.0", build: 168, date: "2026-11-27", items: ["Silence-gate transcription"], channel: "beta"),
+            UpdateChangelogSection(version: "0.3.0", build: 53, date: "2026-11-01", items: ["Initial macOS release"], channel: "stable"),
+        ]
+        let supplemental = [
+            UpdateChangelogSection(version: "0.3.0", build: 169, date: "2026-11-28", items: ["Browse changelog in Updates tab"]),
+            UpdateChangelogSection(version: "0.3.0", build: 168, date: "2026-11-27", items: ["Server markdown bullet"]),
+        ]
+        let merged = UpdateChangelogLedger.merge(bundled: bundled, supplemental: supplemental)
+        XCTAssertEqual(merged.map(\.build), [169, 168, 53])
+        XCTAssertNil(merged[0].channel)
+        XCTAssertEqual(merged[1].channel, "beta", "Existing bundled channel metadata must be preserved")
+        XCTAssertEqual(merged[1].items, ["Silence-gate transcription"])
+
+        XCTAssertEqual(UpdateChangelogLedger.filter(merged, channel: .all, query: "").map(\.build), [169, 168, 53])
+        XCTAssertEqual(UpdateChangelogLedger.filter(merged, channel: .stable, query: "").map(\.build), [53])
+        XCTAssertEqual(UpdateChangelogLedger.filter(merged, channel: .beta, query: "").map(\.build), [168])
+        XCTAssertEqual(UpdateChangelogLedger.filter(merged, channel: .all, query: "SILENCE transcription").map(\.build), [168])
+        XCTAssertEqual(UpdateChangelogLedger.filter(merged, channel: .all, query: "(169) updates").map(\.build), [169])
+
+        let stamped = UpdateChangelogParser.parseSections(sampleMarkdown, targetBuild: 167, targetChannel: "beta")
+        XCTAssertEqual(stamped.first { $0.build == 167 }?.channel, "beta")
+        XCTAssertNil(stamped.first { $0.build == 166 }?.channel)
+    }
 }
 #endif

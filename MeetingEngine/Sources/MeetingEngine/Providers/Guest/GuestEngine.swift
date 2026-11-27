@@ -925,6 +925,7 @@ public final class NativeGuestEngine {
 
     func configureStartupPlayback(sound: Bool) {
         guard !closing else { return }
+        startupAudioDeadline = nil
         startupObservedReceiveDemand = false
         startupExtendedForViableICE = false
         startupPlayoutEpoch = systemAudio?.playoutEpoch
@@ -1217,7 +1218,14 @@ public final class NativeGuestEngine {
     }
 
     func waitForStartupAudio() async throws {
-        guard !outputSuppressed, let gain = startupPlaybackGain, !gain.isOpen, let owner = systemAudio else { return }
+        try checkActive()
+        guard !outputSuppressed else { throw CancellationError() }
+        guard let gain = startupPlaybackGain, let owner = systemAudio else { return }
+        if gain.isOpen {
+            if !gain.soundEnabled || owner.sharedPlayoutIsOpen(expected: startupPlayoutEpoch) != false { return }
+            gain.hold(); startupDecision = nil; startupReadyTopology = nil
+            startupAudioDeadline = nil; startupExtendedForViableICE = false
+        }
         if let task = startupAudioTask { try await task.value; return }
         let generation = startupAudioGeneration
         if startupAudioDeadline == nil {
@@ -1338,7 +1346,7 @@ public final class NativeGuestEngine {
     /// No await separates gain release from GuestSession's Connected notification.
     func releaseStartupAudio() -> Bool {
         guard !closing, failure == nil, !outputSuppressed else { return false }
-        guard let gain = startupPlaybackGain else { return true }
+        guard let gain = startupPlaybackGain, systemAudio != nil else { return true }
         if gain.isOpen {
             if !gain.soundEnabled || systemAudio?.sharedPlayoutIsOpen(expected: startupPlayoutEpoch) != false { return true }
             gain.hold(); startupDecision = nil; startupReadyTopology = nil
@@ -1372,6 +1380,8 @@ public final class NativeGuestEngine {
         }
         startupReport?.decision = startupDecision
         startupConnected = true
+        startupAudioDeadline = nil
+        startupExtendedForViableICE = false
         // Release builds logged this only on timeout; a slow successful start (about 4 s
         // when alone in the room, beta 71) needs the same timeline. In-memory state only.
         // probeSafe: beta 72 never showed this event; live state must not make it invalid JSON.

@@ -622,8 +622,7 @@ final class MeetingTranscriber: @unchecked Sendable {
         lastIdleSweepAt = now
         guard !speakers.isEmpty else { return }
         for (id, speaker) in Array(speakers) {
-            if !speaker.detector.speaking, speaker.hangoverRemainingSamples == 0,
-               speaker.lastAudibleAt != .distantPast,
+            if speaker.lastAudibleAt != .distantPast,
                now.timeIntervalSince(speaker.lastAudibleAt) >= idleSpeakerTTL {
                 finish(id)
             }
@@ -631,12 +630,14 @@ final class MeetingTranscriber: @unchecked Sendable {
     }
 
     static func hasAudibleSignal(_ buffer: AVAudioPCMBuffer) -> Bool {
-        guard buffer.frameLength > 0 else { return false }
+        let frames = Int(buffer.frameLength)
+        guard frames > 0 else { return false }
         let audioBuffers = UnsafeMutableAudioBufferListPointer(buffer.mutableAudioBufferList)
         switch buffer.format.commonFormat {
         case .pcmFormatFloat32:
             for ab in audioBuffers {
-                let count = Int(ab.mDataByteSize) / MemoryLayout<Float>.size
+                let expected = frames * max(1, Int(ab.mNumberChannels))
+                let count = min(expected, Int(ab.mDataByteSize) / MemoryLayout<Float>.size)
                 guard count > 0, let base = ab.mData?.assumingMemoryBound(to: Float.self) else { continue }
                 var peak: Float = 0
                 vDSP_maxmgv(base, 1, &peak, vDSP_Length(count))
@@ -646,7 +647,8 @@ final class MeetingTranscriber: @unchecked Sendable {
         case .pcmFormatInt16:
             let threshold = Int16(max(1, Int(silencePeakThreshold * Float(Int16.max))))
             for ab in audioBuffers {
-                let count = Int(ab.mDataByteSize) / MemoryLayout<Int16>.size
+                let expected = frames * max(1, Int(ab.mNumberChannels))
+                let count = min(expected, Int(ab.mDataByteSize) / MemoryLayout<Int16>.size)
                 guard count > 0, let base = ab.mData?.assumingMemoryBound(to: Int16.self) else { continue }
                 for i in 0..<count {
                     let sample = base[i]
@@ -657,7 +659,8 @@ final class MeetingTranscriber: @unchecked Sendable {
         case .pcmFormatInt32:
             let threshold = Int32(max(1, Int64(Double(silencePeakThreshold) * Double(Int32.max))))
             for ab in audioBuffers {
-                let count = Int(ab.mDataByteSize) / MemoryLayout<Int32>.size
+                let expected = frames * max(1, Int(ab.mNumberChannels))
+                let count = min(expected, Int(ab.mDataByteSize) / MemoryLayout<Int32>.size)
                 guard count > 0, let base = ab.mData?.assumingMemoryBound(to: Int32.self) else { continue }
                 for i in 0..<count {
                     let sample = base[i]

@@ -185,6 +185,7 @@ sources += [ROOT/'NativeMacGuest/prepare-livekit.py',dependency_root/'native-liv
 sources += sorted((ROOT/'Dependencies/native-macos/livekit-patches').glob('*.patch'))
 sources += [ROOT/'NativeMacGuest/native_dependencies.py', ROOT/'Dependencies/native-macos/sdk.unified.lock.json']
 if a.distribution == 'direct':
+    sources.append(ROOT / 'NativeMacGuest/distribution/changelog.json')
     sources += sorted(path for path in (ROOT/'NativeMacGuest/AuthorSupport').rglob('*')
                       if path.is_file() and path.suffix != '.swift' and not path.name.startswith('.'))
     sources += audio_route_recovery_lock_paths(ROOT)
@@ -206,6 +207,11 @@ if not (app / metal_library).is_file():
     raise SystemExit('The GPU voice Metal library is missing from the application')
 artifacts = [executable, app / voice_worker_path, app / gpu_voice_worker_path, app / metal_library, app/'Contents/MacOS'/(EXECUTABLE_NAME+'.debug.dylib'), app/'Contents/Info.plist']
 artifacts += [app/'Contents/Resources/Assets.car', app/'Contents/Resources/AppIcon.icns']
+if a.distribution == 'direct':
+    bundled_changelog = app / 'Contents/Resources/changelog.json'
+    if not bundled_changelog.is_file():
+        raise SystemExit('Direct build is missing Contents/Resources/changelog.json')
+    artifacts.append(bundled_changelog)
 artifacts += [x for x in (app/'Contents/Frameworks').rglob('LiveKitWebRTC') if x.is_file() and not x.is_symlink()]
 if sparkle_evidence:
     artifacts += [x for x in (app/'Contents/Frameworks/Sparkle.framework').rglob('*') if x.is_file() and not x.is_symlink()]
@@ -228,6 +234,8 @@ if archive is not None:
     archived_files = [str(voice_worker_path), str(gpu_voice_worker_path), str(metal_library), str(application_executable(archived_app).relative_to(archived_app)), 'Contents/Info.plist',
         'Contents/Resources/AppIcon.icns', 'Contents/Resources/Assets.car',
         'Contents/Frameworks/LiveKitWebRTC.framework/LiveKitWebRTC']
+    if a.distribution == 'direct':
+        archived_files.append('Contents/Resources/changelog.json')
     subprocess.run(['codesign','--verify','--deep','--strict',str(archived_app)],check=True)
     manifest['archive'] = {'path':str(archive.relative_to(ROOT)),
         'artifacts':{name:hashlib.sha256((archived_app/name).read_bytes()).hexdigest() for name in archived_files}}

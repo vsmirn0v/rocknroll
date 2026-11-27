@@ -199,10 +199,12 @@ public final class GuestSession {
          "controlTaskPresent": control != nil, "shutdownTaskPresent": shutdown != nil,
          "cleanupSucceeded": cleanupSucceeded]
     }
+    private enum ControlDomain: Hashable { case audio, video, microphoneActivation, playout }
     private var control: Task<Void, Never>?
+    private var controlWaiters: [UUID: (domain: ControlDomain, continuation: CheckedContinuation<Void, Error>)] = [:]
     private var shutdown: Task<Bool, Never>?
     private var pendingFailure: Error?
-    private var lastCommandFailure: Error?
+    private var domainFailures: [ControlDomain: Error] = [:]
     private var cleanupSucceeded = true
     private var policy = GuestRecoveryPolicy()
     private let makeAttempt: @MainActor () async throws -> any GuestSessionEngine
@@ -252,7 +254,7 @@ public final class GuestSession {
         guard generation == expected else { throw CancellationError() }
         if Task.isCancelled { _ = await leave(); throw CancellationError() }
         guard drained else { state = .failed; failure = GuestSessionError.cleanupFailed; throw GuestSessionError.cleanupFailed }
-        shutdown = nil; failure = nil; pendingFailure = nil; lastCommandFailure = nil; sessionID = nil
+        shutdown = nil; failure = nil; pendingFailure = nil; domainFailures.removeAll(); sessionID = nil
         cleanupSucceeded = true; policy = GuestRecoveryPolicy(); recoveryAttempts = 0
         microphoneActivationRequested = false; microphonePreparationRequested = initialMicrophonePreparation
         attemptMicrophonePreparation = false; appliedMicrophoneActivation = false
@@ -293,7 +295,7 @@ public final class GuestSession {
             throw failure ?? GuestTransportError.notConnected
         }
         setLocalMuteIntent(muted, video: video)
-        try await reconcileControl()
+        try await reconcileControl(domain: video ? .video : .audio)
     }
 
     /// Explicit user activation after the UI has obtained microphone authorization.
@@ -303,7 +305,7 @@ public final class GuestSession {
             throw failure ?? GuestTransportError.notConnected
         }
         microphoneActivationRequested = true
-        try await reconcileControl()
+        try await reconcileControl(domain: .microphoneActivation)
     }
 
     /// Preparation is separate from explicit user activation. Withdrawing it
@@ -318,7 +320,7 @@ public final class GuestSession {
         }
         microphonePreparationRequested = true
         attemptMicrophonePreparation = true
-        try await reconcileControl()
+        try await reconcileControl(domain: .microphoneActivation)
     }
 
     public func setPlayoutEnabled(_ enabled: Bool) async throws {
@@ -326,19 +328,71 @@ public final class GuestSession {
             throw failure ?? GuestTransportError.notConnected
         }
         desiredPlayoutEnabled = enabled
-        try await reconcileControl()
+        try await reconcileControl(domain: .playout)
     }
 
-    private func reconcileControl() async throws {
+    private func resolveControlWaiters() {
+        let waiters = controlWaiters
+        controlWaiters.removeAll()
+        let failures = domainFailures
+        domainFailures.removeAll()
+        guard !waiters.isEmpty else { return }
+        for (_, entry) in waiters {
+            if state == .left {
+                entry.continuation.resume(throwing: CancellationError())
+            } else if let failure {
+                entry.continuation.resume(throwing: failure)
+            } else if let domainError = failures[entry.domain] {
+                entry.continuation.resume(throwing: domainError)
+            } else if state != .connected {
+                entry.continuation.resume(throwing: GuestTransportError.notConnected)
+            } else {
+                entry.continuation.resume()
+            }
+        }
+    }
+
+    private func reconcileControl(domain: ControlDomain) async throws {
         let expected = generation
-        lastCommandFailure = nil
+        domainFailures[domain] = nil
         startControl()
-        await control?.value
+        if control != nil {
+            let waiterID = UUID()
+            try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                    if Task.isCancelled {
+                        continuation.resume(throwing: CancellationError())
+                        return
+                    }
+                    guard self.control != nil, self.generation == expected else {
+                        if self.state == .left || self.generation != expected {
+                            continuation.resume(throwing: CancellationError())
+                        } else if let failure = self.failure {
+                            continuation.resume(throwing: failure)
+                        } else if let domainError = self.domainFailures.removeValue(forKey: domain) {
+                            continuation.resume(throwing: domainError)
+                        } else if self.state != .connected {
+                            continuation.resume(throwing: GuestTransportError.notConnected)
+                        } else {
+                            continuation.resume()
+                        }
+                        return
+                    }
+                    self.controlWaiters[waiterID] = (domain, continuation)
+                }
+            } onCancel: { [weak self] in
+                Task { @MainActor [weak self] in
+                    self?.controlWaiters.removeValue(forKey: waiterID)?.continuation.resume(throwing: CancellationError())
+                }
+            }
+            try Task.checkCancellation()
+            guard generation == expected else { throw CancellationError() }
+            return
+        }
         try Task.checkCancellation()
         guard generation == expected else { throw CancellationError() }
         if let failure { throw failure }
-        if let commandError = lastCommandFailure {
-            lastCommandFailure = nil
+        if let commandError = domainFailures.removeValue(forKey: domain) {
             throw commandError
         }
         guard state == .connected else { throw GuestTransportError.notConnected }
@@ -402,6 +456,7 @@ public final class GuestSession {
         let job = control, previous = shutdown
         control = nil
         job?.cancel()
+        resolveControlWaiters()
         let task = Task { @MainActor [self] in
             let priorResult = await previous?.value ?? true
             await job?.value
@@ -424,9 +479,15 @@ public final class GuestSession {
         if let pendingFailure { throw pendingFailure }
     }
 
+    private var hasUnappliedDeviceIntent: Bool {
+        ((microphoneActivationRequested || attemptMicrophonePreparation) && !appliedMicrophoneActivation) ||
+            (desiredPlayoutEnabled != nil && desiredPlayoutEnabled != appliedPlayoutEnabled)
+    }
+
     private func run(_ expected: UInt64) async {
         while generation == expected, !Task.isCancelled {
             var relayTrialAwaitingJoin = false
+            var activeCommandDomain: ControlDomain?
             do {
                 if let pendingFailure { throw pendingFailure }
                 if current == nil {
@@ -435,6 +496,7 @@ public final class GuestSession {
                     guard generation == expected, !Task.isCancelled else {
                         next.suppressOutgoingMedia()
                         cleanupSucceeded = await next.leave(sendLeave: false) && cleanupSucceeded
+                        resolveControlWaiters()
                         return
                     }
                     let attempt = UUID()
@@ -461,7 +523,7 @@ public final class GuestSession {
                     // Speculative activation runs once per joined attempt while playout is still closed,
                     // avoiding lobby/failed-join mic activation and multi-second peerless Bluetooth HFP churn.
                     attemptMicrophonePreparation = microphonePreparationRequested
-                    try await reconcileDeviceIntent(next, generation: expected, attempt: attempt)
+                    try await reconcileDeviceIntent(next, generation: expected, attempt: attempt, activeDomain: &activeCommandDomain)
                     try check(expected, attempt: attempt)
                     guard let intent = desiredIntent else { throw CancellationError() }
                     if intent.publish {
@@ -472,41 +534,62 @@ public final class GuestSession {
                     appliedIntent = intent
                 }
                 guard let current, let attempt = attemptID else { throw CancellationError() }
+                if (microphoneActivationRequested || attemptMicrophonePreparation) && !appliedMicrophoneActivation {
+                    activeCommandDomain = .microphoneActivation
+                    try await current.activateMicrophone()
+                    activeCommandDomain = nil
+                    try check(expected, attempt: attempt)
+                    appliedMicrophoneActivation = true
+                    notifyStateChange()
+                }
                 while let intent = desiredIntent, intent.publish, appliedIntent != intent {
                     if appliedIntent?.audioMuted != intent.audioMuted {
+                        if !intent.audioMuted, (microphoneActivationRequested || attemptMicrophonePreparation) && !appliedMicrophoneActivation {
+                            activeCommandDomain = .microphoneActivation
+                            try await current.activateMicrophone()
+                            activeCommandDomain = nil
+                            try check(expected, attempt: attempt)
+                            appliedMicrophoneActivation = true
+                            notifyStateChange()
+                        }
+                        activeCommandDomain = .audio
                         try await current.mute(intent.audioMuted, video: false)
+                        activeCommandDomain = nil
                         try check(expected, attempt: attempt)
                         appliedIntent?.audioMuted = intent.audioMuted
                     }
                     // Re-read desired intent after the audio operation's suspension.
                     guard let latest = desiredIntent else { throw CancellationError() }
                     if appliedIntent?.videoMuted != latest.videoMuted {
+                        activeCommandDomain = .video
                         try await current.mute(latest.videoMuted, video: true)
+                        activeCommandDomain = nil
                         try check(expected, attempt: attempt)
                         appliedIntent?.videoMuted = latest.videoMuted
                     }
                 }
-                try await reconcileDeviceIntent(current, generation: expected, attempt: attempt)
+                try await reconcileDeviceIntent(current, generation: expected, attempt: attempt, activeDomain: &activeCommandDomain)
                 try check(expected, attempt: attempt)
                 // A device operation may suspend after the media loop. Revisit
                 // any newer intent before completing the shared control job.
-                if desiredIntent?.publish == true, desiredIntent != appliedIntent { continue }
+                if (desiredIntent?.publish == true && desiredIntent != appliedIntent) || hasUnappliedDeviceIntent { await Task.yield(); continue }
                 if connectedAttemptID != attempt {
                     try await current.waitForTransportRecovery()
                     try check(expected, attempt: attempt)
                     try await current.waitForStartupAudio()
                     try check(expected, attempt: attempt)
-                    if desiredIntent?.publish == true, desiredIntent != appliedIntent { continue }
-                    if let desiredPlayoutEnabled, desiredPlayoutEnabled != appliedPlayoutEnabled { continue }
-                    guard current.releaseStartupAudio() else { continue }
+                    if (desiredIntent?.publish == true && desiredIntent != appliedIntent) || hasUnappliedDeviceIntent { await Task.yield(); continue }
+                    guard current.releaseStartupAudio() else { await Task.yield(); continue }
                     connectionCount &+= 1; connectedAttemptID = attempt
                     policy.noteConnected(at: now())
                 }
                 state = .connected
                 control = nil
+                resolveControlWaiters()
                 return
             } catch {
                 guard generation == expected, !Task.isCancelled else {
+                    resolveControlWaiters()
                     _ = await retireCurrent(sendLeave: true)
                     return
                 }
@@ -529,9 +612,11 @@ public final class GuestSession {
                     if desiredPlayoutEnabled != appliedPlayoutEnabled {
                         desiredPlayoutEnabled = appliedPlayoutEnabled
                     }
-                    lastCommandFailure = cause
+                    let failedDomain = activeCommandDomain ?? (cause is GuestCameraError ? .video : .audio)
+                    domainFailures[failedDomain] = cause
                     state = .connected
                     control = nil
+                    resolveControlWaiters()
                     notifyStateChange()
                     return
                 }
@@ -544,7 +629,7 @@ public final class GuestSession {
                     recoveryAttempts = policy.retries; state = .recovering
                 }
                 let stopped = await retireCurrent(sendLeave: delay == nil)
-                guard generation == expected, !Task.isCancelled else { return }
+                guard generation == expected, !Task.isCancelled else { resolveControlWaiters(); return }
                 guard stopped else { finish(GuestSessionError.cleanupFailed); return }
                 guard let delay else { finish(cause); return }
                 let rawElapsed = now() - failedAt
@@ -555,23 +640,33 @@ public final class GuestSession {
                 if remainingDelay > 0 {
                     do { try await sleep(remainingDelay) }
                     catch {
-                        guard generation == expected, !Task.isCancelled else { return }
+                        guard generation == expected, !Task.isCancelled else { resolveControlWaiters(); return }
                         finish(error); return
                     }
                 }
-                guard generation == expected, !Task.isCancelled else { return }
+                guard generation == expected, !Task.isCancelled else { resolveControlWaiters(); return }
             }
         }
+        resolveControlWaiters()
     }
 
-    private func reconcileDeviceIntent(_ engine: any GuestSessionEngine, generation expected: UInt64, attempt: UUID) async throws {
+    private func reconcileDeviceIntent(
+        _ engine: any GuestSessionEngine,
+        generation expected: UInt64,
+        attempt: UUID,
+        activeDomain: inout ControlDomain?
+    ) async throws {
         if (microphoneActivationRequested || attemptMicrophonePreparation) && !appliedMicrophoneActivation {
+            activeDomain = .microphoneActivation
             try await engine.activateMicrophone()
+            activeDomain = nil
             try check(expected, attempt: attempt)
             appliedMicrophoneActivation = true; notifyStateChange()
         }
         while let enabled = desiredPlayoutEnabled, enabled != appliedPlayoutEnabled {
+            activeDomain = .playout
             try await engine.setPlayoutEnabled(enabled)
+            activeDomain = nil
             try check(expected, attempt: attempt)
             appliedPlayoutEnabled = enabled
         }
@@ -619,6 +714,7 @@ public final class GuestSession {
 
     private func finish(_ error: Error) {
         failure = error; state = .failed; control = nil
+        resolveControlWaiters()
     }
 
     private func waitUntilConnected(timeout: TimeInterval, after count: UInt64?) async throws {

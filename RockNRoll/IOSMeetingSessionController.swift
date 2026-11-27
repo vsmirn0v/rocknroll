@@ -1315,6 +1315,9 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
                         self.syncCatchUpTranscript()
                     }
                 }
+                Task { @MainActor [weak self] in
+                    await self?.reconcileLocalTranscriptionMode()
+                }
                 syncCatchUpTranscript()
             }
         case .reconnecting:
@@ -1336,6 +1339,15 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
             return
         }
 
+        let reactionsReady: Bool
+        if let features = lastAppliedFeatures {
+            reactionsReady = features.connected && phase == .connected
+        } else {
+            reactionsReady = snapshot.capabilities.supportsReactions && phase == .connected
+        }
+        if reactions.ready != reactionsReady {
+            reactions.ready = reactionsReady
+        }
         renderSnapshot(using: snapshot)
         refreshCameraReactionStatus()
     }
@@ -1368,7 +1380,7 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
             }
         }
 
-        if session.capabilities.supportsProviderTranscript {
+        if session.transcriptService != nil {
             let transcriptMessagesChanged = previousFeatures == nil || previousFeatures?.transcript != features.transcript
             let transcriptMetaChanged = previousFeatures == nil
                 || previousFeatures?.permissions.canViewTranscript != features.permissions.canViewTranscript
@@ -1607,7 +1619,7 @@ final class IOSMeetingSessionController: ObservableObject, CallEngine, Identifia
                 }
             }
         }
-        if session.capabilities.supportsProviderTranscript {
+        if session.transcriptService != nil {
             catchUp.onLoadTranscriptHistory = { [weak self] in
                 guard let self, !self.catchUp.isLoadingTranscriptHistory else { return }
                 self.catchUp.isLoadingTranscriptHistory = true

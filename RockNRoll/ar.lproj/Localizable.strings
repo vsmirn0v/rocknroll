@@ -4574,3 +4574,14 @@
 "Visual snapshots (%ld)" = "اللقطات المرئية (%ld)";
 "Watch / Contradiction" = "تنبيه / تناقض";
 "Whisper a private question…" = "اطرح سؤالاً خاصاً في Whisper…";
+
+"Release notes" = "ملاحظات الإصدار";
+"Browse changelog history for installed and previous builds." = "تصفح سجل التغييرات للإصدار المثبت والإصدارات السابقة.";
+"Filter release notes…" = "تصفية ملاحظات الإصدار…";
+"Installed" = "مثبّت";
+"Available" = "متاح";
+"Show more (%ld remaining)" = "عرض المزيد (متبقي %ld)";
+"Show all (%ld)" = "عرض الكل (%ld)";
+"No matching release notes." = "لا توجد ملاحظات إصدار مطابقة.";
+"No release notes available." = "لا تتوفر ملاحظات إصدار.";
+"Channel" = "القناة";

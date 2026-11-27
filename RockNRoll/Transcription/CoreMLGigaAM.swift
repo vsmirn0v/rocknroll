@@ -53,8 +53,10 @@ final class CoreMLGigaAMRecognizer: @unchecked Sendable {
     private nonisolated(unsafe) static var sharedInflight: [URL: (id: UUID, task: Task<CoreMLGigaAMRecognizer, Error>)] = [:]
     private nonisolated(unsafe) static var sharedActiveLeaseCounts: [URL: Int] = [:]
     private nonisolated(unsafe) static var sharedIdleUnloadTasks: [URL: (id: UUID, task: Task<Void, Never>)] = [:]
+    private nonisolated(unsafe) static var isAppInBackground = false
     private nonisolated(unsafe) static var memoryWarningObserver: NSObjectProtocol?
     private nonisolated(unsafe) static var backgroundObserver: NSObjectProtocol?
+    private nonisolated(unsafe) static var foregroundObserver: NSObjectProtocol?
 
     private static func installLifecycleObserversLocked() {
         if memoryWarningObserver == nil {
@@ -63,7 +65,7 @@ final class CoreMLGigaAMRecognizer: @unchecked Sendable {
                 object: nil,
                 queue: nil
             ) { _ in
-                CoreMLGigaAMRecognizer.invalidateCache()
+                CoreMLGigaAMRecognizer.evictUnleasedRecognizers()
             }
         }
         if backgroundObserver == nil {
@@ -72,7 +74,21 @@ final class CoreMLGigaAMRecognizer: @unchecked Sendable {
                 object: nil,
                 queue: nil
             ) { _ in
+                CoreMLGigaAMRecognizer.sharedLock.withLock {
+                    CoreMLGigaAMRecognizer.isAppInBackground = true
+                }
                 CoreMLGigaAMRecognizer.evictUnleasedRecognizers()
+            }
+        }
+        if foregroundObserver == nil {
+            foregroundObserver = NotificationCenter.default.addObserver(
+                forName: UIApplication.willEnterForegroundNotification,
+                object: nil,
+                queue: nil
+            ) { _ in
+                CoreMLGigaAMRecognizer.sharedLock.withLock {
+                    CoreMLGigaAMRecognizer.isAppInBackground = false
+                }
             }
         }
     }
@@ -139,7 +155,8 @@ final class CoreMLGigaAMRecognizer: @unchecked Sendable {
                 return
             }
             sharedActiveLeaseCounts.removeValue(forKey: key)
-            scheduleIdleUnloadLocked(for: key, delay: idleUnloadDelay)
+            let effectiveDelay: Duration = isAppInBackground ? .zero : idleUnloadDelay
+            scheduleIdleUnloadLocked(for: key, delay: effectiveDelay)
         }
     }
 

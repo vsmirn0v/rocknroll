@@ -66,6 +66,8 @@ import UniformTypeIdentifiers
             }
         }
     }
+    private var hasAppliedGuestFeatures = false
+    private var lastParticipationConnectionIdentity: MeetingConnectionIdentity?
     @Published var panel: Panel?
     /// Durable library and notes drafts, installed by the workspace when the model is created.
     var meetingLibrary: MeetingLibraryController?
@@ -2430,16 +2432,23 @@ import UniformTypeIdentifiers
     private func updateFeatures(_ features: GuestMeetingSnapshot) {
         guard !closed else { return }
         let old = guestFeatures
-        guard old != features else { return }
+        let firstFeatures = !hasAppliedGuestFeatures
+        let currentIdentity = (engine as? MeetingSession)?.participationService?.connectionIdentity
+        let identityChanged = currentIdentity != lastParticipationConnectionIdentity
+        guard firstFeatures || identityChanged || old != features else { return }
+        hasAppliedGuestFeatures = true
+        lastParticipationConnectionIdentity = currentIdentity
         let previousTranscription = old.transcriptionStatus
         let oldMessages = old.messages
-        let transcriptionMetaChanged = old.transcriptionStatus != features.transcriptionStatus ||
+        let transcriptionMetaChanged = firstFeatures ||
+            old.transcriptionStatus != features.transcriptionStatus ||
             old.permissions.canViewTranscript != features.permissions.canViewTranscript ||
             old.permissions.canManageTranscript != features.permissions.canManageTranscript ||
             old.transcriptNetworkRestricted != features.transcriptNetworkRestricted ||
             old.connected != features.connected
-        let transcriptContentChanged = old.transcript != features.transcript
-        let audienceChanged = old.connected != features.connected ||
+        let transcriptContentChanged = firstFeatures || old.transcript != features.transcript
+        let audienceChanged = firstFeatures || identityChanged ||
+            old.connected != features.connected ||
             old.permissions != features.permissions ||
             old.localParticipantID != features.localParticipantID ||
             !Self.sameGuestAudienceMembers(old.participants, features.participants)

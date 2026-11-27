@@ -4574,3 +4574,14 @@
 "Visual snapshots (%ld)" = "Capturas visuales (%ld)";
 "Watch / Contradiction" = "Alerta / contradicción";
 "Whisper a private question…" = "Susurra una pregunta privada…";
+
+"Release notes" = "Notas de la versión";
+"Browse changelog history for installed and previous builds." = "Explora el historial de cambios de la compilación instalada y anteriores.";
+"Filter release notes…" = "Filtrar notas de la versión…";
+"Installed" = "Instalada";
+"Available" = "Disponible";
+"Show more (%ld remaining)" = "Mostrar más (quedan %ld)";
+"Show all (%ld)" = "Mostrar todo (%ld)";
+"No matching release notes." = "No hay notas que coincidan.";
+"No release notes available." = "No hay notas de la versión disponibles.";
+"Channel" = "Canal";

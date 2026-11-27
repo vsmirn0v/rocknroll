@@ -10,6 +10,7 @@ final class NativeSettingsSearchTests: XCTestCase {
         XCTAssertTrue(results.contains { $0.id == "settings.mic-readiness" })
         XCTAssertTrue(NativeSettingsSearchCatalog.search(query: "   ", availableTabs: all).isEmpty)
         XCTAssertTrue(NativeSettingsSearchCatalog.search(query: "updates", availableTabs: [0, 1, 2, 3]).isEmpty)
+        XCTAssertTrue(NativeSettingsSearchCatalog.search(query: "Release notes", availableTabs: [0, 1, 2, 3, 5, 6, 7, 8]).isEmpty)
     }
 
     func testStableIdentifiersAreUnique() {
@@ -32,7 +33,8 @@ final class NativeSettingsSearchTests: XCTestCase {
             ("Endpoint file", "settings.mcp-endpoint"),
             ("In the background", "settings.attention-mode-background"),
             ("Site logins", "settings.site-accounts"),
-            ("mTLS", "settings.mtls-certificates")
+            ("mTLS", "settings.mtls-certificates"),
+            ("Release notes", "settings.changelog")
         ]
         for (query, id) in cases {
             XCTAssertEqual(NativeSettingsSearchCatalog.search(query: query, availableTabs: Set(0...8)).first?.id, id, query)

@@ -128,7 +128,9 @@ struct ListenModelCatalog: Decodable, Equatable {
     let root: URL
     @Published private(set) var states: [String: State] = [:] {
         didSet {
-            if states != oldValue { configurationReadyCache.removeAll() }
+            for key in Set(oldValue.keys).union(states.keys) where oldValue[key]?.installed != states[key]?.installed {
+                configurationReadyCache.removeValue(forKey: key)
+            }
         }
     }
     private var configurationReadyCache: [String: Bool] = [:]
@@ -480,7 +482,8 @@ struct ListenModelCatalog: Decodable, Equatable {
 
     func modelConfigurationReady(_ model: ListenModelCatalog.Model) -> Bool {
         guard model.role == "listen", state(model).installed else { return false }
-        if let cached = configurationReadyCache[model.id] { return cached }
+        let cacheable = catalog.model(model.id) == model
+        if cacheable, let cached = configurationReadyCache[model.id] { return cached }
         let ready: Bool
         if recognizerModel(for: model) == nil || pinnedConfigurationPath("tokens", model: model) == nil {
             ready = false
@@ -498,7 +501,7 @@ struct ListenModelCatalog: Decodable, Equatable {
                 ready = false
             }
         }
-        configurationReadyCache[model.id] = ready
+        if cacheable { configurationReadyCache[model.id] = ready }
         return ready
     }
 

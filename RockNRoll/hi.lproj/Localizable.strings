@@ -4574,3 +4574,14 @@
 "Visual snapshots (%ld)" = "विज़ुअल स्नैपशॉट (%ld)";
 "Watch / Contradiction" = "चेतावनी / विरोधाभास";
 "Whisper a private question…" = "Whisper में निजी प्रश्न पूछें…";
+
+"Release notes" = "रिलीज़ नोट्स";
+"Browse changelog history for installed and previous builds." = "इंस्टॉल और पिछले बिल्ड का चेंजलॉग इतिहास देखें।";
+"Filter release notes…" = "रिलीज़ नोट्स फ़िल्टर करें…";
+"Installed" = "इंस्टॉल";
+"Available" = "उपलब्ध";
+"Show more (%ld remaining)" = "और दिखाएं (%ld शेष)";
+"Show all (%ld)" = "सभी दिखाएं (%ld)";
+"No matching release notes." = "कोई मेल खाने वाले रिलीज़ नोट्स नहीं हैं।";
+"No release notes available." = "कोई रिलीज़ नोट्स उपलब्ध नहीं हैं।";
+"Channel" = "चैनल";

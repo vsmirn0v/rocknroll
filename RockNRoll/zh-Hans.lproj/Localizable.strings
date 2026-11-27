@@ -4574,3 +4574,14 @@
 "Visual snapshots (%ld)" = "视觉截图 (%ld)";
 "Watch / Contradiction" = "风险 / 矛盾";
 "Whisper a private question…" = "向 Whisper 提出私密问题…";
+
+"Release notes" = "更新日志";
+"Browse changelog history for installed and previous builds." = "浏览已安装版本和过往版本的更新历史。";
+"Filter release notes…" = "筛选更新日志…";
+"Installed" = "已安装";
+"Available" = "可安装";
+"Show more (%ld remaining)" = "显示更多（剩余 %ld 条）";
+"Show all (%ld)" = "显示全部（%ld）";
+"No matching release notes." = "没有匹配的更新日志。";
+"No release notes available." = "暂无更新日志。";
+"Channel" = "渠道";

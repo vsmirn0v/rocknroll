@@ -4802,3 +4802,14 @@
 "Visual snapshots (%ld)" = "Visual snapshots (%ld)";
 "Watch / Contradiction" = "Watch / Contradiction";
 "Whisper a private question…" = "Whisper a private question…";
+
+"Release notes" = "Release notes";
+"Browse changelog history for installed and previous builds." = "Browse changelog history for installed and previous builds.";
+"Filter release notes…" = "Filter release notes…";
+"Installed" = "Installed";
+"Available" = "Available";
+"Show more (%ld remaining)" = "Show more (%ld remaining)";
+"Show all (%ld)" = "Show all (%ld)";
+"No matching release notes." = "No matching release notes.";
+"No release notes available." = "No release notes available.";
+"Channel" = "Channel";

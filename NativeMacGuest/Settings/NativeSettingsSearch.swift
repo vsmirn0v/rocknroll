@@ -85,6 +85,7 @@ enum NativeSettingsSearchCatalog {
         .init("update-download", "Automatically download updates", 4, "Updates"),
         .init("update-channel", "Beta updates", 4, "Updates"),
         .init("check-updates", "Check for Updates…", 4, "Updates"),
+        .init("changelog", "Release notes", 4, "Updates"),
         .init("transcribe", "Transcribe meetings on this Mac", 5, "Transcription"),
         .init("transcribe-mic", "Include my microphone", 5, "Transcription"),
         .init("transcribe-external", "Telemost and TrueConf", 5, "Transcription"),

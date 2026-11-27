@@ -371,18 +371,6 @@ public final class GuestPeer: NSObject, LKRTCPeerConnectionDelegate {
         }
     }
 
-    /// Stops or starts an audio sender's RTP and Opus encoding without altering transceiver direction.
-    nonisolated private static func setAudioSending(_ sending: Bool, track: LKRTCMediaStreamTrack?, sender: LKRTCRtpSender?) {
-        if !sending { track?.isEnabled = false }
-        if let sender {
-            let parameters = sender.parameters
-            if !parameters.encodings.isEmpty {
-                parameters.encodings.forEach { $0.isActive = sending }
-                sender.parameters = parameters
-            }
-        }
-        if sending { track?.isEnabled = true }
-    }
     nonisolated private static func setSending(_ sending: Bool, track: LKRTCVideoTrack, sender: LKRTCRtpSender) throws {
         if !sending { track.isEnabled = false }
         let parameters = sender.parameters
@@ -450,8 +438,6 @@ public final class GuestPeer: NSObject, LKRTCPeerConnectionDelegate {
                 let contentCapability = codec.lowercased() == "h264"
                     ? capabilities.filter { $0.name.lowercased() == "vp9" } : []
                 try transceiver.setCodecPreferences(matches + contentCapability + repair, error: ())
-            } else {
-                Self.setAudioSending(track.isEnabled, track: track, sender: transceiver.sender)
             }
             return (video, transceiver.sender)
         }
@@ -471,17 +457,11 @@ public final class GuestPeer: NSObject, LKRTCPeerConnectionDelegate {
         return (try? await native.run("set-synthetic-audio") { () -> Bool in
             guard let sender else { return false }
             if let track {
-                Self.setAudioSending(true, track: nil, sender: sender)
                 track.isEnabled = true
                 sender.track = track
             } else {
-                if !restoreAudioEnabled {
-                    Self.setAudioSending(false, track: micTrack, sender: sender)
-                }
+                micTrack?.isEnabled = restoreAudioEnabled
                 sender.track = micTrack
-                if restoreAudioEnabled {
-                    Self.setAudioSending(true, track: micTrack, sender: sender)
-                }
             }
             return true
         }) ?? false
@@ -517,9 +497,9 @@ public final class GuestPeer: NSObject, LKRTCPeerConnectionDelegate {
                 try Self.setSending(!mute, track: videoTrack, sender: videoSender)
             }
         } else {
-            let track = audioTrack, sender = audioSender
+            let track = audioTrack
             try await native.run(mute ? "mute-audio" : "unmute-audio") {
-                Self.setAudioSending(!mute, track: track, sender: sender)
+                track?.isEnabled = !mute
             }
         }
     }
@@ -534,9 +514,9 @@ public final class GuestPeer: NSObject, LKRTCPeerConnectionDelegate {
                 if let track, let sender { try? Self.setSending(false, track: track, sender: sender) }
             }
         } else {
-            let track = audioTrack, sender = audioSender
+            let track = audioTrack
             native.post("suppress-audio") {
-                Self.setAudioSending(false, track: track, sender: sender)
+                track?.isEnabled = false
             }
         }
     }
@@ -1353,14 +1333,16 @@ public final class GuestFrameCounter: NSObject, LKRTCVideoRenderer, @unchecked S
             if let native = frame.buffer as? LKRTCCVPixelBuffer,
                native.cropX == 0, native.cropY == 0,
                native.cropWidth == native.width, native.cropHeight == native.height,
+               CVPixelBufferGetWidth(native.pixelBuffer) == Int(native.width),
+               CVPixelBufferGetHeight(native.pixelBuffer) == Int(native.height),
                CVPixelBufferIsPlanar(native.pixelBuffer),
                CVPixelBufferLockBaseAddress(native.pixelBuffer, .readOnly) == kCVReturnSuccess {
                 defer { CVPixelBufferUnlockBaseAddress(native.pixelBuffer, .readOnly) }
-                if let base = CVPixelBufferGetBaseAddressOfPlane(native.pixelBuffer, 0) {
+                let strideY = CVPixelBufferGetBytesPerRowOfPlane(native.pixelBuffer, 0)
+                let width = CVPixelBufferGetWidthOfPlane(native.pixelBuffer, 0)
+                let height = CVPixelBufferGetHeightOfPlane(native.pixelBuffer, 0)
+                if strideY >= width, let base = CVPixelBufferGetBaseAddressOfPlane(native.pixelBuffer, 0) {
                     let luma = base.assumingMemoryBound(to: UInt8.self)
-                    let strideY = CVPixelBufferGetBytesPerRowOfPlane(native.pixelBuffer, 0)
-                    let width = CVPixelBufferGetWidthOfPlane(native.pixelBuffer, 0)
-                    let height = CVPixelBufferGetHeightOfPlane(native.pixelBuffer, 0)
                     for y in stride(from: 0, to: height, by: 24) {
                         let rowOffset = y * strideY
                         for x in stride(from: 0, to: width, by: 24) {

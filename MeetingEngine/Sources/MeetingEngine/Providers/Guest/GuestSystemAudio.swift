@@ -461,6 +461,7 @@ public final class GuestSystemAudio: NSObject, LKRTCAudioDeviceModuleDelegate, @
     private let sharedInputOutputDependency: Bool
     private let bypassVoiceProcessingWhenMuted: Bool
     private var keepVoiceProcessingWhenMuted = false
+    private var testingVoiceProcessingBypassOverride: Bool?
     private let sharedPlayoutGate: GuestSharedPlayoutGate
     public let profile: GuestAudioProfile
     private var ownerLease: GuestAudioOwnerLease?
@@ -1315,31 +1316,42 @@ public final class GuestSystemAudio: NSObject, LKRTCAudioDeviceModuleDelegate, @
             self.deferredActivation = self.deferredActivation || self.microphoneOptIn
             self.inputActivation = .init(persistent: false)
             self.microphoneOptIn = false
+            // Unavailable input releases the hardware capture device while preserving WebRTC's
+            // recording demand so a subsequent `setMicrophoneMuted(false)` resumes sending.
             let available = self.applyAvailability(module)
-            let stoppedRecording = !module.isRecording ||
-                self.nativeCall("stop-recording", { module.stopRecording() }) == 0
             self.update(["deferredActivation": self.deferredActivation, "microphoneOptIn": false])
             self.readSnapshot(module)
-            return clearedPrepared && muted && module.isMicrophoneMuted && available && stoppedRecording
+            return clearedPrepared && muted && module.isMicrophoneMuted && available
         }
     }
 
     public func setKeepVoiceProcessingWhenMuted(_ keep: Bool) {
         locked { keepVoiceProcessingWhenMuted = keep }
+        guard bypassVoiceProcessingWhenMuted else { return }
         audioQueue.async {
             guard !self.closed, let module = self.currentModule else { return }
+            self.locked { self.operationDepth += 1 }
             GuestAudioEngineGate.shared.run(for: ObjectIdentifier(self)) {
                 self.syncMutedVoiceProcessingBypass(module, muted: module.isMicrophoneMuted)
                 self.readSnapshot(module)
             }
+            self.locked { self.operationDepth -= 1 }
         }
     }
 
     private func syncMutedVoiceProcessingBypass(_ module: LKRTCAudioDeviceModule, muted: Bool) {
+        let state = locked {
+            (
+                requested: cached["voiceProcessingRequested"] as? Bool == true,
+                keepWhenMuted: keepVoiceProcessingWhenMuted,
+                testingOverride: testingVoiceProcessingBypassOverride
+            )
+        }
         guard bypassVoiceProcessingWhenMuted,
               !manualRenderingMode,
-              snapshot["voiceProcessingRequested"] as? Bool == true else { return }
-        let shouldBypass = muted && !locked({ keepVoiceProcessingWhenMuted })
+              state.requested,
+              state.testingOverride == nil else { return }
+        let shouldBypass = muted && !state.keepWhenMuted
         let activeMismatch = !shouldBypass && module.platformAudioProcessingState.isVoiceProcessingBypassedActive
         if module.isVoiceProcessingBypassed != shouldBypass || activeMismatch {
             nativeCall(shouldBypass ? "bypass-vpio-muted" : "restore-vpio-unmuted") {
@@ -1591,6 +1603,7 @@ public final class GuestSystemAudio: NSObject, LKRTCAudioDeviceModuleDelegate, @
         setWatchdogInputUnmuted(false)
         audioQueue.async {
             guard !self.closed, let module = self.currentModule else { return }
+            self.locked { self.operationDepth += 1 }
             GuestAudioEngineGate.shared.run(for: ObjectIdentifier(self)) {
                 self.update(["microphoneMutedRequested": true])
                 let muted = self.nativeCall("set-microphone-muted", { module.setMicrophoneMuted(true) }) == 0 && module.isMicrophoneMuted
@@ -1598,6 +1611,7 @@ public final class GuestSystemAudio: NSObject, LKRTCAudioDeviceModuleDelegate, @
                 self.readSnapshot(module)
                 self.update(["lastCompletedOperation": "microphone-suppress", "lastOperationSucceeded": muted])
             }
+            self.locked { self.operationDepth -= 1 }
         }
     }
 
@@ -1741,7 +1755,8 @@ public final class GuestSystemAudio: NSObject, LKRTCAudioDeviceModuleDelegate, @
     func setVoiceProcessingBypassedForTesting(_ bypassed: Bool) async -> Bool {
         await perform("diagnostic-processing-bypass", timeout: 2) {
             guard !self.closed, let module = self.currentModule,
-                  self.snapshot["voiceProcessingRequested"] as? Bool == true else { return false }
+                  self.locked({ self.cached["voiceProcessingRequested"] as? Bool == true }) else { return false }
+            self.locked { self.testingVoiceProcessingBypassOverride = bypassed }
             self.nativeCall("set-processing-bypass") { module.isVoiceProcessingBypassed = bypassed }
             self.readSnapshot(module)
             let state = self.snapshot

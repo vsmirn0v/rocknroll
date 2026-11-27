@@ -51,11 +51,16 @@ private actor DirectUpdaterCalendar: CalendarReading {
         }
         let safety = try NativeUpdateSafety(stateDirectoryURL: directory, currentBuild: 100)
         let mediaGate = mediaGate ?? .init(claimIfDrained: { _ in true }, drain: { _ in true }, release: { _ in })
+        let suite = "DirectUpdaterTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        addTeardownBlock { defaults.removePersistentDomain(forName: suite) }
         let updates = NativeDesktopUpdates(
             safety: safety,
             mediaGate: mediaGate,
             currentBuild: 100,
-            currentVersion: "0.3.0"
+            currentVersion: "0.3.0",
+            changelogDefaults: defaults,
+            bundledChangelog: []
         )
         return Fixture(safety: safety, updates: updates, directory: directory)
     }
@@ -428,6 +433,46 @@ private actor DirectUpdaterCalendar: CalendarReading {
         updates.installStagedUpdate()
         XCTAssertEqual(installCalls, 0)
         XCTAssertFalse(fixture.safety.installationReserved)
+    }
+
+    func testChangelogHistoryMergesBundledWithStagedSparkleUpdate() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("direct-updater-history-\(UUID())")
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        let safety = try NativeUpdateSafety(stateDirectoryURL: directory, currentBuild: 100)
+        let suite = "DirectUpdaterHistory-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        addTeardownBlock { defaults.removePersistentDomain(forName: suite) }
+
+        let bundled = [
+            UpdateChangelogSection(version: "0.3.0", build: 100, date: "2026-11-25", items: ["Installed release notes"], channel: "beta"),
+            UpdateChangelogSection(version: "0.3.0", build: 99, date: "2026-11-24", items: ["Older stable release"], channel: "stable"),
+        ]
+        let updates = NativeDesktopUpdates(
+            safety: safety,
+            mediaGate: .init(claimIfDrained: { _ in true }, drain: { _ in true }, release: { _ in }),
+            currentBuild: 100,
+            currentVersion: "0.3.0",
+            changelogDefaults: defaults,
+            bundledChangelog: bundled
+        )
+        XCTAssertEqual(updates.installedBuild, 100)
+        XCTAssertEqual(updates.changelogHistory.map(\.build), [100, 99])
+
+        try updates.updater(updates.updater, mayPerform: .updatesInBackground)
+        let markdown = """
+        ### 0.3.0 (102) — 2026-11-27
+        - Fix audio recovery
+
+        ### 0.3.0 (101) — 2026-11-26
+        - Improve reconnect speed
+
+        ### 0.3.0 (100) — 2026-11-25
+        - Markdown build 100
+        """
+        let item = try self.item("102", shortVersion: "0.3.0", description: markdown)
+        _ = updates.updater(updates.updater, willInstallUpdateOnQuit: item, immediateInstallationBlock: {})
+        XCTAssertEqual(updates.changelogHistory.map(\.build), [102, 101, 100, 99])
+        XCTAssertEqual(updates.changelogHistory.first { $0.build == 100 }?.channel, "beta")
     }
 }
 #endif

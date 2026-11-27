@@ -26,6 +26,7 @@ enum NativeSettingsResultPresentation {
         for id in ["settings.camera-reactions"] { result[id] = "Share matching reactions for camera effects." }
         for id in ["settings.camera-readiness"] { result[id] = "Prepare camera information before use." }
         for id in ["settings.version", "settings.update-check", "settings.update-download", "settings.update-channel", "settings.check-updates"] { result[id] = "Review the installed version and update preferences." }
+        result["settings.changelog"] = "Browse changelog history for installed and previous builds."
         for id in ["settings.transcribe", "settings.transcribe-mic", "settings.transcribe-external", "settings.transcribe-rock"] { result[id] = "Choose which meeting speech is transcribed on this Mac." }
         for id in ["settings.speech-model", "settings.voice-detector", "settings.transcription-model-status", "settings.assistant-model-status"] { result[id] = "Manage the on-device speech recognition components." }
         for id in ["settings.alerts", "settings.battery"] { result[id] = "Control meeting alerts and their battery behavior." }

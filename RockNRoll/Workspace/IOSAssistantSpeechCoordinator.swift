@@ -335,10 +335,12 @@ import UIKit
 
         guard !isTestingEnvironment else { return true }
         if isInCall() && !isAnyMicUnmuted() {
+            SharedAudioEngine.shared.setAssistantWakeListening(true)
             installSharedObserverIfNeeded()
             let sharedOK = await SharedAudioEngine.shared.ensureMutedAssistantCapture()
             guard mode == .pushToTalk, stateGeneration == gen else {
                 lastStartFailure = .audioBusy
+                refreshState()
                 return false
             }
             if sharedOK { return true }

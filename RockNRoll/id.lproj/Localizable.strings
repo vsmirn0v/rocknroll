@@ -4574,3 +4574,14 @@
 "Visual snapshots (%ld)" = "Cuplikan visual (%ld)";
 "Watch / Contradiction" = "Peringatan / Kontradiksi";
 "Whisper a private question…" = "Ajukan pertanyaan privat ke Whisper…";
+
+"Release notes" = "Catatan rilis";
+"Browse changelog history for installed and previous builds." = "Telusuri riwayat perubahan untuk build yang terpasang dan sebelumnya.";
+"Filter release notes…" = "Saring catatan rilis…";
+"Installed" = "Terpasang";
+"Available" = "Tersedia";
+"Show more (%ld remaining)" = "Tampilkan lagi (tersisa %ld)";
+"Show all (%ld)" = "Tampilkan semua (%ld)";
+"No matching release notes." = "Tidak ada catatan rilis yang cocok.";
+"No release notes available." = "Tidak ada catatan rilis.";
+"Channel" = "Saluran";

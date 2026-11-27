@@ -502,7 +502,7 @@ final class GuestPermissionsAndSignalingTests: XCTestCase {
     }
 
     @MainActor
-    func testAudioSenderDeactivatesEncodingWhenMutedAndRestoresForSyntheticReply() async throws {
+    func testAudioSenderKeepsEncodingActiveWhenMutedSoSFURegistersTrackAndSwapsSyntheticReply() async throws {
         let factory = LKRTCPeerConnectionFactory(
             encoderFactory: LKRTCDefaultVideoEncoderFactory(),
             decoderFactory: LKRTCDefaultVideoDecoderFactory()
@@ -514,7 +514,8 @@ final class GuestPermissionsAndSignalingTests: XCTestCase {
         try await peer.attach(mic, codec: "h264")
         let initial = await peer.localAudioStateForTesting()
         XCTAssertEqual(initial["enabled"] as? Bool, false)
-        XCTAssertEqual(initial["encodingActive"] as? [Bool], [false], "Muted audio attachment starts with inactive encoding")
+        XCTAssertEqual(initial["encodingActive"] as? [Bool], [true],
+                       "Audio sender encoding must stay active while track is disabled so the Guest SFU receives initial silent RTP and advertises the track")
 
         try await peer.setMuted(false, video: false)
         let unmuted = await peer.localAudioStateForTesting()
@@ -524,7 +525,7 @@ final class GuestPermissionsAndSignalingTests: XCTestCase {
         try await peer.setMuted(true, video: false)
         let muted = await peer.localAudioStateForTesting()
         XCTAssertEqual(muted["enabled"] as? Bool, false)
-        XCTAssertEqual(muted["encodingActive"] as? [Bool], [false], "Muting deactivates Opus encoding while keeping transceiver")
+        XCTAssertEqual(muted["encodingActive"] as? [Bool], [true])
 
         let synth = try await peer.native.run("make-synth") {
             factory.audioTrack(with: factory.syntheticAudioSource(), trackId: "synth-cid")
@@ -533,14 +534,76 @@ final class GuestPermissionsAndSignalingTests: XCTestCase {
         XCTAssertTrue(attachedSynth)
         let duringSynth = await peer.localAudioStateForTesting()
         XCTAssertEqual(duringSynth["senderTrackID"] as? String, "synth-cid")
-        XCTAssertEqual(duringSynth["encodingActive"] as? [Bool], [true], "Synthetic voice reply activates audio sender encoding")
+        XCTAssertEqual(duringSynth["encodingActive"] as? [Bool], [true])
 
         let restoredMuted = await peer.setSyntheticAudioTrack(nil, restoreAudioEnabled: false)
         XCTAssertTrue(restoredMuted)
         let afterSynth = await peer.localAudioStateForTesting()
         XCTAssertEqual(afterSynth["senderTrackID"] as? String, "mic-cid")
         XCTAssertEqual(afterSynth["enabled"] as? Bool, false)
-        XCTAssertEqual(afterSynth["encodingActive"] as? [Bool], [false])
+        XCTAssertEqual(afterSynth["encodingActive"] as? [Bool], [true])
+    }
+
+    @MainActor
+    func testSuppressOutgoingMediaDuringStartupDoesNotSpinSessionAndCancelsPendingUnmute() async throws {
+        GuestSystemAudio.microphoneAuthorizationOverrideForTesting = true
+        defer { GuestSystemAudio.microphoneAuthorizationOverrideForTesting = nil }
+
+        let audio = try await GuestSystemAudio.create(
+            microphoneEnabled: false,
+            playoutEnabled: true,
+            concurrent: true,
+            manualRendering: true,
+            keepOutputAvailableWithInput: true
+        )
+        let engine = NativeGuestEngine(label: "SuppressStartupNoSpin", systemAudio: audio, verifyReceivedPixels: false)
+        engine.configureStartupPlayback(sound: true)
+        engine.suppressOutgoingMedia()
+
+        do {
+            try await engine.waitForStartupAudio()
+            XCTFail("waitForStartupAudio must throw CancellationError when outputSuppressed is true rather than returning prematurely")
+        } catch is CancellationError {
+            // Expected: breaks GuestSession.run out of startup loop instead of spinning on releaseStartupAudio() == false.
+        }
+        _ = await engine.leave(sendLeave: false)
+        _ = await audio.shutdown()
+    }
+
+    @MainActor
+    func testReleaseMutedTalkInputPreservesRecordingDemandForSubsequentUnmute() async throws {
+        GuestSystemAudio.microphoneAuthorizationOverrideForTesting = true
+        defer { GuestSystemAudio.microphoneAuthorizationOverrideForTesting = nil }
+
+        let audio = try await GuestSystemAudio.create(
+            microphoneEnabled: false,
+            playoutEnabled: true,
+            concurrent: true,
+            manualRendering: true,
+            keepOutputAvailableWithInput: true
+        )
+        let activated = await audio.activateMicrophone()
+        XCTAssertTrue(activated)
+        let unmutedInitially = await audio.setMicrophoneMuted(false)
+        XCTAssertTrue(unmutedInitially)
+        XCTAssertEqual(audio.snapshot["recording"] as? Bool, true)
+        XCTAssertEqual(audio.snapshot["microphoneMuted"] as? Bool, false)
+
+        let mutedAgain = await audio.setMicrophoneMuted(true)
+        XCTAssertTrue(mutedAgain)
+        let released = await audio.releaseMutedTalkInput()
+        XCTAssertTrue(released)
+        XCTAssertEqual(audio.snapshot["inputAvailable"] as? Bool, false)
+        XCTAssertEqual(audio.snapshot["deferredActivation"] as? Bool, true)
+        XCTAssertEqual(audio.snapshot["recording"] as? Bool, true,
+                       "releaseMutedTalkInput must keep WebRTC recording demand so unmuting resumes capture")
+
+        let unmutedAfterRelease = await audio.setMicrophoneMuted(false)
+        XCTAssertTrue(unmutedAfterRelease)
+        XCTAssertEqual(audio.snapshot["inputAvailable"] as? Bool, true)
+        XCTAssertEqual(audio.snapshot["recording"] as? Bool, true)
+        XCTAssertEqual(audio.snapshot["microphoneMuted"] as? Bool, false)
+        _ = await audio.shutdown()
     }
 
     func testNativeVideoPixelBufferInterleavesUVPlanesAccuratelyAcrossWidths() throws {
