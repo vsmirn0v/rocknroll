@@ -136,7 +136,7 @@ python3 NativeMacGuest/distribution/publish.py \
 Release notes live in `NativeMacGuest/distribution/changelog.json` (`schemaVersion: 1`)
 with separate `mac` and `ios` ledgers. `release.py feed` fails closed if the target
 Mac build has no entry in `changelog.json`, and embeds signed Markdown history
-(`<description sparkle:descriptionFormat="markdown">`) inside `appcast.xml` so the
+(`<description sparkle:format="markdown">`) inside `appcast.xml` so the
 Mac app slices exact cumulative diffs from the user's installed build.
 
 Preview or record notes from Git history (honors `Changelog:` commit trailers):

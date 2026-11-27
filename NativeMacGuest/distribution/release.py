@@ -329,7 +329,7 @@ def prepare_feed(args):
             is_head = head_by_channel.get(entry_channel) is entry
             markdown = changelog_lib.render_appcast_markdown(
                 mac_entries, entry_build, single_build=not is_head)
-            desc = ET.SubElement(entry, 'description', {f'{{{NS}}}descriptionFormat': 'markdown'})
+            desc = ET.SubElement(entry, 'description', {f'{{{NS}}}format': 'markdown'})
             desc.text = markdown
         channel.append(entry)
     appcast = output / 'appcast.xml'

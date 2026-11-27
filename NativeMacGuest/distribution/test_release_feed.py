@@ -138,7 +138,7 @@ class FeedIdentityTests(unittest.TestCase):
             descriptions = feed.findall('./channel/item/description')
             self.assertEqual(len(descriptions), 2)
             for desc in descriptions:
-                self.assertEqual(desc.get(f'{{{release.NS}}}descriptionFormat'), 'markdown')
+                self.assertEqual(desc.get(f'{{{release.NS}}}format'), 'markdown')
                 self.assertIn('### 0.3.0 (21) — 2026-11-27', desc.text)
                 self.assertIn('### 0.3.0 (20) — 2026-11-26', desc.text)
                 self.assertIn('- Fix audio handoff stability', desc.text)
