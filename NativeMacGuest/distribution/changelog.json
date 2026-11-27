@@ -2,6 +2,18 @@
   "schemaVersion": 1,
   "mac": [
     {
+      "build": 168,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-27",
+      "commit": "13631980",
+      "items": [
+        "Optimize CPU and memory usage in large meetings: silence-gate local transcription, skip idle ONNX/SileroVAD allocation, vectorize I420->NV12 chroma interleaving, and offload WebRTC stats parsing",
+        "Deactivate muted Opus encoding and bypass VPIO while muted when warm microphone readiness is off, while keeping instant unmute when warm mic is enabled",
+        "Eliminate O(N^2) roster rebuilds on active speaker updates, deduplicate snapshot UI churn, and cache model readiness checks"
+      ]
+    },
+    {
       "build": 167,
       "version": "0.3.0",
       "channel": "beta",
@@ -983,6 +995,18 @@
     }
   ],
   "ios": [
+    {
+      "build": 175,
+      "version": "0.2.0",
+      "channel": "beta",
+      "date": "2026-11-27",
+      "commit": "13631980",
+      "items": [
+        "Optimize CPU and memory usage in large meetings: silence-gate local transcription without dropping late/background joiners, vectorize I420->NV12 chroma interleaving, and offload WebRTC stats parsing",
+        "Unload idle CoreML GigaAM models after 30s or in background when unleased while keeping active background meeting transcription resident",
+        "Deactivate muted Opus encoding, eliminate O(N^2) roster rebuilds on active speaker updates, and deduplicate feature snapshot updates"
+      ]
+    },
     {
       "build": 174,
       "version": "0.2.0",
