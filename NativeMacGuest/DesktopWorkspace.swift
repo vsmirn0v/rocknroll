@@ -32,7 +32,7 @@ import UserNotifications
         !busyForUpdate && pendingScheduled == nil && selectedMeetingID == nil && selection == .home &&
         error == nil && notice == nil && !library.setup.isPresented && !library.continuation.moving &&
         library.persistenceWarning == nil && updates?.safety.installationReserved != true &&
-        updates?.busy() != true && updates?.safety.recoveryTargetBuild == nil &&
+        updates?.busy() != true && updates?.safety.recoveryTargetBuild == nil && updates?.showsBanner != true &&
         invitation.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
         !(window?.firstResponder is NSTextView)
     }

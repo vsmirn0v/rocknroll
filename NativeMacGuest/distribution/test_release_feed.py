@@ -39,8 +39,20 @@ class FeedIdentityTests(unittest.TestCase):
                      downloadURL=release.ORIGIN + '/mac/releases/RockNRoll-0.3.0-20-arm64.dmg'), 'beta': entry}
         inventory_path = path / 'previous.json'
         inventory_path.write_text(json.dumps(inventory))
+        changelog_path = path / 'changelog.json'
+        changelog_path.write_text(json.dumps({
+            'schemaVersion': 1,
+            'mac': [
+                {'build': 21, 'version': '0.3.0', 'channel': 'beta', 'date': '2026-11-27',
+                 'commit': 'abcdef12', 'items': ['Fix audio handoff stability']},
+                {'build': 20, 'version': '0.3.0', 'channel': 'stable', 'date': '2026-11-26',
+                 'commit': '12345678', 'items': ['Initial stable baseline']},
+            ],
+            'ios': [],
+        }))
         args = SimpleNamespace(release=path / 'release.json', channel='stable', output=path / 'Feed',
-                               previous_feed=previous_feed, previous_inventory=inventory_path)
+                               previous_feed=previous_feed, previous_inventory=inventory_path,
+                               changelog=changelog_path)
         return args, root, enclosure, inventory
 
     def run_command(self, command, **kwargs):
@@ -108,6 +120,28 @@ class FeedIdentityTests(unittest.TestCase):
             self.assertEqual(plan['feedSHA256'], hashlib.sha256(signed).hexdigest())
             self.assertTrue(any(str(args.previous_feed) in [str(x) for x in call.args[0]] and '--verify' in call.args[0]
                                 for call in commands.call_args_list))
+
+    def test_missing_changelog_entry_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            args, _, _, _ = self.fixture(temporary)
+            args.changelog.write_text(json.dumps({'schemaVersion': 1, 'mac': [], 'ios': []}))
+            with mock.patch.object(release, 'pinned_sparkle'), mock.patch.object(release, 'run', side_effect=self.run_command):
+                with self.assertRaisesRegex(ValueError, 'Missing changelog entry for Mac build 21'):
+                    release.prepare_feed(args)
+
+    def test_head_items_embed_markdown_changelog_history(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            args, _, _, _ = self.fixture(temporary)
+            with mock.patch.object(release, 'pinned_sparkle'), mock.patch.object(release, 'run', side_effect=self.run_command):
+                release.prepare_feed(args)
+            feed = ET.parse(args.output / 'appcast.xml')
+            descriptions = feed.findall('./channel/item/description')
+            self.assertEqual(len(descriptions), 2)
+            for desc in descriptions:
+                self.assertEqual(desc.get(f'{{{release.NS}}}descriptionFormat'), 'markdown')
+                self.assertIn('### 0.3.0 (21) — 2026-11-27', desc.text)
+                self.assertIn('### 0.3.0 (20) — 2026-11-26', desc.text)
+                self.assertIn('- Fix audio handoff stability', desc.text)
 
 
 if __name__ == '__main__':

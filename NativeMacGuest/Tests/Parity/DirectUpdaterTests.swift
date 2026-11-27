@@ -51,17 +51,31 @@ private actor DirectUpdaterCalendar: CalendarReading {
         }
         let safety = try NativeUpdateSafety(stateDirectoryURL: directory, currentBuild: 100)
         let mediaGate = mediaGate ?? .init(claimIfDrained: { _ in true }, drain: { _ in true }, release: { _ in })
-        return Fixture(safety: safety, updates: NativeDesktopUpdates(safety: safety, mediaGate: mediaGate), directory: directory)
+        let updates = NativeDesktopUpdates(
+            safety: safety,
+            mediaGate: mediaGate,
+            currentBuild: 100,
+            currentVersion: "0.3.0"
+        )
+        return Fixture(safety: safety, updates: updates, directory: directory)
     }
 
-    private func item(_ version: String = "101") throws -> SUAppcastItem {
+    private func item(
+        _ version: String = "101",
+        shortVersion: String = "0.3.0",
+        description: String? = nil
+    ) throws -> SUAppcastItem {
         // This public initializer is deprecated only for system/application-dependent
         // properties; these fixtures use its documented version/enclosure fields.
-        try XCTUnwrap(SUAppcastItem(dictionary: [
+        var dict: [String: Any] = [
             "sparkle:version": version,
+            "sparkle:shortVersionString": shortVersion,
             "enclosure": ["url": "https://example.test/RockNRoll-\(version).dmg",
-                          "length": "1", "sparkle:version": version]
-        ]))
+                          "length": "1", "sparkle:version": version,
+                          "sparkle:shortVersionString": shortVersion]
+        ]
+        if let description { dict["description"] = description }
+        return try XCTUnwrap(SUAppcastItem(dictionary: dict))
     }
 
     private func begin(_ fixture: Fixture, check: SPUUpdateCheck = .updates) throws {
@@ -352,6 +366,68 @@ private actor DirectUpdaterCalendar: CalendarReading {
         XCTAssertEqual(updates.status, idleStatus, "A completed cycle restores neutral status; it does not prove this build is current")
         XCTAssertTrue(updates.mayStartMeeting)
         XCTAssertFalse(fixture.fenceExists)
+    }
+
+    func testStagedUpdateStagesSlicedChangelogWithoutSilentRestartUntilConfirmed() throws {
+        let fixture = try fixture(), updates = fixture.updates
+        var busy = false; updates.busy = { busy }
+        try begin(fixture, check: .updatesInBackground)
+        let markdown = """
+        ### 0.3.0 (102) — 2026-11-27
+        - Fix audio recovery
+
+        ### 0.3.0 (101) — 2026-11-26
+        - Improve reconnect speed
+
+        ### 0.3.0 (100) — 2026-11-25
+        - Already installed
+        """
+        let item = try self.item("102", shortVersion: "0.3.0", description: markdown)
+        var installCalls = 0
+        _ = updates.updater(updates.updater, willInstallUpdateOnQuit: item, immediateInstallationBlock: {
+            installCalls += 1
+        })
+        updates.activityChanged()
+        XCTAssertEqual(installCalls, 0, "Staged update must not silently restart when idle")
+        XCTAssertTrue(updates.mayStartMeeting)
+        XCTAssertEqual(updates.stagedUpdate?.build, 102)
+        XCTAssertEqual(updates.stagedUpdate?.diff.sections.map(\.build), [102, 101])
+        XCTAssertTrue(updates.showsBanner)
+
+        updates.dismissBannerForCurrentUpdate()
+        XCTAssertFalse(updates.showsBanner)
+
+        updates.check()
+        XCTAssertTrue(updates.showingChangelogSheet)
+
+        // If a meeting becomes active before user clicks Restart & Update, install waits until idle.
+        busy = true
+        updates.installStagedUpdate()
+        XCTAssertFalse(updates.showingChangelogSheet)
+        XCTAssertEqual(installCalls, 0)
+        busy = false
+        updates.activityChanged()
+        XCTAssertEqual(installCalls, 1)
+        XCTAssertTrue(fixture.safety.installationReserved)
+    }
+
+    func testAbortClearsStagedUpdateAndRejectsStaleInstallAction() throws {
+        let fixture = try fixture(), updates = fixture.updates
+        updates.busy = { false }
+        try begin(fixture)
+        let item = try self.item("101", shortVersion: "0.3.0", description: "### 0.3.0 (101) — 2026-11-27\n- One fix")
+        var installCalls = 0
+        _ = updates.updater(updates.updater, willInstallUpdateOnQuit: item, immediateInstallationBlock: {
+            installCalls += 1
+        })
+        XCTAssertNotNil(updates.stagedUpdate)
+        updates.updater(updates.updater, didAbortWithError: failure)
+        updates.updater(updates.updater, didFinishUpdateCycleFor: .updates, error: failure)
+        XCTAssertNil(updates.stagedUpdate)
+        XCTAssertFalse(updates.showsBanner)
+        updates.installStagedUpdate()
+        XCTAssertEqual(installCalls, 0)
+        XCTAssertFalse(fixture.safety.installationReserved)
     }
 }
 #endif

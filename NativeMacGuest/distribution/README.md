@@ -131,6 +131,31 @@ python3 NativeMacGuest/distribution/publish.py \
   --package .build/native-dmg/package-BUILD_NUMBER
 ```
 
+### Automated Changelogs & One-Command Release (`ship.py`)
+
+Release notes live in `NativeMacGuest/distribution/changelog.json` (`schemaVersion: 1`)
+with separate `mac` and `ios` ledgers. `release.py feed` fails closed if the target
+Mac build has no entry in `changelog.json`, and embeds signed Markdown history
+(`<description sparkle:descriptionFormat="markdown">`) inside `appcast.xml` so the
+Mac app slices exact cumulative diffs from the user's installed build.
+
+Preview or record notes from Git history (honors `Changelog:` commit trailers):
+
+```sh
+python3 NativeMacGuest/distribution/release.py notes --platform mac
+python3 NativeMacGuest/distribution/release.py notes --platform ios --since-build 173 --copy
+```
+
+Build, notarize, package, sign the feed with changelog history, and preflight in one step
+(add `--apply` to publish and tag `mac-<version>-<build>`, or `--resume <work_dir>` if
+notarization exceeded the wait window):
+
+```sh
+python3 NativeMacGuest/distribution/ship.py \
+  --channel beta \
+  --identity 'Apple Development: YOUR EXISTING IDENTITY'
+```
+
 Add `--apply` to publish the reviewed files through `root@kachat.app`.
 Optionally use `--evidence NEW_FILE.json` to save successful HTTPS readback.
 The only public write root is `/var/www/rocknroll/releases`; the private upload,

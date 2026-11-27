@@ -16,16 +16,33 @@ import SwiftUI
 
 /// Direct-distribution only. Meeting admission and Sparkle callbacks share MainActor.
 @MainActor final class NativeDesktopUpdates: NSObject, ObservableObject, SPUUpdaterDelegate {
+    struct StagedUpdate: Equatable {
+        let version: String
+        let build: Int
+        let diff: UpdateChangelogDiff
+    }
+
     let safety: NativeUpdateSafety
     @Published private(set) var status = L("Updates install only when no meeting is active.")
     @Published private(set) var beta = UserDefaults.standard.bool(forKey: "native.updates.beta")
+    @Published private(set) var stagedUpdate: StagedUpdate?
+    @Published private(set) var recoveryChangelog: UpdateChangelogDiff?
+    @Published var showingChangelogSheet = false
+    @Published private(set) var bannerDismissedBuild: Int?
     private var subscriptions = Set<AnyCancellable>()
     private var deferred: [() -> Void] = []
     private var installWhenIdle: (() -> Void)?
+    private var stagedInstallAction: (() -> Void)?
+    private var stagedAppcastItem: SUAppcastItem?
     private var driver: MeetingSafeUpdateDriver!
     private(set) var updater: SPUUpdater!
     var busy: () -> Bool = { true }
     var channelLocked: Bool { safety.recoveryTargetBuild != nil || prepared || updater?.sessionInProgress == true }
+    var activeChangelog: UpdateChangelogDiff? { stagedUpdate?.diff ?? recoveryChangelog }
+    var showsBanner: Bool {
+        !mayStartMeeting || (stagedUpdate != nil && bannerDismissedBuild != stagedUpdate?.build)
+    }
+    var canTriggerCheckOrReview: Bool { updater.canCheckForUpdates || stagedUpdate != nil }
     private var prepared = false
     private var stage2Requested = false
     private var cycleActive = false
@@ -33,16 +50,41 @@ import SwiftUI
     private var mediaPreparedForInstall = false
     private var mediaPreparation: Task<Bool, Never>?
     private let mediaGate: NativeDesktopUpdateMediaGate
+    private let currentBuild: Int
+    private let currentVersion: String
+    private let changelogDefaults: UserDefaults
     var mayStartMeeting: Bool { safety.mayStartMeeting }
 
-    init(safety: NativeUpdateSafety, mediaGate: NativeDesktopUpdateMediaGate? = nil) {
-        self.safety = safety; self.mediaGate = mediaGate ?? .live
+    init(
+        safety: NativeUpdateSafety,
+        mediaGate: NativeDesktopUpdateMediaGate? = nil,
+        currentBuild: Int? = nil,
+        currentVersion: String? = nil,
+        changelogDefaults: UserDefaults = .standard
+    ) {
+        self.safety = safety
+        self.mediaGate = mediaGate ?? .live
+        self.currentBuild = currentBuild ?? (Int(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "") ?? 0)
+        self.currentVersion = currentVersion ?? (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.3.0")
+        self.changelogDefaults = changelogDefaults
         super.init()
         driver = MeetingSafeUpdateDriver(owner: self)
         updater = SPUUpdater(hostBundle: .main, applicationBundle: .main, userDriver: driver, delegate: self)
         safety.objectWillChange.sink { [weak self] in self?.objectWillChange.send() }.store(in: &subscriptions)
         updater.publisher(for: \.canCheckForUpdates).sink { [weak self] _ in self?.objectWillChange.send() }.store(in: &subscriptions)
-        if let target = safety.recoveryTargetBuild { status = L("Finish updating to build %ld before joining a meeting.", target); prepared = true }
+        if let target = safety.recoveryTargetBuild {
+            status = L("Finish updating to build %ld before joining a meeting.", target)
+            prepared = true
+            if let cached = UpdateChangelogCache.load(targetBuild: target, defaults: changelogDefaults) {
+                recoveryChangelog = UpdateChangelogParser.slice(
+                    markdown: cached.markdown,
+                    installedBuild: self.currentBuild,
+                    targetBuild: target,
+                    installedVersion: self.currentVersion,
+                    targetVersion: cached.targetVersion
+                )
+            }
+        }
     }
     /// A newer published build than the update Sparkle already downloaded.
     @Published private(set) var newerThanDownloaded: (build: Int, url: URL)?
@@ -87,11 +129,59 @@ import SwiftUI
         }.max { $0.build < $1.build }
     }
     func check() {
+        if stagedUpdate != nil {
+            if let item = stagedAppcastItem { compareWithPublished(item) }
+            showingChangelogSheet = true
+            return
+        }
         guard updater.canCheckForUpdates else { return }
         if busy() {
             status = L("Checking in the background. Installation will wait until the meeting ends.")
             updater.checkForUpdatesInBackground()
         } else { updater.checkForUpdates() }
+    }
+    func installStagedUpdate() {
+        guard let stagedInstallAction else { return }
+        showingChangelogSheet = false
+        stagedInstallAction()
+    }
+    func dismissBannerForCurrentUpdate() {
+        bannerDismissedBuild = stagedUpdate?.build
+    }
+    private func makeDiff(for item: SUAppcastItem, targetBuild: Int) -> UpdateChangelogDiff {
+        if let description = item.itemDescription, !description.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            UpdateChangelogCache.save(
+                markdown: description,
+                targetBuild: targetBuild,
+                targetVersion: item.displayVersionString,
+                defaults: changelogDefaults
+            )
+            return UpdateChangelogParser.slice(
+                markdown: description,
+                installedBuild: currentBuild,
+                targetBuild: targetBuild,
+                installedVersion: currentVersion,
+                targetVersion: item.displayVersionString
+            )
+        }
+        if let cached = UpdateChangelogCache.load(targetBuild: targetBuild, defaults: changelogDefaults) {
+            return UpdateChangelogParser.slice(
+                markdown: cached.markdown,
+                installedBuild: currentBuild,
+                targetBuild: targetBuild,
+                installedVersion: currentVersion,
+                targetVersion: item.displayVersionString
+            )
+        }
+        return UpdateChangelogDiff(
+            installedVersion: currentVersion,
+            installedBuild: currentBuild,
+            targetVersion: item.displayVersionString,
+            targetBuild: targetBuild,
+            sections: [],
+            fallbackMarkdown: nil,
+            hasOlderUnshownChanges: false
+        )
     }
     func setBeta(_ value: Bool) {
         guard !channelLocked else { return }
@@ -159,6 +249,10 @@ import SwiftUI
     }
     func allowedChannels(for updater: SPUUpdater) -> Set<String> { beta ? ["beta"] : [] }
     func updaterShouldPromptForPermissionToCheck(forUpdates updater: SPUUpdater) -> Bool { false }
+    func updater(_ updater: SPUUpdater, didFindValidUpdate item: SUAppcastItem) {
+        guard let target = Int(item.versionString) else { return }
+        _ = makeDiff(for: item, targetBuild: target)
+    }
     func updater(_ updater: SPUUpdater, shouldProceedWithUpdate item: SUAppcastItem, updateCheck: SPUUpdateCheck) throws {
         guard cycleActive, let target = Int(item.versionString) else { throw NativeUpdateSafety.SafetyError.invalidBuild }
         try safety.prepareUpdate(targetBuild: target); prepared = true
@@ -167,13 +261,18 @@ import SwiftUI
     func updater(_ updater: SPUUpdater, willInstallUpdate item: SUAppcastItem) { stage2Requested = true }
     func updaterShouldRelaunchApplication(_ updater: SPUUpdater) -> Bool { reserve() }
     func updater(_ updater: SPUUpdater, willInstallUpdateOnQuit item: SUAppcastItem, immediateInstallationBlock action: @escaping () -> Void) -> Bool {
-        guard cycleActive, prepareChoice(item) else { return true }
+        guard cycleActive, prepareChoice(item), let target = Int(item.versionString) else { return true }
         let epoch = cycleEpoch
-        installWhenIdle = { [weak self] in
+        let diff = makeDiff(for: item, targetBuild: target)
+        stagedAppcastItem = item
+        stagedUpdate = StagedUpdate(version: item.displayVersionString, build: target, diff: diff)
+        bannerDismissedBuild = nil
+        stagedInstallAction = { [weak self] in
             guard let self, self.cycleActive, self.cycleEpoch == epoch else { return }
             self.installChoice(.install) { if $0 == .install { action() } }
         }
-        Task { @MainActor [weak self] in self?.activityChanged() }
+        compareWithPublished(item)
+        status = L("Version %@ (%ld) is ready to install.", item.displayVersionString, target)
         return true
     }
     func updater(_ updater: SPUUpdater, didAbortWithError error: Error) {
@@ -188,7 +287,9 @@ import SwiftUI
     }
     private func invalidateCycle() {
         let epoch = cycleEpoch
-        cycleActive = false; cycleEpoch = UUID(); installWhenIdle = nil; newerThanDownloaded = nil; deferred.removeAll(); driver.invalidate()
+        cycleActive = false; cycleEpoch = UUID(); installWhenIdle = nil; stagedInstallAction = nil
+        stagedUpdate = nil; stagedAppcastItem = nil; showingChangelogSheet = false; newerThanDownloaded = nil
+        deferred.removeAll(); driver.invalidate()
         if !safety.installationReserved {
             mediaPreparedForInstall = false
             // A native operation may outlive cancellation. Release its exclusion
@@ -205,11 +306,32 @@ import SwiftUI
     func willTerminate() { clearPreparedIfSafe() }
 }
 
-@MainActor private final class MeetingSafeUpdateDriver: NSObject, SPUUserDriver {
+@MainActor private final class MeetingSafeUpdateDriver: NSObject, SPUUserDriver, SPUStandardUserDriverDelegate {
     weak var owner: NativeDesktopUpdates?
     private var generation = 0
-    private let standard = SPUStandardUserDriver(hostBundle: .main, delegate: nil)
-    init(owner: NativeDesktopUpdates) { self.owner = owner }
+    private lazy var standard = SPUStandardUserDriver(hostBundle: .main, delegate: self)
+    init(owner: NativeDesktopUpdates) {
+        self.owner = owner
+        super.init()
+    }
+    nonisolated func standardUserDriverWillShowReleaseNotesText(
+        _ releaseNotesAttributedString: NSAttributedString,
+        forUpdate update: SUAppcastItem,
+        withBundleDisplayVersion bundleDisplayVersion: String,
+        bundleVersion: String
+    ) -> NSAttributedString? {
+        guard let targetBuild = Int(update.versionString) else { return nil }
+        let installedBuild = Int(bundleVersion) ?? 0
+        let diff = UpdateChangelogParser.slice(
+            markdown: update.itemDescription,
+            installedBuild: installedBuild,
+            targetBuild: targetBuild,
+            installedVersion: bundleDisplayVersion,
+            targetVersion: update.displayVersionString
+        )
+        guard !diff.isEmpty else { return nil }
+        return diff.attributedString()
+    }
     private func present(_ action: @escaping () -> Void) {
         let token = generation
         owner?.showWhenIdle { [weak self] in guard self?.generation == token else { return }; action() }
@@ -255,13 +377,149 @@ import SwiftUI
 struct NativeDesktopUpdateBanner: View {
     @ObservedObject var updates: NativeDesktopUpdates
     var body: some View {
-        if !updates.mayStartMeeting {
-            HStack {
-                Label(updates.status, systemImage: "arrow.down.circle")
-                Spacer()
-                Button("Finish update…") { updates.check() }.disabled(!updates.updater.canCheckForUpdates)
-            }.padding(12).background(.regularMaterial)
+        Group {
+            if !updates.mayStartMeeting {
+                HStack(spacing: 10) {
+                    Label(updates.status, systemImage: "arrow.down.circle")
+                    Spacer()
+                    if updates.recoveryChangelog != nil {
+                        Button(L("What's Changed…")) { updates.showingChangelogSheet = true }
+                    }
+                    Button(L("Finish update…")) { updates.check() }.disabled(!updates.updater.canCheckForUpdates)
+                }
+                .padding(12)
+                .background(.regularMaterial)
+            } else if let staged = updates.stagedUpdate, updates.bannerDismissedBuild != staged.build {
+                HStack(spacing: 12) {
+                    Image(systemName: "arrow.down.circle.fill")
+                        .foregroundStyle(Color.accentColor)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(L("Update %@ (%ld) is ready", staged.version, staged.build))
+                            .font(.subheadline.weight(.medium))
+                        if let summary = staged.diff.bannerSummary() {
+                            Text(summary)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+                    }
+                    Spacer()
+                    Button(L("What's Changed…")) { updates.showingChangelogSheet = true }
+                    Button(L("Restart & Update")) { updates.installStagedUpdate() }
+                        .buttonStyle(.borderedProminent)
+                    Button(L("Later")) { updates.dismissBannerForCurrentUpdate() }
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+                .background(.regularMaterial)
+            }
         }
+        .sheet(isPresented: $updates.showingChangelogSheet) {
+            NativeDesktopChangelogSheet(updates: updates)
+        }
+    }
+}
+
+struct NativeDesktopChangelogSheet: View {
+    @ObservedObject var updates: NativeDesktopUpdates
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(updates.stagedUpdate != nil ? L("Update Ready") : L("What's Changed"))
+                        .font(.title3.bold())
+                    if let diff = updates.activeChangelog {
+                        if diff.installedBuild > 0 {
+                            Text("\(diff.installedVersion ?? "?") (\(diff.installedBuild)) → \(diff.targetVersion) (\(diff.targetBuild))")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        } else {
+                            Text("\(diff.targetVersion) (\(diff.targetBuild))")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                Spacer()
+            }
+
+            if let newer = updates.newerThanDownloaded {
+                HStack(spacing: 8) {
+                    Image(systemName: "info.circle")
+                        .foregroundStyle(.secondary)
+                    Text(L("Build %ld is now available.", newer.build))
+                        .font(.caption)
+                    Spacer()
+                    Link(L("Download build %ld", newer.build), destination: newer.url)
+                        .font(.caption)
+                }
+                .padding(10)
+                .background(Color.secondary.opacity(0.1), in: RoundedRectangle(cornerRadius: 8))
+            }
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
+                    if let diff = updates.activeChangelog, !diff.isEmpty {
+                        if diff.sections.isEmpty, let fallback = diff.fallbackMarkdown {
+                            Text(fallback)
+                                .font(.callout)
+                                .textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        } else {
+                            ForEach(diff.sections) { section in
+                                VStack(alignment: .leading, spacing: 6) {
+                                    Text(section.date.map { "\(section.version) (\(section.build)) — \($0)" }
+                                         ?? "\(section.version) (\(section.build))")
+                                        .font(.headline)
+                                    ForEach(Array(section.items.enumerated()), id: \.offset) { _, item in
+                                        HStack(alignment: .top, spacing: 8) {
+                                            Text("•").foregroundStyle(.secondary)
+                                            Text(item)
+                                                .font(.callout)
+                                                .textSelection(.enabled)
+                                                .frame(maxWidth: .infinity, alignment: .leading)
+                                        }
+                                    }
+                                }
+                            }
+                            if diff.hasOlderUnshownChanges, let oldestBuild = diff.sections.last?.build {
+                                Text(L("Older release notes before build %ld are omitted.", oldestBuild))
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    } else {
+                        Text(L("No release notes are available for this update."))
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(2)
+            }
+            .frame(minHeight: 200, maxHeight: 360)
+
+            HStack {
+                Button(L("Later")) {
+                    dismiss()
+                    updates.showingChangelogSheet = false
+                }
+                .keyboardShortcut(.cancelAction)
+                Spacer()
+                if updates.stagedUpdate != nil {
+                    Button(L("Restart & Update")) {
+                        updates.installStagedUpdate()
+                    }
+                    .keyboardShortcut(.defaultAction)
+                    .buttonStyle(.borderedProminent)
+                }
+            }
+        }
+        .padding(20)
+        .frame(width: 500)
     }
 }
 
@@ -274,13 +532,43 @@ struct NativeDesktopUpdatesView: View {
                    let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String {
                     LabeledContent(L("Installed version"), value: "\(version) (\(build))").nativeSettingAnchor("settings.version")
                 }
-                NativeSettingsButton(title: L("Check for Updates…"), id: "settings.check-updates") {
+                NativeSettingsButton(
+                    title: updates.stagedUpdate != nil ? L("Review Pending Update…") : L("Check for Updates…"),
+                    id: "settings.check-updates"
+                ) {
                     updates.check()
                 }
-                .disabled(!updates.updater.canCheckForUpdates)
+                .disabled(!updates.canTriggerCheckOrReview)
                 Text(updates.status).font(.caption).foregroundStyle(.secondary)
                 if let newer = updates.newerThanDownloaded {
                     Link(L("Download build %ld", newer.build), destination: newer.url)
+                }
+            }
+            if let staged = updates.stagedUpdate {
+                Section(L("Ready to install: %@ (%ld)", staged.version, staged.build)) {
+                    if !staged.diff.sections.isEmpty {
+                        ForEach(staged.diff.sections) { section in
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(section.date.map { "\(section.version) (\(section.build)) — \($0)" }
+                                     ?? "\(section.version) (\(section.build))")
+                                    .font(.subheadline.weight(.semibold))
+                                ForEach(Array(section.items.enumerated()), id: \.offset) { _, item in
+                                    HStack(alignment: .top, spacing: 6) {
+                                        Text("•").foregroundStyle(.secondary)
+                                        Text(item).font(.caption)
+                                    }
+                                }
+                            }
+                            .padding(.vertical, 2)
+                        }
+                    } else if let fallback = staged.diff.fallbackMarkdown, !fallback.isEmpty {
+                        Text(fallback).font(.caption)
+                    } else {
+                        Text(L("No release notes are available for this update.")).font(.caption).foregroundStyle(.secondary)
+                    }
+                    NativeSettingsButton(title: L("Restart & Update"), id: "settings.restart-update") {
+                        updates.installStagedUpdate()
+                    }
                 }
             }
             Section(L("Automatic updates")) {

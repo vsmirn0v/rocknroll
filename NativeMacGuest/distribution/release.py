@@ -17,6 +17,7 @@ import uuid
 import xml.etree.ElementTree as ET
 
 from build_support import APP_NAME, BUNDLE_ID, DIRECT_INFO, FEED_URL, KEYCHAIN_ACCOUNT, PUBLIC_KEY, TEAM_ID, find_application, pinned_sparkle, sha256
+import changelog as changelog_lib
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 ORIGIN = 'https://rock.glowsoft.ru'
@@ -237,6 +238,11 @@ def prepare_feed(args):
     if (not isinstance(version, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]*', version)
             or not isinstance(build, str) or not build.isdecimal() or int(build) < 1):
         raise ValueError('Invalid release version/build')
+    changelog_path = pathlib.Path(getattr(args, 'changelog', None) or changelog_lib.DEFAULT_CHANGELOG_PATH)
+    changelog_data = changelog_lib.load_changelog(changelog_path)
+    mac_entries = changelog_data['mac']
+    if changelog_lib.entry_for_build(changelog_data, 'mac', int(build)) is None:
+        raise ValueError(f'Missing changelog entry for Mac build {build} in {changelog_path}')
     filename = f'RockNRoll-{version}-{build}-arm64.dmg'
     dmg = release_path.parent / filename
     url = ORIGIN + '/mac/releases/' + filename
@@ -305,17 +311,34 @@ def prepare_feed(args):
     items = sorted(channel.findall('item'),
                    key=lambda entry: int(entry.find('enclosure').get(f'{{{NS}}}version')), reverse=True)
     counts = {'stable': 0, 'beta': 0}
+    head_by_channel = {}
+    retained = []
     for entry in items:
         channel.remove(entry)
         name = item_channel(entry)
         counts[name] += 1
         if counts[name] <= 6:
-            channel.append(entry)
+            retained.append(entry)
+            head_by_channel.setdefault(name, entry)
+    for entry in retained:
+        entry_build = int(entry.find('enclosure').get(f'{{{NS}}}version'))
+        entry_channel = item_channel(entry)
+        if changelog_lib.entry_for_build(changelog_data, 'mac', entry_build) is not None:
+            for existing_desc in list(entry.findall('description')):
+                entry.remove(existing_desc)
+            is_head = head_by_channel.get(entry_channel) is entry
+            markdown = changelog_lib.render_appcast_markdown(
+                mac_entries, entry_build, single_build=not is_head)
+            desc = ET.SubElement(entry, 'description', {f'{{{NS}}}descriptionFormat': 'markdown'})
+            desc.text = markdown
+        channel.append(entry)
     appcast = output / 'appcast.xml'
     ET.indent(rss)
     ET.ElementTree(rss).write(appcast, encoding='utf-8', xml_declaration=True)
     run(sign + [appcast])
     run(sign + ['--verify', appcast])
+    if appcast.stat().st_size > 262144:
+        raise ValueError('Generated appcast exceeds its size limit')
     entry = {key: release[key] for key in ['version', 'build', 'downloadURL', 'sha256']}
     if args.channel in inventory and int(inventory[args.channel]['build']) > int(build):
         raise ValueError('Refusing to move a release channel backwards')
@@ -326,6 +349,56 @@ def prepare_feed(args):
         inventory['beta'] = entry
     write_json(output / 'latest.json', inventory)
     print(appcast)
+
+
+def prepare_notes(args):
+    changelog_path = pathlib.Path(args.changelog).resolve()
+    data = changelog_lib.load_changelog(changelog_path)
+    entries = data[args.platform]
+    latest = changelog_lib.latest_entry(data, args.platform)
+    if args.since_build is not None and not args.record:
+        if args.platform == 'ios':
+            output = changelog_lib.render_testflight_notes(entries, since_build=args.since_build)
+        else:
+            target = args.build or (latest['build'] if latest else None)
+            if target is None:
+                raise ValueError('Specify --build when rendering Mac changelog diff')
+            filtered = [e for e in entries if e['build'] > args.since_build]
+            output = changelog_lib.render_appcast_markdown(filtered, target) if filtered else ''
+        if not output:
+            raise ValueError('No recorded changelog entries match the requested build range')
+        print(output)
+        if args.copy:
+            subprocess.run(['pbcopy'], input=output, text=True, check=True)
+        return
+    since_commit = args.since_commit or (latest['commit'] if latest else None)
+    notes = [item.strip() for item in (args.note or []) if item.strip()]
+    if not notes:
+        notes = changelog_lib.extract_changes(ROOT, args.platform, since_commit=since_commit)
+    if not notes:
+        raise ValueError('No changes found since the previous recorded commit; pass --note "..." to supply bullets')
+    default_version = latest['version'] if latest else ('0.3.0' if args.platform == 'mac' else '0.2.0')
+    version = args.version or default_version
+    build = args.build or ((latest['build'] + 1) if latest else 1)
+    entry = {
+        'build': build,
+        'version': version,
+        'channel': args.channel,
+        'date': changelog_lib.today_iso(),
+        'commit': changelog_lib.head_commit(ROOT),
+        'items': notes,
+    }
+    if args.record:
+        updated = changelog_lib.upsert_entry(data, args.platform, entry)
+        changelog_lib.save_changelog(changelog_path, updated)
+        entries = updated[args.platform]
+    if args.platform == 'ios':
+        output = changelog_lib.render_testflight_notes([entry])
+    else:
+        output = changelog_lib.format_section(entry)
+    print(output)
+    if args.copy:
+        subprocess.run(['pbcopy'], input=output, text=True, check=True)
 
 
 def main():
@@ -353,7 +426,20 @@ def main():
     feed.add_argument('--output', type=pathlib.Path, required=True)
     feed.add_argument('--previous-feed', type=pathlib.Path)
     feed.add_argument('--previous-inventory', type=pathlib.Path)
+    feed.add_argument('--changelog', type=pathlib.Path, default=changelog_lib.DEFAULT_CHANGELOG_PATH)
     feed.set_defaults(action=prepare_feed)
+    notes = commands.add_parser('notes', help='Extract, preview, or record release changelog notes from git')
+    notes.add_argument('--platform', choices=changelog_lib.PLATFORMS, required=True)
+    notes.add_argument('--changelog', type=pathlib.Path, default=changelog_lib.DEFAULT_CHANGELOG_PATH)
+    notes.add_argument('--build', type=int)
+    notes.add_argument('--version')
+    notes.add_argument('--channel', choices=changelog_lib.CHANNELS, default='beta')
+    notes.add_argument('--since-commit')
+    notes.add_argument('--since-build', type=int)
+    notes.add_argument('--note', action='append', help='Explicit changelog bullet (repeatable)')
+    notes.add_argument('--record', action='store_true', help='Save the extracted entry into changelog.json')
+    notes.add_argument('--copy', action='store_true', help='Copy formatted notes to the clipboard via pbcopy')
+    notes.set_defaults(action=prepare_notes)
     args = parser.parse_args()
     if args.command in {'export', 'finalize'} and not 0 <= args.wait_seconds <= 1800:
         parser.error('--wait-seconds must be between 0 and 1800')

@@ -1,0 +1,986 @@
+{
+  "schemaVersion": 1,
+  "mac": [
+    {
+      "build": 166,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-26",
+      "commit": "b1600b55",
+      "items": [
+        "Guard SharedAudioEngine unmute and background media transitions"
+      ]
+    },
+    {
+      "build": 165,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-26",
+      "commit": "116ce50c",
+      "items": [
+        "Harden Guest ICE relay recovery, background transitions, and audio handoff"
+      ]
+    },
+    {
+      "build": 164,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-26",
+      "commit": "e148fded",
+      "items": [
+        "Fix visual snapshots in meeting Markdown export and history summary on macOS & iOS"
+      ]
+    },
+    {
+      "build": 163,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-26",
+      "commit": "6ea678e6",
+      "items": [
+        "Keep iCloud sync calm when healthy, respect backoff, and defer during meetings"
+      ]
+    },
+    {
+      "build": 162,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-26",
+      "commit": "7c73e638",
+      "items": [
+        "Fix diagnostic disk-write storm, call stability, wake recovery, and audio churn on macOS & iOS",
+        "Fix guest reconnect roster wipe, Bluetooth audio rebuild churn, and transport diagnostics",
+        "Fix macOS 26 Assistant tab blank detail pane and sidebar titlebar overlap"
+      ]
+    },
+    {
+      "build": 161,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-25",
+      "commit": "4efce53c",
+      "items": [
+        "Polish macOS Instant Meeting menu chevron contrast and native Liquid Glass toolbar spacing",
+        "Make macOS sidebar Meetings sync status clickable with iCloud popover",
+        "Refine macOS & iOS Instant Meeting UI, persistent websites, sidebar status footer, and clean video tiles",
+        "Fix silent VPIO input wedge across idle transitions and add self-healing recovery"
+      ]
+    },
+    {
+      "build": 160,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-25",
+      "commit": "2cc0383b",
+      "items": [
+        "Fix macOS Spacebar mute/unmute when sidebar or passive controls hold focus"
+      ]
+    },
+    {
+      "build": 159,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-25",
+      "commit": "d8caf4cd",
+      "items": [
+        "Add macOS Instant Meeting 2-click flow, menu bar & shortcuts, and Liquid Glass invite card",
+        "Fix macOS speaker UI re-render storm and incremental sync replica I/O on macOS and iOS",
+        "Add 2-click Instant Meeting flow, Liquid Glass invite card, and auto-copied toast"
+      ]
+    },
+    {
+      "build": 158,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-25",
+      "commit": "12b05176",
+      "items": [
+        "Fix CoreML GigaAM IOSurface exhaustion crash on macOS and iOS",
+        "Add in-meeting visual snapshots (Snap to Summary) for macOS and iOS",
+        "Clarify active facilitator role selection in macOS meeting popover",
+        "Fix duplicate ReminderOccurrence ID crash on synced/shifted calendar updates",
+        "Add Cyrillic output validation and retry to iOS on-device summaries",
+        "Fix Russian meeting summaries drifting into other Cyrillic languages"
+      ]
+    },
+    {
+      "build": 157,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-25",
+      "commit": "31a148d0",
+      "items": [
+        "Fix macOS Calendar enter/exit lockup with timeline windowing and cached rows",
+        "Fix macOS in-meeting facilitator role chooser auto-closing on live updates",
+        "Add unified Calendar timeline, History date scrubbers, and Create Calendar Meeting across macOS and iOS",
+        "Fix macOS Scrum Master speech delivery, proactive Jira board sharing, and WebView JS timeouts",
+        "Fix macOS Meeting History click lag and per-render recomputation",
+        "Fix standup task deduplication, board-derived Jira keys, settings persistence, presentation scrolling, wait-for-silence/barge-in",
+        "Add per-meeting transcript copy/export & configurable auto-export, fix Scrum Master conduct & board share recovery",
+        "Stream VoxCPM2 voice synthesis across macOS and iOS"
+      ]
+    },
+    {
+      "build": 137,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-20",
+      "commit": "83abd49f",
+      "items": [
+        "Native Mac beta build 137"
+      ]
+    },
+    {
+      "build": 133,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-20",
+      "commit": "1823fcc0",
+      "items": [
+        "Native Mac beta build 133"
+      ]
+    },
+    {
+      "build": 132,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-19",
+      "commit": "7a565b05",
+      "items": [
+        "Native Mac beta build 132"
+      ]
+    },
+    {
+      "build": 131,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-19",
+      "commit": "d0d4ccee",
+      "items": [
+        "Keep visible participant cameras subscribed beside a focused screen share and preserve sidebar identity while the share loads",
+        "Suppress quiet-stream relay fallback when another stream on the same subscriber transport receives packets",
+        "Record packet loss, decoder concealment, anonymous affected receivers and audio output callback gaps. Add audio-reception.log to diagnostic archives"
+      ]
+    },
+    {
+      "build": 125,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-19",
+      "commit": "8dc4d882",
+      "items": [
+        "Native Mac beta build 125"
+      ]
+    },
+    {
+      "build": 124,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-18",
+      "commit": "e3d92f8b",
+      "items": [
+        "Native Mac beta build 124"
+      ]
+    },
+    {
+      "build": 123,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-18",
+      "commit": "e3d92f8b",
+      "items": [
+        "Native Mac beta build 123"
+      ]
+    },
+    {
+      "build": 122,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-18",
+      "commit": "e3d92f8b",
+      "items": [
+        "Native Mac beta build 122"
+      ]
+    },
+    {
+      "build": 121,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-18",
+      "commit": "e3d92f8b",
+      "items": [
+        "Native Mac beta build 121"
+      ]
+    },
+    {
+      "build": 120,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-18",
+      "commit": "e3d92f8b",
+      "items": [
+        "Native Mac beta build 120"
+      ]
+    },
+    {
+      "build": 119,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-18",
+      "commit": "4f000d36",
+      "items": [
+        "Native Mac beta build 119"
+      ]
+    },
+    {
+      "build": 118,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-17",
+      "commit": "e57cc23b",
+      "items": [
+        "Native Mac beta build 118"
+      ]
+    },
+    {
+      "build": 117,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-17",
+      "commit": "e57cc23b",
+      "items": [
+        "Native Mac beta build 117"
+      ]
+    },
+    {
+      "build": 116,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-17",
+      "commit": "3105de9c",
+      "items": [
+        "Native Mac beta build 116"
+      ]
+    },
+    {
+      "build": 115,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-17",
+      "commit": "e01d362e",
+      "items": [
+        "Native Mac beta build 115"
+      ]
+    },
+    {
+      "build": 114,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-17",
+      "commit": "b2ace0b5",
+      "items": [
+        "Native Mac beta build 114"
+      ]
+    },
+    {
+      "build": 113,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-17",
+      "commit": "65d97f05",
+      "items": [
+        "Native Mac beta build 113"
+      ]
+    },
+    {
+      "build": 112,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-16",
+      "commit": "0fa7a787",
+      "items": [
+        "Native Mac beta build 112"
+      ]
+    },
+    {
+      "build": 111,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-16",
+      "commit": "8f2c3775",
+      "items": [
+        "Native Mac beta build 111"
+      ]
+    },
+    {
+      "build": 110,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-14",
+      "commit": "170d0cf0",
+      "items": [
+        "Native Mac beta build 110"
+      ]
+    },
+    {
+      "build": 109,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-14",
+      "commit": "170d0cf0",
+      "items": [
+        "Native Mac beta build 109"
+      ]
+    },
+    {
+      "build": 108,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-14",
+      "commit": "daef0581",
+      "items": [
+        "Native Mac beta build 108"
+      ]
+    },
+    {
+      "build": 107,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-14",
+      "commit": "2520bb14",
+      "items": [
+        "Native Mac beta build 107"
+      ]
+    },
+    {
+      "build": 106,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-14",
+      "commit": "5a8290cc",
+      "items": [
+        "Native Mac beta build 106"
+      ]
+    },
+    {
+      "build": 105,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-13",
+      "commit": "d0587553",
+      "items": [
+        "Native Mac beta build 105"
+      ]
+    },
+    {
+      "build": 104,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-12",
+      "commit": "d04d8224",
+      "items": [
+        "Native Mac beta build 104"
+      ]
+    },
+    {
+      "build": 103,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-12",
+      "commit": "d04d8224",
+      "items": [
+        "Native Mac meeting workspace with focused and parallel live conversations, status, per-meeting private guidance, pause, manual takeover, and draft controls",
+        "Durable locally stored transcript revisions, assistant responses, delivery states, context snapshots, bookmarks, review and saved guidance",
+        "English and Russian workspace and command localization",
+        "Guest-first mixed meetings retain Rock listening and chat; microphone and assistant speech are gated until a verified SDK audio route exists",
+        "Approved speech uses separate cancellable local and outgoing audio routes, with fail-closed microphone protection"
+      ]
+    },
+    {
+      "build": 102,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-12",
+      "commit": "d04d8224",
+      "items": [
+        "Natural first-person replies on behalf of the user. No default brand or assistant prefix in chat, speech or private transcript",
+        "Prefix is applied only when supported by explicit user instructions, with current meeting guidance taking precedence over global style",
+        "Answers use current meeting information, notes, About and relevant excerpts from the selected Obsidian vault. The selected vault remains available for lookup when automatic export is paused",
+        "Model-requested bounded vault retrieval uses the existing security-scoped bookmark. Source removal and changes cancel pending replies. Retrieved content is evidence rather than behavioral instructions",
+        "Host-owned scope checks prevent calendar logistics from grounding unrelated project answers. Current meeting schedule questions remain supported",
+        "Fresh direct questions can receive consecutive replies while unsolicited pacing, exact-turn ownership, echo protection and voice delivery guards remain"
+      ]
+    },
+    {
+      "build": 101,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-12",
+      "commit": "d04d8224",
+      "items": [
+        "Participation can offer to take a question when a participant asks whether the local attendee is on the line or can respond",
+        "Adjacent verified speech from the same participant can provide the missing name in a split request. Current requests, exact name evidence and the approved roster determine the reply",
+        "Quiet verified local turns receive a current-request check so explicit hearing checks can produce a reply. Typed diagnostics identify proposal and assessment outcomes",
+        "Suggested reply buttons use localized stance identifiers. Older brief hold and hold labels resolve to the existing translated label"
+      ]
+    },
+    {
+      "build": 100,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-12",
+      "commit": "d04d8224",
+      "items": [
+        "Automatic participation can invite a named attendee's question or acknowledge a verified inbound audio check in the assistant's own words",
+        "The host binds fixed replies to the verified current turn. An independent current-turn classifier checks the cue and addressee",
+        "Successful Start remembers the approved reply channel for later setup. Typed decision progress and English and Russian labels identify silent outcomes"
+      ]
+    },
+    {
+      "build": 99,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-12",
+      "commit": "d04d8224",
+      "items": [
+        "Automatic voice uses the reviewed Assistant voice, including the selected clone recording",
+        "A reply can open the WebRTC capture gate while the physical microphone remains isolated. The permit restores the gate at completion or interruption"
+      ]
+    },
+    {
+      "build": 98,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-12",
+      "commit": "d04d8224",
+      "items": [
+        "Fresh live-context-only grants follow attendee changes within the same room and connection; pending work and earlier context are discarded",
+        "Approved-note grants still require audience review; manual pause never auto-resumes",
+        "Distinct localized lifecycle reasons and content-free transition diagnostics; background lifecycle regression coverage"
+      ]
+    },
+    {
+      "build": 97,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-12",
+      "commit": "d04d8224",
+      "items": [
+        "Participate consumes locally transcribed Guest meeting audio with attribution and echo safeguards",
+        "Expanded Russian localization across assistant, knowledge, settings, notes and updates"
+      ]
+    },
+    {
+      "build": 96,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-12",
+      "commit": "d04d8224",
+      "items": [
+        "Native Mac beta build 96"
+      ]
+    },
+    {
+      "build": 95,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-12",
+      "commit": "d04d8224",
+      "items": [
+        "Supervised cloned voice worker, persistent readiness and retry, targeted cache repair, and optimized Debug inference",
+        "Autonomous meeting participation and native meeting notes, tasks, and Obsidian sync from commits 15fd3a2 and ce56e36"
+      ]
+    },
+    {
+      "build": 94,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-11",
+      "commit": "40ab113e",
+      "items": [
+        "Adaptive per-peer TURN TCP/TLS fallback and next-join transport preference"
+      ]
+    },
+    {
+      "build": 93,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-11",
+      "commit": "b4c78b4",
+      "items": [
+        "Bound established ICE recovery to one ten-second interval; prevent repeated or stale failure callbacks"
+      ]
+    },
+    {
+      "build": 92,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-11",
+      "commit": "af79be09",
+      "items": [
+        "Durably save the bounded outcome input before sending a generation request",
+        "Display specific failures and retry the same outcome after relaunch with the original provider",
+        "Guard against duplicate retry requests and ignore completions from attempts that no longer own the outcome"
+      ]
+    },
+    {
+      "build": 90,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-10",
+      "commit": "37e53ed7",
+      "items": [
+        "Fix the beta-89 cloned-voice recurrence: specializations are stored in an explicit app-group AIModelCache instead of the OS-managed purgeable default cache, so macOS storage-pressure purges no longer wipe them between launches",
+        "Purge policy drops .storagePressure; only a source-asset change invalidates a voice-model entry",
+        "All specialize and rebuild-delete paths share one cache scope",
+        "New vox-cache-lookup probes (per-asset cache hit/miss) and a rebuild-time low-disk probe for the next diagnostics"
+      ]
+    },
+    {
+      "build": 89,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-10",
+      "commit": "37e53ed7",
+      "items": [
+        "Everything from beta 88: WebRTC M156 audio-route recovery r1 framework actually linked (LK namespace overlay, configuration-recovery race guard, default-route native handover), fixing the build-87 errata",
+        "Redesign Mini meeting as an explicit PiP with a streaming cap",
+        "Bound voice preview during cache recovery",
+        "Fix first assistant send, compact timeline, and direct-send policy",
+        "Never notify based on the user's own lines"
+      ]
+    },
+    {
+      "build": 88,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-10",
+      "commit": "37e53ed7",
+      "items": [
+        "WebRTC M156 audio-route recovery r1 framework is actually linked into this build: LK namespace overlay regenerated, configuration-recovery race guard and default-route native handover included, fixing the build-87 errata where the published app carried the unpatched screen-r5 framework",
+        "All seven LKRTC desktop audio gate exports present and verified in the packaged framework (binary SHA-256 9996ae0c23d9c6fa20481bc3c811623803b56fd8d98f944684d6f20afde85977, source manifest SHA-256 6d82900d4a71ee10b9b294bcbfffcbc064e5f9e36762044ea837acbcab6dc3ae)",
+        "Rebuild tooling committed to the repo: Experiments/WebRTCM156/rebuild_framework.py, REBUILD.md, and the namespace overlay patch/audit so the framework can be reproduced from git alone"
+      ]
+    },
+    {
+      "build": 87,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-10",
+      "commit": "0796a714",
+      "items": [
+        "Assistant selected-meeting fixes: the selected active meeting UUID is used for a missing meeting_id or an exact selected-title alias, invalid calls are returned to the model for bounded correction, unavailable targets report unknownMeeting instead of misleading missing-text errors, and duplicate terminal errors are suppressed",
+        "Cloned-voice cache recovery and meeting voice-setting fixes from f37ddc9",
+        "WebRTC M156 audio route recovery guards from 863bdbb and 5c51eb7",
+        "Includes the meeting notes, Obsidian export, assistant notes and voice foundation already shipped in beta 86"
+      ]
+    },
+    {
+      "build": 86,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-10",
+      "commit": "4f2033f",
+      "items": [
+        "Meeting notes and Obsidian export foundation: durable MeetingLibrary with schema and legacy migration, in-app notes editor with autosave and formatting commands, manual markdown export",
+        "Obsidian export with managed rnr: blocks, structure scanning, conflict-safe patching, vault-path validation and .obsidian write-protection, background export worker and settings UI",
+        "Assistant notes: personal note tools and read-only rocknroll_get_notes MCP tool (server 0.3.0, 14 tools), offline parity in mcp/rocknroll_local.py with get_notes and note search",
+        "New parity tests (85 cases across MeetingLibrary, notes, search, markdown/Obsidian/manual export, assistant notes, MCP contract) caught and fixed six production bugs (ManagedBlock.parse field order, legacy import NOT NULL violation, searchNotes SQLITE_RANGE, saveOutcome and saveBinding bind mismatches, failOutbox Int64 trap, patcher trailing-newline false conflicts)"
+      ]
+    },
+    {
+      "build": 85,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-10",
+      "commit": "ac3729c",
+      "items": [
+        "MCP server for AI-agent meeting integration: thirteen read-only and ask-first tools with published, handler-accurate inputSchemas (server 0.2.0) and pre-dispatch validation with structured field-level errors",
+        "Keep the assistant situation when a meeting is left: hangup no longer reads as the user silencing the meeting while the window is still on screen",
+        "Skip redundant native mute on audio rebuild and log lifecycle events",
+        "Full MCP test-suite repair: the memory-checker workaround and async XCTest hollowing were silently skipping test bodies; all green results are now genuine (451 tests)"
+      ]
+    },
+    {
+      "build": 84,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-10",
+      "commit": "f40c4ab",
+      "items": [
+        "Local ASR/TTS readiness and memory status: a toolbar chip in Assistant and a Settings -> Assistant section show each on-device model's readiness (off, downloading, needs preparation, ready, setup needed, failed, managed), kept separate from residency so a warmed-but-unloaded model reads Ready - Not loaded, plus per-model memory estimated from the process footprint while loaded, compute-path text (Neural Engine vs CPU), and a system memory bar",
+        "MCP server for AI-agent meeting integration: twelve read-only and ask-first tools over a loopback endpoint with pairing tokens and revocable clients",
+        "Bounded assistant agent runtime over typed native tools, bound to the MCP backend via a read-only loopback",
+        "MCP Server settings tab: live status, endpoint copy, pairing instructions, paired clients with Remove, and the exact tool surface",
+        "Rate-limit hotkey registration and flag silent push-to-talk captures",
+        "Adaptive Attention settings layout fix"
+      ]
+    },
+    {
+      "build": 83,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-09",
+      "commit": "d7ad9da",
+      "items": [
+        "Add the compact Assistant meeting selector: it changes only the meeting Assistant talks about, defaults to the microphone owner, preserves a valid explicit choice, repairs a stale target, and never opens a meeting or moves microphone or sound ownership",
+        "Suppress the automatic floating meeting preview while Assistant is selected so its composer stays unobstructed; Mini meeting remains available explicitly and meetings remain embedded",
+        "Assistant push-to-talk works without a live meeting",
+        "Keep the active transcription info popover open across local and remote meeting updates",
+        "Exclude the incomplete acoustic diagnostic harness from app targets so a clean pushed source tree builds reproducibly"
+      ]
+    },
+    {
+      "build": 82,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-09",
+      "commit": "13f14b6",
+      "items": [
+        "Warm SharedAudioEngine in the foreground before any meeting starts so the macOS microphone indicator appears on app launch and the first meeting adopts the running engine immediately",
+        "Keep the silent output leg available alongside active input in SharedAudioEngine.live() so enabling playout on first meeting join does not tear down and restart AVAudioEngine",
+        "Start muted recording during pre-join microphone activation on prepared media contexts and preserve already-running warm input in prepareIdleInput without transient unmuting or restarts",
+        "Fix the active transcription info popover in AttentionToolbarStrip from auto-closing on periodic audio telemetry updates by decoupling the popover button from status-text identity"
+      ]
+    },
+    {
+      "build": 81,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-09",
+      "commit": "e57215a",
+      "items": [
+        "Restore the Assistant push-to-talk default to on for an upgraded install: the previous implicit default never wrote the preference key, so an absent value now keeps working. An explicit off value is unchanged",
+        "Assistant Talk observes AttentionStore directly, so enabling or disabling push-to-talk updates the Listen button immediately instead of waiting for a later coordinator tick",
+        "Includes all beta 80 review fixes: degraded assistant data recovery, Moments reconnection and in-flight speech guards, scoped outcome status, journal dedup/pruning, approved-headphone routing, Neural Engine cache recovery, and the compile and test-fixture corrections from 2da1adb and 1a290ee"
+      ]
+    },
+    {
+      "build": 80,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-09",
+      "commit": "2da1adb",
+      "items": [
+        "Assistant review fixes (a5b802f..adbc4e9): remote outcome capture requires Attention on and the person's opt-in; a degraded assistant.json is copied to assistant.recovered.json and never overwritten with a partial decode; an outcome without endedAt is rejected instead of being pruned; journal replay deduplicates and sorts by event time; overflow IDs are scoped per meeting",
+        "Background push-to-talk restored with a Carbon Option-Space hotkey that consumes the key, suppresses while a text field is focused, reports registration failures, and ends a hold after 30 seconds even without audio",
+        "Moments: only open meetings are resolved, with invitation, preset and unique-title fallbacks after a stale meeting ID; sayReply records a delivered utterance and clears speaking when the card closed during playback; all delivery actions guard in-flight speech",
+        "Headphone routing no longer classifies device names: it accepts the CoreAudio headphone source, rejects speakers, and otherwise requires the person to approve the device UID",
+        "Localization: Russian Settings path uses Ассистент; the People memory key exists in both languages; voice-cache recovery matches _GenericObjCError, __GenericObjCError and nilError tokens instead of a bare substring",
+        "Compile fixes on top of the review commits (2da1adb): explicit AssistantDataDocument CodingKeys, Combine import for AnyCancellable, explicit self in the VoxAsset rebuild closure"
+      ]
+    },
+    {
+      "build": 79,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-08",
+      "commit": "1a9d22a0",
+      "items": [
+        "Complete Assistant Moments overflow navigation, truthful read-only terminal details, per-Moment errors and rendered-row read state",
+        "Notification click-through reveals and retains the selected Moment without recency reordering; repeated terminal actions cannot deliver content twice",
+        "English and Russian 900 x 560 layouts, accessibility actions and live VoiceOver navigation reviewed; Russian filter clipping and stale decline editing fixed",
+        "Retains beta 78 Neural Engine voice function load recovery and the reviewed Assistant audio, commands, outcomes and Talk implementation"
+      ]
+    },
+    {
+      "build": 78,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-07",
+      "commit": "3a246ff9",
+      "items": [
+        "Neural Engine voice recovery now recognizes reflected GenericObjCError and nilError failures, including failures thrown by AIModel.loadFunction",
+        "Recovery releases model and function references before deleting the unusable Core AI specialization through AIModelCache, then specializes the existing model again and retries once",
+        "Includes all native Mac beta 77 changes from eba0c2d"
+      ]
+    },
+    {
+      "build": 77,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-07",
+      "commit": "eba0c2df",
+      "items": [
+        "Durable Assistant Moments inbox with Live, Missed, Answered, Dismissed and Not for me states; unread badge, filters, quiet-check summaries, reminders and bounded Since then summaries",
+        "Missed chat, reaction and voice actions use the active meeting while closed or missing meetings remain read-only; journal restoration and legacy record compatibility are preserved",
+        "Notification click-through opens the selected Moment; sidebar updates follow store changes; on-device summaries retain the existing English translation convention"
+      ]
+    },
+    {
+      "build": 76,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-07",
+      "commit": "042c099",
+      "items": [
+        "Neural Engine voice cloning recovers from an unusable persistent Core AI specialization by deleting it, specializing the existing model again and retrying inference once; unrelated errors do not trigger a rebuild"
+      ]
+    },
+    {
+      "build": 75,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-06",
+      "commit": "25ffb66",
+      "items": [
+        "Attention modes: each meeting is Off, Mentions or Watch, from your choice for it (until you leave or 30 min), else its instructions (every time), else the situation default (Off on screen, Watch in the background, Mentions when silenced). Mentions judges at once on your name or a question to you, otherwise every 2 min and only an urgent now >= 0.8 shows; Off replaces the per-meeting pause. Chip in each sidebar row, Assistant button in the meeting control bar (Ctrl-Option-A), Attention by situation in Settings → Intelligence, Attention picker in a meeting's instructions"
+      ]
+    },
+    {
+      "build": 74,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-06",
+      "commit": "260c47f",
+      "items": [
+        "Voice replies: \"Your voice, on the Neural Engine\" in Settings → Intelligence → Voice (macOS 27). VoxCPM2 runs in process through a Swift port of tinkerbox-ane's runtime on public Core AI: download of this chip's bundle with every file SHA-256-pinned (VoiceModels.json, 21 chip families), one-time background preparation for the Neural Engine, a short read sample of your voice kept only as latents, replies one at a time and the model unloaded after 10 idle minutes"
+      ]
+    },
+    {
+      "build": 73,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-06",
+      "commit": "6ee13ff",
+      "items": [
+        "Guest meetings: startup-audio-ready passes its live audio state through probeSafe (non-finite numbers become -1, other types their description), because beta 72 never logged the event in real joins and probeLog silently drops values JSON cannot encode"
+      ]
+    },
+    {
+      "build": 72,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-06",
+      "commit": "78a365d",
+      "items": [
+        "Local transcription: the speech model warms up 3 s after launch off every meeting's path and is freed unless a meeting uses it; the first Neural Engine load per run took 10-12 s, a reload after freeing 0.04 s",
+        "Guest meetings: every successful join logs startup-audio-ready with the startup report and the system-audio operation timeline, to attribute the ~4.7-5 s to active controls when alone in a room (~2 s with someone else)"
+      ]
+    },
+    {
+      "build": 71,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-06",
+      "commit": "9552478",
+      "items": [
+        "Meetings: the startup-audio timeout log and Copy/Export Diagnostics read the audio route off the main thread, bounded to 1 s (beta 70 froze its main thread on a stalled CoreAudio lock)",
+        "Meetings: AirPods/headset-button mute is a setting (Settings > General > Meetings), off by default; on macOS 27.2 audiomxd deadlocked on its opt-in at 4 of 5 meeting starts and left meeting audio unable to start; an opt-in that fails or takes over 2 s turns the setting off for later meetings",
+        "Attention: API keys per provider kind, the old key moves to the judge's provider; writer and escalation get their own key fields",
+        "Local transcription: the speech model unloads when no meeting transcribes; line times re-anchor to each buffer's arrival so a playout stall no longer dates lines early",
+        "Attention: a card crowded out by two more urgent ones changes nothing and is logged crowdedOut; system and Personal Voice synthesis gives up after 30 s"
+      ]
+    },
+    {
+      "build": 70,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-06",
+      "commit": "fb959c3",
+      "items": [
+        "Meetings: Guest and Telemost/TrueConf peer connections are created on the peer's native queue, not the main thread; join and recovery drop a peer created after close",
+        "Attention: a trailing question followed by 4 s of silence judges at once",
+        "Attention: 'When the judge is unsure, ask' re-judges verdicts with probability 0.35-0.65 on a second provider, which also stands in when the primary judge errors; first verdict and model kept in the decision log",
+        "Settings > Intelligence: roles view (Listen, Judge, When unsure, Write, Voice) with On this Mac / Cloud badges and installed speech-model size",
+        "Listen models: signed remote catalog client (appcast key over the exact bytes, newer revision only, every model pinned), bundled fallback; sign-catalog.py",
+        "Voice: Personal Voice as a reply voice, macOS 14+, behind the system prompt"
+      ]
+    },
+    {
+      "build": 69,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-06",
+      "commit": "d7c37fd",
+      "items": [
+        "Telemost/TrueConf meetings: after creation, every NativeDesktopRTCPeer call into native WebRTC runs on a serial background queue (GuestNativeCalls), as Guest peers do since beta 68; a WebRTC stall behind the audio device no longer freezes the app; microphone enable/disable is queued in order so a later mute wins; configure, enablePublishing and setScreenTrack are async"
+      ]
+    },
+    {
+      "build": 68,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-06",
+      "commit": "d2dc2d5",
+      "items": [
+        "Guest meetings: every GuestPeer call into native WebRTC runs on a serial background queue per peer (GuestNativeCalls); the main thread only awaits with timeouts, so a WebRTC stall behind the audio device (e.g. 30+ s in CoreAudio after AirPods drop) no longer freezes the app; stalled calls are logged as native-call-timeout and complete later in order, so a later mute always wins over a late unmute"
+      ]
+    },
+    {
+      "build": 67,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-06",
+      "commit": "24799f2",
+      "items": [
+        "Meetings: a failed macOS input-mute write (AVAudioApplication.setInputMuted, e.g. err -50 while the audio session service restarts after AirPods drop) is logged as headset-mute-platform-error instead of shown as a meeting alert; the capture gate already fails closed and retries",
+        "Attention: new judge provider \"Apple on this Mac\" (macOS 26+): Foundation Models judges and drafts replies; Russian meetings are translated to English on this Mac first (per-line cache) and the reason and chat drafts are translated back; per-window verdict schema and four extra rules; FoundationModels and Translation weak-linked so the app still runs on macOS 13"
+      ]
+    },
+    {
+      "build": 66,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-06",
+      "commit": "608715d",
+      "items": [
+        "Local transcription: GigaAM v3 (end-to-end RNN-T with punctuation) runs natively through Core ML on the Neural Engine and is the default model for new setups; the previous default stays selected when it is the only installed model"
+      ]
+    },
+    {
+      "build": 65,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-06",
+      "commit": "1c4970a",
+      "items": [
+        "One audio engine for all meetings (experimental setting, off by default, applies after relaunch): Guest, Telemost, TrueConf and Rock meetings share one WebRTC audio engine; only the meeting with the microphone sends; per-meeting sound and volume; recovery after device changes and sleep (R4 S0-S5: e999737, 4ecd652, d6cc140, 83d23e3, 7f2917c, 1c4970a)",
+        "LiveKit SDK patches applied by prepare-livekit.py: shared factory injection and sender switch for Rock (shared-factory.patch, shared-track.patch)",
+        "Guest: receive-path ICE stalls are logged in release builds and the subscriber is relayed after one"
+      ]
+    },
+    {
+      "build": 64,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-06",
+      "commit": "04fbbae",
+      "items": [
+        "Attention Phase 4: judge on this Mac via Rapid-MLX (preset, status check, JSON mode, 60 s timeout), separate reply writer, local drafts opt-in; 10 s checks when plugged in and cool, pauses on heat, Low Power Mode or memory pressure; per-meeting threshold tuning from your choices, rewritten drafts and repeated declines in the prompts",
+        "Attention Phase 7: Say it on cards speaks the reply into the meeting with the macOS voice or Qwen3-TTS through Rapid-MLX; Listen preview in Settings"
+      ]
+    },
+    {
+      "build": 63,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-05",
+      "commit": "177d19a",
+      "items": [
+        "Settings > Intelligence > Compare models: saved judge decisions and reply drafts run through another model and scored against your choices (agreement, precision, recall, cards, median time); decisions whose card outcome changes are listed; drafts side by side; switch the judge to the compared model"
+      ]
+    },
+    {
+      "build": 62,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-05",
+      "commit": "0e95a1a",
+      "items": [
+        "Attention Phase 5: cards draft a chat reply (Guest, Telemost, Rock) or reaction (Guest) that you edit and send; nothing is sent by itself; Intelligence > Replies with writing style and a per-meeting toggle; drafts and sends logged for model comparison"
+      ]
+    },
+    {
+      "build": 61,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-05",
+      "commit": "a1f6492",
+      "items": [
+        "A second meeting can be joined while the first is still connecting; only service detection runs one at a time, and a join asked for during it starts right after"
+      ]
+    },
+    {
+      "build": 60,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-05",
+      "commit": "914c39b",
+      "items": [
+        "With the experimental warm microphone, a meeting joined without the talk role starts its microphone muted once connected, so the first move into it skips the ~1.65 s device and voice-processing start; logged as microphone-prewarm"
+      ]
+    },
+    {
+      "build": 59,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-05",
+      "commit": "0db3bb8",
+      "items": [
+        "Fix beta 58 hang when the microphone moved between meetings: one meeting's voice-processing teardown overlapped another's setup and deadlocked in AudioDSP. GuestAudioEngineGate runs native audio work one owner at a time, draining other owners' queued work first and its own last"
+      ]
+    },
+    {
+      "build": 58,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-05",
+      "commit": "7b2ef65",
+      "items": [
+        "Microphone moves log a talk-handover diagnostics event with per-step timings (Telemost/TrueConf now time permission, activation, renegotiation); Experiments/AudioBench/handover_report.py summarises them",
+        "Experimental, off by default: keep the microphone ready in every meeting (released meetings stay muted with input running)",
+        "Experimental, off by default: voice replies through a microphone gate and player in the input graph for Guest, Telemost, TrueConf, and LiveKit app audio for Rock; More > Play test voice reply uses the system voice",
+        "Guest microphone tracks are created disabled inside prepareAudio"
+      ]
+    },
+    {
+      "build": 57,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-05",
+      "commit": "e968a32",
+      "items": [
+        "Attention phase 2b: local transcription of Telemost and TrueConf (mixed stream, decoded silently with sound off, Telemost requests audio on silent joins when transcription is on), speakers attributed from the service's speaking signal",
+        "Attention phase 2c: optional per-musician transcription of Rock jam sessions; Settings > Transcription > Meetings to transcribe"
+      ]
+    },
+    {
+      "build": 56,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-05",
+      "commit": "66a753f",
+      "items": [
+        "Settings > Intelligence: Choose… lists the provider's models from GET /models with search; structured-output models first, prices and context shown when listed",
+        "Judge errors carry the provider's own message; OpenAI insufficient_quota and 402 are reported as quota problems and not retried",
+        "Updates: check again right after a new build launches; when Sparkle offers an earlier downloaded update, compare with latest.json and link the newer build"
+      ]
+    },
+    {
+      "build": 55,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-05",
+      "commit": "4b389a2",
+      "items": [
+        "Attention phase 2a: your own microphone joins the local transcript while you are unmuted in the meeting that holds it; Settings > Transcription > Include my microphone",
+        "Attention phase 3: meeting instructions, a judge on an OpenAI-compatible endpoint, attention cards with Open/Decline feedback, sidebar badges, inspector, Settings > Intelligence, local decision log and replay script"
+      ]
+    },
+    {
+      "build": 54,
+      "version": "0.3.0",
+      "channel": "beta",
+      "date": "2026-11-05",
+      "commit": "0cbba16",
+      "items": [
+        "Attention phase 0-1: optional local Russian transcription of Guest meetings on this Mac (sherpa-onnx, GigaAM v3), Settings Transcription tab, teal indicator, transcript continues while a meeting's sound is off"
+      ]
+    },
+    {
+      "build": 53,
+      "version": "0.3.0",
+      "channel": "stable",
+      "date": "2026-11-03",
+      "commit": "cd65c62",
+      "items": [
+        "Catch-up places undated live text by arrival time; provider times from several keys in s or ms; live text shows times and reactions; catch-up shows line times and reactions",
+        "Leave all meetings acts immediately without a confirmation alert; camera readiness defaults to Off"
+      ]
+    }
+  ],
+  "ios": [
+    {
+      "build": 173,
+      "version": "0.2.0",
+      "channel": "beta",
+      "date": "2026-11-26",
+      "commit": "b1600b55",
+      "items": [
+        "Fix iOS background camera & screen sharing, guard SharedAudioEngine unmute",
+        "Harden Guest ICE relay recovery, background transitions, and audio handoff"
+      ]
+    }
+  ]
+}
